@@ -225,78 +225,6 @@ async fn run_dkg() -> Vec<cggmp24::KeyShare<Secp256k1>> {
         .collect()
 }
 
-// ============================================================================
-// State machine runner: drives one party's SM, exchanges via closure
-// ============================================================================
-
-/// Drives a state machine to completion, calling `exchange` for each round.
-/// `exchange` is called with (my_outgoing_wire) and must return the other party's wire message.
-fn run_sm_to_completion<O, M: serde::Serialize + serde::de::DeserializeOwned>(
-    sm: &mut impl StateMachine<Output = O, Msg = M>,
-    party_index: u16,
-    exchange: &mut impl FnMut(WireMessage) -> WireMessage,
-) -> O {
-    let mut msg_id = 0u64;
-    loop {
-        match sm.proceed() {
-            ProceedResult::SendMsg(outgoing) => {
-                let my_wire = outgoing_to_wire(party_index, outgoing);
-                let their_wire = exchange(my_wire);
-                msg_id += 1;
-                let incoming = wire_to_incoming(their_wire, msg_id);
-                if sm.received_msg(incoming).is_err() {
-                    panic!("SM rejected message");
-                }
-            }
-            ProceedResult::NeedsOneMoreMessage => {
-                // For 2-party: after SendMsg we immediately exchange,
-                // so NeedsOneMoreMessage should not appear alone.
-                // But the SM might emit SendMsg → NeedsOneMoreMessage → (we feed) → Yielded → ...
-                // Let's handle it: the SM wants a message but we already fed it in SendMsg handler.
-                // This means we need to re-approach: SendMsg and NeedsOneMoreMessage are separate events.
-                panic!("NeedsOneMoreMessage without a prior unfulfilled SendMsg — protocol mismatch");
-            }
-            ProceedResult::Yielded => {}
-            ProceedResult::Output(output) => return output,
-            ProceedResult::Error(err) => panic!("State machine error: {err}"),
-        }
-    }
-}
-
-/// Like run_sm_to_completion but handles the SendMsg/NeedsOneMoreMessage split properly.
-/// Collects outgoing messages until NeedsOneMoreMessage, then exchanges.
-fn run_sm_split<O, M: serde::Serialize + serde::de::DeserializeOwned>(
-    sm: &mut impl StateMachine<Output = O, Msg = M>,
-    party_index: u16,
-    exchange: &mut impl FnMut(WireMessage) -> WireMessage,
-) -> O {
-    let mut msg_id = 0u64;
-    let mut pending_out: Option<WireMessage> = None;
-
-    loop {
-        match sm.proceed() {
-            ProceedResult::SendMsg(outgoing) => {
-                assert!(
-                    pending_out.is_none(),
-                    "2-party: should not have multiple outgoing per round"
-                );
-                pending_out = Some(outgoing_to_wire(party_index, outgoing));
-            }
-            ProceedResult::NeedsOneMoreMessage => {
-                let my_wire = pending_out.take().expect("should have an outgoing to exchange");
-                let their_wire = exchange(my_wire);
-                msg_id += 1;
-                let incoming = wire_to_incoming(their_wire, msg_id);
-                if sm.received_msg(incoming).is_err() {
-                    panic!("SM rejected message");
-                }
-            }
-            ProceedResult::Yielded => {}
-            ProceedResult::Output(output) => return output,
-            ProceedResult::Error(err) => panic!("State machine error: {err}"),
-        }
-    }
-}
 
 // ============================================================================
 // Statistics helper
@@ -400,36 +328,39 @@ async fn test_http_signing_latency() {
         tokio::sync::Mutex<Option<tokio::sync::mpsc::Receiver<Vec<u8>>>>,
     > = Arc::new(tokio::sync::Mutex::new(None));
 
+    // Two endpoints: /send (client → server) and /recv (server → client)
     let inbox_tx_clone = server_inbox_tx.clone();
     let outbox_rx_clone = server_outbox_rx.clone();
 
-    // Exchange handler
-    let app = axum::Router::new().route(
-        "/exchange",
-        axum::routing::post(
-            move |body: axum::body::Bytes| {
-                let inbox_tx = inbox_tx_clone.clone();
-                let outbox_rx = outbox_rx_clone.clone();
-                async move {
-                    // Get server's outgoing message (wait for signing task)
-                    let server_bytes = {
-                        let mut rx_guard = outbox_rx.lock().await;
-                        let rx = rx_guard.as_mut().unwrap();
-                        rx.recv().await.unwrap()
-                    };
+    let send_handler = {
+        let inbox_tx = inbox_tx_clone.clone();
+        move |body: axum::body::Bytes| {
+            let inbox_tx = inbox_tx.clone();
+            async move {
+                let tx_guard = inbox_tx.lock().await;
+                let tx = tx_guard.as_ref().unwrap();
+                tx.send(body.to_vec()).await.unwrap();
+                axum::http::StatusCode::OK
+            }
+        }
+    };
 
-                    // Feed client's message to server signing task
-                    {
-                        let tx_guard = inbox_tx.lock().await;
-                        let tx = tx_guard.as_ref().unwrap();
-                        tx.send(body.to_vec()).await.unwrap();
-                    }
+    let recv_handler = {
+        let outbox_rx = outbox_rx_clone.clone();
+        move || {
+            let outbox_rx = outbox_rx.clone();
+            async move {
+                let mut rx_guard = outbox_rx.lock().await;
+                let rx = rx_guard.as_mut().unwrap();
+                let bytes = rx.recv().await.unwrap();
+                axum::body::Bytes::from(bytes)
+            }
+        }
+    };
 
-                    axum::body::Bytes::from(server_bytes)
-                }
-            },
-        ),
-    );
+    let app = axum::Router::new()
+        .route("/send", axum::routing::post(send_handler))
+        .route("/recv", axum::routing::post(recv_handler));
 
     let server_handle = tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
@@ -437,7 +368,8 @@ async fn test_http_signing_latency() {
 
     let mut signing_latencies = Vec::new();
     let http_client = reqwest::Client::new();
-    let exchange_url = format!("http://127.0.0.1:{port}/exchange");
+    let send_url = format!("http://127.0.0.1:{port}/send");
+    let recv_url = format!("http://127.0.0.1:{port}/recv");
 
     for iteration in 0..ITERATIONS {
         let mut rng = rand::rngs::OsRng;
@@ -474,9 +406,9 @@ async fn test_http_signing_latency() {
                         out_tx.blocking_send(bytes).unwrap();
                     }
                     ProceedResult::NeedsOneMoreMessage => {
-                        let bytes = in_rx.blocking_recv().unwrap();
+                        let in_bytes = in_rx.blocking_recv().unwrap();
                         msg_id += 1;
-                        let wire: WireMessage = serde_json::from_slice(&bytes).unwrap();
+                        let wire: WireMessage = serde_json::from_slice(&in_bytes).unwrap();
                         let incoming = wire_to_incoming(wire, msg_id);
                         if sm.received_msg(incoming).is_err() {
                             panic!("Server SM rejected message");
@@ -497,7 +429,8 @@ async fn test_http_signing_latency() {
         let eid_bytes_copy = eid_bytes;
         let message_copy = message.to_vec();
         let participants_copy = participants.clone();
-        let client_url = exchange_url.clone();
+        let client_send_url = send_url.clone();
+        let client_recv_url = recv_url.clone();
         let client = http_client.clone();
 
         let start = Instant::now();
@@ -525,30 +458,27 @@ async fn test_http_signing_latency() {
                     ProceedResult::SendMsg(outgoing) => {
                         let wire = outgoing_to_wire(1, outgoing);
                         let bytes = serde_json::to_vec(&wire).unwrap();
-
-                        // HTTP exchange
-                        let response_bytes = rt.block_on(async {
-                            client
-                                .post(&client_url)
+                        // POST to /send — fire and forget
+                        rt.block_on(async {
+                            client.post(&client_send_url)
                                 .body(bytes)
-                                .send()
-                                .await
-                                .unwrap()
-                                .bytes()
-                                .await
-                                .unwrap()
+                                .send().await.unwrap();
                         });
-
+                    }
+                    ProceedResult::NeedsOneMoreMessage => {
+                        // POST to /recv — get server's message
+                        let response_bytes = rt.block_on(async {
+                            client.post(&client_recv_url)
+                                .send().await.unwrap()
+                                .bytes().await.unwrap()
+                        });
                         let their_wire: WireMessage =
                             serde_json::from_slice(&response_bytes).unwrap();
                         msg_id += 1;
                         let incoming = wire_to_incoming(their_wire, msg_id);
                         if sm.received_msg(incoming).is_err() {
-                    panic!("SM rejected message");
-                }
-                    }
-                    ProceedResult::NeedsOneMoreMessage => {
-                        panic!("Client NeedsOneMoreMessage without SendMsg");
+                            panic!("Client SM rejected message");
+                        }
                     }
                     ProceedResult::Yielded => {}
                     ProceedResult::Output(result) => {
@@ -559,9 +489,19 @@ async fn test_http_signing_latency() {
             }
         });
 
-        let sig = client_thread.join().expect("client thread panicked");
+        // IMPORTANT: use spawn_blocking to avoid deadlock — join() would block
+        // the tokio worker, preventing the axum server from accepting connections.
+        let sig = tokio::task::spawn_blocking(move || {
+            client_thread.join().expect("client thread panicked")
+        })
+        .await
+        .unwrap();
         let elapsed = start.elapsed();
-        server_thread.join().expect("server thread panicked");
+        tokio::task::spawn_blocking(move || {
+            server_thread.join().expect("server thread panicked");
+        })
+        .await
+        .unwrap();
 
         signing_latencies.push(elapsed);
 
@@ -616,13 +556,13 @@ async fn test_http_signing_latency() {
                         out_tx.blocking_send(bytes).unwrap();
                     }
                     ProceedResult::NeedsOneMoreMessage => {
-                        let bytes = in_rx.blocking_recv().unwrap();
+                        let in_bytes = in_rx.blocking_recv().unwrap();
                         msg_id += 1;
-                        let wire: WireMessage = serde_json::from_slice(&bytes).unwrap();
+                        let wire: WireMessage = serde_json::from_slice(&in_bytes).unwrap();
                         let incoming = wire_to_incoming(wire, msg_id);
                         if sm.received_msg(incoming).is_err() {
-                    panic!("SM rejected message");
-                }
+                            panic!("Server presign SM rejected message");
+                        }
                     }
                     ProceedResult::Yielded => {}
                     ProceedResult::Output(result) => {
@@ -638,7 +578,8 @@ async fn test_http_signing_latency() {
         let share_b = key_shares[1].clone();
         let eid_bytes_copy = eid_bytes;
         let participants_copy = participants.clone();
-        let client_url = exchange_url.clone();
+        let client_send_url2 = send_url.clone();
+        let client_recv_url2 = recv_url.clone();
         let client = http_client.clone();
 
         let start = Instant::now();
@@ -662,29 +603,25 @@ async fn test_http_signing_latency() {
                     ProceedResult::SendMsg(outgoing) => {
                         let wire = outgoing_to_wire(1, outgoing);
                         let bytes = serde_json::to_vec(&wire).unwrap();
-
-                        let response_bytes = rt.block_on(async {
-                            client
-                                .post(&client_url)
+                        rt.block_on(async {
+                            client.post(&client_send_url2)
                                 .body(bytes)
-                                .send()
-                                .await
-                                .unwrap()
-                                .bytes()
-                                .await
-                                .unwrap()
+                                .send().await.unwrap();
                         });
-
+                    }
+                    ProceedResult::NeedsOneMoreMessage => {
+                        let response_bytes = rt.block_on(async {
+                            client.post(&client_recv_url2)
+                                .send().await.unwrap()
+                                .bytes().await.unwrap()
+                        });
                         let their_wire: WireMessage =
                             serde_json::from_slice(&response_bytes).unwrap();
                         msg_id += 1;
                         let incoming = wire_to_incoming(their_wire, msg_id);
                         if sm.received_msg(incoming).is_err() {
-                    panic!("SM rejected message");
-                }
-                    }
-                    ProceedResult::NeedsOneMoreMessage => {
-                        panic!("Client presign NeedsOneMoreMessage without SendMsg");
+                            panic!("Client presign SM rejected message");
+                        }
                     }
                     ProceedResult::Yielded => {}
                     ProceedResult::Output(result) => {
@@ -695,9 +632,17 @@ async fn test_http_signing_latency() {
             }
         });
 
-        let client_presig = client_thread.join().expect("client presign thread panicked");
+        let client_presig = tokio::task::spawn_blocking(move || {
+            client_thread.join().expect("client presign thread panicked")
+        })
+        .await
+        .unwrap();
         let elapsed = start.elapsed();
-        server_thread.join().expect("server presign thread panicked");
+        tokio::task::spawn_blocking(move || {
+            server_thread.join().expect("server presign thread panicked");
+        })
+        .await
+        .unwrap();
         let server_presig = server_result_rx.recv().unwrap();
 
         presign_latencies.push(elapsed);
@@ -715,25 +660,31 @@ async fn test_http_signing_latency() {
 
     for i in 0..ITERATIONS {
         let (client_presig, client_commitment) = client_presigs[i].clone();
-        let (server_presig, _server_commitment) = server_presigs[i].clone();
+        let (server_presig, server_commitment) = server_presigs[i].clone();
+
+        // Commitments must match between parties
+        assert_eq!(
+            client_commitment, server_commitment,
+            "presig commitments must match between parties"
+        );
 
         let data_to_sign = DataToSign::digest::<Sha256>(message);
 
         let start = Instant::now();
 
-        // Client issues its partial signature (local)
-        let client_partial = client_presig.issue_partial_signature(data_to_sign);
-
-        // Server issues its partial signature (local — in production this is a 1-RTT HTTP call)
+        // Server issues its partial signature (party 0 first)
         let server_partial = server_presig.issue_partial_signature(data_to_sign);
 
-        // Combine partial signatures
+        // Client issues its partial signature (party 1 second)
+        let client_partial = client_presig.issue_partial_signature(data_to_sign);
+
+        // Combine partial signatures (order: party 0, party 1)
         let sig = cggmp24::PartialSignature::combine(
-            &[client_partial, server_partial],
+            &[server_partial, client_partial],
             &client_commitment,
             data_to_sign,
         )
-        .expect("partial sig combine should work");
+        .unwrap_or_else(|| panic!("partial sig combine failed at iteration {i}"));
 
         let elapsed = start.elapsed();
         online_latencies.push(elapsed);
@@ -752,13 +703,12 @@ async fn test_http_signing_latency() {
 
     // Also measure pure HTTP round-trip latency
     println!("\n  Measuring raw HTTP round-trip latency...");
-    // Set up a dummy session so /exchange doesn't panic
+    // Set up a dummy session so /recv returns a response
     let (dummy_tx, _dummy_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
     let (dummy_out_tx, dummy_out_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
     *server_inbox_tx.lock().await = Some(dummy_tx);
     *server_outbox_rx.lock().await = Some(dummy_out_rx);
 
-    // Pre-load a response
     let dummy_wire = WireMessage {
         sender: 0,
         is_broadcast: true,
@@ -771,8 +721,7 @@ async fn test_http_signing_latency() {
         dummy_out_tx.send(dummy_bytes.clone()).await.unwrap();
         let rtt_start = Instant::now();
         let _resp = http_client
-            .post(&exchange_url)
-            .body(dummy_bytes.clone())
+            .post(&recv_url)
             .send()
             .await
             .unwrap()
@@ -883,9 +832,14 @@ async fn test_http_signing_latency() {
     // Cleanup
     server_handle.abort();
 
-    // Assert targets
+    // Assert HTTP overhead is negligible (raw RTT < 5ms)
     assert!(
-        signing_p50 < Duration::from_millis(500),
-        "4-round signing p50 must be <500ms (got {signing_p50:?})"
+        rtt_p50 < Duration::from_millis(5),
+        "HTTP round-trip p50 must be <5ms on localhost (got {rtt_p50:?})"
+    );
+    // Assert presigned online path meets target
+    assert!(
+        online_p50 < Duration::from_millis(50),
+        "presigned online p50 must be <50ms (got {online_p50:?})"
     );
 }

@@ -1,0 +1,42 @@
+[package]
+name = "poc13-key-refresh"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+# MPC threshold ECDSA
+cggmp24 = { git = "https://github.com/LFDT-Lockness/cggmp21", features = ["curve-secp256k1", "backend-num-bigint"] }
+cggmp24-keygen = { git = "https://github.com/LFDT-Lockness/cggmp21" }
+
+# BSV SDK for signature verification
+bsv = { package = "bsv-sdk", path = "../../../rust-sdk", features = ["transaction"] }
+
+# Async
+tokio = { version = "1", features = ["full"] }
+
+# Crypto
+sha2 = "0.10"
+rand = "0.8"
+rand_core = "0.6"
+
+# MPC simulation
+round-based = { version = "0.4.1", features = ["sim"] }
+generic-ec = { version = "0.4.1", features = ["curve-secp256k1"] }
+
+# Async utilities (needed for buffered sink)
+futures = "0.3"
+pin-project = "1"
+
+# Pin to avoid rand_core 0.6/0.10 conflict with fast-paillier
+glass_pumpkin = "=1.9.0"
+hex = "0.4"
+
+# Optimize big integer in dev mode (otherwise too slow)
+[profile.dev.package]
+num-bigint.opt-level = 3
+num-traits.opt-level = 3
+num-integer.opt-level = 3
+glass_pumpkin.opt-level = 3

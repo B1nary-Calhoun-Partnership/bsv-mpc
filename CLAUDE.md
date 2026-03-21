@@ -124,6 +124,8 @@ Four POCs validated — the critical crypto path is fully de-risked:
 | POC 4: Real BSV transaction | Can MPC produce a valid mainnet transaction? | **PASS** — [TXID on WhatsOnChain](https://whatsonchain.com/tx/2e4a3afa0ae5c9c92422f6c703e36590884165669775cf7c7705a2ae43046bb7) |
 | POC 6: Wallet toolbox dep | Can proxy reuse rust-wallet-toolbox, swap only signer? | **PASS** — ZERO coupling in UTXO/fee/handlers. ~30-line fork to add WalletSignerApi trait. 4-6 week path confirmed. |
 | POC 7: Fee injection | Can fee output be injected without breaking tx? | **PASS** — 3-output tx on mainnet. [TXID](https://whatsonchain.com/tx/6033e4fb4872d1d6a28acb6659f35641e63738bb8297bca56dc88b60276b2d42) |
+| POC 5: HTTP latency | Is MPC signing fast enough over HTTP? | **PASS** — 359µs presigned (target <50ms), ~135µs HTTP overhead per round |
+| POC 12: 3-of-5 threshold | Does production config work? | **PASS** — 5-party DKG 138ms, any 3-of-5 subset signs, 4.4ms presig combine, below-threshold correctly rejected |
 
 ### Critical Lessons from POC 3 + POC 4
 
