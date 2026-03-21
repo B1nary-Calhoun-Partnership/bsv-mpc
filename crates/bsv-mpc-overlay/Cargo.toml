@@ -1,0 +1,18 @@
+[package]
+name = "bsv-mpc-overlay"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "BSV overlay network integration for MPC node discovery (SHIP/SLAP, BRC-22/23/24/25)"
+
+[dependencies]
+bsv-mpc-core = { path = "../bsv-mpc-core" }
+bsv.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+reqwest.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+chrono.workspace = true

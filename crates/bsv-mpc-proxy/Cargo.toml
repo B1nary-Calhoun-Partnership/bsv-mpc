@@ -1,0 +1,22 @@
+[package]
+name = "bsv-mpc-proxy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "BRC-100 compatible MPC signing proxy — drop-in replacement for bsv-wallet-cli"
+
+[dependencies]
+bsv-mpc-core = { path = "../bsv-mpc-core" }
+bsv.workspace = true
+axum.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+reqwest.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+chrono.workspace = true
+anyhow.workspace = true

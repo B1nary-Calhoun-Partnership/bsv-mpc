@@ -1,0 +1,15 @@
+[advisories]
+vulnerability = "deny"
+unmaintained = "warn"
+
+[licenses]
+unlicensed = "deny"
+allow = ["MIT", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "ISC", "Unicode-3.0", "Unicode-DFS-2016"]
+copyleft = "deny"
+
+[bans]
+multiple-versions = "warn"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "allow"  # cggmp24 is git-sourced

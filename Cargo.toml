@@ -1,0 +1,54 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/bsv-mpc-core",
+    "crates/bsv-mpc-proxy",
+    "crates/bsv-mpc-worker",
+    "crates/bsv-mpc-service",
+    "crates/bsv-mpc-overlay",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/anthropics/bsv-mpc"
+
+[workspace.dependencies]
+# MPC crypto
+cggmp24 = { git = "https://github.com/LFDT-Lockness/cggmp21", features = ["curve-secp256k1", "hd-wallet", "hd-slip10"] }
+cggmp24-keygen = { git = "https://github.com/LFDT-Lockness/cggmp21", features = ["hd-wallet"] }
+
+# BSV
+bsv = { package = "bsv-sdk", path = "../rust-sdk", features = ["transaction"] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# HTTP
+axum = { version = "0.8", features = ["ws"] }
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+
+# Crypto
+sha2 = "0.10"
+rand = "0.8"
+aes-gcm = "0.10"
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Temp/test
+tempfile = "3"

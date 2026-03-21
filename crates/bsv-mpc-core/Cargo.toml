@@ -1,0 +1,24 @@
+[package]
+name = "bsv-mpc-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Core MPC threshold ECDSA signing protocol for BSV (wraps cggmp24)"
+
+[dependencies]
+cggmp24.workspace = true
+cggmp24-keygen.workspace = true
+bsv.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+rand.workspace = true
+aes-gcm.workspace = true
+thiserror.workspace = true
+chrono.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+tempfile.workspace = true
