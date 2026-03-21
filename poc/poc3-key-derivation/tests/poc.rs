@@ -102,10 +102,10 @@ fn mpc_partial_ecdh(
         let lambda_bytes = lambda.to_be_bytes();
         let mut lambda_arr = [0u8; 32];
         lambda_arr.copy_from_slice(lambda_bytes.as_bytes());
-        let lambda_scalar =
-            Option::from(k256::Scalar::from_repr(lambda_arr.into()))
-                .expect("valid scalar for Lagrange coefficient");
-        let weighted = partial_point * lambda_scalar;
+        let lambda_ct = k256::Scalar::from_repr(lambda_arr.into());
+        assert!(bool::from(lambda_ct.is_some()), "Lagrange coefficient must be valid scalar");
+        let lambda_k256: k256::Scalar = lambda_ct.unwrap();
+        let weighted: ProjectivePoint = partial_point * lambda_k256;
 
         result = result + weighted;
     }

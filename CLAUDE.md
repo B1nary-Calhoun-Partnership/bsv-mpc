@@ -255,13 +255,17 @@ GET https://api.whatsonchain.com/v1/bsv/main/address/<address>/unspent
 ```
 Returns UTXOs at an address. Use this to find spendable outputs at the MPC address.
 
-### Key repos for tx infrastructure
+### Key repos (all at ~/bsv/)
 | Repo | Path | What it provides |
 |------|------|-----------------|
-| **rust-sdk** | `~/bsv/rust-sdk` | Transaction, Script, PublicKey, sighash computation, BEEF |
-| **bsv-wallet-cli** | `~/bsv/bsv-wallet-cli` | Running wallet for funding MPC addresses |
-| **rust-wallet-toolbox** | `~/bsv/rust-wallet-toolbox` | UTXO selection, fee calculation, tx construction (if POC 6 passes) |
-| **rust-wallet-infra** | `~/bsv/rust-wallet-infra` | Fallback CF Worker wallet patterns if toolbox doesn't work |
+| **rust-sdk** | `~/bsv/rust-sdk` | BSV SDK — Transaction, Script, PublicKey, BRC-42 key derivation, sighash, BEEF. Core dependency. |
+| **bsv-wallet-cli** | `~/bsv/bsv-wallet-cli` | Reference BRC-100 wallet daemon (Rust + Axum + SQLite). The binary we're replacing. Use for funding MPC addresses during POCs. Has BRC-31 auth implementation. |
+| **rust-wallet-toolbox** | `~/bsv/rust-wallet-toolbox` | Wallet engine — ProtoWallet (signing), StorageSqlx (UTXOs), WalletSigner (tx signing orchestration). If POC 6 passes, reuse this and only swap the signer. |
+| **rust-wallet-infra** | `~/bsv/rust-wallet-infra` | CF Worker wallet (Rust → WASM, D1+R2 storage). Fallback patterns if toolbox doesn't work. Already deployed. |
+| **rust-middleware** | `~/bsv/rust-middleware` | `bsv-auth-cloudflare` crate — **USE THIS** for BRC-31 auth + BRC-29 payment middleware in bsv-mpc-worker. Ready-made, production-proven. Don't rewrite auth from scratch. |
+| **agents** | `~/bsv/agents` | 11 production CF Workers with BRC-31 auth + BRC-29 micropayments. Pattern reference for WASM deployment, nonce-bound pricing, identity-scoped results, refund handling. |
+| **rust-wallet-utils** | `~/bsv/rust-wallet-utils` | CLI wallet utility with BRC-42 key derivation. Test reference. |
+| **BRCs** | `~/bsv/BRCs` | 114 BRC specifications. Key ones: BRC-42 (key derivation), BRC-100 (wallet API), BRC-22/23/24/25 (overlays). |
 
 ### Mainnet only
 Never testnet. BSV mainnet transactions cost fractions of a cent. Testnet has different behavior and hides real bugs.
