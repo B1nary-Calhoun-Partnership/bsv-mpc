@@ -131,6 +131,7 @@ Four POCs validated — the critical crypto path is fully de-risked:
 | POC 8: BRC-31 auth | Does Authrite work through MPC? | **PASS** — 1 KSS round-trip for partial ECDH (~135µs), then local HMAC offset. Server-side verification works. DER wire format correct. |
 | POC 9: encrypt/decrypt | Is MPC encryption compatible with normal wallet? | **PASS** — Byte-identical symmetric keys. Zero data loss during migration. All 3 protocols (memory, state, conversation) validated. |
 | POC 11: Fee settlement | Can MPC nodes co-sign a settlement tx using their own threshold signing? | **PASS** — 2-of-3 DKG among nodes, proportional split (45/35/20%), all 3 subsets sign, below-threshold rejected. [TXID](https://whatsonchain.com/tx/afbb7ecd746bf75c346303e863e9e6a4bd17184d8149ac68f0bdcc1003e485d7) |
+| POC 14: Overlay discovery | Does SHIP/SLAP work for MPC node registration? | **PASS** — 4/4 mainnet SLAP trackers alive (BSV Association + Babbage). Live SHIP host discovered. tm_mpc_signing query works (0 results = nobody registered yet). No fallback needed — overlay is production-ready. |
 
 ### Critical Lessons from POC 3 + POC 4
 
@@ -185,6 +186,13 @@ Four POCs validated — the critical crypto path is fully de-risked:
 - Port `threshold_reshare()` to `bsv-mpc-core` with Schnorr proofs for production hardening
 - Enables Fireblocks-style automatic refresh (every few minutes, near-zero cost)
 - **cggmp24 lacks this natively** — cggmp24 v0.7 only has aux_info_gen, cggmp21 v0.6 has non-threshold refresh but requires rug (LGPL, no WASM). Our solution avoids both limitations.
+
+**Overlay discovery (POC 14):**
+- **Production overlay is LIVE** — no fallback needed
+- 4 mainnet SLAP trackers: 3 from BSV Association (US/EU/AP bsvb.tech) + 1 Babbage (bapp.dev)
+- `LookupResolver` query works — `tm_mpc_signing` returns 0 outputs (correct, nobody registered yet)
+- Path to production: `create_overlay_admin_token(Protocol::Ship, key, domain, "tm_mpc_signing")` → broadcast via `TopicBroadcaster` → nodes discoverable on live overlay
+- Local registry pattern (register → discover → deregister) proven end-to-end
 
 **Fee settlement (POC 11):**
 - **Nodes' DKG is completely independent from agent's DKG** — same CGGMP'24 protocol, different participants, different joint key
