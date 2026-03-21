@@ -5,6 +5,12 @@
 > Valid ECDSA signatures require t+1 parties to cooperate. Neither party alone can sign.
 > Nodes are discoverable via BSV overlay network. Fees distributed on-chain.
 
+## IMPORTANT: This is a 100% Rust project
+
+**Everything is Rust.** All 5 crates, all tests, the CF Worker (Rust → WASM), the standalone service, the overlay integration — all Rust. No TypeScript, no Go, no Python, no JavaScript. The only exception is the sCrypt fee covenant (contracts/mpc-fee-pool/) which is deferred to Phase 2 and uses sCrypt's TypeScript eDSL — but that is NOT part of the core build and should not be worked on until Level 2 multisig settlement is proven.
+
+When writing code for this project, write Rust. When writing tests, write Rust. When building the CF Worker, compile Rust to WASM. Do not introduce other languages.
+
 ## Architecture
 
 5 Rust crates in a Cargo workspace. The MPC Signing Proxy presents a BRC-100 wallet API on localhost:3322 — bsv-worm (or any BRC-100 client) calls it unchanged. Internally, every signing request becomes a 2-party CGGMP'24 threshold ECDSA ceremony with a remote Key Share Service (KSS).
