@@ -11,6 +11,8 @@
 
 When writing code for this project, write Rust. When writing tests, write Rust. When building the CF Worker, compile Rust to WASM. Do not introduce other languages.
 
+For BSV smart contracts (Level 3 fee covenant), use **Runar** (`https://github.com/icellan/runar`) — a Rust-native BSV Script compiler. This keeps even the covenant code in Rust instead of sCrypt TypeScript.
+
 ## Architecture
 
 5 Rust crates in a Cargo workspace. The MPC Signing Proxy presents a BRC-100 wallet API on localhost:3322 — bsv-worm (or any BRC-100 client) calls it unchanged. Internally, every signing request becomes a 2-party CGGMP'24 threshold ECDSA ceremony with a remote Key Share Service (KSS).
