@@ -122,6 +122,8 @@ Four POCs validated — the critical crypto path is fully de-risked:
 | POC 2: WASM compilation | Does cggmp24 compile to `wasm32-unknown-unknown` and run? | **PASS** — 636KB module, 79.5MB RSS, 1ms presig combine |
 | POC 3: Key derivation | Do MPC-derived keys match standard HD wallets? | **PASS** — Self_ needs partial ECDH w/ Lagrange interpolation |
 | POC 4: Real BSV transaction | Can MPC produce a valid mainnet transaction? | **PASS** — [TXID on WhatsOnChain](https://whatsonchain.com/tx/2e4a3afa0ae5c9c92422f6c703e36590884165669775cf7c7705a2ae43046bb7) |
+| POC 6: Wallet toolbox dep | Can proxy reuse rust-wallet-toolbox, swap only signer? | **PASS** — ZERO coupling in UTXO/fee/handlers. ~30-line fork to add WalletSignerApi trait. 4-6 week path confirmed. |
+| POC 7: Fee injection | Can fee output be injected without breaking tx? | **PASS** — 3-output tx on mainnet. [TXID](https://whatsonchain.com/tx/6033e4fb4872d1d6a28acb6659f35641e63738bb8297bca56dc88b60276b2d42) |
 
 ### Critical Lessons from POC 3 + POC 4
 
@@ -149,6 +151,20 @@ Four POCs validated — the critical crypto path is fully de-risked:
 **DKG key persistence (POC 4):**
 - **ALWAYS persist DKG keys before funding the MPC address** — ephemeral keys = lost funds
 - POC 4 lost 3,000 sats (~$0.0015) from ephemeral DKG keys in failed runs
+
+**Wallet toolbox reuse (POC 6):**
+- **ZERO signer coupling** in StorageSqlx, Services, handlers, types — all reusable as-is
+- **WalletSigner is the only blocker** — hardcoded concrete struct, not a trait
+- **Fix: ~30-line fork** — add `WalletSignerApi` trait, make `Wallet` generic over it, implement `MpcSigner`
+- **Alternative (no-fork):** Use `create_action(sign_and_process: false)` → sign externally → `sign_action` with pre-computed unlocking scripts
+- **MpcSigner prototype works** — same SignerInput structs, same sighash, same unlocking script, only signing step changes
+
+**Fee injection (POC 7):**
+- Fee output is a simple append + change reduction — no structural tx changes
+- **Must inject BEFORE sighash** — fee is part of hashOutputs in BIP-143 (confirmed working)
+- Split fee among N operators handles remainder correctly
+- Graceful failure when change < fee (outputs not modified)
+- 3-output tx (recipient + change + fee) works on mainnet at 150 sats mining fee
 
 **Wallet integration quirks (POC 4 full loop):**
 - **Wallet uses `Origin: http://admin.com` header** for default basket access

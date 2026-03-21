@@ -1,0 +1,51 @@
+[package]
+name = "poc6-toolbox-dep"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+# The toolbox we're evaluating — path dependency
+bsv-wallet-toolbox = { path = "../../../rust-wallet-toolbox", features = ["sqlite"] }
+
+# BSV SDK (same version toolbox uses)
+bsv = { package = "bsv-sdk", path = "../../../rust-sdk", features = ["full", "http"] }
+
+# MPC threshold ECDSA (from POC 1)
+cggmp24 = { git = "https://github.com/LFDT-Lockness/cggmp21", features = ["curve-secp256k1", "backend-num-bigint"] }
+cggmp24-keygen = { git = "https://github.com/LFDT-Lockness/cggmp21" }
+
+# MPC simulation infra
+round-based = { version = "0.4.1", features = ["sim"] }
+generic-ec = { version = "0.4.1", features = ["curve-secp256k1"] }
+
+# Async
+tokio = { version = "1", features = ["full"] }
+
+# Crypto
+sha2 = "0.10"
+rand = "0.8"
+rand_core = "0.6"
+
+# Async utilities (buffered sink for MPC sim)
+futures = "0.3"
+pin-project = "1"
+
+# Misc
+hex = "0.4"
+tracing = "0.1"
+
+# Pin to avoid rand_core conflict
+glass_pumpkin = "=1.9.0"
+
+# Temp file for SQLite DB
+tempfile = "3"
+
+# Optimize big integer in dev mode (otherwise DKG too slow)
+[profile.dev.package]
+num-bigint.opt-level = 3
+num-traits.opt-level = 3
+num-integer.opt-level = 3
+glass_pumpkin.opt-level = 3
