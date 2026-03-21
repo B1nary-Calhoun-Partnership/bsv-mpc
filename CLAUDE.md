@@ -114,15 +114,43 @@ bsv-mpc/
 
 ## POC Validation Results
 
-Three POCs have been validated, de-risking the critical path:
+Four POCs validated — the critical crypto path is fully de-risked:
 
 | POC | Risk Validated | Result |
 |-----|---------------|--------|
 | POC 1: cggmp24 signing | Does cggmp24 API work for 2-of-2 DKG + signing on secp256k1? | **PASS** — DKG completes, signatures verify with bsv SDK |
-| POC 2: WASM compilation | Does cggmp24 compile to `wasm32-unknown-unknown` and run? | **PASS** — Compiles, runs in Node.js, getrandom/js works |
-| POC 3: Key derivation | Do MPC-derived keys match standard HD wallets? | **PASS** — SLIP-10/BIP-32 compatible |
+| POC 2: WASM compilation | Does cggmp24 compile to `wasm32-unknown-unknown` and run? | **PASS** — 636KB module, 79.5MB RSS, 1ms presig combine |
+| POC 3: Key derivation | Do MPC-derived keys match standard HD wallets? | **PASS** — Self_ needs partial ECDH w/ Lagrange interpolation |
+| POC 4: Real BSV transaction | Can MPC produce a valid mainnet transaction? | **PASS** — [TXID on WhatsOnChain](https://whatsonchain.com/tx/2e4a3afa0ae5c9c92422f6c703e36590884165669775cf7c7705a2ae43046bb7) |
 
-Remaining POCs (4-7): transaction signing, HTTP latency, wallet-toolbox integration, fee injection. See `POCS.md`.
+### Critical Lessons from POC 3 + POC 4
+
+**Key derivation (POC 3):**
+- `Anyone` counterparty: derive locally from joint pubkey (0 round-trips)
+- `Self_` counterparty: partial ECDH with KSS (1 round-trip, Lagrange interpolation on VSS shares)
+- `Other(key)` counterparty: partial ECDH with KSS (1 round-trip)
+- Memory encryption (`[2, "worm memory"]`, counterparty "self") hits the Self_ path
+
+**Transaction signing (POC 4):**
+- Use `PrehashedDataToSign::from_scalar()` for cggmp24 signing (not raw bytes)
+- Use `TransactionSignature::to_checksig_format()` for DER + sighash byte (0x41 = ALL|FORKID)
+- BIP-143 sighash uses internal byte order txid (reversed from display)
+- cggmp24 auto-normalizes to low-S (BIP-62 compliant)
+- ARC GorillaPool (`https://arc.gorillapool.io`) works without API key
+- Fee rate: 100 sats/kb works on mainnet
+
+**BEEF construction (POC 4):**
+- Wallet's `internalizeAction` requires **AtomicBEEF** with complete merkle proof ancestry
+- Use BSV SDK's `Beef` struct — don't build manually
+- WoC TSC endpoint (`/tx/{txid}/proof/tsc`) works for merkle proofs; regular `/proof` returns 404
+- TSC → BUMP conversion needed (`tsc_to_merkle_path` helper)
+- The MPC proxy MUST maintain BEEF ancestry for its transactions
+
+**DKG key persistence (POC 4):**
+- **ALWAYS persist DKG keys before funding the MPC address** — ephemeral keys = lost funds
+- POC 4 lost 3,000 sats (~$0.0015) from ephemeral DKG keys in failed runs
+
+Remaining POCs (5-13): HTTP latency, wallet-toolbox, fee injection, BRC-31 auth, encrypt/decrypt, CF Worker HTTPS, fee settlement, 3-of-5, overlay. See `POCS.md` and GitHub issues.
 
 ## Implementation Status
 

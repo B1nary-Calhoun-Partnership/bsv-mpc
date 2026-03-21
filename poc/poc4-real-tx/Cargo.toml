@@ -1,0 +1,51 @@
+[package]
+name = "poc4-real-tx"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+# MPC threshold ECDSA
+cggmp24 = { git = "https://github.com/LFDT-Lockness/cggmp21", features = [
+    "curve-secp256k1",
+    "backend-num-bigint",
+] }
+cggmp24-keygen = { git = "https://github.com/LFDT-Lockness/cggmp21" }
+
+# BSV SDK
+bsv = { package = "bsv-sdk", path = "../../../rust-sdk", features = ["transaction"] }
+
+# Async
+tokio = { version = "1", features = ["full"] }
+
+# HTTP client (for WoC API + funding)
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+
+# Crypto
+sha2 = "0.10"
+rand = "0.8"
+
+# MPC simulation
+round-based = { version = "0.4.1", features = ["sim"] }
+generic-ec = { version = "0.4.1", features = ["curve-secp256k1"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Hex + async utilities
+hex = "0.4"
+futures = "0.3"
+pin-project = "1"
+
+# Pin to avoid rand_core version conflict
+glass_pumpkin = "=1.9.0"
+
+# Optimize big integer in dev mode
+[profile.dev.package]
+num-bigint.opt-level = 3
+num-traits.opt-level = 3
+num-integer.opt-level = 3
+glass_pumpkin.opt-level = 3
