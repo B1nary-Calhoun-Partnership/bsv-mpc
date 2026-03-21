@@ -1,0 +1,64 @@
+[package]
+name = "poc2-wasm"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false
+
+[workspace]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# MPC threshold ECDSA — no_std for WASM compatibility
+cggmp24 = { git = "https://github.com/LFDT-Lockness/cggmp21", default-features = false, features = [
+    "no_std",
+    "backend-num-bigint",
+    "curve-secp256k1",
+    "state-machine",
+] }
+cggmp24-keygen = { git = "https://github.com/LFDT-Lockness/cggmp21", default-features = false, features = [
+    "state-machine",
+] }
+
+# WASM entropy — CRITICAL: js feature required for wasm32-unknown-unknown
+getrandom = { version = "0.2", features = ["js"] }
+
+# Crypto
+sha2 = { version = "0.10", default-features = false }
+rand = { version = "0.8", default-features = false, features = ["getrandom"] }
+rand_core = { version = "0.6", default-features = false, features = ["getrandom"] }
+
+# MPC simulation (sync API for WASM — no async runtime needed)
+round-based = { version = "0.4.1", default-features = false, features = ["sim", "state-machine"] }
+generic-ec = { version = "0.4.1", default-features = false, features = ["curve-secp256k1"] }
+
+# WASM bindings
+wasm-bindgen = "0.2"
+js-sys = "0.3"
+
+# Hex encoding for output
+hex = { version = "0.4", default-features = false, features = ["alloc"] }
+
+# Pin to avoid rand_core 0.6/0.10 conflict
+glass_pumpkin = "=1.9.0"
+
+[dev-dependencies]
+wasm-bindgen-test = "0.3"
+web-sys = { version = "0.3", features = ["console"] }
+
+# Optimize big integer in dev mode (otherwise painfully slow)
+[profile.dev.package]
+num-bigint.opt-level = 3
+num-traits.opt-level = 3
+num-integer.opt-level = 3
+glass_pumpkin.opt-level = 3
+
+# Release profile for measuring WASM module size
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
