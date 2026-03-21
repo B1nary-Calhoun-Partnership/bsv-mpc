@@ -127,6 +127,8 @@ Four POCs validated — the critical crypto path is fully de-risked:
 | POC 5: HTTP latency | Is MPC signing fast enough over HTTP? | **PASS** — 359µs presigned (target <50ms), ~135µs HTTP overhead per round |
 | POC 12: 3-of-5 threshold | Does production config work? | **PASS** — 5-party DKG 138ms, any 3-of-5 subset signs, 4.4ms presig combine, below-threshold correctly rejected |
 | POC 13: Key refresh | Can shares be refreshed without moving funds? | **PASS** — Built threshold resharing (~50 LOC) from cggmp24 primitives. Same joint key, 0 on-chain cost, old shares invalidated. |
+| POC 8: BRC-31 auth | Does Authrite work through MPC? | **PASS** — 1 KSS round-trip for partial ECDH (~135µs), then local HMAC offset. Server-side verification works. DER wire format correct. |
+| POC 9: encrypt/decrypt | Is MPC encryption compatible with normal wallet? | **PASS** — Byte-identical symmetric keys. Zero data loss during migration. All 3 protocols (memory, state, conversation) validated. |
 
 ### Critical Lessons from POC 3 + POC 4
 
@@ -161,6 +163,18 @@ Four POCs validated — the critical crypto path is fully de-risked:
 - **Fix: ~30-line fork** — add `WalletSignerApi` trait, make `Wallet` generic over it, implement `MpcSigner`
 - **Alternative (no-fork):** Use `create_action(sign_and_process: false)` → sign externally → `sign_action` with pre-computed unlocking scripts
 - **MpcSigner prototype works** — same SignerInput structs, same sighash, same unlocking script, only signing step changes
+
+**BRC-31 auth (POC 8):**
+- 1 KSS round-trip (~135µs) for partial ECDH, then each party adds HMAC offset locally (0 extra round-trips)
+- Additive share offset proven: `reconstruct(shares) + hmac = child_priv`
+- Server-side verification works via ECDH commutativity
+- DER encoding for BRC-31 wire format confirmed working
+
+**Encrypt/decrypt compatibility (POC 9):**
+- **Byte-identical symmetric keys** between MPC and normal wallet — zero data loss during migration
+- Existing bsv-worm encrypted memory readable after switching to MPC proxy
+- Algorithm: 2 partial ECDH rounds with Lagrange interpolation
+- All 3 protocols validated: `worm memory`, `worm state`, `worm conversation`
 
 **Key refresh / threshold resharing (POC 13):**
 - **Built from scratch** using cggmp24's existing primitives (`generic_ec_zkp::polynomial`, `lagrange_coefficient_at_zero`). ~50 LOC. No upstream library changes.
