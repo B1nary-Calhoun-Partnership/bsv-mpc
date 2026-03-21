@@ -1,0 +1,57 @@
+[package]
+name = "poc8-brc31-auth"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+# MPC threshold ECDSA — spof for trusted_dealer
+cggmp24 = { git = "https://github.com/LFDT-Lockness/cggmp21", features = [
+    "curve-secp256k1",
+    "backend-num-bigint",
+    "spof",
+] }
+cggmp24-keygen = { git = "https://github.com/LFDT-Lockness/cggmp21" }
+
+# BSV SDK — wallet key derivation + signature verification
+bsv = { package = "bsv-sdk", path = "../../../rust-sdk", features = ["transaction", "wallet"] }
+
+# Async
+tokio = { version = "1", features = ["full"] }
+
+# Crypto
+sha2 = "0.10"
+hmac = "0.12"
+rand = "0.8"
+rand_core = "0.6"
+
+# MPC simulation
+round-based = { version = "0.4.1", features = ["sim"] }
+generic-ec = { version = "0.4.1", features = ["curve-secp256k1"] }
+
+# Direct secp256k1 point arithmetic (for partial ECDH Lagrange)
+k256 = { version = "0.13", features = ["arithmetic"] }
+
+# Async utilities (buffered sink)
+futures = "0.3"
+pin-project = "1"
+
+# Encoding
+hex = "0.4"
+base64 = "0.22"
+serde_json = "1"
+
+# HTTP client for bonus real handshake test
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+
+# Pin to avoid rand_core version conflict
+glass_pumpkin = "=1.9.0"
+
+# Optimize big integer in dev mode (otherwise too slow)
+[profile.dev.package]
+num-bigint.opt-level = 3
+num-traits.opt-level = 3
+num-integer.opt-level = 3
+glass_pumpkin.opt-level = 3

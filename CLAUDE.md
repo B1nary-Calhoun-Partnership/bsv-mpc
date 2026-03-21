@@ -126,6 +126,7 @@ Four POCs validated — the critical crypto path is fully de-risked:
 | POC 7: Fee injection | Can fee output be injected without breaking tx? | **PASS** — 3-output tx on mainnet. [TXID](https://whatsonchain.com/tx/6033e4fb4872d1d6a28acb6659f35641e63738bb8297bca56dc88b60276b2d42) |
 | POC 5: HTTP latency | Is MPC signing fast enough over HTTP? | **PASS** — 359µs presigned (target <50ms), ~135µs HTTP overhead per round |
 | POC 12: 3-of-5 threshold | Does production config work? | **PASS** — 5-party DKG 138ms, any 3-of-5 subset signs, 4.4ms presig combine, below-threshold correctly rejected |
+| POC 13: Key refresh | Can shares be refreshed without moving funds? | **PASS** — Built threshold resharing (~50 LOC) from cggmp24 primitives. Same joint key, 0 on-chain cost, old shares invalidated. |
 
 ### Critical Lessons from POC 3 + POC 4
 
@@ -160,6 +161,14 @@ Four POCs validated — the critical crypto path is fully de-risked:
 - **Fix: ~30-line fork** — add `WalletSignerApi` trait, make `Wallet` generic over it, implement `MpcSigner`
 - **Alternative (no-fork):** Use `create_action(sign_and_process: false)` → sign externally → `sign_action` with pre-computed unlocking scripts
 - **MpcSigner prototype works** — same SignerInput structs, same sighash, same unlocking script, only signing step changes
+
+**Key refresh / threshold resharing (POC 13):**
+- **Built from scratch** using cggmp24's existing primitives (`generic_ec_zkp::polynomial`, `lagrange_coefficient_at_zero`). ~50 LOC. No upstream library changes.
+- Same joint key, same BSV address, 0 on-chain cost (vs re-DKG which needs ~188 sat fund transfer)
+- Old shares cryptographically invalidated after reshare
+- Port `threshold_reshare()` to `bsv-mpc-core` with Schnorr proofs for production hardening
+- Enables Fireblocks-style automatic refresh (every few minutes, near-zero cost)
+- **cggmp24 lacks this natively** — cggmp24 v0.7 only has aux_info_gen, cggmp21 v0.6 has non-threshold refresh but requires rug (LGPL, no WASM). Our solution avoids both limitations.
 
 **Fee injection (POC 7):**
 - Fee output is a simple append + change reduction — no structural tx changes

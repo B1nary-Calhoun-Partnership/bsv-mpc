@@ -25,6 +25,10 @@ rand_core = "0.6"
 # MPC simulation
 round-based = { version = "0.4.1", features = ["sim"] }
 generic-ec = { version = "0.4.1", features = ["curve-secp256k1"] }
+generic-ec-zkp = { version = "0.4.1", features = ["alloc"] }
+
+# Key share types (for constructing shares after resharing)
+key-share = { git = "https://github.com/LFDT-Lockness/cggmp21", features = ["serde"] }
 
 # Async utilities (needed for buffered sink)
 futures = "0.3"

@@ -1,0 +1,43 @@
+[package]
+name = "poc9-encrypt-decrypt"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+# MPC — trusted_dealer requires `spof` feature
+cggmp24 = { git = "https://github.com/LFDT-Lockness/cggmp21", features = [
+    "curve-secp256k1",
+    "backend-num-bigint",
+    "spof",
+] }
+cggmp24-keygen = { git = "https://github.com/LFDT-Lockness/cggmp21" }
+
+# BSV SDK — wallet key derivation + encryption
+bsv = { package = "bsv-sdk", path = "../../../rust-sdk", features = ["transaction", "wallet"] }
+
+# Crypto
+sha2 = "0.10"
+hmac = "0.12"
+rand = "0.8"
+
+# EC curve types
+generic-ec = { version = "0.4.1", features = ["curve-secp256k1"] }
+
+# Hex
+hex = "0.4"
+
+# Direct secp256k1 point arithmetic (for manual point addition)
+k256 = { version = "0.13", features = ["arithmetic"] }
+
+# Pin to avoid rand_core version conflict
+glass_pumpkin = "=1.9.0"
+
+# Optimize big integer in dev mode (otherwise DKG takes minutes)
+[profile.dev.package]
+num-bigint.opt-level = 3
+num-traits.opt-level = 3
+num-integer.opt-level = 3
+glass_pumpkin.opt-level = 3

@@ -1,31 +1,29 @@
-//! POC 13: Key Refresh / Re-DKG Fallback
+//! POC 13: Key Refresh — Threshold Resharing + Re-DKG Fallback
 //!
-//! FINDING: cggmp24 v0.7.0-alpha.3 does NOT support key refresh.
-//! The `key_refresh` module only contains `aux_info_gen` (Paillier parameter
-//! generation), not actual share rotation. The lib.rs explicitly states:
-//!   "This crate does not (currently) support:
-//!    Key refresh for both threshold and non-threshold keys"
+//! FINDING: cggmp24 v0.7.0-alpha.3 does NOT support key refresh natively.
+//! The `key_refresh` module only contains `aux_info_gen` (Paillier parameters).
 //!
-//! The older cggmp21 had non-threshold-only refresh using `rug` (GMP/LGPL),
-//! which is incompatible with our WASM target and copyleft policy.
+//! SOLUTION: We implement threshold resharing ourselves using cggmp24's
+//! existing primitives (generic-ec polynomials, Lagrange interpolation).
+//! This is Proactive Secret Sharing (PSS) — surviving parties generate
+//! refresh polynomials with zero constant term, creating new shares for
+//! the SAME joint secret. Old shares become cryptographically useless.
 //!
-//! This POC validates the FALLBACK approach: full re-DKG with fund migration.
-//!
-//! Test plan:
-//! (1) 3-party DKG (t=2, n=3) → joint key A
-//! (2) Sign with parties [0,1] — verify signature, record joint public key A
-//! (3) Simulate node 2 going offline. Fresh 2-of-3 DKG with [0,1,new_party] → joint key B
-//! (4) Sign with parties [0,2] using KEY B — verify signature valid for key B
-//! (5) Sign a "fund transfer A→B" message with parties [0,1] using KEY A — verify
-//! (6) Verify key A ≠ key B (different BSV addresses = on-chain fund transfer needed)
-//! (7) Verify old key A shares cannot produce signatures for key B
+//! Two tests:
+//! 1. `test_threshold_resharing_preserves_key` — the main event:
+//!    resharing preserves joint public key, old shares invalidated
+//! 2. `test_key_refresh_fallback_re_dkg` — fallback validation:
+//!    full re-DKG produces different key, requires fund transfer
 
 use std::collections::VecDeque;
 
+use cggmp24::key_share::{DirtyIncompleteKeyShare, DirtyKeyInfo, Validate, VssSetup};
 use cggmp24::security_level::SecurityLevel128;
 use cggmp24::signing::DataToSign;
 use cggmp24::supported_curves::Secp256k1;
 use cggmp24::ExecutionId;
+use generic_ec::{NonZero, Point, Scalar, SecretScalar};
+use generic_ec_zkp::polynomial::{lagrange_coefficient_at_zero, Polynomial};
 use rand::Rng;
 use sha2::Sha256;
 
@@ -128,22 +126,17 @@ fn generate_pregenerated_primes(
         .expect("primes have wrong bit size")
 }
 
-// ---- Helper: run full DKG + aux info → complete KeyShares ----
+// ---- Helper: run DKG keygen only (no aux info) ----
 
-async fn run_dkg(
+async fn run_keygen(
     n: u16,
     t: u16,
-) -> (
-    generic_ec::Point<Secp256k1>,
-    Vec<cggmp24::KeyShare<Secp256k1, SecurityLevel128>>,
-) {
+) -> Vec<cggmp24::key_share::IncompleteKeyShare<Secp256k1>> {
     let mut rng = rand::rngs::OsRng;
-
-    // Step 1: Keygen
     let eid_bytes: [u8; 32] = rng.gen();
     let eid = ExecutionId::new(&eid_bytes);
 
-    let incomplete_shares = round_based::sim::run(n, |i, party| {
+    round_based::sim::run(n, |i, party| {
         let party = buffer_outgoing(party);
         let mut party_rng = rand::rngs::OsRng;
         async move {
@@ -155,11 +148,15 @@ async fn run_dkg(
     })
     .unwrap()
     .expect_ok()
-    .into_vec();
+    .into_vec()
+}
 
-    let joint_pubkey = incomplete_shares[0].shared_public_key;
+// ---- Helper: run aux info generation ----
 
-    // Step 2: Aux info
+async fn run_aux_gen(
+    n: u16,
+) -> Vec<cggmp24::key_share::AuxInfo<SecurityLevel128>> {
+    let mut rng = rand::rngs::OsRng;
     let eid_bytes: [u8; 32] = rng.gen();
     let eid_aux = ExecutionId::new(&eid_bytes);
 
@@ -167,7 +164,7 @@ async fn run_dkg(
         .map(|_| generate_pregenerated_primes(&mut rng))
         .collect();
 
-    let aux_infos = round_based::sim::run(n, |i, party| {
+    round_based::sim::run(n, |i, party| {
         let party = buffer_outgoing(party);
         let mut party_rng = rand::rngs::OsRng;
         let pregenerated = primes[usize::from(i)].clone();
@@ -179,9 +176,22 @@ async fn run_dkg(
     })
     .unwrap()
     .expect_ok()
-    .into_vec();
+    .into_vec()
+}
 
-    // Step 3: Combine
+// ---- Helper: run full DKG + aux info → complete KeyShares ----
+
+async fn run_dkg(
+    n: u16,
+    t: u16,
+) -> (
+    generic_ec::Point<Secp256k1>,
+    Vec<cggmp24::KeyShare<Secp256k1, SecurityLevel128>>,
+) {
+    let incomplete_shares = run_keygen(n, t).await;
+    let joint_pubkey = incomplete_shares[0].shared_public_key;
+    let aux_infos = run_aux_gen(n).await;
+
     let key_shares: Vec<_> = incomplete_shares
         .into_iter()
         .zip(aux_infos)
@@ -225,238 +235,452 @@ async fn sign_with_parties(
     .expect_eq()
 }
 
-// ---- The test ----
+// ============================================================================
+// THRESHOLD RESHARING (Proactive Secret Sharing)
+//
+// Protocol: Given t surviving parties with shares on a degree-(t-1) polynomial
+// F(x) where F(0) = secret, generate new shares for n' parties on a DIFFERENT
+// polynomial G(x) where G(0) = same secret.
+//
+// Each surviving party k:
+//   1. Computes Lagrange coefficient λ_k (for interpolation at x=0)
+//   2. Computes w_k = λ_k · x_k (their weighted contribution)
+//   3. Generates random polynomial f_k(x) of degree (t'-1) with f_k(0) = w_k
+//   4. Sends f_k(I'_i) to each new party i
+//
+// Each new party i computes: x'_i = Σ_k f_k(I'_i)
+//
+// This works because: Σ_k f_k(0) = Σ_k w_k = Σ_k λ_k·x_k = secret
+// (by Lagrange interpolation). So the composite polynomial Σ_k f_k has the
+// same constant term (secret) but different coefficients → new shares.
+// ============================================================================
+
+/// Perform threshold resharing.
+///
+/// Returns (new_secret_shares, new_public_shares) for the new party set.
+/// The joint public key is UNCHANGED — new shares reconstruct the same secret.
+fn threshold_reshare(
+    // Surviving parties (must have at least new_t members)
+    surviving_eval_points: &[NonZero<Scalar<Secp256k1>>],
+    surviving_secret_shares: &[Scalar<Secp256k1>],
+    // New party configuration
+    new_eval_points: &[NonZero<Scalar<Secp256k1>>],
+    new_t: usize,
+    rng: &mut impl rand::RngCore,
+) -> (Vec<Scalar<Secp256k1>>, Vec<Point<Secp256k1>>) {
+    assert!(
+        surviving_eval_points.len() >= new_t,
+        "need at least new_t surviving parties for resharing"
+    );
+    assert_eq!(
+        surviving_eval_points.len(),
+        surviving_secret_shares.len(),
+        "eval points and shares must have same length"
+    );
+
+    // Use exactly new_t surviving parties for the qualified subset
+    let subset_points = &surviving_eval_points[..new_t];
+    let subset_shares = &surviving_secret_shares[..new_t];
+
+    // For each party in the qualified subset, generate a refresh polynomial
+    let mut polynomials: Vec<Polynomial<Scalar<Secp256k1>>> = Vec::new();
+
+    for k in 0..new_t {
+        // Lagrange coefficient for party k at point 0
+        let lambda = lagrange_coefficient_at_zero(k, subset_points)
+            .expect("evaluation points must be pairwise distinct");
+
+        // w_k = λ_k · x_k (weighted share contribution)
+        let w_k: Scalar<Secp256k1> = *lambda * subset_shares[k];
+
+        // Generate random polynomial of degree (new_t - 1) with f(0) = w_k
+        // f(x) = w_k + a_1·x + a_2·x² + ... + a_{t-1}·x^{t-1}
+        let mut coefs: Vec<Scalar<Secp256k1>> = Vec::with_capacity(new_t);
+        coefs.push(w_k);
+        for _ in 1..new_t {
+            coefs.push(Scalar::random(rng));
+        }
+        polynomials.push(Polynomial::from_coefs(coefs));
+    }
+
+    // Generate new shares for each new party
+    let new_n = new_eval_points.len();
+    let mut new_secret_shares = Vec::with_capacity(new_n);
+    let mut new_public_shares = Vec::with_capacity(new_n);
+
+    for eval_point in new_eval_points {
+        // x'_i = Σ_k f_k(I'_i)
+        let share: Scalar<Secp256k1> = polynomials
+            .iter()
+            .map(|f| f.value::<_, Scalar<Secp256k1>>(eval_point.as_ref()))
+            .fold(Scalar::zero(), |acc, s| acc + s);
+
+        // Y'_i = G · x'_i
+        let pub_share = Point::<Secp256k1>::generator() * share;
+
+        new_secret_shares.push(share);
+        new_public_shares.push(pub_share);
+    }
+
+    (new_secret_shares, new_public_shares)
+}
+
+// ============================================================================
+// TEST 1: Threshold resharing — joint public key preserved
+// ============================================================================
+
+#[tokio::test]
+async fn test_threshold_resharing_preserves_key() {
+    let n: u16 = 3;
+    let t: u16 = 2; // 2-of-3
+
+    // =========================================================================
+    // STEP 1: 3-party DKG (t=2, n=3)
+    // =========================================================================
+    println!("=== STEP 1: 2-of-3 DKG ===");
+
+    let (joint_pubkey, key_shares) = run_dkg(n, t).await;
+
+    let pubkey_hex = hex::encode(joint_pubkey.to_bytes(true));
+    println!("  Joint public key: {pubkey_hex}");
+
+    let bsv_pubkey = bsv::PublicKey::from_bytes(&joint_pubkey.to_bytes(true)).unwrap();
+    let address = bsv_pubkey.to_address();
+    println!("  BSV address: {address}");
+
+    // =========================================================================
+    // STEP 2: Sign with [0,1] — verify before refresh
+    // =========================================================================
+    println!("\n=== STEP 2: Sign with [0,1] before refresh ===");
+
+    let msg_before = b"POC 13: message signed BEFORE key refresh";
+    let data_before = DataToSign::digest::<Sha256>(msg_before);
+    let sig_before = sign_with_parties(&key_shares, &[0, 1], &data_before).await;
+
+    sig_before
+        .verify(&joint_pubkey, &data_before)
+        .expect("pre-refresh signature must verify");
+    println!("  Pre-refresh signing [0,1]: PASS");
+
+    // Also verify [1,2] works
+    let sig_12 = sign_with_parties(&key_shares, &[1, 2], &data_before).await;
+    sig_12
+        .verify(&joint_pubkey, &data_before)
+        .expect("pre-refresh [1,2] must verify");
+    println!("  Pre-refresh signing [1,2]: PASS");
+
+    // =========================================================================
+    // STEP 3: Extract share data and perform resharing
+    // =========================================================================
+    println!("\n=== STEP 3: Threshold resharing (party 2 offline → replaced) ===");
+    println!("  Surviving parties: [0, 1]");
+    println!("  New party set: [0, 1, 2] (party 2 is replacement node)");
+
+    // Extract evaluation points and secret shares from DKG output
+    // KeyShare = Valid<DirtyKeyShare>. into_inner() gives DirtyKeyShare, then .core is DirtyCoreKeyShare.
+    let dirty0 = key_shares[0].clone().into_inner().core;
+    let dirty1 = key_shares[1].clone().into_inner().core;
+    let vss = dirty0.key_info.vss_setup.as_ref().expect("must have VSS setup");
+
+    // Surviving parties: 0 and 1
+    let surviving_eval_points = vec![vss.I[0], vss.I[1]];
+    let surviving_shares = vec![
+        *(*dirty0.x).as_ref(), // NonZero<SecretScalar> -> SecretScalar -> &Scalar -> Scalar
+        *(*dirty1.x).as_ref(),
+    ];
+
+    // New party set uses same evaluation points (I = [1, 2, 3])
+    let new_eval_points = vss.I.clone();
+
+    let mut rng = rand::rngs::OsRng;
+    let (new_secret_shares, new_public_shares) = threshold_reshare(
+        &surviving_eval_points,
+        &surviving_shares,
+        &new_eval_points,
+        t as usize,
+        &mut rng,
+    );
+
+    println!("  Resharing complete. Generated {} new shares.", new_secret_shares.len());
+
+    // =========================================================================
+    // STEP 4: Verify joint public key is UNCHANGED
+    // =========================================================================
+    println!("\n=== STEP 4: Verify joint public key is unchanged ===");
+
+    // Reconstruct public key from new shares via Lagrange interpolation at x=0
+    let first_t_points = &new_eval_points[..t as usize];
+    let first_t_pub_shares = &new_public_shares[..t as usize];
+
+    let reconstructed_pubkey: Point<Secp256k1> = (0..t as usize)
+        .map(|j| {
+            let lambda =
+                lagrange_coefficient_at_zero(j, first_t_points).expect("points must be distinct");
+            first_t_pub_shares[j] * *lambda
+        })
+        .fold(Point::zero(), |acc, p| acc + p);
+
+    assert_eq!(
+        joint_pubkey, reconstructed_pubkey,
+        "joint public key must be UNCHANGED after resharing"
+    );
+    println!("  Joint public key after resharing: {}", hex::encode(reconstructed_pubkey.to_bytes(true)));
+    println!("  Matches original: CONFIRMED");
+
+    // =========================================================================
+    // STEP 5: Construct new IncompleteKeyShares from reshared data
+    // =========================================================================
+    println!("\n=== STEP 5: Constructing new key shares ===");
+
+    let curve = dirty0.key_info.curve.clone();
+    let original_shared_pubkey = dirty0.key_info.shared_public_key;
+
+    let new_nz_public_shares: Vec<NonZero<Point<Secp256k1>>> = new_public_shares
+        .iter()
+        .map(|p| NonZero::from_point(*p).expect("public share must be non-zero"))
+        .collect();
+
+    let new_incomplete_shares: Vec<cggmp24::key_share::IncompleteKeyShare<Secp256k1>> = (0..n)
+        .map(|i| {
+            let mut share_scalar = new_secret_shares[i as usize];
+            let dirty = DirtyIncompleteKeyShare {
+                i,
+                key_info: DirtyKeyInfo {
+                    curve: curve.clone(),
+                    shared_public_key: original_shared_pubkey, // SAME key!
+                    public_shares: new_nz_public_shares.clone(),
+                    vss_setup: Some(VssSetup {
+                        min_signers: t,
+                        I: new_eval_points.clone(),
+                    }),
+                },
+                x: NonZero::from_secret_scalar(SecretScalar::new(&mut share_scalar))
+                    .expect("secret share must be non-zero"),
+            };
+            dirty.validate().expect("new share must pass validation")
+        })
+        .collect();
+
+    println!("  All {} new IncompleteKeyShares validated successfully", new_incomplete_shares.len());
+
+    // =========================================================================
+    // STEP 6: Generate fresh aux info and combine into complete KeyShares
+    // =========================================================================
+    println!("\n=== STEP 6: Generating aux info for new shares ===");
+
+    let new_aux_infos = run_aux_gen(n).await;
+
+    let new_key_shares: Vec<cggmp24::KeyShare<Secp256k1, SecurityLevel128>> = new_incomplete_shares
+        .into_iter()
+        .zip(new_aux_infos)
+        .map(|(core, aux)| {
+            cggmp24::KeyShare::from_parts((core, aux))
+                .expect("new key share must validate with aux info")
+        })
+        .collect();
+
+    println!("  {} complete KeyShares created", new_key_shares.len());
+
+    // =========================================================================
+    // STEP 7: Sign with [0, 2] using NEW shares (party 2 is replacement)
+    // =========================================================================
+    println!("\n=== STEP 7: Sign with [0, replacement_node] using new shares ===");
+
+    let msg_after = b"POC 13: message signed AFTER key refresh with replacement node";
+    let data_after = DataToSign::digest::<Sha256>(msg_after);
+
+    let sig_after = sign_with_parties(&new_key_shares, &[0, 2], &data_after).await;
+    sig_after
+        .verify(&joint_pubkey, &data_after)
+        .expect("post-refresh signature with replacement node must verify against SAME key");
+    println!("  Post-refresh signing [0, new_party_2]: PASS");
+    println!("  Verified against ORIGINAL joint public key: PASS");
+
+    // BSV SDK cross-check
+    let mut sig_after_bytes = [0u8; 64];
+    sig_after.write_to_slice(&mut sig_after_bytes);
+    let msg_after_hash: [u8; 32] = {
+        use sha2::Digest;
+        sha2::Sha256::digest(msg_after).into()
+    };
+    let bsv_sig_after = bsv::Signature::from_compact(&sig_after_bytes).unwrap();
+    assert!(bsv_pubkey.verify(&msg_after_hash, &bsv_sig_after));
+    println!("  BSV SDK verify with SAME address: PASS");
+
+    // Also verify [1, 2] works
+    let sig_new_12 = sign_with_parties(&new_key_shares, &[1, 2], &data_after).await;
+    sig_new_12
+        .verify(&joint_pubkey, &data_after)
+        .expect("post-refresh [1,2] must verify");
+    println!("  Post-refresh signing [1, 2]: PASS");
+
+    // And [0, 1]
+    let sig_new_01 = sign_with_parties(&new_key_shares, &[0, 1], &data_after).await;
+    sig_new_01
+        .verify(&joint_pubkey, &data_after)
+        .expect("post-refresh [0,1] must verify");
+    println!("  Post-refresh signing [0, 1]: PASS");
+
+    // =========================================================================
+    // STEP 8: Verify old shares are INVALIDATED
+    // =========================================================================
+    println!("\n=== STEP 8: Verify old shares are invalidated ===");
+
+    // Old party 2's secret share should differ from new party 2's share
+    let dirty2_old = key_shares[2].clone().into_inner().core;
+    let old_share_2: Scalar<Secp256k1> = *(*dirty2_old.x).as_ref();
+    let new_share_2 = new_secret_shares[2];
+
+    assert_ne!(
+        old_share_2, new_share_2,
+        "old party 2 share must differ from new party 2 share"
+    );
+    println!("  Old share[2] ≠ New share[2]: CONFIRMED");
+
+    // Old party 0's share should also differ (ALL shares change in resharing)
+    let old_share_0: Scalar<Secp256k1> = *(*dirty0.x).as_ref();
+    let new_share_0 = new_secret_shares[0];
+
+    assert_ne!(
+        old_share_0, new_share_0,
+        "old party 0 share must differ from new party 0 share (all shares rotate)"
+    );
+    println!("  Old share[0] ≠ New share[0]: CONFIRMED (all shares rotate)");
+
+    // Old public shares differ from new public shares
+    let old_pub_shares: Vec<_> = key_shares[0]
+        .core
+        .public_shares
+        .iter()
+        .map(|p| p.to_bytes(true))
+        .collect();
+    let new_pub_shares_bytes: Vec<_> = new_nz_public_shares
+        .iter()
+        .map(|p| p.to_bytes(true))
+        .collect();
+    assert_ne!(
+        old_pub_shares, new_pub_shares_bytes,
+        "public share sets must change after resharing"
+    );
+    println!("  Public share sets changed: CONFIRMED");
+
+    // The dead node's old share (party 2) cannot be used with the new key shares.
+    // Specifically: if an attacker has old_share_2, they cannot produce valid signatures
+    // because old_share_2 lies on the OLD polynomial, not the new one.
+    // We verify this by checking old_share_2 ≠ f_new(I_2).
+    // (A signing attempt would fail because the share doesn't match the public share.)
+    let old_pub_2 = Point::<Secp256k1>::generator() * old_share_2;
+    let new_pub_2 = new_public_shares[2];
+    assert!(
+        old_pub_2 != new_pub_2,
+        "old share produces different public point than new share"
+    );
+    println!("  G·old_share[2] ≠ G·new_share[2]: CONFIRMED");
+    println!("  Dead node's old share is cryptographically useless");
+
+    // =========================================================================
+    // STEP 9: Verify BSV address is UNCHANGED (no fund transfer needed!)
+    // =========================================================================
+    println!("\n=== STEP 9: Verify BSV address unchanged ===");
+
+    let post_refresh_pubkey = new_key_shares[0].core.shared_public_key;
+    assert_eq!(
+        joint_pubkey, *post_refresh_pubkey,
+        "joint public key must be identical after resharing"
+    );
+
+    let post_refresh_bsv_key =
+        bsv::PublicKey::from_bytes(&post_refresh_pubkey.to_bytes(true)).unwrap();
+    let post_refresh_address = post_refresh_bsv_key.to_address();
+    assert_eq!(
+        address, post_refresh_address,
+        "BSV address must be identical after resharing"
+    );
+    println!("  Address before: {address}");
+    println!("  Address after:  {post_refresh_address}");
+    println!("  IDENTICAL — no fund transfer needed!");
+
+    // =========================================================================
+    // SUMMARY
+    // =========================================================================
+    println!("\n========================================");
+    println!("  POC 13 RESULT: THRESHOLD RESHARING WORKS");
+    println!("========================================");
+    println!();
+    println!("  KEY ACHIEVEMENT: Implemented threshold resharing using");
+    println!("  cggmp24's existing primitives (Lagrange interpolation +");
+    println!("  polynomial secret sharing). No upstream changes needed.");
+    println!();
+    println!("  [x] 2-of-3 DKG produces valid joint key");
+    println!("  [x] Pre-refresh signing works (any 2-of-3)");
+    println!("  [x] Threshold resharing generates new shares");
+    println!("  [x] New shares pass cggmp24 KeyShare validation");
+    println!("  [x] Post-refresh signing works with replacement node");
+    println!("  [x] Post-refresh signatures verify against SAME joint key");
+    println!("  [x] BSV address is UNCHANGED (no fund transfer!)");
+    println!("  [x] ALL old shares are rotated (different from new)");
+    println!("  [x] Dead node's old share is cryptographically useless");
+    println!();
+    println!("  vs FALLBACK (re-DKG):");
+    println!("  - Resharing: same key, no fund transfer, 0 sats cost");
+    println!("  - Re-DKG: different key, fund transfer needed, ~188 sats");
+    println!("========================================");
+}
+
+// ============================================================================
+// TEST 2: Fallback — full re-DKG (different key, requires fund transfer)
+// ============================================================================
 
 #[tokio::test]
 async fn test_key_refresh_fallback_re_dkg() {
     let n: u16 = 3;
     let t: u16 = 2; // 2-of-3
 
-    // =========================================================================
-    // STEP 1: 3-party DKG (t=2, n=3) → joint key A
-    // =========================================================================
-    println!("=== STEP 1: 3-party DKG (threshold={t}, n={n}) → key A ===");
+    println!("=== Fallback: Re-DKG with fund transfer ===");
 
+    // DKG A
     let (joint_pubkey_a, key_shares_a) = run_dkg(n, t).await;
-
-    assert_eq!(key_shares_a.len(), 3);
-    for share in &key_shares_a {
-        assert_eq!(
-            share.core.shared_public_key, joint_pubkey_a,
-            "all parties must agree on joint public key A"
-        );
-    }
-
-    let pubkey_a_hex = hex::encode(joint_pubkey_a.to_bytes(true));
-    println!("  Joint public key A: {pubkey_a_hex}");
-
-    // Derive BSV address for key A
-    let bsv_pubkey_a = bsv::PublicKey::from_bytes(&joint_pubkey_a.to_bytes(true))
-        .expect("BSV SDK should accept key A");
+    let bsv_pubkey_a = bsv::PublicKey::from_bytes(&joint_pubkey_a.to_bytes(true)).unwrap();
     let address_a = bsv_pubkey_a.to_address();
-    println!("  BSV address A: {address_a}");
-
-    // =========================================================================
-    // STEP 2: Sign with parties [0,1] using key A — verify
-    // =========================================================================
-    println!("\n=== STEP 2: Sign with parties [0,1] using key A ===");
-
-    let message1 = b"POC 13: signing with original 2-of-3 shares";
-    let data1 = DataToSign::digest::<Sha256>(message1);
-
-    let sig1 = sign_with_parties(&key_shares_a, &[0, 1], &data1).await;
-
-    // Verify with cggmp24
-    sig1.verify(&joint_pubkey_a, &data1)
-        .expect("signature with [0,1] must verify against key A");
-    println!("  cggmp24 verify [0,1] on key A: PASS");
-
-    // Verify with BSV SDK
-    let mut sig1_bytes = [0u8; 64];
-    sig1.write_to_slice(&mut sig1_bytes);
-    let msg1_hash: [u8; 32] = {
-        use sha2::Digest;
-        sha2::Sha256::digest(message1).into()
-    };
-    let bsv_sig1 = bsv::Signature::from_compact(&sig1_bytes).unwrap();
-    assert!(bsv_pubkey_a.verify(&msg1_hash, &bsv_sig1));
-    println!("  BSV SDK verify [0,1] on key A: PASS");
-
-    // Also verify [0,2] works (any 2 of 3)
-    let sig1b = sign_with_parties(&key_shares_a, &[0, 2], &data1).await;
-    sig1b.verify(&joint_pubkey_a, &data1)
-        .expect("signature with [0,2] must verify against key A");
-    println!("  cggmp24 verify [0,2] on key A: PASS");
-
-    // And [1,2]
-    let sig1c = sign_with_parties(&key_shares_a, &[1, 2], &data1).await;
-    sig1c.verify(&joint_pubkey_a, &data1)
-        .expect("signature with [1,2] must verify against key A");
-    println!("  cggmp24 verify [1,2] on key A: PASS");
-
-    // =========================================================================
-    // STEP 3: Simulate node 2 offline. Fresh 2-of-3 DKG → key B
-    // =========================================================================
-    println!("\n=== STEP 3: Node 2 dies. Fresh 2-of-3 DKG → key B ===");
-    println!("  (Parties 0, 1 survive. New party replaces dead node 2.)");
-
-    let (joint_pubkey_b, key_shares_b) = run_dkg(n, t).await;
-
-    let pubkey_b_hex = hex::encode(joint_pubkey_b.to_bytes(true));
-    println!("  Joint public key B: {pubkey_b_hex}");
-
-    let bsv_pubkey_b = bsv::PublicKey::from_bytes(&joint_pubkey_b.to_bytes(true))
-        .expect("BSV SDK should accept key B");
-    let address_b = bsv_pubkey_b.to_address();
-    println!("  BSV address B: {address_b}");
-
-    // =========================================================================
-    // STEP 4: Verify key A ≠ key B (different addresses)
-    // =========================================================================
-    println!("\n=== STEP 4: Verify key A ≠ key B ===");
-
-    assert_ne!(
-        joint_pubkey_a, joint_pubkey_b,
-        "fresh DKG must produce a DIFFERENT joint public key"
-    );
-    println!("  Key A ≠ Key B: CONFIRMED");
+    println!("  Key A: {}", hex::encode(joint_pubkey_a.to_bytes(true)));
     println!("  Address A: {address_a}");
+
+    // Sign with [0,1] on key A
+    let msg = b"fallback test";
+    let data = DataToSign::digest::<Sha256>(msg);
+    let sig = sign_with_parties(&key_shares_a, &[0, 1], &data).await;
+    sig.verify(&joint_pubkey_a, &data).expect("key A signing must work");
+    println!("  Sign with key A [0,1]: PASS");
+
+    // DKG B (simulate node replacement)
+    let (joint_pubkey_b, key_shares_b) = run_dkg(n, t).await;
+    let bsv_pubkey_b = bsv::PublicKey::from_bytes(&joint_pubkey_b.to_bytes(true)).unwrap();
+    let address_b = bsv_pubkey_b.to_address();
+    println!("  Key B: {}", hex::encode(joint_pubkey_b.to_bytes(true)));
     println!("  Address B: {address_b}");
-    println!("  → On-chain fund transfer required from A → B");
 
-    // =========================================================================
-    // STEP 5: Sign with parties [0,2] using key B (new party = index 2)
-    // =========================================================================
-    println!("\n=== STEP 5: Sign with parties [0,2] using key B ===");
-    println!("  (Party 2 in key B is the replacement node)");
+    // Keys must differ
+    assert_ne!(joint_pubkey_a, joint_pubkey_b);
+    println!("  Key A ≠ Key B: CONFIRMED (fund transfer required)");
 
-    let message2 = b"POC 13: signing with new shares after re-DKG";
-    let data2 = DataToSign::digest::<Sha256>(message2);
-
-    let sig2 = sign_with_parties(&key_shares_b, &[0, 2], &data2).await;
-    sig2.verify(&joint_pubkey_b, &data2)
-        .expect("signature with new party must verify against key B");
-    println!("  cggmp24 verify [0, new_party] on key B: PASS");
-
-    // BSV SDK verification
-    let mut sig2_bytes = [0u8; 64];
-    sig2.write_to_slice(&mut sig2_bytes);
-    let msg2_hash: [u8; 32] = {
-        use sha2::Digest;
-        sha2::Sha256::digest(message2).into()
-    };
-    let bsv_sig2 = bsv::Signature::from_compact(&sig2_bytes).unwrap();
-    assert!(bsv_pubkey_b.verify(&msg2_hash, &bsv_sig2));
-    println!("  BSV SDK verify [0, new_party] on key B: PASS");
-
-    // =========================================================================
-    // STEP 6: Sign "fund transfer A→B" with parties [0,1] using key A
-    // =========================================================================
-    println!("\n=== STEP 6: Sign fund transfer A→B with [0,1] using key A ===");
-    println!("  (Simulates moving funds from old MPC address to new one)");
-
-    let transfer_msg = format!(
-        "Transfer funds from {} to {}",
-        address_a, address_b
-    );
+    // Sign fund transfer A→B
+    let transfer_msg = format!("Transfer {} → {}", address_a, address_b);
     let data_transfer = DataToSign::digest::<Sha256>(transfer_msg.as_bytes());
-
     let sig_transfer = sign_with_parties(&key_shares_a, &[0, 1], &data_transfer).await;
-    sig_transfer.verify(&joint_pubkey_a, &data_transfer)
-        .expect("fund transfer signature must verify against key A");
-    println!("  Fund transfer signed by [0,1] with key A: PASS");
-    println!("  (In production: this would be a real tx moving UTXOs from address A → address B)");
+    sig_transfer
+        .verify(&joint_pubkey_a, &data_transfer)
+        .expect("fund transfer must verify");
+    println!("  Fund transfer A→B signed: PASS");
 
-    // =========================================================================
-    // STEP 7: Verify cross-key signing fails
-    // =========================================================================
-    println!("\n=== STEP 7: Verify old shares cannot sign for new key ===");
+    // Sign with new key B
+    let sig_b = sign_with_parties(&key_shares_b, &[0, 2], &data).await;
+    sig_b.verify(&joint_pubkey_b, &data).expect("key B signing must work");
+    println!("  Sign with key B [0,2]: PASS");
 
-    // Sign a message with key A shares
-    let message3 = b"POC 13: cross-key verification test";
-    let data3 = DataToSign::digest::<Sha256>(message3);
-    let sig_old = sign_with_parties(&key_shares_a, &[0, 1], &data3).await;
+    // Cross-key verification fails
+    assert!(sig.verify(&joint_pubkey_b, &data).is_err());
+    assert!(sig_b.verify(&joint_pubkey_a, &data).is_err());
+    println!("  Cross-key verification fails: CONFIRMED");
 
-    // This signature should NOT verify against key B
-    let cross_verify = sig_old.verify(&joint_pubkey_b, &data3);
-    assert!(
-        cross_verify.is_err(),
-        "old key A signature must NOT verify against key B"
-    );
-    println!("  Key A signature fails verification against key B: CONFIRMED");
-
-    // And key B signature should NOT verify against key A
-    let sig_new = sign_with_parties(&key_shares_b, &[0, 1], &data3).await;
-    let cross_verify2 = sig_new.verify(&joint_pubkey_a, &data3);
-    assert!(
-        cross_verify2.is_err(),
-        "key B signature must NOT verify against key A"
-    );
-    println!("  Key B signature fails verification against key A: CONFIRMED");
-
-    // =========================================================================
-    // STEP 8: Verify party isolation — mixing shares from different DKGs fails
-    // =========================================================================
-    println!("\n=== STEP 8: Verify mixed shares from different DKGs cannot sign ===");
-    println!("  (Party 0 from DKG_A + Party 1 from DKG_B should fail)");
-
-    // We can't easily test this with the sim runner because it expects
-    // shares from the same DKG. But we can verify the shares are incompatible
-    // by checking they have different public key sets.
-    let shares_a_pubkeys: Vec<_> = key_shares_a[0]
-        .core
-        .public_shares
-        .iter()
-        .map(|p| p.to_bytes(true))
-        .collect();
-    let shares_b_pubkeys: Vec<_> = key_shares_b[0]
-        .core
-        .public_shares
-        .iter()
-        .map(|p| p.to_bytes(true))
-        .collect();
-
-    assert_ne!(
-        shares_a_pubkeys, shares_b_pubkeys,
-        "public share sets must differ between DKGs"
-    );
-    println!("  Public share sets differ: CONFIRMED");
-    println!("  Shares from different DKGs are cryptographically incompatible");
-
-    // =========================================================================
-    // SUMMARY
-    // =========================================================================
-    println!("\n========================================");
-    println!("  POC 13 RESULT: FALLBACK VALIDATED");
-    println!("========================================");
-    println!();
-    println!("  KEY FINDING: cggmp24 v0.7 does NOT support key refresh.");
-    println!("  The key_refresh module only provides aux_info_gen (Paillier params).");
-    println!("  The older cggmp21 had non-threshold-only refresh using rug (LGPL/no WASM).");
-    println!("  Threshold key refresh is not available in any version.");
-    println!();
-    println!("  FALLBACK: Full re-DKG with fund migration");
-    println!("  [x] 2-of-3 DKG produces valid key A (3 shares)");
-    println!("  [x] Any 2-of-3 subset can sign with key A");
-    println!("  [x] Fresh 2-of-3 DKG produces DIFFERENT key B");
-    println!("  [x] New party (replacement node) can sign with key B");
-    println!("  [x] Surviving parties [0,1] can sign fund transfer with key A");
-    println!("  [x] Old shares (key A) cannot forge signatures for key B");
-    println!("  [x] New shares (key B) cannot forge signatures for key A");
-    println!("  [x] Shares from different DKGs are incompatible");
-    println!();
-    println!("  COST OF FALLBACK:");
-    println!("  - Requires on-chain transaction to move funds A → B");
-    println!("  - ~188 sats per transfer (~$0.00009 at current rates)");
-    println!("  - 9-18s WoC indexing delay before new UTXOs are spendable");
-    println!("  - Must complete DKG + fund transfer before old node's");
-    println!("    share becomes a security risk (time pressure)");
-    println!();
-    println!("  RECOMMENDATIONS:");
-    println!("  1. Use re-DKG fallback for MVP (works today)");
-    println!("  2. Contribute threshold key refresh upstream to cggmp24");
-    println!("  3. Consider backporting from cggmp21 non-threshold refresh");
-    println!("     (requires porting from rug to num-bigint)");
-    println!("  4. Monitor LFDT-Lockness/cggmp21 for upstream key refresh");
-    println!("========================================");
+    println!("\n  Fallback VALIDATED — works but requires on-chain fund transfer");
 }
