@@ -241,12 +241,25 @@ curl -X POST http://localhost:3322/createAction -d '{"description":"fund MPC","o
 Use bsv SDK (`~/bsv/rust-sdk`) directly — `Transaction`, `Script`, `PublicKey`, `PrivateKey` types. Construct P2PKH transactions, compute BIP-143 sighashes, build unlocking scripts. No wallet needed for raw tx construction.
 
 ### Broadcasting
-Use WhatsOnChain API (free, no auth for broadcast):
+Use the built-in broadcasters from rust-sdk or rust-wallet-toolbox — do NOT write raw HTTP calls.
+
+**rust-sdk** (`~/bsv/rust-sdk/src/transaction/broadcasters/`):
+```rust
+// Simple single-tx broadcast
+use bsv::ArcBroadcaster; // or WhatsOnChainBroadcaster
+let broadcaster = WhatsOnChainBroadcaster::mainnet();
+let result = broadcaster.broadcast(&tx).await;
+// ARC (TAAL):
+let broadcaster = ArcBroadcaster::new("https://arc.taal.com", Some("api-key".into()));
 ```
-POST https://api.whatsonchain.com/v1/bsv/main/tx/raw
-Body: {"txhex": "<hex-encoded-signed-tx>"}
+
+**rust-wallet-toolbox** (`~/bsv/rust-wallet-toolbox/src/services/`):
+```rust
+// Multi-service with failover (WhatsOnChain → ARC TAAL → ARC GorillaPool → Bitails)
+services.post_beef(&beef_bytes, &txids).await // UntilSuccess mode
 ```
-Or use TAAL's MAPI endpoint. The bsv SDK may have broadcast helpers.
+
+Use the SDK broadcasters for POCs (simpler). Use the toolbox Services for production (failover).
 
 ### UTXO queries
 WhatsOnChain API (free):
@@ -263,9 +276,9 @@ Returns UTXOs at an address. Use this to find spendable outputs at the MPC addre
 | **rust-wallet-toolbox** | `~/bsv/rust-wallet-toolbox` | Wallet engine — ProtoWallet (signing), StorageSqlx (UTXOs), WalletSigner (tx signing orchestration). If POC 6 passes, reuse this and only swap the signer. |
 | **rust-wallet-infra** | `~/bsv/rust-wallet-infra` | CF Worker wallet (Rust → WASM, D1+R2 storage). Fallback patterns if toolbox doesn't work. Already deployed. |
 | **rust-middleware** | `~/bsv/rust-middleware` | `bsv-auth-cloudflare` crate — **USE THIS** for BRC-31 auth + BRC-29 payment middleware in bsv-mpc-worker. Ready-made, production-proven. Don't rewrite auth from scratch. |
-| **agents** | `~/bsv/agents` | 11 production CF Workers with BRC-31 auth + BRC-29 micropayments. Pattern reference for WASM deployment, nonce-bound pricing, identity-scoped results, refund handling. |
+| **agents** | `~/bsv/agents` | 11 production CF Workers with BRC-31 auth + BRC-29 micropayments. **Best working example of BRC-31 in Rust WASM.** Pattern reference for WASM deployment, nonce-bound pricing, identity-scoped results, refund handling. Use these as the reference implementation for how bsv-mpc-worker should handle auth. |
+| **BRCs** | `~/bsv/BRCs` | 114 BRC specifications. Key ones: BRC-31 (`peer-to-peer/0031.md` — Authrite mutual auth spec), BRC-42 (`key-derivation/0042.md`), BRC-100 (`wallet/0100.md`), BRC-22/23/24/25 (overlays). Read BRC-31 spec directly when implementing auth. |
 | **rust-wallet-utils** | `~/bsv/rust-wallet-utils` | CLI wallet utility with BRC-42 key derivation. Test reference. |
-| **BRCs** | `~/bsv/BRCs` | 114 BRC specifications. Key ones: BRC-42 (key derivation), BRC-100 (wallet API), BRC-22/23/24/25 (overlays). |
 
 ### Mainnet only
 Never testnet. BSV mainnet transactions cost fractions of a cent. Testnet has different behavior and hides real bugs.
