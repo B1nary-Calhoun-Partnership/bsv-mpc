@@ -204,19 +204,19 @@ Can the MPC signing produce a transaction that the BSV network accepts?
 #[tokio::test]
 async fn test_mpc_signed_transaction_is_valid() {
     // 1. Two-party DKG → joint public key
-    // 2. Fund the MPC address (send testnet BSV to it)
+    // 2. Fund the MPC address (send 10,000 sats — mainnet, never testnet)
     // 3. Build a P2PKH transaction spending from the MPC address
     // 4. Compute sighash (BIP-143)
     // 5. MPC sign the sighash → ECDSA signature
     // 6. Build unlocking script (sig + pubkey)
     // 7. Verify transaction locally (script evaluation)
-    // 8. Optionally broadcast to testnet
+    // 8. Broadcast to mainnet
 }
 ```
 
 ### Pass criteria
 - Transaction passes local script evaluation
-- Transaction is accepted by BSV testnet (if broadcast)
+- Transaction is accepted by BSV mainnet
 - Signature is standard DER format
 - Unlocking script is standard P2PKH
 
