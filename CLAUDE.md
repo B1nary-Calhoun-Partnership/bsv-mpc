@@ -106,6 +106,7 @@ bsv-mpc/
     poc1-cggmp24-signing/            # VALIDATED — DKG + signing on secp256k1
     poc2-wasm/                       # VALIDATED — compiles to wasm32-unknown-unknown
     poc3-key-derivation/             # VALIDATED — SLIP-10/BIP-32 compatibility
+    poc10-cf-worker-https/           # VALIDATED — MPC signing over real HTTPS to deployed CF Worker
     poc11-fee-settlement/            # VALIDATED — 2-of-3 nodes co-sign settlement tx on mainnet
   brc-drafts/                        # 4 BRC specification drafts (~2K lines total)
   contracts/mpc-fee-pool/            # sCrypt fee covenant (deferred to Phase 2)
@@ -131,6 +132,7 @@ Four POCs validated — the critical crypto path is fully de-risked:
 | POC 8: BRC-31 auth | Does Authrite work through MPC? | **PASS** — 1 KSS round-trip for partial ECDH (~135µs), then local HMAC offset. Server-side verification works. DER wire format correct. |
 | POC 9: encrypt/decrypt | Is MPC encryption compatible with normal wallet? | **PASS** — Byte-identical symmetric keys. Zero data loss during migration. All 3 protocols (memory, state, conversation) validated. |
 | POC 11: Fee settlement | Can MPC nodes co-sign a settlement tx using their own threshold signing? | **PASS** — 2-of-3 DKG among nodes, proportional split (45/35/20%), all 3 subsets sign, below-threshold rejected. [TXID](https://whatsonchain.com/tx/afbb7ecd746bf75c346303e863e9e6a4bd17184d8149ac68f0bdcc1003e485d7) |
+| POC 10: CF Worker HTTPS | Does MPC signing work over real HTTPS to a deployed CF Worker? | **PASS** — 1069KB WASM, 1ms startup, 16ms HTTPS RTT p50, DKG in 52ms (2 requests), signing verified by BSV SDK. DO storage works. No CORS/header issues. |
 | POC 14: Overlay discovery | Does SHIP/SLAP work for MPC node registration? | **PASS** — 4/4 mainnet SLAP trackers alive (BSV Association + Babbage). Live SHIP host discovered. tm_mpc_signing query works (0 results = nobody registered yet). No fallback needed — overlay is production-ready. |
 
 ### Critical Lessons from POC 3 + POC 4
@@ -203,6 +205,15 @@ Four POCs validated — the critical crypto path is fully de-risked:
 - All 3 subsets (A+B, A+C, B+C) produce valid signatures verified by BSV SDK
 - Below-threshold (single node) correctly rejected
 - **Confirms Level 2 fee settlement architecture** — nodes self-settle using their own threshold signing
+
+**CF Worker HTTPS (POC 10):**
+- **cggmp24 compiles and runs inside CF Worker WASM** — 1069KB module (gzip 393KB), 1ms startup, no dep conflicts with worker 0.7
+- **HTTPS RTT is ~16ms p50** (US West ↔ CF edge). Presigned signing will be ~16ms end-to-end — 12x under 200ms target
+- **Deterministic replay works** for stateless protocol handling — Worker replays protocol from scratch each request using seeded RNG. DKG keygen completes in 52ms (2 HTTPS requests). Signing works but replay is slow (28s) due to Paillier prime re-generation
+- **Production approach**: Store key shares in DO (KeyShare serializes to 10KB JSON via serde_json), load per signing request — eliminates Paillier replay. Or use DO WebSocket for persistent SM connection
+- **DO storage confirmed** — put/get works for small (10B) and large (10KB) values. First access ~58ms (instance creation), subsequent ~24ms
+- **No CORS, header size, or cold start issues** — all validated
+- **worker crate 0.7 required** — 0.4 rejected by worker-build v0.7.5. DO API changed: `impl DurableObject` no longer needs `#[durable_object]` macro, `fetch(&self)` not `fetch(&mut self)`
 
 **Fee injection (POC 7):**
 - Fee output is a simple append + change reduction — no structural tx changes

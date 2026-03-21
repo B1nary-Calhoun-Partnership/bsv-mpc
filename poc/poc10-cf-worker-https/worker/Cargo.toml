@@ -1,0 +1,62 @@
+[package]
+name = "poc10-worker"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[workspace]
+
+[dependencies]
+# CF Worker SDK
+worker = "0.7"
+
+# MPC threshold ECDSA (WASM-compatible, no_std)
+cggmp24 = { git = "https://github.com/LFDT-Lockness/cggmp21", default-features = false, features = [
+    "no_std",
+    "backend-num-bigint",
+    "curve-secp256k1",
+    "state-machine",
+] }
+cggmp24-keygen = { git = "https://github.com/LFDT-Lockness/cggmp21", default-features = false, features = [
+    "state-machine",
+] }
+
+# MPC state machine API (sync, no async runtime needed)
+round-based = { version = "0.4.1", default-features = false, features = ["state-machine"] }
+generic-ec = { version = "0.4.1", default-features = false, features = ["curve-secp256k1", "serde"] }
+
+# WASM entropy — CRITICAL for wasm32-unknown-unknown
+getrandom = { version = "0.2", features = ["js"] }
+
+# Crypto
+sha2 = { version = "0.10", default-features = false }
+rand = { version = "0.8", default-features = false, features = ["getrandom"] }
+rand_core = { version = "0.6", default-features = false, features = ["getrandom"] }
+rand_chacha = { version = "0.3", default-features = false }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hex = { version = "0.4", default-features = false, features = ["alloc"] }
+
+# WASM utilities
+console_error_panic_hook = "0.1"
+wasm-bindgen = "0.2"
+js-sys = "0.3"
+
+# Prime generation (pinned to avoid rand_core conflict)
+glass_pumpkin = "=1.9.0"
+
+# Optimize big integer in dev mode (crypto is too slow without it)
+[profile.dev.package]
+num-bigint.opt-level = 3
+num-traits.opt-level = 3
+num-integer.opt-level = 3
+glass_pumpkin.opt-level = 3
+
+[profile.release]
+opt-level = "s"
+lto = true
