@@ -150,7 +150,14 @@ Four POCs validated — the critical crypto path is fully de-risked:
 - **ALWAYS persist DKG keys before funding the MPC address** — ephemeral keys = lost funds
 - POC 4 lost 3,000 sats (~$0.0015) from ephemeral DKG keys in failed runs
 
-Remaining POCs (5-13): HTTP latency, wallet-toolbox, fee injection, BRC-31 auth, encrypt/decrypt, CF Worker HTTPS, fee settlement, 3-of-5, overlay. See `POCS.md` and GitHub issues.
+**Wallet integration quirks (POC 4 full loop):**
+- **Wallet uses `Origin: http://admin.com` header** for default basket access
+- **UTXO vout is NOT always 0** — wallet puts its own change outputs first, user output index varies
+- **WoC indexing delay: 9-18s** before a tx appears after wallet broadcast — retry logic needed
+- **BEEF needs full ancestry** — chain of unconfirmed txs back to a confirmed ancestor with BUMP
+- **Full loop cost: 188 sats** (~$0.00009) for: wallet → fund MPC → MPC sign → return to wallet
+
+Remaining POCs (5-14): HTTP latency, wallet-toolbox, fee injection, BRC-31 auth, encrypt/decrypt, CF Worker HTTPS, fee settlement, key refresh, 3-of-5, overlay, capstone integration. See GitHub issues.
 
 ## Implementation Status
 
