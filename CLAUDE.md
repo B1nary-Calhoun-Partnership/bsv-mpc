@@ -106,6 +106,7 @@ bsv-mpc/
     poc1-cggmp24-signing/            # VALIDATED — DKG + signing on secp256k1
     poc2-wasm/                       # VALIDATED — compiles to wasm32-unknown-unknown
     poc3-key-derivation/             # VALIDATED — SLIP-10/BIP-32 compatibility
+    poc11-fee-settlement/            # VALIDATED — 2-of-3 nodes co-sign settlement tx on mainnet
   brc-drafts/                        # 4 BRC specification drafts (~2K lines total)
   contracts/mpc-fee-pool/            # sCrypt fee covenant (deferred to Phase 2)
   research/                          # Strategic analysis docs
@@ -129,6 +130,7 @@ Four POCs validated — the critical crypto path is fully de-risked:
 | POC 13: Key refresh | Can shares be refreshed without moving funds? | **PASS** — Built threshold resharing (~50 LOC) from cggmp24 primitives. Same joint key, 0 on-chain cost, old shares invalidated. |
 | POC 8: BRC-31 auth | Does Authrite work through MPC? | **PASS** — 1 KSS round-trip for partial ECDH (~135µs), then local HMAC offset. Server-side verification works. DER wire format correct. |
 | POC 9: encrypt/decrypt | Is MPC encryption compatible with normal wallet? | **PASS** — Byte-identical symmetric keys. Zero data loss during migration. All 3 protocols (memory, state, conversation) validated. |
+| POC 11: Fee settlement | Can MPC nodes co-sign a settlement tx using their own threshold signing? | **PASS** — 2-of-3 DKG among nodes, proportional split (45/35/20%), all 3 subsets sign, below-threshold rejected. [TXID](https://whatsonchain.com/tx/afbb7ecd746bf75c346303e863e9e6a4bd17184d8149ac68f0bdcc1003e485d7) |
 
 ### Critical Lessons from POC 3 + POC 4
 
@@ -183,6 +185,16 @@ Four POCs validated — the critical crypto path is fully de-risked:
 - Port `threshold_reshare()` to `bsv-mpc-core` with Schnorr proofs for production hardening
 - Enables Fireblocks-style automatic refresh (every few minutes, near-zero cost)
 - **cggmp24 lacks this natively** — cggmp24 v0.7 only has aux_info_gen, cggmp21 v0.6 has non-threshold refresh but requires rug (LGPL, no WASM). Our solution avoids both limitations.
+
+**Fee settlement (POC 11):**
+- **Nodes' DKG is completely independent from agent's DKG** — same CGGMP'24 protocol, different participants, different joint key
+- 2-of-3 among nodes: any 2 can settle, no single node can steal fees
+- Proportional distribution with integer division; remainder to first node (matches `calculate_settlement()` in overlay crate)
+- Settlement tx: 1 input (fee UTXO at nodes' joint address) → N outputs (one P2PKH per node, proportional)
+- Total cost: 3000 sats input, 150 sats mining fee, 2850 sats distributed (45%/35%/20%)
+- All 3 subsets (A+B, A+C, B+C) produce valid signatures verified by BSV SDK
+- Below-threshold (single node) correctly rejected
+- **Confirms Level 2 fee settlement architecture** — nodes self-settle using their own threshold signing
 
 **Fee injection (POC 7):**
 - Fee output is a simple append + change reduction — no structural tx changes

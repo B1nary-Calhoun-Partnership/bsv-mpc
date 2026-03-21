@@ -1,0 +1,32 @@
+[package]
+name = "poc14-overlay-discovery"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+# BSV SDK — overlay module (SHIP/SLAP) + HTTP facilitators + transaction/script
+bsv = { package = "bsv-sdk", path = "../../../rust-sdk", features = [
+    "overlay",
+    "http",
+    "transaction",
+] }
+
+# Async
+tokio = { version = "1", features = ["full"] }
+
+# HTTP client (for direct SLAP tracker queries)
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+
+# HTTP server (local registry fallback)
+axum = "0.8"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Crypto / encoding
+rand = "0.8"
+hex = "0.4"
