@@ -310,14 +310,33 @@ async fn test_full_loop() {
         }
     }
 
-    // If not mined yet, get funding tx's proof instead and build BEEF that way
+    // If not mined yet, go deeper — find the funding tx's confirmed parent
     if merkle_hex.is_empty() {
-        println!("  Not mined yet — using funding tx proof for BEEF");
-        // Get funding tx merkle proof from WoC
+        println!("  Not mined yet — finding confirmed ancestor for BEEF");
+
+        // Get funding tx raw to find its parent
+        let fund_raw: String = client
+            .get(format!("https://api.whatsonchain.com/v1/bsv/main/tx/{fund_txid}/hex"))
+            .send().await.unwrap().text().await.unwrap().trim_matches('"').to_string();
+        let fund_bytes = from_hex(&fund_raw).unwrap();
+        let fund_parsed = bsv::primitives::bsv::sighash::parse_transaction(&fund_bytes).unwrap();
+
+        // Get the parent txid (first input of funding tx)
+        let parent_txid_internal = &fund_parsed.inputs[0].txid;
+        let mut parent_txid_disp = *parent_txid_internal;
+        parent_txid_disp.reverse();
+        let parent_txid = hex::encode(parent_txid_disp);
+        println!("  Funding tx parent: {parent_txid}");
+
+        // Get the parent's raw tx and merkle proof
+        let parent_raw: String = client
+            .get(format!("https://api.whatsonchain.com/v1/bsv/main/tx/{parent_txid}/hex"))
+            .send().await.unwrap().text().await.unwrap().trim_matches('"').to_string();
+
         let proof_text: String = client
-            .get(format!("https://api.whatsonchain.com/v1/bsv/main/tx/{fund_txid}/proof/tsc"))
+            .get(format!("https://api.whatsonchain.com/v1/bsv/main/tx/{parent_txid}/proof/tsc"))
             .send().await.unwrap().text().await.unwrap();
-        let proof: serde_json::Value = serde_json::from_str(&proof_text).unwrap();
+        let proof: serde_json::Value = serde_json::from_str(&proof_text).expect("parent should have proof");
         let proof = &proof[0];
         let target = proof["target"].as_str().unwrap();
         let block_info: serde_json::Value = client
@@ -325,17 +344,19 @@ async fn test_full_loop() {
             .send().await.unwrap().json().await.unwrap();
         block_height = block_info["height"].as_u64().unwrap() as u32;
         let idx = proof["index"].as_u64().unwrap();
-        let nodes: Vec<String> = proof["nodes"].as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_string()).collect();
+        let nodes: Vec<String> = proof["nodes"].as_array().unwrap().iter()
+            .map(|v| v.as_str().unwrap().to_string()).collect();
+        println!("  Parent confirmed in block {block_height}, index {idx}");
 
-        let mp = tsc_to_merkle_path(block_height, idx, fund_txid, &nodes);
-        let fund_raw: String = client
-            .get(format!("https://api.whatsonchain.com/v1/bsv/main/tx/{fund_txid}/hex"))
-            .send().await.unwrap().text().await.unwrap().trim_matches('"').to_string();
+        let mp = tsc_to_merkle_path(block_height, idx, &parent_txid, &nodes);
 
+        // Build 3-tx BEEF: confirmed parent → unconfirmed funding → unconfirmed spending
         let mut beef = Beef::with_version(bsv::transaction::beef_tx::BEEF_V2);
         let bi = beef.merge_bump(mp);
-        beef.merge_raw_tx(from_hex(&fund_raw).unwrap(), Some(bi));
-        beef.merge_raw_tx(raw_tx.clone(), None);
+        beef.merge_raw_tx(from_hex(&parent_raw).unwrap(), Some(bi)); // parent with proof
+        beef.merge_raw_tx(fund_bytes, None); // funding tx (chains to parent)
+        beef.merge_raw_tx(raw_tx.clone(), None); // spending tx (chains to funding)
+        println!("  BEEF valid: {}", beef.is_valid(false));
         assert!(beef.is_valid(false), "BEEF must be valid");
 
         let atomic = beef.to_binary_atomic(&txid_hex).unwrap();
