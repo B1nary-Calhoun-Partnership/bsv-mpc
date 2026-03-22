@@ -67,12 +67,36 @@ impl ThresholdConfig {
 /// After a successful DKG ceremony, all parties hold shares of the private key
 /// corresponding to this public key. The public key is a standard compressed
 /// secp256k1 point and can be used to derive a P2PKH BSV address.
+///
+/// ## Chain Code
+///
+/// BIP-32 HD key derivation requires a 32-byte chain code alongside the public
+/// key. In a standard wallet, the chain code comes from the master seed via
+/// `HMAC-SHA512("Bitcoin seed", seed)`. In MPC, the chain code can come from:
+///
+/// 1. **DKG transcript hash** — deterministic and shared by all parties.
+/// 2. **Explicit provision** — set during DKG or key import.
+///
+/// If no chain code is available (e.g., legacy keys created before this field
+/// existed), `derive_child_key` will derive one deterministically from
+/// `SHA-256(compressed_pubkey)`. This is safe for non-hardened derivation
+/// because the chain code adds domain separation but does not need to be secret
+/// for public-key-only derivation (the parent public key is already public).
+///
+/// The `chain_code` field is `Option` for backward compatibility with existing
+/// serialized `JointPublicKey` values that lack it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JointPublicKey {
     /// Compressed 33-byte secp256k1 public key (02/03 prefix + 32-byte x-coordinate).
     pub compressed: Vec<u8>,
     /// BSV address derived from this key (Base58Check P2PKH).
     pub address: String,
+    /// BIP-32 chain code (32 bytes) for HD key derivation.
+    ///
+    /// Optional for backward compatibility. When `None`, `derive_child_key`
+    /// deterministically derives a chain code from `SHA-256(compressed_pubkey)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chain_code: Option<Vec<u8>>,
 }
 
 /// Encrypted key share for persistent storage.

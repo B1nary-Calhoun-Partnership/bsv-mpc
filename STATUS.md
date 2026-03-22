@@ -69,11 +69,16 @@ The capstone (POC 15) validated the full flow but used shortcuts that must be re
 - [x] All validated on BSV mainnet where applicable
 - [x] ~60% of code directly portable to production crates
 
-### Project Structure (unchanged from scaffolding)
+### Project Structure
 - [x] Cargo workspace with 5 crates (~6,200 LOC scaffolded)
 - [x] All types, errors, configs, routing complete
 - [x] Pool management working (presign_manager.rs)
 - [x] All 28 BRC-100 routes wired (server.rs)
+
+### Production Code (M1 progress)
+- [x] Share encryption: AES-256-GCM encrypt/decrypt/derive_key (share.rs, 22 tests)
+- [x] Participation proofs: create/serialize to OP_RETURN/verify (proof.rs, 33 tests)
+- [x] HD key derivation: BIP-32/SLIP-10 non-hardened derivation from joint public key (hd.rs, 43 tests). Added `chain_code` field to `JointPublicKey` for BIP-32 chain code propagation. Includes `derive_tweak()` for MPC share updates.
 
 ### Documentation
 - [x] CLAUDE.md — full architecture context
@@ -98,8 +103,8 @@ The capstone (POC 15) validated the full flow but used shortcuts that must be re
 1. **#8 DKG coordinator** — port POC 1 DKG patterns to `dkg.rs` (2-3 days)
 2. **#9 Signing coordinator** — port POC 1 signing + POC 5 HTTP SM to `signing.rs` (2-3 days)
 3. **#10 Presigning manager** — integrate cggmp24 presign with existing pool (1-2 days)
-4. **#11 Share encryption** — AES-256-GCM, straightforward (1 day)
-5. **#12 Participation proofs** — OP_RETURN format (1-2 days)
+4. **#11 Share encryption** — AES-256-GCM **DONE** (encrypt/decrypt/derive_key implemented + 22 tests)
+5. **#12 Participation proofs** — OP_RETURN format **DONE** (create/serialize/verify implemented + 33 tests)
 
 ### M2: Signing Proxy (Mar 28 - Apr 4)
 1. **#13 MPC bridge** — port POC 5 HTTP state machine (2-3 days)

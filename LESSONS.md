@@ -421,3 +421,33 @@ Which POC code to port into production crates:
 | `getrandom` | No entropy source in WASM by default | Enable `js` feature |
 | `bsv` SDK | `features = ["transaction"]` required for tx building | Always include |
 | WoC API | `/proof` returns 404, must use `/proof/tsc` | Use TSC endpoint specifically |
+| `glass_pumpkin` workspace pin | POCs each pin individually, but workspace `Cargo.toml` was missing it | Add `glass_pumpkin = "=1.9.0"` to `[workspace.dependencies]` |
+| `hmac` crate | Not in workspace deps despite being a transitive dep of cggmp24 | Add `hmac = "0.12"` to workspace and bsv-mpc-core for HMAC-SHA256 key derivation |
+
+---
+
+## 16. Production Implementation Notes (M1)
+
+### Share encryption (share.rs)
+- `aes-gcm 0.10` API: `Aes256Gcm::new(Key::from_slice(bytes))`, `cipher.encrypt(nonce, plaintext)`, `cipher.decrypt(nonce, ciphertext)`
+- GCM auth tag (16 bytes) is automatically appended to ciphertext by `encrypt()` and verified by `decrypt()`
+- `rand::rngs::OsRng.fill_bytes()` for 12-byte nonce generation; compiles to WASM via getrandom/js
+- `hmac::Hmac::<Sha256>::new_from_slice(key)` accepts any key length (no padding issue for 32 bytes)
+- `validate_encrypted_share()` should be called before `decrypt_share()` to catch structural issues before hitting crypto
+
+### HD key derivation (hd.rs)
+- **BIP-32 chain codes are required** for HD derivation but `JointPublicKey` originally lacked a `chain_code` field. Added `Option<Vec<u8>>` with `#[serde(default, skip_serializing_if = "Option::is_none")]` for backward compatibility with existing serialized values.
+- **Chain code bootstrapping**: When `chain_code` is `None` (legacy keys, pre-DKG-upgrade), the code derives a deterministic chain code from `SHA-256(compressed_pubkey)`. This is safe for non-hardened (public) derivation because chain codes add domain separation but are not secret material. For production DKG, the chain code SHOULD be set from the DKG transcript hash.
+- **Non-hardened derivation is pure public-key math**: `HMAC-SHA512(chain_code, pubkey || index)` → left 32 bytes = tweak scalar, right 32 bytes = child chain code → `child_pub = parent_pub + tweak * G`. No MPC communication needed. Each party can independently derive the child public key AND update their share by adding the same tweak scalar.
+- **Hardened derivation is impossible without MPC protocol**: It requires the private key in the HMAC input (`0x00 || privkey || index`). A 2-party HMAC protocol would be needed. The current implementation returns `MpcError::Protocol` for hardened paths.
+- **Scalar validity check required by BIP-32**: The left 32 bytes of the HMAC output must be < secp256k1 curve order `n`. This is astronomically unlikely to fail (~1 in 2^128) but must be checked for correctness.
+- **BSV SDK provides all needed primitives**: `PublicKey::from_scalar_mul_generator()` for `G * scalar`, `PublicKey::add()` for point addition, `sha512_hmac()` for HMAC-SHA512, `Address::new_from_public_key()` for P2PKH address derivation. No additional crypto dependencies needed.
+- **`derive_tweak()` enables share updates**: The exported `derive_tweak()` function returns the scalar tweak and child chain code separately, so the proxy and KSS can each add the tweak to their share independently (for non-hardened derivation) without any communication.
+- **Incremental vs single-call derivation**: `derive_child_key(key, "m/0/1")` produces identical results to `derive_child_key(derive_child_key(key, "m/0"), "m/1")` because chain codes propagate correctly through each level.
+
+### Participation proofs (proof.rs)
+- Bitcoin PUSHDATA encoding: 0 bytes = OP_0 (0x00), 1-75 = direct length byte, 76-255 = OP_PUSHDATA1 + 1-byte len, 256-65535 = OP_PUSHDATA2 + 2-byte LE len
+- The BRC draft specifies `"mpc-signing-proof"` as protocol ID, but the proof.rs code uses `"bsv-mpc-participation"` (matching the existing stub doc comments and proof struct). These will be reconciled when finalizing the BRC spec
+- Compressed pubkey validation: check `len == 33` and `prefix in {0x02, 0x03}` — format check only, not on-curve verification (no secp256k1 dependency needed)
+- `chrono::Utc::now()` works in both native and WASM (chrono's `wasmbind` feature)
+- `timestamp_millis()` returns `i64`; cast to `u64` for big-endian serialization in OP_RETURN
