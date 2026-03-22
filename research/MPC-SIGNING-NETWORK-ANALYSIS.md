@@ -1,6 +1,6 @@
 # MPC Signing Network Analysis
 
-> Full analysis is at `~/bsv/rust-bsv-worm/research/MPC-SIGNING-NETWORK-ANALYSIS.md`
+> Full analysis is at `~/bsv/strategy/MPC-SIGNING-NETWORK-ANALYSIS.md`
 >
 > This file contains a summary. See the source document for complete details.
 
@@ -37,4 +37,4 @@ CF Workers win on cold start (critical for signing latency) and WASM support.
 
 ## Source
 
-Full 1,276-line analysis: `~/bsv/rust-bsv-worm/research/MPC-SIGNING-NETWORK-ANALYSIS.md`
+Full 1,276-line analysis: `~/bsv/strategy/MPC-SIGNING-NETWORK-ANALYSIS.md`

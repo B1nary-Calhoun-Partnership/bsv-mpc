@@ -68,39 +68,40 @@ Core MPC protocol layer wrapping cggmp24 for threshold ECDSA on secp256k1. **All
 - `types.rs` — **Complete.** All 10 core types: SessionId, ShareIndex, ThresholdConfig, JointPublicKey, EncryptedShare, Presignature, ParticipationProof, RoundMessage, DkgResult, SigningResult.
 - `error.rs` — **Complete.** MpcError enum with 9 variants + From impls.
 
-#### bsv-mpc-proxy (~6.2K LOC, 9 files)
+#### bsv-mpc-proxy (~7K LOC, 10 files)
 BRC-100 compatible signing proxy. Drop-in replacement for bsv-wallet-cli at localhost:3322.
 - `server.rs` — **Complete.** Axum router with all 28 BRC-100 endpoints, AppState, background presig task.
-- `wallet_api.rs` — 28 handlers. 18 working or partially implemented, **10 todo!() stubs** remaining (certificates, discovery, key linkage, some crypto ops).
-- `bridge.rs` — **Implemented.** MPC protocol bridge to KSS. HTTP client, share loading/decryption, session management.
-- `fee_injector.rs` — **Implemented.** Fee output injection into transactions. P2PKH split and bare multisig modes. 7 tests.
-- `utxo_tracker.rs` — **Implemented.** In-memory UTXO tracking with FIFO management, spending status, basket/tag metadata.
+- `wallet_api.rs` — 28 handlers. 18 working or partially implemented, **10 todo!() stubs** remaining (certificates, discovery, key linkage). 40+ tests.
+- `bridge.rs` — **Implemented.** MPC protocol bridge to KSS. HTTP client, share loading/decryption, BRC-31 auth, session management. 15+ tests.
+- `fee_injector.rs` — **Implemented.** Fee output injection into transactions. P2PKH split and bare multisig modes. 20+ tests.
+- `utxo_tracker.rs` — **Implemented.** In-memory UTXO tracking with FIFO management, spending status, basket/tag metadata. 12 tests.
 - `presign_manager.rs` — **Implemented.** FIFO pool management, background replenishment loop with exponential backoff.
 - `config.rs` — **Complete.** `ProxyConfig::from_env()` reads `MPC_*` env vars.
 - `error.rs` — **Complete.** ProxyError enum with HTTP status mapping.
 - `main.rs` — **Complete.** Binary entry point.
+- `lib.rs` — **Complete.** Module declarations.
 
 #### bsv-mpc-worker (~2.5K LOC, 4 files)
 Cloudflare Worker Key Share Service (Rust -> WASM). Holds share_A.
 - `lib.rs` — **Complete.** CF Worker router with all 8 endpoints.
-- `api.rs` — All 12 request/response types defined. Handler bodies have detailed pseudocode.
-- `storage.rs` — ShareStorage struct + ShareMetadata. 3-table DO SQLite schema. Methods have pseudocode.
-- `auth.rs` — `verify_agent_authorization()` **implemented**. BRC-31 handshake and request verification have pseudocode.
+- `api.rs` — **Implemented.** All 8 handlers call bsv-mpc-core coordinators (DKG, signing, presigning, ECDH). 12 request/response types. BRC-31 auth verification is TODO on all mutation endpoints.
+- `storage.rs` — **Implemented.** ShareStorage struct + ShareMetadata. 3-table DO SQLite schema with working methods.
+- `auth.rs` — `verify_agent_authorization()` **implemented**. BRC-31 handshake (`verify_request`, `handle_authrite_handshake`) are TODO.
 
 #### bsv-mpc-service (~1.2K LOC, 4 files)
-Standalone Key Share Service binary. Same API as bsv-mpc-worker but backed by local SQLite.
-- `main.rs` — **Complete.** Axum server with all 9 routes, AppState with RwLock storage.
-- `handlers.rs` — `handle_health` **implemented**. 8 protocol handlers have pseudocode.
-- `storage.rs` — SqliteShareStorage with 5-table schema. 15+ methods have pseudocode.
+Standalone Key Share Service binary. Same API as bsv-mpc-worker but backed by in-memory storage (planned: local SQLite).
+- `lib.rs` — **Complete.** AppState struct, `build_router()`, module exports.
+- `main.rs` — **Complete.** Axum server with all 10 routes, env config, tracing setup.
+- `handlers.rs` — **Implemented.** All 9 protocol handlers (DKG, signing, presigning, ECDH, health, share metadata) call bsv-mpc-core coordinators. BRC-31 auth verification is TODO. Authrite handshake is a stub.
+- `storage.rs` — **Implemented (in-memory).** HashMap/VecDeque storage for shares, protocol state, presignatures. 5-table SQL schema documented for future SQLite migration.
 
-#### bsv-mpc-overlay (~1.9K LOC, 6 files + tests)
+#### bsv-mpc-overlay (~1.9K LOC, 6 files)
 BSV overlay network integration for MPC node discovery.
-- `types.rs` — **Complete.** MpcNodeInfo, DiscoveryQuery, OverlayProof, FeeSettlement, constants.
+- `types.rs` — **Complete.** MpcNodeInfo, DiscoveryQuery, OverlayProof, FeeSettlement, NodeFeeShare, constants.
 - `error.rs` — **Complete.** OverlayError with 8 variants.
-- `proofs.rs` — `calculate_settlement()` **implemented** for proportional fee distribution. 4 todo!() stubs for proof publication/querying.
-- `chip.rs` — CHIP token creation/parsing for node advertisement (BRC-23). Pseudocode.
-- `discovery.rs` — SLAP/CLAP lookup to find MPC nodes (BRC-24/25). Pseudocode.
-- `tests/integration.rs` — Integration test for CHIP tokens + discovery (ported from POC 14).
+- `proofs.rs` — `calculate_settlement()` **implemented** for proportional fee distribution. 3 todo!() stubs for proof publication/querying (publish_proof, query_proofs, count_proofs_by_node).
+- `chip.rs` — **Implemented.** CHIP token creation/parsing (BRC-23 PushDrop), overlay publication, SDK admin token wrappers. `revoke_chip_token` is a stub. 14 tests.
+- `discovery.rs` — **Implemented.** SLAP/CLAP node discovery via BSV SDK `LookupResolver`, health checking, reputation scoring, client-side filtering/ranking. 9 tests.
 - Topic: `tm_mpc_signing` on BRC-22 overlay.
 
 ## Project Layout
@@ -121,10 +122,10 @@ bsv-mpc/
   src/lib.rs                         # Root crate (exists solely to host integration tests)
   crates/
     bsv-mpc-core/src/                # 11 files, ~8K LOC — all protocol modules implemented
-    bsv-mpc-proxy/src/               # 9 files, ~6.2K LOC — bridge + fee injector implemented
-    bsv-mpc-worker/src/              # 4 files, ~2.5K LOC — router complete, handlers pseudocode
-    bsv-mpc-service/src/             # 4 files, ~1.2K LOC — router complete, handlers pseudocode
-    bsv-mpc-overlay/src/             # 6 files + tests, ~1.9K LOC — settlement implemented
+    bsv-mpc-proxy/src/               # 10 files, ~7K LOC — bridge + fee injector + 18/28 handlers
+    bsv-mpc-worker/src/              # 4 files, ~2.5K LOC — all handlers implemented, BRC-31 auth TODO
+    bsv-mpc-service/src/             # 4 files, ~1.2K LOC — all handlers implemented, in-memory storage
+    bsv-mpc-overlay/src/             # 6 files, ~1.9K LOC — chip + discovery implemented, proofs TODO
   poc/                               # 15 POCs, all VALIDATED (~12,300 LOC)
   tests/
     e2e.rs                           # E2E test suite: proxy + KSS over HTTP (6 scenarios)
@@ -174,7 +175,7 @@ All 15 POCs PASSED. See `LESSONS.md` for comprehensive technical findings.
 
 ## Implementation Status
 
-~20K LOC production code + ~12,300 LOC POC code. Core protocol fully implemented. Remaining work: KSS handlers, remaining wallet API endpoints, overlay publication.
+~21.5K LOC production code + ~12,300 LOC POC code. Core protocol and KSS handlers fully implemented. Remaining work: BRC-31 auth in KSS, 10 wallet API stubs, overlay proof publication, SQLite persistence.
 
 | Layer | Status | Notes |
 |-------|--------|-------|
@@ -195,9 +196,11 @@ All 15 POCs PASSED. See `LESSONS.md` for comprehensive technical findings.
 | BRC-100 handlers (18 of 28) | **Partial** | 10 todo!() stubs (certificates, discovery, key linkage) |
 | Fee settlement calculation | **Implemented** | proofs.rs: proportional distribution |
 | E2E test suite | **Implemented** | tests/e2e.rs: 6 scenarios incl mainnet tx signing |
-| KSS handlers (worker + service) | **Pseudocode** | All types defined, handler bodies need porting from POCs |
-| Overlay publication (CHIP/SLAP) | **Pseudocode** | chip.rs, discovery.rs need porting from POC 14 |
-| KSS storage (SQLite/DO) | **Pseudocode** | Schema documented, methods need implementation |
+| KSS handlers (worker + service) | **Implemented** | All protocol handlers call bsv-mpc-core coordinators. BRC-31 auth TODO. |
+| CHIP tokens + discovery | **Implemented** | chip.rs: 14 tests, discovery.rs: 9 tests. Proof publication TODO. |
+| KSS storage (service) | **In-memory** | HashMap/VecDeque working. SQLite (rusqlite) not yet wired. |
+| KSS storage (worker) | **Implemented** | DO SQLite schema + methods working. |
+| BRC-31 auth (KSS) | **TODO** | verify_agent_authorization() done, full handshake TODO |
 
 ### Timeline
 
@@ -206,8 +209,8 @@ All 15 POCs PASSED. See `LESSONS.md` for comprehensive technical findings.
 | M0: POC Validation | Mar 21 | **DONE** (15/15) |
 | M1: Core MPC Library | Mar 28 | **DONE** — all protocol modules implemented |
 | M2: Signing Proxy | Apr 4 | In progress — bridge + fee injector done, wallet API 18/28 |
-| M3: CF Worker Deployment | Apr 8 | |
-| M4: Fee System | Apr 11 | |
+| M3: CF Worker Deployment | Apr 8 | Mostly done — all handlers implemented, BRC-31 auth + deployment remaining |
+| M4: Fee System | Apr 11 | Partially done — settlement calc + CHIP/discovery implemented, proof pub TODO |
 | M5: Integration & BRCs | Apr 14 | |
 | Beta: Overlay & Hardening | Apr 25 | |
 

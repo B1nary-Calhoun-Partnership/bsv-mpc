@@ -53,6 +53,10 @@ In-memory share storage (production: local SQLite). Fields:
 - `dkg_state` — intermediate DKG coordinator state between rounds
 - `signing_state` — intermediate signing coordinator state between rounds
 
+### Internal Storage Types (storage.rs)
+- `StoredShare` (storage.rs:86) — private wrapper: `share: EncryptedShare`, `created_at: String`, `updated_at: String`
+- `StoredPresignature` (storage.rs:94) — private wrapper: `id`, `session_id`, `data: Vec<u8>`, `created_at` (fields used for audit/debugging in production SQLite)
+
 ### `ShareMetadata` (storage.rs:103)
 Wire-safe share info (no secrets): `agent_id`, `session_id`, `share_index`, `threshold`, `parties`, timestamps, `presignature_count`.
 
@@ -93,19 +97,26 @@ Mirror the types in `bsv-mpc-worker::api`. Could be extracted to a shared crate 
 
 ### Handler Implementation Details
 
-**DKG** (`handle_dkg_init`, `handle_dkg_round`): Creates `DkgCoordinator` with `ShareIndex(0)`, runs 4-round CGGMP'24 protocol. On completion, stores the resulting share via `storage.store_share()` and removes the coordinator from `COORDINATOR_STORE`.
+**DKG** (`handle_dkg_init`, `handle_dkg_round`): Creates `DkgCoordinator` with `ShareIndex(0)`, runs 4-round CGGMP'24 protocol. On completion, stores the resulting share via `storage.store_share()` keyed by `dkg_result.session_id` (not agent_id) and removes the coordinator from `COORDINATOR_STORE`. Note: `DkgInitRequest.agent_id` is received but not currently used as the storage key — the DKG session ID is used instead. This means share retrieval for signing/ECDH must use the session ID as the agent lookup key.
 
-**Signing** (`handle_sign_init`, `handle_sign_round`): Loads agent's share from storage, creates `SigningCoordinator`. Supports optional `hmac_offset` field for BRC-42 derived key signing. On completion, returns `SigningResult` and cleans up coordinator.
+**Signing** (`handle_sign_init`, `handle_sign_round`): Loads agent's share from storage, creates `SigningCoordinator` with all parties as participants (`0..config.parties`). Supports optional `hmac_offset` field (32-byte hex) for BRC-42 derived key signing via `set_additive_shift()`. On completion, returns `SigningResult` and cleans up coordinator.
 
-**ECDH** (`handle_ecdh`): Computes partial ECDH for BRC-42 key derivation. Parses counterparty public key, loads agent's share, extracts scalar via `bsv_mpc_core::ecdh::parse_share_scalar()`, computes `counterparty_pub * share_scalar` via `compute_partial_ecdh_point()`. Returns compressed point as hex.
+**ECDH** (`handle_ecdh`): Computes partial ECDH for BRC-42 key derivation. Parses counterparty public key (33-byte compressed hex), loads agent's share, extracts scalar via `bsv_mpc_core::ecdh::parse_share_scalar()`, computes `counterparty_pub * share_scalar` via `compute_partial_ecdh_point()`. Returns compressed point as hex.
 
-**Presigning** (`handle_presign_init`, `handle_presign_round`): Creates `PresigningManager` for batch generation (1-100 presignatures). 3-round protocol.
+**Presigning** (`handle_presign_init`, `handle_presign_round`): Creates `PresigningManager` for batch generation. Validates count is 1-100 (rejects 0 or >100 with 400 BAD_REQUEST). 3-round protocol. On completion, cleans up coordinator and reports `presignatures_generated`.
 
-**Health** (`handle_health`): Returns version, share count, total presignatures across all agents, uptime, data directory.
+**Health** (`handle_health`): Returns `CARGO_PKG_VERSION`, share count, total presignatures summed across all agents, uptime in seconds, data directory path.
 
-### Message Bundling
+**Share Metadata** (`handle_get_share_metadata`): Returns `ShareMetadata` for a single agent (no secrets exposed). Includes presignature count.
 
-Handlers use `bundle_outgoing_messages()` and `unbundle_incoming_message()` helper functions to multiplex/demux multiple `RoundMessage`s into a single transport message. Bundled payloads are JSON arrays; unbundling detects the array prefix byte `[` to decide whether to split.
+**Authrite** (`handle_authrite`): Stub that returns a zeroed 33-byte identity key, `"development-stub-nonce"`, and empty certificates array. Accepts `identityKey` and `nonce` from body but doesn't process them.
+
+### Helper Functions (handlers.rs)
+
+- `generate_session_id(prefix)` (handlers.rs:211) — 32 bytes from `getrandom`, SHA-256 hashed, formatted as `"{prefix}-{hex(first_16_bytes)}"`. Used for all session IDs (dkg, sign, presign).
+- `err_response(status, msg)` (handlers.rs:219) — Returns `(StatusCode, Json({"error": "..."}))` tuple for error responses.
+- `bundle_outgoing_messages(messages)` (handlers.rs:227) — Combines multiple `RoundMessage`s into one by JSON-array-encoding their payloads. Preserves `session_id`, `round`, `from` from the first message, sets `to: None`.
+- `unbundle_incoming_message(msg)` (handlers.rs:254) — Splits a transport `RoundMessage` back into individual messages. Detects bundled payloads by checking if the first byte is `[` (JSON array). If not an array, returns the message as-is in a single-element vec.
 
 ## Configuration
 
@@ -117,7 +128,7 @@ All via environment variables (parsed in `main.rs:60-64`):
 | `MPC_DATA_DIR` | `./shares` | Directory for SQLite database |
 | `RUST_LOG` | `bsv_mpc_service=info` | Tracing filter (via `tracing-subscriber`) |
 
-The data directory is created automatically on startup. SQLite database path: `{data_dir}/mpc-shares.db` (logged but not yet opened).
+The data directory is created automatically on startup (`std::fs::create_dir_all`). SQLite database path: `{data_dir}/mpc-shares.db` (logged but not yet opened).
 
 ## Storage Methods
 
@@ -126,29 +137,29 @@ All methods return `anyhow::Result`. Currently in-memory; SQL schemas documented
 ### Share CRUD
 - `open(data_dir)` — create in-memory storage, record planned db path
 - `store_share(agent_id, share)` — upsert encrypted share with timestamps
-- `get_share(agent_id)` → `Option<EncryptedShare>`
+- `get_share(agent_id)` -> `Option<EncryptedShare>`
 - `delete_share(agent_id)` — cascading delete of share + presignatures
-- `list_agents()` → `Vec<String>` — sorted agent IDs
-- `share_count()` → `usize`
-- `get_share_metadata(agent_id)` → `Option<ShareMetadata>` — includes presignature count
+- `list_agents()` -> `Vec<String>` — sorted agent IDs
+- `share_count()` -> `usize`
+- `get_share_metadata(agent_id)` -> `Option<ShareMetadata>` — includes presignature count
 
 ### DKG State
 - `store_dkg_state(state)` — persist between rounds (keyed as `dkg:{session_id}`)
-- `get_dkg_state(session_id)` → `Option<DkgSessionState>`
+- `get_dkg_state(session_id)` -> `Option<DkgSessionState>` — note: `agent_id` and `round` are not preserved in retrieval (empty/zero)
 - `delete_dkg_state(session_id)` — cleanup after completion
 
 ### Signing State
 - `store_signing_state(state)` — persist between rounds (keyed as `sign:{session_id}`)
-- `get_signing_state(session_id)` → `Option<SigningSessionState>`
+- `get_signing_state(session_id)` -> `Option<SigningSessionState>` — note: `agent_id`, `round`, `sighash` are not preserved in retrieval
 - `delete_signing_state(session_id)` — cleanup after completion
 
 ### Presigning
 - `store_presigning_state(agent_id, session_id, round, state)` — keyed as `presign:{agent_id}:{session_id}:{round}`
-- `get_presigning_state(agent_id, round)` → `Option<Vec<u8>>` — prefix-match search
+- `get_presigning_state(agent_id, round)` -> `Option<Vec<u8>>` — prefix-match search across all sessions
 - `store_presignature(agent_id, session_id, presig_id, data)` — append to FIFO queue
-- `consume_presignature(agent_id)` → `Option<Vec<u8>>` — FIFO pop_front
-- `presignature_count(agent_id)` → `u64`
-- `prune_consumed_presignatures(older_than)` → `u64` — no-op for in-memory (consumed entries already removed)
+- `consume_presignature(agent_id)` -> `Option<Vec<u8>>` — FIFO pop_front
+- `presignature_count(agent_id)` -> `u64`
+- `prune_consumed_presignatures(older_than)` -> `u64` — no-op for in-memory (consumed entries already removed)
 
 ## Thread Safety
 
@@ -166,16 +177,18 @@ All methods return `anyhow::Result`. Currently in-memory; SQL schemas documented
 | `chrono` | Timestamps, uptime calculation |
 | `tracing` / `tracing-subscriber` | Structured logging |
 | `anyhow` | Error handling in main + storage |
-| `getrandom` | Entropy for session ID generation |
+| `thiserror` | Error derive macros (workspace dep) |
+| `getrandom` | Entropy for session ID generation (v0.2) |
 | `sha2` | SHA-256 for session ID hashing |
 | `hex` | Hex encoding/decoding for sighash, keys, session IDs |
 
 ## What Needs Implementation
 
-1. **BRC-31 auth verification** — All mutation handlers have `// TODO: Verify BRC-31 auth` comments. Need to extract identity from headers and verify signatures.
-2. **SQLite persistence** — Add `rusqlite` dependency, implement `SqliteShareStorage::open()` with WAL mode + table creation, migrate all methods from HashMap to SQL.
-3. **Full Authrite handshake** (`handle_authrite`) — Currently returns a placeholder identity key and stub nonce.
+1. **BRC-31 auth verification** — All mutation handlers have `// TODO: Verify BRC-31 auth` comments. Need to extract identity from headers and verify signatures. Reference: `~/bsv/rust-middleware` (`bsv-auth-cloudflare`).
+2. **SQLite persistence** — Add `rusqlite` dependency, implement `SqliteShareStorage::open()` with WAL mode + table creation, migrate all methods from HashMap to SQL. Schema is already documented in `storage.rs` module doc comments.
+3. **Full Authrite handshake** (`handle_authrite`) — Currently returns a zeroed identity key and stub nonce. Must implement BRC-31 handshake per `~/bsv/BRCs/peer-to-peer/0031.md`.
 4. **Coordinator cleanup** — No TTL or eviction for abandoned sessions in `COORDINATOR_STORE`. Long-running server could leak memory from incomplete protocol sessions.
+5. **DKG share keying** — `handle_dkg_round` stores shares keyed by `dkg_result.session_id.0` rather than the `agent_id` from the init request. This works but means callers must know the session ID to look up shares for signing/ECDH.
 
 ## Differences from bsv-mpc-worker
 

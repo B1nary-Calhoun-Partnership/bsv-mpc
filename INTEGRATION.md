@@ -378,6 +378,72 @@ Then adjusts the change output to account for the additional fee.
 
 ---
 
+## Hosted Mode: Storage Architecture
+
+In hosted mode (CF Containers), the proxy does NOT manage its own UTXO storage. Instead, it uses `StorageClient` from `rust-wallet-toolbox` to persist UTXOs in `rust-wallet-infra` (D1 + R2 on Cloudflare Workers).
+
+### Storage Modes
+
+| Mode | Storage Backend | Where UTXOs Live |
+|------|----------------|------------------|
+| Dev/testing | In-memory `UtxoTracker` | RAM (current state) |
+| Sovereign | `StorageSqlx` | Local SQLite file |
+| Hosted | `StorageClient` → `rust-wallet-infra` | D1 + R2 on CF Workers |
+
+The current in-memory `UtxoTracker` in `utxo_tracker.rs` is a dev convenience. Production deployments MUST use `rust-wallet-toolbox`'s storage backends, which already implement UTXO selection (~4000 LOC), fee calculation, tx construction, and the full 16-table schema.
+
+### Why Not Reimplement?
+
+The wallet-toolbox signing flow already separates storage from signing:
+
+```
+1. storage.createAction(outputs)     → selects UTXOs, builds UNSIGNED tx
+2. signer.sign_transaction(tx)       → THIS is where MPC goes
+3. storage.processAction(signed_tx)  → updates UTXO state, queues broadcast
+```
+
+The MPC proxy only needs to replace step 2 (`WalletSigner` → `MpcSigner`). Everything else is reused.
+
+### Full Hosted Stack
+
+```
+bsv-worm (CF Container)
+  → JIT proxy (USD credit check — spending ops only)
+    → bsv-mpc-proxy (threshold signing)
+      ├── StorageClient → rust-wallet-infra (UTXOs, txs, proofs in D1/R2)
+      └── MPC bridge → KSS (key shares on separate CF account)
+```
+
+Three orthogonal layers:
+- **JIT proxy**: Credit management (USD → BSV funding). Transparent BRC-100 proxy.
+- **MPC proxy**: Threshold signing. Replaces `WalletSigner` with 2-party ECDSA.
+- **rust-wallet-infra**: UTXO persistence. `StorageClient` backend, already deployed.
+
+### JIT Proxy Compatibility
+
+The JIT proxy (rust-bsv-worm issue #13) sits in front of the MPC proxy and:
+1. Proxies all 28 BRC-100 endpoints transparently
+2. Intercepts spending operations (`createAction`) to check USD credits
+3. Performs JIT conversion (USD → BSV at spot rate + margin)
+4. Forwards to the actual wallet backend (bsv-mpc-proxy in hosted mode)
+
+The JIT proxy doesn't touch signing or storage — it's purely a credit layer. This means JIT + MPC compose cleanly with zero coupling.
+
+### Worm Data vs Wallet Data
+
+Separate persistence paths:
+
+| Data | Where | Encrypted? |
+|------|-------|------------|
+| Wallet UTXOs, txs, proofs | rust-wallet-infra (D1/R2) | Standard wallet encryption |
+| Worm memory files | R2 blobs | MPC-derived keys (`counterparty: "self"`) |
+| Worm conversations | R2 blobs | MPC-derived keys |
+| Worm budget/schedules | D1 | Selective encryption |
+
+The platform stores opaque ciphertext for worm data — it cannot decrypt without the MPC key.
+
+---
+
 ## CRITICAL FINDING: bsv-wallet-cli Architecture
 
 ### The wallet stack has a clean separation
