@@ -742,30 +742,26 @@ async fn test_mainnet_transaction(env: &TestEnv, client: &Client) {
     };
     eprintln!("  Funded: txid={fund_txid} ({} bytes)", fund_raw_tx.len() / 2);
 
-    // Step 2: Internalize the funding transaction
-    // Find the output index that pays to our locking script
-    let _fund_tx_bytes = hex::decode(&fund_raw_tx).expect("decode rawTx");
-    let mut vout: u64 = 0;
-    // Try each output index to find the one paying to our script
-    for i in 0..10 {
-        let resp = post_json(
-            client,
-            &format!("{base_url}/internalizeAction"),
-            &json!({
-                "tx": fund_raw_tx,
-                "outputs": [{
-                    "outputIndex": i,
-                    "protocol": "wallet payment"
-                }]
-            }),
-        )
-        .await;
-        if resp.get("error").is_none() && resp["accepted"] == true {
-            vout = i;
-            break;
-        }
+    // Step 2: Internalize the funding transaction.
+    // Use auto-scan mode (no "outputs" array) — the handler will scan all outputs
+    // and add any that match our P2PKH script. This handles BEEF/AtomicBEEF and
+    // raw tx formats automatically, and finds the correct vout regardless of the
+    // wallet's output ordering.
+    let internalize_resp = post_json(
+        client,
+        &format!("{base_url}/internalizeAction"),
+        &json!({
+            "tx": fund_raw_tx,
+        }),
+    )
+    .await;
+    if internalize_resp.get("error").is_some() {
+        eprintln!("  internalizeAction error: {internalize_resp}");
+        eprintln!("  FAIL: Could not internalize funding tx");
+        return;
     }
-    eprintln!("  Internalized output at vout={vout}");
+    let intern_txid = internalize_resp["txid"].as_str().unwrap_or("unknown");
+    eprintln!("  Internalized: txid={intern_txid}");
 
     // Step 3: Verify balance via listOutputs
     let resp = post_json(
@@ -811,24 +807,54 @@ async fn test_mainnet_transaction(env: &TestEnv, client: &Client) {
     .await;
     let elapsed = start.elapsed();
 
-    if resp.get("error").is_some() {
-        eprintln!("  createAction error: {resp}");
-        eprintln!("  (This may happen if UTXO tracker is empty — try internalizing first)");
-        return;
-    }
+    assert!(
+        resp.get("error").is_none(),
+        "createAction MUST succeed on mainnet. Error: {}",
+        resp
+    );
 
-    let txid = resp["txid"].as_str().expect("txid");
+    let txid = resp["txid"].as_str().expect("txid must be in response");
     eprintln!("  Transaction broadcast! txid={txid} ({:.0}ms)", elapsed.as_millis());
     eprintln!("  View: https://whatsonchain.com/tx/{txid}");
 
-    // Step 5: Verify UTXO tracker updated
+    // Step 5: Verify UTXO tracker updated (change output should exist)
     let resp = post_json(
         client,
         &format!("{base_url}/listOutputs"),
         &json!({"basket": "default"}),
     )
     .await;
+    let total = resp["totalOutputs"].as_u64().unwrap_or(0);
     eprintln!("  listOutputs after spend: {resp}");
+    // Should have 1 change output (the 5000 - 3000 - fee remaining)
+    assert!(total >= 1, "should have at least 1 change output after spend");
+
+    // Step 6: Verify transaction on WhatsOnChain (may take a few seconds to index)
+    eprintln!("  Verifying on WhatsOnChain...");
+    let mut verified = false;
+    for attempt in 1..=10 {
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        let woc_url = format!("https://api.whatsonchain.com/v1/bsv/main/tx/{txid}");
+        match client.get(&woc_url).send().await {
+            Ok(r) if r.status().is_success() => {
+                let woc: Value = r.json().await.unwrap_or_default();
+                if woc.get("txid").is_some() {
+                    eprintln!(
+                        "  Verified on WoC (attempt {attempt}): confirmations={}",
+                        woc.get("confirmations").and_then(|v| v.as_i64()).unwrap_or(-1)
+                    );
+                    verified = true;
+                    break;
+                }
+            }
+            _ => {
+                eprintln!("  WoC not indexed yet (attempt {attempt}/10)...");
+            }
+        }
+    }
+    if !verified {
+        eprintln!("  WARNING: tx not yet indexed by WoC — this is normal for fresh txs");
+    }
 
     eprintln!("  PASS\n");
 }

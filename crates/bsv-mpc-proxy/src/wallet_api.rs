@@ -398,21 +398,65 @@ async fn broadcast_tx(
     client: &reqwest::Client,
     raw_tx_hex: &str,
 ) -> Result<serde_json::Value, String> {
-    let arc_endpoints = [
-        "https://arc.taal.com",
-        "https://arc.gorillapool.io",
-    ];
-
+    // Retry loop: parent transactions may not have propagated yet when we're
+    // spending a fresh output. Retry up to 5 times with 3-second delays.
+    let max_retries = 5;
     let mut last_error = String::new();
 
-    for endpoint in &arc_endpoints {
-        let url = format!("{}/v1/tx", endpoint);
+    for attempt in 0..max_retries {
+        if attempt > 0 {
+            tracing::info!(attempt, "Retrying broadcast after parent propagation delay");
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        }
 
+        // Try ARC broadcasters first (they return detailed status info).
+        let arc_endpoints = [
+            "https://arc.taal.com",
+            "https://arc.gorillapool.io",
+        ];
+
+        let mut arc_error = String::new();
+        for endpoint in &arc_endpoints {
+            let url = format!("{}/v1/tx", endpoint);
+
+            match client
+                .post(&url)
+                .header("Content-Type", "application/json")
+                .header("XDeployment-ID", "bsv-mpc-proxy")
+                .json(&json!({ "rawTx": raw_tx_hex }))
+                .send()
+                .await
+            {
+                Ok(resp) => {
+                    let status = resp.status();
+                    let text = resp.text().await.unwrap_or_default();
+
+                    if status.is_success()
+                        || text.contains("SEEN_ON_NETWORK")
+                        || text.contains("MINED")
+                    {
+                        let response: serde_json::Value = serde_json::from_str(&text)
+                            .unwrap_or_else(|_| json!({ "status": "success", "raw": text }));
+                        return Ok(response);
+                    }
+
+                    arc_error = format!("{} returned {}: {}", endpoint, status, text);
+                    tracing::warn!(endpoint, status = %status, attempt, "ARC broadcast attempt failed");
+                }
+                Err(e) => {
+                    arc_error = format!("{} error: {}", endpoint, e);
+                    tracing::warn!(endpoint, error = %e, attempt, "ARC broadcast request failed");
+                }
+            }
+        }
+
+        // Fallback: WhatsOnChain broadcast API.
+        // WoC accepts raw hex transactions and doesn't require Extended Format.
+        let woc_url = "https://api.whatsonchain.com/v1/bsv/main/tx/raw";
         match client
-            .post(&url)
+            .post(woc_url)
             .header("Content-Type", "application/json")
-            .header("XDeployment-ID", "bsv-mpc-proxy")
-            .json(&json!({ "rawTx": raw_tx_hex }))
+            .json(&json!({ "txhex": raw_tx_hex }))
             .send()
             .await
         {
@@ -420,22 +464,35 @@ async fn broadcast_tx(
                 let status = resp.status();
                 let text = resp.text().await.unwrap_or_default();
 
-                if status.is_success()
-                    || text.contains("SEEN_ON_NETWORK")
-                    || text.contains("MINED")
-                {
-                    let response: serde_json::Value = serde_json::from_str(&text)
-                        .unwrap_or_else(|_| json!({ "status": "success", "raw": text }));
-                    return Ok(response);
+                if status.is_success() {
+                    // WoC returns the txid as a plain string (with quotes)
+                    let txid_str = text.trim().trim_matches('"');
+                    tracing::info!(broadcaster = "whatsonchain", txid = txid_str, "Broadcast successful via WoC");
+                    return Ok(json!({ "status": "success", "txid": txid_str, "broadcaster": "whatsonchain" }));
                 }
 
-                last_error = format!("{} returned {}: {}", endpoint, status, text);
-                tracing::warn!(endpoint, status = %status, "ARC broadcast attempt failed");
+                last_error = format!("WoC returned {}: {}", status, text);
+                tracing::warn!(
+                    broadcaster = "whatsonchain",
+                    status = %status,
+                    attempt,
+                    "WoC broadcast failed"
+                );
             }
             Err(e) => {
-                last_error = format!("{} error: {}", endpoint, e);
-                tracing::warn!(endpoint, error = %e, "ARC broadcast request failed");
+                last_error = format!("WoC request error: {}", e);
+                tracing::warn!(broadcaster = "whatsonchain", error = %e, attempt, "WoC broadcast request failed");
             }
+        }
+
+        // If the error mentions "missing inputs" or "parent not found", retry
+        // after a delay to allow the parent tx to propagate.
+        let combined = format!("{} {}", arc_error, last_error);
+        let retryable = combined.contains("Missing inputs")
+            || combined.contains("parent")
+            || combined.contains("460");
+        if !retryable {
+            break;
         }
     }
 
@@ -1020,11 +1077,16 @@ pub async fn create_action(
 ///
 /// Accept an incoming payment or BEEF envelope by internalizing its outputs
 /// into the local UTXO set.
+///
+/// Handles both raw transaction hex AND AtomicBEEF/BEEF format (BRC-62/95/96).
+/// The wallet at localhost:3321 returns `tx` as an AtomicBEEF byte array. We
+/// detect the format from magic bytes and extract the raw transaction using the
+/// BSV SDK's `Beef` parser.
 pub async fn internalize_action(
     State(state): State<Arc<AppState>>,
     Json(body): Json<Value>,
 ) -> Json<Value> {
-    // Parse the transaction (rawTx hex)
+    // Parse the transaction (hex string from "tx" or "rawTx")
     let raw_tx_hex = match body
         .get("tx")
         .or_else(|| body.get("rawTx"))
@@ -1034,18 +1096,38 @@ pub async fn internalize_action(
         None => return Json(json!({"error": "missing tx or rawTx field"})),
     };
 
-    let raw_tx_bytes = match hex::decode(raw_tx_hex) {
+    let input_bytes = match hex::decode(raw_tx_hex) {
         Ok(b) => b,
         Err(e) => return Json(json!({"error": format!("invalid hex in tx: {}", e)})),
     };
 
-    // Parse the transaction to extract outputs
-    let tx_outputs = match parse_tx_outputs(&raw_tx_bytes) {
-        Ok(outputs) => outputs,
-        Err(e) => return Json(json!({"error": format!("failed to parse tx: {}", e)})),
+    // Detect whether input is BEEF/AtomicBEEF or a raw transaction.
+    // BEEF magic bytes (little-endian u32):
+    //   AtomicBEEF: 0x01010101 → bytes [01, 01, 01, 01]
+    //   BEEF V1:    0xEFBE0001 → bytes [01, 00, BE, EF]
+    //   BEEF V2:    0xEFBE0002 → bytes [02, 00, BE, EF]
+    // Raw transactions start with version [01, 00, 00, 00] or [02, 00, 00, 00].
+    let (tx_outputs, txid) = if is_beef_format(&input_bytes) {
+        match extract_tx_from_beef(&input_bytes) {
+            Ok(result) => result,
+            Err(e) => return Json(json!({"error": format!("failed to parse BEEF: {}", e)})),
+        }
+    } else {
+        // Raw transaction — parse directly
+        let outputs = match parse_tx_outputs(&input_bytes) {
+            Ok(o) => o,
+            Err(e) => return Json(json!({"error": format!("failed to parse tx: {}", e)})),
+        };
+        let txid = compute_txid(&input_bytes);
+        (outputs, txid)
     };
 
-    let txid = compute_txid(&raw_tx_bytes);
+    tracing::debug!(
+        txid = %txid,
+        num_outputs = tx_outputs.len(),
+        is_beef = is_beef_format(&input_bytes),
+        "Parsed transaction for internalization"
+    );
 
     // Build our expected P2PKH locking script for root key verification
     let root_pubkey = match PublicKey::from_bytes(&state.bridge.joint_public_key().compressed) {
@@ -1134,6 +1216,77 @@ pub async fn internalize_action(
         "accepted": true,
         "txid": txid,
     }))
+}
+
+/// Detect whether bytes represent a BEEF/AtomicBEEF format (vs raw transaction).
+///
+/// BEEF magic bytes (read as little-endian u32 from first 4 bytes):
+///   - AtomicBEEF: `0x01010101` → bytes `[01, 01, 01, 01]`
+///   - BEEF V1:    `0xEFBE0001` → bytes `[01, 00, BE, EF]`
+///   - BEEF V2:    `0xEFBE0002` → bytes `[02, 00, BE, EF]`
+///
+/// Raw transactions start with version `[01, 00, 00, 00]` or `[02, 00, 00, 00]`,
+/// which do not match any BEEF magic.
+fn is_beef_format(bytes: &[u8]) -> bool {
+    if bytes.len() < 4 {
+        return false;
+    }
+    let magic = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    magic == 0x01010101  // ATOMIC_BEEF
+        || magic == 0xEFBE0001  // BEEF_V1
+        || magic == 0xEFBE0002  // BEEF_V2
+}
+
+/// Extract the target transaction's outputs and txid from BEEF/AtomicBEEF bytes.
+///
+/// Uses the BSV SDK's `Beef::from_binary()` to parse the envelope, then extracts
+/// the target transaction (for AtomicBEEF: the atomic_txid; otherwise: the last tx).
+fn extract_tx_from_beef(bytes: &[u8]) -> Result<(Vec<(u64, Vec<u8>)>, String), String> {
+    use bsv::transaction::Beef;
+
+    let beef = Beef::from_binary(bytes)
+        .map_err(|e| format!("Beef::from_binary failed: {}", e))?;
+
+    // Determine the target transaction ID:
+    // - AtomicBEEF has an explicit atomic_txid
+    // - Otherwise, use the last transaction in the BEEF (the tip)
+    let target_txid = if let Some(ref atomic_txid) = beef.atomic_txid {
+        atomic_txid.clone()
+    } else if let Some(last_tx) = beef.txs.last() {
+        last_tx.txid()
+    } else {
+        return Err("BEEF contains no transactions".to_string());
+    };
+
+    tracing::debug!(
+        target_txid = %target_txid,
+        num_txs = beef.txs.len(),
+        num_bumps = beef.bumps.len(),
+        is_atomic = beef.atomic_txid.is_some(),
+        "Parsed BEEF envelope"
+    );
+
+    // Find the target transaction in the BEEF
+    let beef_tx = beef.find_txid(&target_txid)
+        .ok_or_else(|| format!("target tx {} not found in BEEF", target_txid))?;
+
+    // Extract outputs from the BeefTx.
+    // Try the parsed Transaction first, then fall back to raw bytes.
+    if let Some(tx) = beef_tx.tx() {
+        let outputs: Vec<(u64, Vec<u8>)> = tx.outputs.iter().map(|o| {
+            (o.get_satoshis(), o.locking_script.to_binary())
+        }).collect();
+        let txid = tx.id();
+        Ok((outputs, txid))
+    } else if let Some(raw_tx) = beef_tx.raw_tx() {
+        // Parse outputs from raw transaction bytes
+        let outputs = parse_tx_outputs(raw_tx)
+            .map_err(|e| format!("failed to parse raw tx from BEEF: {}", e))?;
+        let txid = compute_txid(raw_tx);
+        Ok((outputs, txid))
+    } else {
+        Err(format!("BEEF tx {} has no transaction data (txid-only entry)", target_txid))
+    }
 }
 
 // ─── Encryption (local) ─────────────────────────────────────────────────────
@@ -2532,5 +2685,69 @@ mod tests {
         let Json(resp) = internalize_action(State(state), Json(body)).await;
         assert!(resp.get("error").is_some());
         assert!(resp["error"].as_str().unwrap().contains("out of range"));
+    }
+
+    // ── BEEF detection tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_is_beef_format_atomic_beef() {
+        // AtomicBEEF: 0x01010101 as little-endian
+        let bytes = vec![0x01, 0x01, 0x01, 0x01, 0x00, 0x00];
+        assert!(is_beef_format(&bytes));
+    }
+
+    #[test]
+    fn test_is_beef_format_v1() {
+        // BEEF V1: 0xEFBE0001 as little-endian → [01, 00, BE, EF]
+        let bytes = vec![0x01, 0x00, 0xBE, 0xEF, 0x00];
+        assert!(is_beef_format(&bytes));
+    }
+
+    #[test]
+    fn test_is_beef_format_v2() {
+        // BEEF V2: 0xEFBE0002 as little-endian → [02, 00, BE, EF]
+        let bytes = vec![0x02, 0x00, 0xBE, 0xEF, 0x00];
+        assert!(is_beef_format(&bytes));
+    }
+
+    #[test]
+    fn test_is_beef_format_raw_tx() {
+        // Raw tx version 1: [01, 00, 00, 00] — NOT BEEF
+        let bytes = vec![0x01, 0x00, 0x00, 0x00, 0x01];
+        assert!(!is_beef_format(&bytes));
+    }
+
+    #[test]
+    fn test_is_beef_format_raw_tx_v2() {
+        // Raw tx version 2: [02, 00, 00, 00] — NOT BEEF
+        let bytes = vec![0x02, 0x00, 0x00, 0x00, 0x01];
+        assert!(!is_beef_format(&bytes));
+    }
+
+    #[test]
+    fn test_is_beef_format_too_short() {
+        let bytes = vec![0x01, 0x00];
+        assert!(!is_beef_format(&bytes));
+    }
+
+    #[test]
+    fn test_extract_tx_from_beef_with_valid_atomic_beef() {
+        // Build a minimal AtomicBEEF using the BSV SDK
+        use bsv::transaction::{Beef, Transaction};
+
+        // Create a simple transaction
+        let tx_hex = "0100000001c997a5e56e104102fa209c6a852dd90660a20b2d9c352423edce25857fcd3704000000004847304402204e45e16932b8af514961a1d3a1a25fdf3f4f7732e9d624c6c61548ab5fb8cd410220181522ec8eca07de4860a4acdd12909d831cc56cbbac4622082221a8768d1d0901ffffffff0200ca9a3b00000000434104ae1a62fe09c5f51b13905f07f06b99a2f7159b2225f374cd378d71302fa28414e7aab37397f554a7df5f142c21c1b7303b8a0626f1baded5c72a704f7e6cd84cac00286bee0000000043410411db93e1dcdb8a016b49840f8c53bc1eb68a382e97b1482ecad7b148a6909a5cb2e0eaddfb84ccf9744464f82e160bfa9b8b64f9d4c03f999b8643f656b412a3ac00000000";
+        let tx = Transaction::from_hex(tx_hex).unwrap();
+        let txid = tx.id();
+
+        let mut beef = Beef::new();
+        beef.merge_transaction(tx);
+        let atomic_bytes = beef.to_binary_atomic(&txid).unwrap();
+
+        assert!(is_beef_format(&atomic_bytes));
+        let (outputs, extracted_txid) = extract_tx_from_beef(&atomic_bytes).unwrap();
+        assert_eq!(extracted_txid, txid);
+        assert_eq!(outputs.len(), 2);
+        assert_eq!(outputs[0].0, 1_000_000_000); // 10 BTC in satoshis
     }
 }
