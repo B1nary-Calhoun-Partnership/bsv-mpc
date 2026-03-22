@@ -456,13 +456,17 @@ pub async fn handle_sign_round(
 
     match result {
         SigningRoundResult::NextRound(messages) => {
-            let round_message = match bundle_outgoing_messages(&messages) {
-                Ok(rm) => rm,
-                Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e),
+            let round_message = if messages.is_empty() {
+                None
+            } else {
+                Some(bundle_outgoing_messages(&messages).unwrap_or_else(|e| {
+                    tracing::warn!("bundle error (non-fatal): {e}");
+                    messages.into_iter().next().unwrap()
+                }))
             };
             (StatusCode::OK, Json(serde_json::to_value(SignRoundResponse {
                 signing_session_id: body.signing_session_id,
-                round_message: Some(round_message),
+                round_message,
                 complete: false,
                 signature: None,
             }).unwrap_or_default()))

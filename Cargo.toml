@@ -1,3 +1,11 @@
+[package]
+name = "bsv-mpc"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+publish = false
+
 [workspace]
 resolver = "2"
 members = [
@@ -14,6 +22,45 @@ edition = "2021"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/anthropics/bsv-mpc"
+
+# Root crate dependencies (for integration tests)
+[dependencies]
+
+[dev-dependencies]
+bsv-mpc-core = { path = "crates/bsv-mpc-core" }
+bsv-mpc-proxy = { path = "crates/bsv-mpc-proxy" }
+bsv-mpc-service = { path = "crates/bsv-mpc-service" }
+
+# MPC crypto (for DKG simulation in E2E tests)
+cggmp24 = { git = "https://github.com/LFDT-Lockness/cggmp21", features = ["curve-secp256k1", "backend-num-bigint"] }
+round-based = { version = "0.4.1", features = ["sim", "state-machine"] }
+generic-ec = { version = "0.4.1", features = ["curve-secp256k1", "serde"] }
+
+# BSV SDK
+bsv = { package = "bsv-sdk", path = "../rust-sdk", features = ["transaction", "wallet"] }
+
+# HTTP + async
+axum = { version = "0.8" }
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hex = "0.4"
+base64 = "0.22"
+
+# Crypto
+sha2 = "0.10"
+rand = "0.8"
+
+# Utilities
+tempfile = "3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+chrono = { version = "0.4", features = ["serde"] }
+pin-project = "1"
+futures = "0.3"
 
 [workspace.dependencies]
 # MPC crypto

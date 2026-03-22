@@ -43,28 +43,10 @@
 //! | GET    | `/health`         | Liveness check + share count                  |
 //! | GET    | `/shares/:agent`  | Share metadata (no secrets exposed)            |
 
-mod handlers;
-mod storage;
-
 use std::sync::Arc;
-
-use axum::{
-    routing::{get, post},
-    Router,
-};
 use std::sync::RwLock;
 
-use crate::storage::SqliteShareStorage;
-
-/// Shared application state, accessible from all request handlers via `State<Arc<AppState>>`.
-pub struct AppState {
-    /// Path to the data directory where the SQLite database lives.
-    pub data_dir: String,
-    /// SQLite-backed share storage.
-    pub storage: RwLock<SqliteShareStorage>,
-    /// Server start time for uptime reporting.
-    pub started_at: chrono::DateTime<chrono::Utc>,
-}
+use bsv_mpc_service::{AppState, SqliteShareStorage};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -94,27 +76,10 @@ async fn main() -> anyhow::Result<()> {
         started_at: chrono::Utc::now(),
     });
 
-    let app = Router::new()
-        // DKG protocol
-        .route("/dkg/init", post(handlers::handle_dkg_init))
-        .route("/dkg/round", post(handlers::handle_dkg_round))
-        // Signing protocol
-        .route("/sign/init", post(handlers::handle_sign_init))
-        .route("/sign/round", post(handlers::handle_sign_round))
-        // Partial ECDH (for BRC-42 key derivation)
-        .route("/ecdh", post(handlers::handle_ecdh))
-        // Presigning protocol
-        .route("/presign/init", post(handlers::handle_presign_init))
-        .route("/presign/round", post(handlers::handle_presign_round))
-        // Read-only
-        .route("/health", get(handlers::handle_health))
-        .route("/shares/:agent_id", get(handlers::handle_get_share_metadata))
-        // Authrite handshake
-        .route("/.well-known/auth", post(handlers::handle_authrite))
-        .with_state(state);
+    let app = bsv_mpc_service::build_router(state);
 
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}")).await?;
     tracing::info!("Listening on 0.0.0.0:{port}");
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app.into_make_service()).await?;
     Ok(())
 }

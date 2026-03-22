@@ -40,17 +40,45 @@ use generic_ec::{SecretScalar, Scalar};
 
 // ── Share parsing ────────────────────────────────────────────────────────────
 
-/// Extract the secret scalar bytes from a serialized cggmp24 IncompleteKeyShare.
+/// Parse the IncompleteKeyShare from raw JSON.
+///
+/// Handles both formats:
+/// - Full `KeyShare` (has `.core` containing the IncompleteKeyShare + `.aux` with Paillier data)
+/// - Raw `IncompleteKeyShare` (legacy/POC format)
+fn parse_incomplete_key_share(
+    raw_share_json: &[u8],
+) -> Result<cggmp24::IncompleteKeyShare<Secp256k1>> {
+    // Try full KeyShare first (production format from complete DKG).
+    // Extract the core's JSON and re-deserialize as IncompleteKeyShare.
+    if let Ok(full) = serde_json::from_slice::<serde_json::Value>(raw_share_json) {
+        if let Some(core_val) = full.get("core") {
+            let core_bytes = serde_json::to_vec(core_val).map_err(|e| {
+                MpcError::InvalidShare(format!("failed to re-serialize core: {e}"))
+            })?;
+            if let Ok(share) =
+                serde_json::from_slice::<cggmp24::IncompleteKeyShare<Secp256k1>>(&core_bytes)
+            {
+                return Ok(share);
+            }
+        }
+    }
+
+    // Fall back to raw IncompleteKeyShare (legacy/POC format)
+    serde_json::from_slice(raw_share_json).map_err(|e| {
+        MpcError::InvalidShare(format!("failed to deserialize key share: {e}"))
+    })
+}
+
+/// Extract the secret scalar bytes from a serialized cggmp24 key share.
 ///
 /// The raw_share_json is the key share data (the `ciphertext` field from
 /// `EncryptedShare`, which despite its name holds raw JSON).
 ///
+/// Handles both full `KeyShare` and raw `IncompleteKeyShare` formats.
+///
 /// Returns the 32-byte big-endian scalar.
 pub fn parse_share_scalar(raw_share_json: &[u8]) -> Result<[u8; 32]> {
-    let share: cggmp24::IncompleteKeyShare<Secp256k1> =
-        serde_json::from_slice(raw_share_json).map_err(|e| {
-            MpcError::InvalidShare(format!("failed to deserialize key share: {e}"))
-        })?;
+    let share = parse_incomplete_key_share(raw_share_json)?;
     let scalar: &Scalar<Secp256k1> =
         <SecretScalar<Secp256k1> as AsRef<Scalar<Secp256k1>>>::as_ref(&share.x);
     let encoded = scalar.to_be_bytes();
@@ -59,16 +87,15 @@ pub fn parse_share_scalar(raw_share_json: &[u8]) -> Result<[u8; 32]> {
     Ok(arr)
 }
 
-/// Extract VSS evaluation points from a serialized cggmp24 IncompleteKeyShare.
+/// Extract VSS evaluation points from a serialized cggmp24 key share.
 ///
 /// Returns one 32-byte big-endian scalar per party, in party order.
 /// These are the polynomial evaluation points `I[0], I[1], ...` from the
 /// Feldman VSS setup. Needed for Lagrange coefficient computation.
+///
+/// Handles both full `KeyShare` and raw `IncompleteKeyShare` formats.
 pub fn parse_share_vss_points(raw_share_json: &[u8]) -> Result<Vec<[u8; 32]>> {
-    let share: cggmp24::IncompleteKeyShare<Secp256k1> =
-        serde_json::from_slice(raw_share_json).map_err(|e| {
-            MpcError::InvalidShare(format!("failed to deserialize key share: {e}"))
-        })?;
+    let share = parse_incomplete_key_share(raw_share_json)?;
     let vss = share.vss_setup.as_ref().ok_or_else(|| {
         MpcError::InvalidShare("share missing VSS setup (not a threshold share?)".into())
     })?;
