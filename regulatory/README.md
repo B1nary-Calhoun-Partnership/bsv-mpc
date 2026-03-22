@@ -8,6 +8,8 @@ MPC-specific regulatory analysis for the threshold signing network.
 |------|-------|--------|
 | [mpc-fee-network-analysis.md](mpc-fee-network-analysis.md) | Are MPC node operators MSBs? Fee injection character. Operator transition timeline. | Draft |
 | [action-items.md](action-items.md) | MPC-specific regulatory work items. | Living document |
+| [compute-service-position-paper.md](compute-service-position-paper.md) | Position paper: MPC operators as compute service providers, not MSBs. FinCEN total independent control analysis. | Complete |
+| [fee-model-evaluation.md](fee-model-evaluation.md) | Per-tx vs subscription vs hybrid fee model evaluation. Regulatory and economic trade-offs. | Complete |
 
 ## The Core Question
 

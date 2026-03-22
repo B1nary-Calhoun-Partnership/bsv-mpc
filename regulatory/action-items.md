@@ -6,12 +6,12 @@ Tracked in GitHub milestone "Regulatory & Licensing".
 
 - [ ] **Counsel opinion on KSS operator MSB classification** — bundle with bsv-worm agent-to-agent memo. Core question: does holding one MPC key share and earning per-signature fees make you an MSB?
 - [ ] **Make fees transparent and configurable** — proxy should log fees, allow queries, support max-fee caps. Removes "unauthorized diversion" framing.
-- [ ] **"Compute service" position paper** — MPC operators provide elliptic curve computation, not money movement. 1-2 pages for counsel reference.
+- [x] **"Compute service" position paper** — See [compute-service-position-paper.md](compute-service-position-paper.md). Closes #47.
 
 ## Before GA (Oct+ 2026 — Permissionless Network)
 
 - [ ] **Operator compliance requirements** — what independent operators need before joining.
-- [ ] **Evaluate fee model alternatives** — subscription vs per-tx. Subscription has cleaner regulatory profile.
+- [x] **Evaluate fee model alternatives** — See [fee-model-evaluation.md](fee-model-evaluation.md). Recommends subscription at GA, per-tx fine through Beta. Closes #46.
 - [ ] **State-by-state US analysis for operators** — which states require what for MPC node operation.
 
 ## Cross-Repo
