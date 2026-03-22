@@ -8,7 +8,8 @@ description = "BSV overlay network integration for MPC node discovery (SHIP/SLAP
 
 [dependencies]
 bsv-mpc-core = { path = "../bsv-mpc-core" }
-bsv.workspace = true
+# Override workspace bsv to add overlay + http features needed for SHIP/SLAP
+bsv = { package = "bsv-sdk", path = "../../../rust-sdk", features = ["transaction", "wallet", "overlay", "http"] }
 serde.workspace = true
 serde_json.workspace = true
 reqwest.workspace = true
@@ -16,3 +17,10 @@ sha2.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 chrono.workspace = true
+hex.workspace = true
+futures.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+axum.workspace = true
+tokio = { workspace = true, features = ["full"] }

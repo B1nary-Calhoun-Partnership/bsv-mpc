@@ -116,7 +116,7 @@ pub async fn query_proofs(
                  \"service\": \"ls_mpc_proofs\",\n\
                  \"query\": {{\n\
                      \"node\": \"{node_identity}\",\n\
-                     \"since\": \"{since_iso8601}\"  // optional\n\
+                     \"since\": \"<since_iso8601>\"  // optional\n\
                  }}\n\
              }}\n\
          2. Parse the response as a list of UTXO references\n\
