@@ -3,40 +3,46 @@
 
 ## Overview
 
-This is the cryptographic heart of the bsv-mpc system. It implements the CGGMP'24 threshold ECDSA protocol for BSV's secp256k1 curve — distributed key generation, threshold signing with presignature optimization, HD key derivation from MPC shares, share encryption, and on-chain participation proofs. No networking or transport — this crate is pure protocol logic consumed by `bsv-mpc-proxy`, `bsv-mpc-worker`, and `bsv-mpc-service`.
+This is the cryptographic heart of the bsv-mpc system. It implements the CGGMP'24 threshold ECDSA protocol for BSV's secp256k1 curve — distributed key generation, threshold signing with presignature optimization, partial ECDH for BRC-42 key derivation, key refresh via threshold resharing, share encryption, and on-chain participation proofs. No networking or transport — this crate is pure protocol logic consumed by `bsv-mpc-proxy`, `bsv-mpc-worker`, and `bsv-mpc-service`.
 
 ## Implementation Status
 
-Most modules contain well-documented `todo!()` stubs describing the exact cggmp24 integration steps. Working code exists for:
-- All types and error handling (`types.rs`, `error.rs`) — **complete**
-- `ThresholdConfig::new()` validation — **complete**
-- `PresigningManager` pool management (`new`, `take`, `should_replenish`, `pool_size`) — **complete**
-- `validate_encrypted_share()` — **complete**
-- `DkgCoordinator::new()` and accessor methods — **complete**
-- `SigningCoordinator::new()` and accessor methods — **complete**
+**All protocol modules are fully implemented — zero `todo!()` stubs remain.** 109 unit tests across 8 files.
 
-Everything else (`todo!()`) awaits cggmp24 wiring.
+| Module | Tests | Status |
+|--------|-------|--------|
+| `dkg.rs` | 10 | Implemented — 4-round DKG with thread-based SM bridge |
+| `signing.rs` | 9 | Implemented — full protocol with SM bridge, BRC-42 offset support |
+| `presigning.rs` | 5 | Implemented — 3-round protocol with SM bridge + FIFO pool |
+| `ecdh.rs` | 8 | Implemented — partial ECDH + Lagrange interpolation + symmetric key derivation |
+| `hd.rs` | 21 | Implemented — BRC-42 derivation, validates against BSV SDK + spec vectors |
+| `proof.rs` | 33 | Implemented — create/serialize/verify participation proofs |
+| `share.rs` | 22 | Implemented — AES-256-GCM encrypt/decrypt + key derivation |
+| `refresh.rs` | 1 | Implemented — threshold resharing (Proactive Secret Sharing) |
 
 ## Files
 
-| File | Purpose | Status |
-|------|---------|--------|
-| `lib.rs` | Module declarations + re-exports of all 10 key public types | Complete |
-| `types.rs` | 10 core data types: `SessionId`, `ShareIndex`, `ThresholdConfig`, `JointPublicKey`, `EncryptedShare`, `Presignature`, `ParticipationProof`, `RoundMessage`, `DkgResult`, `SigningResult` | Complete |
-| `error.rs` | `MpcError` enum (9 variants) + `Result<T>` alias + `From<serde_json::Error>` | Complete |
-| `dkg.rs` | `DkgCoordinator` — 4-round DKG ceremony producing a joint secp256k1 key | Stub |
-| `signing.rs` | `SigningCoordinator` — threshold signing (1-round with presig, 4-round without) | Stub |
-| `presigning.rs` | `PresigningManager` — FIFO pool of presignatures for low-latency signing | Partial (pool logic works, `generate()` is stub) |
-| `share.rs` | AES-256-GCM share encryption/decryption + BRC-42 key derivation | Partial (`validate_encrypted_share` works, rest stub) |
-| `hd.rs` | BIP-32/SLIP-10 HD derivation from MPC joint keys | Stub |
-| `proof.rs` | BRC-18 participation proofs — create, serialize to OP_RETURN, verify | Stub |
+| File | LOC | Purpose |
+|------|-----|---------|
+| `lib.rs` | 65 | Module declarations + re-exports of 11 key public types |
+| `types.rs` | 194 | 10 core data types with serde support |
+| `error.rs` | 79 | `MpcError` enum (9 variants) + `Result<T>` alias |
+| `dkg.rs` | 1563 | `DkgCoordinator` — 4-round DKG via thread-based SM bridge |
+| `signing.rs` | 1562 | `SigningCoordinator` — threshold signing with BRC-42 additive offset |
+| `presigning.rs` | 1200 | `PresigningManager` — 3-round presig generation + FIFO pool |
+| `ecdh.rs` | 583 | Partial ECDH, Lagrange interpolation, symmetric key derivation |
+| `hd.rs` | 585 | BRC-42 key derivation (NOT BIP-32), invoice computation |
+| `proof.rs` | 811 | BRC-18 participation proofs — create, OP_RETURN serialize, verify |
+| `refresh.rs` | 816 | Key refresh via threshold resharing (ported from POC 13) |
+| `share.rs` | 549 | AES-256-GCM share encryption + HMAC-SHA256 key derivation |
 
 ## Key Exports
 
-All re-exported from `lib.rs` for ergonomic `use bsv_mpc_core::X` imports:
+Re-exported from `lib.rs` for ergonomic `use bsv_mpc_core::X` imports:
 
 ```rust
 pub use error::{MpcError, Result};
+pub use refresh::RefreshResult;
 pub use types::{
     DkgResult, EncryptedShare, JointPublicKey, ParticipationProof,
     Presignature, RoundMessage, SessionId, ShareIndex, SigningResult,
@@ -63,59 +69,155 @@ pub use types::{
 
 `MpcError` has 9 variants: `Dkg`, `Signing`, `ShareStorage`, `InvalidThreshold { t, n }`, `InvalidShare`, `PresigningExhausted`, `Encryption`, `Serialization`, `Protocol`. Converts from `serde_json::Error`.
 
-### Coordinators
+## State Machine Architecture
 
-| Struct | Module | Purpose |
-|--------|--------|---------|
-| `DkgCoordinator` | `dkg.rs` | Drives one party through 4-round DKG. `init()` -> `process_round()` loop -> `DkgRoundResult::Complete` |
-| `SigningCoordinator` | `signing.rs` | Drives one party through signing. Fast path: `sign(hash, Some(presig))`. Slow path: `init_round(hash)` -> `process_round()` loop -> `SigningRoundResult::Complete` |
-| `PresigningManager` | `presigning.rs` | FIFO pool of presignatures. `generate()` runs 3-round offline protocol. `take()` consumes oldest. `should_replenish()` triggers at < 50% capacity. |
+DKG, signing, and presigning all use the same architecture:
 
-### Share Functions (`share.rs`)
+1. The cggmp24 state machine (`StateMachine`) is `!Send` — cannot cross tokio task boundaries.
+2. Each coordinator spawns a dedicated `std::thread` for the SM.
+3. Communication between coordinator and SM thread uses `std::sync::mpsc` channels (`SmInbound`/`SmOutbound` enums).
+4. The caller drives the protocol via synchronous `init()` → `process_round()` loop.
+5. Wire messages are serialized to JSON via `WireMessage` struct (sender, is_broadcast, msg payload).
 
-| Function | Status | Description |
-|----------|--------|-------------|
-| `encrypt_share(bytes, key) -> EncryptedShare` | **Done** | AES-256-GCM encrypt with random 12-byte nonce |
-| `decrypt_share(encrypted, key) -> Vec<u8>` | **Done** | AES-256-GCM decrypt, verifies auth tag |
-| `derive_share_encryption_key(root_key, session_id) -> [u8; 32]` | **Done** | `HMAC-SHA256(root_key, "bsv-mpc-share" \|\| session_id)` |
-| `validate_encrypted_share(share) -> Result<()>` | **Done** | Checks nonce=12 bytes, ciphertext non-empty, index < parties, threshold valid |
+Helper functions in `dkg.rs` (used by all coordinators):
+- `outgoing_to_wire<M>()` — converts cggmp24 `Outgoing<M>` to `WireMessage`
+- `wire_to_incoming<M>()` — converts `WireMessage` back to cggmp24 `Incoming<M>`
 
-### BRC-42 Key Derivation Functions (`hd.rs`)
+## Coordinators
 
-Uses BRC-42 (~/bsv/BRCs/key-derivation/0042.md), NOT BIP-32. Proven in POC 3, 8, 9.
+### `DkgCoordinator` (`dkg.rs`)
 
-| Function | Status | Description |
-|----------|--------|-------------|
-| `derive_child_pubkey(root_pub, shared_secret, invoice) -> PublicKey` | **Done** | Core BRC-42: `root_pub + G * HMAC-SHA256(shared_secret, invoice)` |
-| `compute_brc42_hmac(shared_secret, invoice) -> [u8; 32]` | **Done** | HMAC scalar for MPC share offset addition |
-| `compute_invoice(security_level, protocol_name, key_id) -> String` | **Done** | Builds `"{level}-{protocol}-{key_id}"` |
-| `derive_anyone_pubkey(root_pub, protocol, key_id, level) -> PublicKey` | **Done** | Anyone counterparty (0 MPC round-trips) |
-| `derive_anyone_joint_key(joint_key, protocol, key_id, level) -> JointPublicKey` | **Done** | Convenience wrapper with BSV address |
-| `derive_joint_key_with_secret(joint_key, secret, protocol, key_id, level) -> JointPublicKey` | **Done** | For Self_/Other after MPC partial ECDH |
+Drives one party through the CGGMP'24 DKG ceremony (keygen + aux info generation).
 
-### Proof Functions (`proof.rs`)
+| Method | Description |
+|--------|-------------|
+| `new(session_id, config, my_index)` | Create coordinator for a party |
+| `set_pregenerated_primes(p, q)` | Inject pre-computed safe primes (skips expensive generation) |
+| `init()` | Start DKG, returns initial `Vec<RoundMessage>` |
+| `process_round(messages)` | Feed incoming messages, returns `DkgRoundResult` |
+| `current_round()` | Current round number |
+| `config()` | Threshold config |
+| `my_index()` | This party's share index |
+| `phase()` | Current phase: `"not_started"`, `"keygen"`, `"aux_info"`, `"complete"` |
 
-| Function | Status | Description |
-|----------|--------|-------------|
-| `create_participation_proof(session_id, agent_key, nodes, signing_hash, fee_txid) -> ParticipationProof` | **Done** | Constructs proof with SHA-256 session hash |
-| `proof_to_op_return(proof) -> Vec<u8>` | **Done** | Serializes to `OP_FALSE OP_RETURN` with Bitcoin PUSHDATA opcodes |
-| `verify_participation_proof(proof) -> bool` | **Done** | Structural validation: field lengths, compressed pubkey prefixes, no duplicates, agent in participants |
+Returns `DkgRoundResult::NextRound(msgs)` or `DkgRoundResult::Complete(DkgResult)`.
+
+### `SigningCoordinator` (`signing.rs`)
+
+Drives one party through threshold signing. Supports BRC-42 derived key signing via `hmac_offset`.
+
+| Method | Description |
+|--------|-------------|
+| `new(session_id, share, config, participants)` | Create coordinator |
+| `sign(hash, presig, hmac_offset)` | Start signing (delegates to `init_round`) |
+| `init_round(hash, hmac_offset)` | Start full 4-round protocol |
+| `process_round(messages)` | Feed incoming messages, returns `SigningRoundResult` |
+| `current_round()` | Current round number |
+| `config()` | Threshold config |
+
+The `hmac_offset` parameter is used for BRC-42 derived key signing — the cggmp24 fork's `set_additive_shift()` applies this HMAC scalar to the signing key share without reconstructing the private key.
+
+Returns `SigningRoundResult::NextRound(msgs)` or `SigningRoundResult::Complete(SigningResult)`.
+
+### `PresigningManager` (`presigning.rs`)
+
+FIFO pool of presignatures with SM-based generation protocol.
+
+| Method | Description |
+|--------|-------------|
+| `new(session_id, share, participants, max_pool)` | Create manager |
+| `init_generate()` | Start 3-round presig generation protocol |
+| `process_generate_round(messages)` | Feed messages, returns `PresigningRoundResult` |
+| `take()` | Consume oldest presignature (serialized `Presignature`) |
+| `take_raw()` | Consume oldest with raw cggmp24 data (`Box<dyn Any + Send>`) |
+| `add(presig)` | Manually add a presignature |
+| `pool_size()` | Current pool count |
+| `should_replenish()` | True when pool < 50% capacity |
+| `max_pool_size()` | Configured capacity |
+| `is_generating()` | True if generation protocol is in progress |
+
+Returns `PresigningRoundResult::NextRound(msgs)` or `PresigningRoundResult::Complete`.
+
+## Partial ECDH (`ecdh.rs`)
+
+Distributed ECDH for BRC-42 key derivation when the private key is split across MPC shares. Proven in POC 3, 8, 9.
+
+| Function | Description |
+|----------|-------------|
+| `parse_share_scalar(raw_json) -> [u8; 32]` | Extract secret scalar from serialized cggmp24 key share (handles both `KeyShare` and `IncompleteKeyShare` formats) |
+| `parse_share_vss_points(raw_json) -> Vec<[u8; 32]>` | Extract VSS evaluation points for Lagrange computation |
+| `compute_partial_ecdh_point(pub, scalar) -> PublicKey` | EC scalar multiplication: `pub * scalar` |
+| `point_add(a, b) -> PublicKey` | EC point addition |
+| `combine_partials_lagrange(partials) -> PublicKey` | Lagrange interpolation at x=0: `Σ λ_i * partial_i = pub * secret` |
+| `derive_symmetric_key_anyone(root_pub, level, proto, key_id) -> [u8; 32]` | Full BRC-42 symmetric key for "anyone" counterparty (0 MPC rounds) |
+| `derive_symmetric_key_from_partials(counter_pub, shared_secret, root_times_child, invoice) -> [u8; 32]` | Final symmetric key computation for "self"/"other" after 2-round partial ECDH |
+
+### Counterparty round-trip costs
+
+| Counterparty | MPC Rounds | Symmetric Key Function |
+|-------------|------------|----------------------|
+| Anyone | 0 (local) | `derive_symmetric_key_anyone()` |
+| Self_ | 2 (partial ECDH) | `derive_symmetric_key_from_partials()` |
+| Other(key) | 2 (partial ECDH) | `derive_symmetric_key_from_partials()` |
+
+## BRC-42 Key Derivation (`hd.rs`)
+
+Uses BRC-42 (NOT BIP-32). Proven in POC 3, 8, 9. Validates against BSV SDK `KeyDeriver` and BRC-42 spec test vectors.
+
+| Function | Description |
+|----------|-------------|
+| `derive_child_pubkey(root_pub, shared_secret, invoice) -> PublicKey` | Core BRC-42: `root_pub + G * HMAC-SHA256(shared_secret, invoice)` |
+| `compute_brc42_hmac(shared_secret, invoice) -> [u8; 32]` | HMAC scalar for MPC share offset addition |
+| `compute_invoice(security_level, protocol_name, key_id) -> String` | Builds `"{level}-{protocol}-{key_id}"` |
+| `derive_anyone_pubkey(root_pub, protocol, key_id, level) -> PublicKey` | Anyone counterparty (0 MPC round-trips) |
+| `derive_anyone_joint_key(joint_key, protocol, key_id, level) -> JointPublicKey` | Convenience wrapper with BSV address |
+| `derive_joint_key_with_secret(joint_key, secret, protocol, key_id, level) -> JointPublicKey` | For Self_/Other after MPC partial ECDH |
+
+## Proof Functions (`proof.rs`)
+
+| Function | Description |
+|----------|-------------|
+| `create_participation_proof(session_id, agent_key, nodes, signing_hash, fee_txid) -> ParticipationProof` | Constructs proof with SHA-256 session hash, validates all inputs |
+| `proof_to_op_return(proof) -> Vec<u8>` | Serializes to `OP_FALSE OP_RETURN` with Bitcoin PUSHDATA opcodes |
+| `verify_participation_proof(proof) -> bool` | Structural validation: hash lengths, pubkey prefixes, no duplicates, agent in participants, valid fee_txid hex, non-zero timestamp |
+
+## Key Refresh (`refresh.rs`)
+
+Threshold resharing (Proactive Secret Sharing) — ported from POC 13. Same joint key, 0 on-chain cost, old shares cryptographically invalidated.
+
+| Item | Description |
+|------|-------------|
+| `RefreshResult` | Struct with `new_secret_shares`, `new_public_shares`, `new_eval_points`, `original_joint_key`, `new_threshold`, `new_parties` |
+| `threshold_reshare(surviving_points, surviving_shares, new_points, new_t, rng) -> (secrets, publics)` | Generate new shares via weighted Lagrange + random polynomials |
+| `verify_reshare(original_pubkey, new_publics, new_points, new_t) -> bool` | Verify reconstructed key matches original |
+
+Supports arbitrary `(t, n) → (t', n')` resharing.
+
+## Share Functions (`share.rs`)
+
+| Function | Description |
+|----------|-------------|
+| `encrypt_share(bytes, key) -> EncryptedShare` | AES-256-GCM encrypt with random 12-byte nonce |
+| `decrypt_share(encrypted, key) -> Vec<u8>` | AES-256-GCM decrypt, verifies auth tag |
+| `derive_share_encryption_key(root_key, session_id) -> [u8; 32]` | `HMAC-SHA256(root_key, "bsv-mpc-share" \|\| session_id)` |
+| `validate_encrypted_share(share) -> Result<()>` | Checks nonce=12 bytes, ciphertext non-empty, index < parties, threshold valid |
 
 ## Protocol Round Counts
 
 | Operation | Rounds | Notes |
 |-----------|--------|-------|
-| DKG | 4 | Commitment -> decommitment -> share distribution -> verification |
-| Signing with presignature | 1 | Partial sig broadcast + combine |
-| Signing without presignature | 4 | Nonce commit -> decommit -> partial sig -> combine |
-| Presigning (offline) | 3 | Nonce commit -> MtA sub-protocol -> delta broadcast |
+| DKG | Multi-round | Keygen phase + aux info phase (safe prime generation) |
+| Signing with presignature | 1 | Not yet wired (requires cggmp24 `insecure-assume-preimage-known` feature) |
+| Signing without presignature | 4 | Full interactive protocol via SM bridge |
+| Presigning (offline) | 3 | Nonce commit → MtA sub-protocol → delta broadcast |
 
 ## Round Result Enums
 
-Both DKG and signing use the same pattern — a round result enum that is either `NextRound(Vec<RoundMessage>)` or `Complete(result)`:
+All three coordinators use the same pattern — a round result enum that is either `NextRound(Vec<RoundMessage>)` or `Complete(result)`:
 
 - `DkgRoundResult::NextRound(msgs)` / `DkgRoundResult::Complete(DkgResult)`
 - `SigningRoundResult::NextRound(msgs)` / `SigningRoundResult::Complete(SigningResult)`
+- `PresigningRoundResult::NextRound(msgs)` / `PresigningRoundResult::Complete`
 
 The caller (transport layer in proxy/worker/service) is responsible for delivering `RoundMessage`s between parties.
 
@@ -134,92 +236,27 @@ Share encryption follows BRC-42 pattern:
 | `cggmp24` | CGGMP'24 threshold ECDSA (with `num-bigint` feature, NOT `rug`) |
 | `cggmp24-keygen` | DKG protocol |
 | `bsv` | BSV primitives (`features = ["transaction"]`) |
+| `generic-ec` / `generic-ec-zkp` | EC scalar/point operations, Lagrange interpolation, polynomials |
+| `round-based` | State machine driver for cggmp24 protocols |
 | `aes-gcm` | AES-256-GCM share encryption |
-| `sha2` | SHA-256 for session IDs, BRC-42 derivation |
+| `hmac` / `sha2` | HMAC-SHA256 for BRC-42 derivation, SHA-256 for session IDs |
 | `serde` / `serde_json` | Serialization for all types |
 | `chrono` | Timestamps on `Presignature` and `ParticipationProof` |
-| `rand` | `OsRng` for nonce generation |
+| `rand` | `OsRng` for nonce generation and random polynomial coefficients |
 | `thiserror` | `MpcError` derive |
 | `tracing` | Structured logging |
 
 **Critical constraint**: cggmp24 MUST use `num-bigint` (not `rug`) — `rug` depends on GMP (LGPL, blocked by `deny.toml`) and doesn't compile to `wasm32-unknown-unknown`.
 
-## Usage Patterns
-
-### DKG Ceremony (from proxy/worker)
-
-```rust
-use bsv_mpc_core::dkg::{DkgCoordinator, DkgRoundResult};
-use bsv_mpc_core::{ThresholdConfig, ShareIndex};
-
-let config = ThresholdConfig::new(2, 3)?; // 2-of-3
-let mut coord = DkgCoordinator::new(config, ShareIndex(0));
-
-let msg = coord.init().await?;
-transport.broadcast(msg).await;
-
-loop {
-    let incoming = transport.receive_round().await;
-    match coord.process_round(incoming).await? {
-        DkgRoundResult::NextRound(msgs) => transport.send_all(msgs).await,
-        DkgRoundResult::Complete(result) => {
-            // result.joint_key — the agent's BSV public key
-            // result.share — encrypted key share to store
-            // result.session_id — identifies this MPC group
-            break;
-        }
-    }
-}
-```
-
-### Threshold Signing (fast path)
-
-```rust
-use bsv_mpc_core::signing::SigningCoordinator;
-
-let coord = SigningCoordinator::new(session_id, share, config);
-let result = coord.sign(&sighash, Some(presig)).await?;
-// result.signature — DER-encoded, ready for BSV Script OP_CHECKSIG
-// result.proof — participation proof for fee distribution
-```
-
-### Presignature Pool
-
-```rust
-use bsv_mpc_core::presigning::PresigningManager;
-
-let mut mgr = PresigningManager::new(session_id, 20);
-
-// Background loop (run during idle time)
-while mgr.should_replenish() {
-    mgr.generate().await?; // 3-round protocol with KSS
-}
-
-// At signing time
-if let Some(presig) = mgr.take() {
-    coordinator.sign(&hash, Some(presig)).await?; // 1 round
-} else {
-    coordinator.sign(&hash, None).await?; // 4 rounds (fallback)
-}
-```
-
-### Share Validation
-
-```rust
-use bsv_mpc_core::share::validate_encrypted_share;
-
-// This is the only share function that works today
-validate_encrypted_share(&encrypted_share)?;
-// Checks: nonce=12 bytes, ciphertext non-empty, index < parties, 2 <= t <= n
-```
-
 ## Implementation Notes
 
-- All async methods (`init`, `process_round`, `sign`, `init_round`, `generate`) use `async fn` but currently hit `todo!()`. The async boundary exists because cggmp24 protocol steps will need RNG and potentially I/O.
-- `PresigningManager::take()` uses `Vec::remove(0)` for FIFO. Consider `VecDeque` when implementing for better O(1) pop performance.
-- `SigningCoordinator` stores the `EncryptedShare` and decrypts it in memory only during signing. The `todo!()` notes mention using `zeroize::Zeroizing<Vec<u8>>` for the decrypted share.
-- BIP-62 low-s normalization is required by BSV consensus: if `s > n/2`, replace with `n - s`.
-- HD derivation (`hd.rs`) only supports non-hardened paths without MPC communication. Hardened derivation requires a 2-party HMAC protocol (future work).
+- All coordinator methods are synchronous (`fn`, not `async fn`). The SM runs in a dedicated `std::thread` with `mpsc` channel bridge.
+- `SigningCoordinator::sign()` currently ignores the presignature parameter and always uses the full 4-round protocol. The presigned 1-round path requires the `insecure-assume-preimage-known` feature on cggmp24.
+- `SigningCoordinator` accepts an optional `hmac_offset: Option<[u8; 32]>` for BRC-42 derived key signing — passed through to cggmp24's `set_additive_shift()`.
+- BIP-62 low-s normalization is handled automatically by cggmp24.
+- `PresigningManager` stores raw cggmp24 presignature data via `Box<dyn Any + Send>` because the concrete type doesn't implement `Serialize`. Use `take_raw()` to access the underlying cggmp24 data.
+- `ecdh.rs` handles both full `KeyShare` and raw `IncompleteKeyShare` JSON formats when parsing share scalars.
+- `DkgCoordinator::set_pregenerated_primes()` allows injecting safe primes to skip expensive generation in tests.
 
 ## Related
 

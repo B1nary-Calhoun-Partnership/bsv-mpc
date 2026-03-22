@@ -7,7 +7,22 @@ This crate handles the overlay-facing aspects of the MPC signing network: advert
 
 ## Implementation Status
 
-Most functions contain detailed `todo!()` stubs describing the intended implementation. The only implemented logic is `calculate_settlement()` in `proofs.rs`, which performs proportional fee distribution from proof counts. All other functions will panic at runtime.
+CHIP token creation/parsing and node discovery are **fully implemented** with comprehensive test coverage. Overlay publication (`publish_chip_token`) works but lacks BRC-31 auth headers. Proof publication and parsing remain `todo!()` stubs. Fee settlement calculation is implemented.
+
+| Area | Status |
+|------|--------|
+| CHIP token create/parse | **Implemented** — 5-field PushDrop with capabilities JSON, 14 tests |
+| CHIP token publish | **Implemented** — HTTP POST to `/submit`, missing BRC-31 auth |
+| CHIP token revoke | **Stub** — returns error explaining what's needed |
+| SDK admin token wrappers | **Implemented** — `create_ship_admin_token`, `parse_ship_admin_token` |
+| Node discovery | **Implemented** — `LookupResolver` + SLAP, filter, dedup, sort. 9 tests |
+| Node health checking | **Implemented** — HTTP GET `/health` with 5s timeout |
+| Node reputation | **Implemented** — proof count lookup via overlay |
+| Client-side filtering | **Implemented** — pure `filter_and_rank_nodes()` |
+| Proof publication | **Stub** — `todo!()` with detailed pseudocode |
+| Proof querying/counting | **Stub** — `todo!()` with detailed pseudocode |
+| Proof script parsing | **Stub** — `todo!()` with detailed pseudocode |
+| Fee settlement | **Implemented** — proportional integer distribution |
 
 ## Files
 
@@ -16,8 +31,8 @@ Most functions contain detailed `todo!()` stubs describing the intended implemen
 | `lib.rs` | Module declarations and re-exports (`OverlayError`, `DiscoveryQuery`, `MpcNodeInfo`, `OverlayProof`, `MPC_TOPIC`) |
 | `types.rs` | Shared data structures: `MpcNodeInfo`, `DiscoveryQuery`, `OverlayProof`, `FeeSettlement`, `NodeFeeShare`, and the `MPC_TOPIC` constant |
 | `error.rs` | `OverlayError` enum with 8 variants covering overlay communication, CHIP parsing, and proof errors |
-| `chip.rs` | CHIP token (BRC-23/BRC-48 PushDrop) creation, parsing, publishing, and revocation |
-| `discovery.rs` | SLAP/CLAP overlay lookup to find MPC nodes, health checking, reputation scoring |
+| `chip.rs` | CHIP token (BRC-23/BRC-48 PushDrop) creation, parsing, publishing, revocation, and SDK wrappers. 14 tests |
+| `discovery.rs` | SLAP overlay lookup to find MPC nodes, health checking, reputation scoring, client-side filtering. 9 tests |
 | `proofs.rs` | BRC-18 participation proof publication, querying, counting, parsing, and fee settlement calculation |
 
 ## Key Exports
@@ -27,8 +42,8 @@ Most functions contain detailed `todo!()` stubs describing the intended implemen
 | Export | Description |
 |--------|-------------|
 | `MPC_TOPIC` | Constant `"tm_mpc_signing"` — the overlay topic for all MPC data |
-| `MpcNodeInfo` | Node advertisement data: identity key, domain, curves, threshold configs, fee, version, optional limits |
-| `DiscoveryQuery` | Query filters: curve, threshold config, max fee, result limit (all optional) |
+| `MpcNodeInfo` | Node advertisement data: identity key, domain, curves, threshold configs, fee, version, published_at, optional limits |
+| `DiscoveryQuery` | Query filters: curve, threshold config, max fee, result limit (all optional, `Default` derived) |
 | `OverlayProof` | Wraps a `bsv_mpc_core::types::ParticipationProof` with on-chain txid, vout, and optional block height |
 | `FeeSettlement` | Epoch-bounded fee distribution: total fees + per-node `NodeFeeShare` breakdown |
 | `NodeFeeShare` | Single node's share: identity key, proof count, and proportional fee in sats |
@@ -52,23 +67,38 @@ Most functions contain detailed `todo!()` stubs describing the intended implemen
 
 | Function | Signature | Status |
 |----------|-----------|--------|
-| `create_chip_token` | `(identity_key: &[u8; 33], domain: &str, node_info: &MpcNodeInfo) -> Result<Vec<u8>, OverlayError>` | Stub |
-| `parse_chip_token` | `(script: &[u8]) -> Result<MpcNodeInfo, OverlayError>` | Stub |
-| `publish_chip_token` | `async (overlay_url: &str, token_tx: &[u8]) -> Result<(), OverlayError>` | Stub |
+| `create_chip_token` | `(identity_key: &[u8; 33], domain: &str, node_info: &MpcNodeInfo) -> Result<Vec<u8>, OverlayError>` | **Implemented** |
+| `parse_chip_token` | `(script_bytes: &[u8]) -> Result<MpcNodeInfo, OverlayError>` | **Implemented** |
+| `create_ship_admin_token` | `(identity_key: &[u8; 33], domain: &str) -> Result<Vec<u8>, OverlayError>` | **Implemented** |
+| `parse_ship_admin_token` | `(script_bytes: &[u8]) -> Result<OverlayAdminTokenData, OverlayError>` | **Implemented** |
+| `publish_chip_token` | `async (overlay_url: &str, token_tx: &[u8]) -> Result<(), OverlayError>` | **Implemented** |
 | `revoke_chip_token` | `async (overlay_url: &str, token_txid: &str, token_vout: u32) -> Result<String, OverlayError>` | Stub |
 
-`ChipCapabilities` struct holds the JSON blob embedded in the PushDrop script: curves, threshold_configs, fee_sats, version, and optional limits.
+`ChipCapabilities` struct holds the JSON blob embedded in the PushDrop script: curves, threshold_configs, fee_sats, version, and optional max_presignatures/min_balance_sats (skipped in JSON when None).
+
+`create_chip_token` validates that domain is non-empty and fee_sats > 0. `parse_chip_token` accepts both 5-field MPC tokens (with capabilities JSON) and 4-field standard SHIP tokens (with defaults: secp256k1, 2-of-2, 100 sats, version "0.0.0").
+
+`create_ship_admin_token` / `parse_ship_admin_token` are SDK wrappers around `bsv::overlay::create_overlay_admin_token` / `decode_overlay_admin_token` that enforce the `tm_mpc_signing` topic.
 
 ### Discovery Functions (`discovery.rs`)
 
 | Function | Signature | Status |
 |----------|-----------|--------|
-| `discover_nodes` | `async (overlay_url: &str, query: &DiscoveryQuery) -> Result<Vec<MpcNodeInfo>, OverlayError>` | Stub |
-| `node_reputation` | `async (overlay_url: &str, identity_key: &str) -> Result<u64, OverlayError>` | Stub |
-| `verify_node_health` | `async (node: &MpcNodeInfo) -> Result<bool, OverlayError>` | Stub |
-| `discover_healthy_nodes` | `async (overlay_url: &str, query: &DiscoveryQuery, max_concurrent_checks: Option<usize>) -> Result<Vec<MpcNodeInfo>, OverlayError>` | Stub |
+| `discover_nodes` | `async (overlay_url: &str, query: &DiscoveryQuery) -> Result<Vec<MpcNodeInfo>, OverlayError>` | **Implemented** |
+| `node_reputation` | `async (overlay_url: &str, identity_key: &str) -> Result<u64, OverlayError>` | **Implemented** |
+| `verify_node_health` | `async (node: &MpcNodeInfo) -> Result<bool, OverlayError>` | **Implemented** |
+| `discover_healthy_nodes` | `async (overlay_url: &str, query: &DiscoveryQuery, max_concurrent_checks: Option<usize>) -> Result<Vec<MpcNodeInfo>, OverlayError>` | **Implemented** |
+| `filter_and_rank_nodes` | `(nodes: Vec<MpcNodeInfo>, query: &DiscoveryQuery) -> Vec<MpcNodeInfo>` | **Implemented** |
+
+Constants: `MPC_LOOKUP_SERVICE = "ls_mpc_signing"`.
 
 Default result limit is 20. Default max concurrent health checks is 5.
+
+`discover_nodes` uses the BSV SDK's `LookupResolver` with mainnet preset. If `overlay_url` is non-empty, it's added as an additional SHIP host. The flow: build `LookupQuestion` for `ls_ship` with topic `tm_mpc_signing`, parse returned BEEF outputs as CHIP tokens, filter/dedup/sort, truncate to limit.
+
+`filter_and_rank_nodes` is a pure (no-network) function for client-side filtering of cached or locally-registered nodes. Same filter/dedup/sort logic as `discover_nodes`.
+
+`verify_node_health` sends GET to `https://{domain}/health` with 5-second timeout. Returns `false` (not error) on connection failure.
 
 ### Proof Functions (`proofs.rs`)
 
@@ -86,26 +116,28 @@ Constants: `PROOF_VERSION = 1`, `PROOF_PREFIX = b"mpc-proof"`.
 
 ```
 Agent needs MPC signing:
-  1. CLAP (BRC-25): Find overlay nodes hosting CHIP lookups for tm_mpc_signing
-  2. SLAP (BRC-24): Query those nodes for CHIP tokens (node advertisements)
+  1. LookupResolver queries SLAP trackers for SHIP hosts serving tm_mpc_signing
+  2. SHIP hosts return BEEF outputs containing CHIP token PushDrop scripts
   3. Parse CHIP tokens into MpcNodeInfo via chip::parse_chip_token()
-  4. Filter by curve, threshold config, max fee
-  5. Health-check candidates via GET https://{domain}/health
-  6. Initiate DKG/signing with selected node(s)
+  4. Filter by curve, threshold config, max fee; dedup by identity_key
+  5. Sort by fee_sats ascending (cheapest first)
+  6. Health-check candidates via GET https://{domain}/health
+  7. Initiate DKG/signing with selected node(s)
 ```
 
 ## CHIP Token PushDrop Layout
 
 ```
-OP_PUSH <signing_pubkey>       # BRC-42 derived: protocol [2,"CHIP"], key "tm_mpc_signing", counterparty "anyone"
-OP_PUSH "CHIP"                 # Protocol identifier
-OP_PUSH <identity_key>         # 33-byte compressed secp256k1
-OP_PUSH <domain>               # HTTPS domain (e.g., "mpc.example.com")
-OP_PUSH "tm_mpc_signing"       # Topic name
-OP_PUSH <capabilities_json>   # ChipCapabilities JSON
-OP_5 OP_DROP                   # Clean stack
-OP_CHECKSIG                    # Verify BRC-42 signature
+<signing_pubkey> OP_CHECKSIG
+OP_PUSH "SHIP"                 # Protocol identifier (field 0)
+OP_PUSH <identity_key>         # 33-byte compressed secp256k1 (field 1)
+OP_PUSH <domain>               # HTTPS domain, e.g. "mpc.example.com" (field 2)
+OP_PUSH "tm_mpc_signing"       # Topic name (field 3)
+OP_PUSH <capabilities_json>    # ChipCapabilities JSON (field 4, optional)
+OP_2DROP OP_2DROP OP_DROP      # Clean stack (5 fields)
 ```
+
+The signing/locking key is the identity key itself. Standard 4-field SHIP tokens (without field 4) are accepted with default capabilities.
 
 ## Participation Proof OP_RETURN Format
 
@@ -123,7 +155,7 @@ OP_FALSE OP_RETURN
 
 ## Fee Settlement Logic
 
-`calculate_settlement()` is the only fully implemented function. It performs proportional integer distribution:
+`calculate_settlement()` performs proportional integer distribution:
 
 ```
 node_fee = (total_fees * node_proof_count) / total_proof_count
@@ -131,18 +163,39 @@ node_fee = (total_fees * node_proof_count) / total_proof_count
 
 Integer division rounds down. If total proofs is zero, all nodes receive 0 sats. Rounding remainder is not explicitly redistributed (lost to truncation, typically < n sats total).
 
+## Tests
+
+**chip.rs** — 14 tests covering:
+- Create/parse roundtrip (full capabilities, minimal config, various thresholds, various fees)
+- Validation errors (empty domain, zero fee, invalid identity key, invalid script)
+- Protocol/topic validation (wrong topic, wrong protocol)
+- 4-field standard SHIP token parsing with defaults
+- SDK `create_ship_admin_token` / `parse_ship_admin_token` roundtrip
+- PushDrop field count verification
+- `ChipCapabilities` JSON roundtrip
+- Multiple nodes produce distinct tokens
+
+**discovery.rs** — 9 tests covering:
+- Filter by curve, threshold, max fee, and combined filters
+- Sort by fee ascending
+- Deduplication by identity_key (keeps most recent `published_at`)
+- Result limit truncation
+- Empty input and no-filter cases
+- `MPC_LOOKUP_SERVICE` constant value
+
 ## Dependencies
 
 | Crate | Purpose |
 |-------|---------|
 | `bsv-mpc-core` | `ParticipationProof` type from `types.rs` |
-| `bsv` | BSV primitives (transactions, scripts) |
-| `reqwest` | HTTP client for overlay communication |
-| `serde` / `serde_json` | Serialization for all types and API payloads |
-| `sha2` | Hashing (session transcripts) |
+| `bsv` | BSV primitives, scripts, `PushDrop`, `LockingScript`, overlay SDK (`LookupResolver`, `create_overlay_admin_token`, `decode_overlay_admin_token`, `Protocol`, `Transaction`) |
+| `reqwest` | HTTP client for overlay communication and health checks |
+| `serde` / `serde_json` | Serialization for all types, API payloads, and `ChipCapabilities` |
+| `hex` | Encoding transaction bytes for overlay submission |
 | `chrono` | UTC timestamps on `MpcNodeInfo`, `OverlayProof`, `FeeSettlement` |
+| `futures` | `future::join_all` for concurrent health checks |
 | `thiserror` | `OverlayError` derive macro |
-| `tracing` | Logging |
+| `tracing` | Structured logging in discovery and publication |
 
 ## Related
 

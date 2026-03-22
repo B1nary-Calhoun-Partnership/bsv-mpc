@@ -16,20 +16,21 @@ BRC-100 client ──HTTP──► bsv-mpc-proxy ──HTTPS──► KSS (remot
 
 | File | Lines | Status | Purpose |
 |------|-------|--------|---------|
-| `lib.rs` | 44 | Complete | Module declarations and crate-level docs |
+| `lib.rs` | 45 | Complete | Module declarations and crate-level docs |
 | `main.rs` | 41 | Complete | Binary entry point — loads `ProxyConfig`, inits tracing, calls `server::run()` |
 | `config.rs` | 146 | Complete | `ProxyConfig` from `MPC_*` env vars, with defaults and test |
 | `error.rs` | 125 | Complete | `ProxyError` enum (11 variants), HTTP status mapping, `From` impls |
-| `server.rs` | 183 | Complete | Axum router, `AppState` struct, all 28 BRC-100 routes, background presig task |
-| `wallet_api.rs` | 796 | Mostly stubs | 28 handler functions — 4 implemented (`get_network`, `get_version`, `is_authenticated`, `health`), 24 are `todo!()` |
-| `bridge.rs` | 228 | Stub | `MpcBridge` struct with field definitions; `new()`, `sign()`, `presign()` are `todo!()` |
-| `fee_injector.rs` | 249 | Partial | `FeeInjector` struct, `is_enabled()`, `parse_threshold()` work; `inject_fee()` is `todo!()` |
+| `server.rs` | 202 | Complete | Axum router, `AppState` struct (6 fields), all 28 BRC-100 routes, background presig task |
+| `wallet_api.rs` | 2536 | **Implemented** | 28 handlers — 18 implemented, 10 `todo!()` stubs. 40+ tests. |
+| `bridge.rs` | 1417 | **Implemented** | `MpcBridge` with BRC-31 auth, sign/presign/partial_ecdh, key derivation. 15+ tests. |
+| `fee_injector.rs` | 984 | **Implemented** | Fee injection with raw tx parse/serialize, P2PKH + P2MS scripts. 20+ tests. |
 | `presign_manager.rs` | 268 | Complete | `PresignManager` FIFO pool, `background_replenish()` loop with exponential backoff |
+| `utxo_tracker.rs` | 403 | Complete | In-memory UTXO tracker with basket/tag filtering, greedy UTXO selection. 12 tests. |
 
 ## Key Exports
 
 ### `config::ProxyConfig`
-Configuration loaded from environment variables. All fields have defaults except none are strictly required (share_path defaults to `"share.enc"`).
+Configuration loaded from environment variables. All fields have defaults (share_path defaults to `"share.enc"`).
 
 | Field | Env Var | Default | Type |
 |-------|---------|---------|------|
@@ -45,18 +46,24 @@ Configuration loaded from environment variables. All fields have defaults except
 ### `server::AppState`
 Shared state passed to all Axum handlers via `State<Arc<AppState>>`:
 - `config: ProxyConfig` — immutable after startup
-- `bridge: MpcBridge` — holds decrypted share, joint key, reqwest client, session ID
+- `bridge: MpcBridge` — holds decrypted share, joint key, BRC-31 auth session, reqwest client
 - `presign_manager: Arc<RwLock<PresignManager>>` — presignature pool (RwLock for concurrent reads)
 - `fee_injector: FeeInjector` — constructs fee outputs for `createAction` transactions
+- `utxo_tracker: Arc<RwLock<UtxoTracker>>` — local UTXO set for outputs controlled by the proxy
+- `http_client: reqwest::Client` — shared client for broadcasting and outbound requests (30s timeout)
 
 ### `bridge::MpcBridge`
-Core translation layer between BRC-100 API and MPC protocol:
-- `new(config) -> Result<Self>` — loads/decrypts share, establishes KSS session (stub)
-- `sign(hash, presignature) -> Result<SigningResult>` — 2PC ECDSA: 1 round with presig, 4 without (stub)
-- `presign() -> Result<Presignature>` — 3-round offline protocol to generate reusable presignature (stub)
-- `joint_public_key()` — returns the secp256k1 compressed public key for on-chain use
-- `session_id()` — KSS session identifier
-- `kss_url()` — KSS endpoint
+Core translation layer between BRC-100 API and MPC protocol. All methods fully implemented.
+- `new(config) -> Result<Self>` — reads share file, optionally decrypts (AES-256-GCM), validates share, parses root pubkey and share scalar/VSS points, determines signing participants, creates HTTP client, performs BRC-31 handshake with KSS
+- `sign(hash, presignature, hmac_offset) -> Result<SigningResult>` — 4-round interactive 2PC ECDSA via `spawn_blocking`. Creates ephemeral `SigningCoordinator`, exchanges bundled messages with KSS. Optional HMAC offset for BRC-42 derived key signing.
+- `presign() -> Result<Presignature>` — 3-round offline presigning via `spawn_blocking`. Creates ephemeral `PresigningManager` with pool_size=1.
+- `partial_ecdh(counterparty_pub) -> Result<PublicKey>` — threshold partial ECDH: local computation + KSS `/ecdh` endpoint, combined with Lagrange interpolation
+- `derive_symmetric_key(counterparty, level, protocol_name, key_id) -> Result<[u8; 32]>` — BRC-42 symmetric key for any counterparty type. "anyone" = 0 round-trips, "self"/"other" = 2 partial ECDH rounds.
+- `derive_child_key(counterparty, level, protocol_name, key_id, for_self) -> Result<PublicKey>` — BRC-42 child public key derivation. "anyone" = local, "self"/"other" = 1 partial ECDH round.
+- `root_pub()`, `joint_public_key()`, `session_id()`, `kss_url()`, `agent_id()` — accessors
+- `new_for_test(joint_key)` — `#[cfg(test)]` constructor for unit tests (no KSS connection)
+
+Internal types: `BridgeAuth` (BRC-31 client session), `SignInitRequest/Response`, `SignRoundRequest/Response`, `PresignInitRequest/Response`, `PresignRoundRequest/Response`, `EcdhRequest/Response`.
 
 ### `error::ProxyError`
 11-variant error enum with HTTP status mapping:
@@ -78,12 +85,24 @@ Core translation layer between BRC-100 API and MPC protocol:
 `From` impls: `reqwest::Error` → `KssError`, `serde_json::Error` → `InvalidRequest`, `io::Error` → `ShareLoad`, `MpcError` → `Protocol`.
 
 ### `fee_injector::FeeInjector`
-Adds MPC signing fee outputs to `createAction` transactions:
+Adds MPC signing fee outputs to `createAction` transactions. Fully implemented.
 - `new(fee_sats, fee_addresses, fee_threshold)` — constructor
 - `is_enabled()` — true when both fee > 0 and addresses are non-empty
-- `inject_fee(tx_bytes) -> Result<Vec<u8>>` — appends fee output(s) to serialized tx (stub)
+- `inject_fee(tx_bytes) -> Result<Vec<u8>>` — parses raw tx, injects fee output(s), reduces change, re-serializes
+- `inject_fee_into_outputs(outputs, change_index) -> Result<FeeInjectionInfo>` — direct output list manipulation (used by `createAction`)
 - `parse_threshold()` — parses `"2-of-3"` format into `(t, n)` with validation
-- Two fee models: bare P2MS multisig (when threshold set) or split P2PKH (default)
+- `fee_sats()`, `fee_addresses()` — accessors
+- Two fee models: bare P2MS multisig (when threshold set) or split P2PKH (default, remainder to first address)
+- Internal helpers: `resolve_address_to_p2pkh_script()` (supports hex pubkeys and Base58Check addresses), `build_p2ms_script()`, `split_fee_outputs()`, raw tx parser/serializer
+
+### `utxo_tracker::UtxoTracker`
+In-memory UTXO tracker. Thread-safety via `Arc<RwLock<UtxoTracker>>` in `AppState`.
+- `TrackedOutput` — struct with txid, vout, satoshis, locking_script, spending_txid, basket, tags, created_at
+- `add_output(output)` — add new tracked output
+- `mark_spent(txid, vout, spending_txid) -> bool` — mark as spent (returns false if not found or already spent)
+- `list_unspent(basket, tags) -> Vec<&TrackedOutput>` — filtered listing; tags use "any" matching
+- `select_utxos(target_sats) -> (Vec<TrackedOutput>, u64)` — greedy largest-first selection
+- `total_balance()`, `len()`, `is_empty()`, `unspent_count()` — status
 
 ### `presign_manager::PresignManager`
 FIFO pool of pre-computed presignatures:
@@ -106,86 +125,101 @@ Async loop that runs forever as a spawned Tokio task:
 ### MPC-routed (require KSS round-trips)
 | Handler | Route | Status |
 |---------|-------|--------|
-| `get_public_key` | `POST /getPublicKey` | Stub — returns joint key or BRC-42 derived child |
-| `create_signature` | `POST /createSignature` | Stub — 2PC ECDSA with presig fast path |
-| `create_action` | `POST /createAction` | Stub — UTXO select + build + fee inject + MPC sign + broadcast |
-| `internalize_action` | `POST /internalizeAction` | Stub — accept incoming payment |
+| `get_public_key` | `POST /getPublicKey` | **Implemented** — returns root joint key or BRC-42 derived child. "anyone" = local, "self"/"other" = 1 partial ECDH round. |
+| `create_signature` | `POST /createSignature` | **Implemented** — 2PC ECDSA with presig pool fast path. Supports `hashToDirectlySign`, BRC-42 HMAC offset for "anyone" counterparty. |
+| `create_action` | `POST /createAction` | **Implemented** — full pipeline: parse outputs → UTXO select → build tx → inject fee → BIP-143 sighash → MPC sign per input → broadcast via ARC → update UTXO tracker. |
+| `internalize_action` | `POST /internalizeAction` | **Implemented** — parse raw tx, accept specific outputs or auto-scan for root-key P2PKH matches, update UTXO tracker. |
 
 ### Local-only (no MPC rounds)
 | Handler | Route | Status |
 |---------|-------|--------|
-| `encrypt` / `decrypt` | `POST /encrypt`, `/decrypt` | Stub — BRC-42 derived AES-256-GCM |
-| `create_hmac` / `verify_hmac` | `POST /createHmac`, `/verifyHmac` | Stub — BRC-42 derived HMAC key |
-| `verify_signature` | `POST /verifySignature` | Stub — pure ECDSA verify |
-| `list_outputs` / `list_actions` | `POST /listOutputs`, `/listActions` | Stub — local UTXO/action tracker |
-| `relinquish_output` | `POST /relinquishOutput` | Stub |
+| `encrypt` / `decrypt` | `POST /encrypt`, `/decrypt` | **Implemented** — AES-256-GCM with BRC-42 derived key. Random 12-byte nonce. All counterparty types supported via `derive_symmetric_key`. |
+| `create_hmac` / `verify_hmac` | `POST /createHmac`, `/verifyHmac` | **Implemented** — HMAC-SHA256 with BRC-42 derived key. `verify_hmac` uses constant-time comparison. |
+| `verify_signature` | `POST /verifySignature` | **Implemented** — ECDSA verify against BRC-42 derived pubkey. Supports `forSelf`, `hashToDirectlySign`. |
+| `list_outputs` | `POST /listOutputs` | **Implemented** — basket/tag filtering, pagination (limit/offset), optional locking script inclusion. |
+| `list_actions` | `POST /listActions` | todo!() |
+| `relinquish_output` | `POST /relinquishOutput` | todo!() |
 | `get_network` | `POST /getNetwork` | **Implemented** — returns `"mainnet"` |
 | `get_version` | `POST /getVersion` | **Implemented** — returns `"bsv-mpc-proxy {version}"` |
 | `is_authenticated` | `POST /isAuthenticated` | **Implemented** — returns `true` (share loaded at startup) |
 | `health` | `GET /health` | **Implemented** — status, version, presig count, KSS URL, fee |
-| Certificate handlers | 4 POST routes | Stub |
-| Discovery handlers | 2 POST routes | Stub |
-| Key linkage handlers | 2 POST routes | Stub |
+| Certificate handlers | 4 POST routes | todo!() |
+| Discovery handlers | 2 POST routes | todo!() |
+| Key linkage handlers | 2 POST routes | todo!() |
 
 ## Startup Flow
 
 1. `main.rs`: init tracing, load `ProxyConfig::from_env()`
 2. `server::run()`:
-   - `MpcBridge::new(&config)` — load share, decrypt, validate, connect to KSS
+   - `MpcBridge::new(&config)` — read share file, optionally decrypt, validate, parse root pubkey + share scalar + VSS points, determine participants, create HTTP client, BRC-31 handshake with KSS
    - Construct `FeeInjector` from config
    - Construct `PresignManager` with `max_presignatures` capacity
+   - Construct `UtxoTracker` (empty)
+   - Create shared `reqwest::Client` (30s timeout)
    - Bundle into `Arc<AppState>`
    - Spawn `background_replenish()` as a Tokio task
    - Build Axum router with all 28 routes + `/health`
    - Bind `0.0.0.0:{port}` and serve
 
-## `createAction` Pipeline (when implemented)
+## `createAction` Pipeline
 
 This is the most complex handler — called by bsv-worm for every on-chain operation:
 
-1. Parse `description`, `inputs`, `outputs`, `labels`, `options`
-2. Select UTXOs from local tracker for inputs
-3. Build unsigned transaction with requested outputs
-4. `fee_injector.inject_fee()` — append MPC signing fee output(s)
-5. Calculate miner fee, add change output
-6. For each input:
-   - Derive child share via BRC-42 from input's `protocolID`/`keyID`
-   - Compute sighash
-   - `presign_manager.take()` for fast path
-   - `bridge.sign(sighash, presignature)` — 2PC with KSS
-   - Apply signature to input
-7. Broadcast signed transaction
-8. Update local UTXO set
-9. Return `{ txid, tx, outputMap, mapiResponses }`
+1. Parse `outputs` array (each with `satoshis` and `lockingScript` hex)
+2. Compute P2PKH change script from root joint key
+3. Determine MPC fee amount and output count (multisig=1, split=N addresses)
+4. Select UTXOs via `utxo_tracker.select_utxos()` (greedy largest-first)
+5. Compute exact mining fee (`estimate_mining_fee`: 1 sat/byte, min 100 sats)
+6. Build output list: user outputs + change (change includes MPC fee, deducted next)
+7. `fee_injector.inject_fee_into_outputs()` — append fee output(s), reduce change
+8. For each input:
+   - Compute BIP-143 sighash (SIGHASH_ALL | SIGHASH_FORKID = 0x41)
+   - Try `presign_manager.take()` for fast path
+   - `bridge.sign(sighash, presig, None)` — 2PC with KSS (root key for now)
+   - Build P2PKH unlocking script: `<DER sig + 0x41> <33-byte compressed pubkey>`
+9. Serialize signed transaction
+10. Broadcast via ARC (TAAL first, GorillaPool fallback; accepts SEEN_ON_NETWORK/MINED)
+11. Update UTXO tracker: mark inputs as spent, add change output
+12. Return `{ txid, rawTx }`
 
 ## Dependencies
 
 | Crate | Use in this module |
 |-------|-------------------|
-| `bsv-mpc-core` | `MpcError`, `Presignature`, `EncryptedShare`, `JointPublicKey`, `SessionId`, `SigningResult` |
+| `bsv-mpc-core` | `MpcError`, `Presignature`, `EncryptedShare`, `JointPublicKey`, `SessionId`, `SigningResult`, `SigningCoordinator`, `PresigningManager`, `ecdh`, `hd` |
+| `bsv` | `PublicKey`, `PrivateKey`, `Signature`, `Address` — BSV primitives for keys, scripts, addresses |
 | `axum` (0.8) | HTTP router, `State`, `Json`, `IntoResponse` |
-| `reqwest` (0.12) | HTTP client for KSS communication (in `MpcBridge`) |
-| `tokio` (1) | Async runtime, `RwLock`, `spawn`, `time::sleep` |
+| `reqwest` (0.12) | HTTP client for KSS communication and tx broadcasting |
+| `tokio` (1) | Async runtime, `RwLock`, `spawn`, `spawn_blocking`, `time::sleep` |
+| `aes-gcm` | AES-256-GCM for encrypt/decrypt handlers |
+| `hmac` / `sha2` | HMAC-SHA256 for createHmac/verifyHmac, SHA-256 for hashing |
 | `serde` / `serde_json` | Request/response serialization |
 | `thiserror` (2) | `ProxyError` derive macro |
 | `tracing` | Structured logging throughout |
 | `anyhow` | Error handling in `ProxyConfig`, `FeeInjector`, `MpcBridge` |
+| `chrono` | UTC timestamps for `TrackedOutput.created_at` |
+| `base64` | Encode/decode for encrypt/decrypt/HMAC payloads |
+| `rand` | Random nonce generation (OsRng) |
+| `hex` | Hex encode/decode throughout |
 
 ## Tests
 
-Tests exist in `config.rs`, `fee_injector.rs`, and `presign_manager.rs`:
+Tests exist in `bridge.rs`, `wallet_api.rs`, `fee_injector.rs`, `presign_manager.rs`, `utxo_tracker.rs`, and `config.rs`:
 
 ```bash
 cargo test -p bsv-mpc-proxy
 ```
 
-- `config::tests::defaults_are_sane` — verifies default env var parsing
-- `fee_injector::tests` — 7 tests: enabled/disabled states, threshold parsing (valid, none, invalid format, t > n, n mismatch), inject noop when disabled
+- `config::tests` — 1 test: default env var parsing
+- `bridge::tests` — 15 tests: hex encode/decode, API type serialization, share loading (plaintext, missing file, 2-of-3 participants)
+- `fee_injector::tests` — 20+ tests: enabled/disabled states, threshold parsing, inject into output list (single/split/multisig/remainder/insufficient/exact), raw tx round-trip injection, address resolution (hex pubkey, BSV address), P2MS script structure, split fee edge cases, balance equation verification
 - `presign_manager::tests` — 6 tests: empty pool, take from empty, should_replenish, utilization, zero max, metrics
+- `utxo_tracker::tests` — 12 tests: empty tracker, add/list, mark spent (found/not found/already spent), basket filter, tag filter ("any" mode), greedy UTXO selection (exact/insufficient/skips spent), outpoint format
+- `wallet_api::tests` — 40+ tests: protocol param parsing, symmetric key derivation (anyone/deterministic/different invoices/self errors/other errors), encrypt/decrypt round-trip (normal/empty/large), nonce randomness, wrong key fails, short ciphertext rejected, self counterparty errors without KSS, HMAC create/verify (deterministic, valid, invalid, wrong data), verify_signature (valid anyone, invalid, self errors, bad data length, forSelf=false), getPublicKey (identity, no params, derived anyone, self errors), tx helpers (sha256d, P2PKH script, unlocking script, BIP-143 sighash deterministic/changes with output, serialize/parse roundtrip, txid, mining fee, varint roundtrip), internalizeAction (specific outputs, auto-scan, then list, invalid tx, missing tx, output out of range)
 
 ## Related
 
 - [`../../CLAUDE.md`](../../CLAUDE.md) — project root: architecture, deployment modes, fee economics, protocol latency
-- [`../bsv-mpc-core/src/`](../../bsv-mpc-core/src/) — `MpcError`, `Presignature`, `SigningResult`, and all MPC protocol types this proxy depends on
+- [`../bsv-mpc-core/src/`](../../bsv-mpc-core/src/) — `MpcError`, `Presignature`, `SigningResult`, `SigningCoordinator`, `PresigningManager`, `ecdh`, `hd`, and all MPC protocol types this proxy depends on
 - [`../bsv-mpc-worker/src/`](../../bsv-mpc-worker/src/) — CF Worker KSS that this proxy communicates with (the remote party)
 - [`../bsv-mpc-service/src/`](../../bsv-mpc-service/src/) — standalone KSS binary (same API as worker, for self-hosted deployments)
