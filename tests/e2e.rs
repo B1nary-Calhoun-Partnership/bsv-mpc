@@ -337,6 +337,7 @@ async fn setup() -> TestEnv {
         fee_threshold: None,
         max_presignatures: 0,   // Disable background presigning
         encryption_key: None,
+        arc_api_key: "<REDACTED-ARC-API-KEY>".into(),
     };
 
     tokio::spawn(async move {

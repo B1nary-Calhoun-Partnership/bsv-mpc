@@ -1338,6 +1338,7 @@ mod tests {
             fee_threshold: None,
             max_presignatures: 5,
             encryption_key: None,
+            arc_api_key: "test_key".into(),
         };
 
         let bridge = MpcBridge::new(&config).await.unwrap();
@@ -1362,6 +1363,7 @@ mod tests {
             fee_threshold: None,
             max_presignatures: 5,
             encryption_key: None,
+            arc_api_key: "test_key".into(),
         };
 
         let result = MpcBridge::new(&config).await;
@@ -1406,6 +1408,7 @@ mod tests {
             fee_threshold: None,
             max_presignatures: 5,
             encryption_key: None,
+            arc_api_key: "test_key".into(),
         };
 
         let bridge = MpcBridge::new(&config).await.unwrap();

@@ -21,6 +21,7 @@
 //! | `MPC_FEE_THRESHOLD` | (none) | Fee multisig threshold, e.g. `"2-of-3"` |
 //! | `MPC_MAX_PRESIGS` | `20` | Maximum presignatures to stockpile |
 //! | `MPC_ENCRYPTION_KEY` | (none) | Hex-encoded AES-256 key for share decryption |
+//! | `MPC_ARC_API_KEY` | TAAL mainnet key | ARC API key for TAAL broadcasting |
 
 use serde::Deserialize;
 
@@ -77,6 +78,13 @@ pub struct ProxyConfig {
     /// If not set, the proxy attempts to derive the decryption key from the
     /// DKG session metadata. In production, always set this explicitly.
     pub encryption_key: Option<String>,
+
+    /// ARC API key for TAAL broadcasting (Bearer token).
+    ///
+    /// GorillaPool requires BEEF format (Extended Format) but no API key.
+    /// TAAL requires this Bearer token for authentication.
+    /// Defaults to a mainnet key if not set.
+    pub arc_api_key: String,
 }
 
 impl ProxyConfig {
@@ -113,6 +121,9 @@ impl ProxyConfig {
                 .map_err(|e| anyhow::anyhow!("Invalid MPC_MAX_PRESIGS: {e}"))?,
 
             encryption_key: std::env::var("MPC_ENCRYPTION_KEY").ok(),
+
+            arc_api_key: std::env::var("MPC_ARC_API_KEY")
+                .unwrap_or_else(|_| "<REDACTED-ARC-API-KEY>".into()),
         })
     }
 }
@@ -132,6 +143,7 @@ mod tests {
         std::env::remove_var("MPC_FEE_THRESHOLD");
         std::env::remove_var("MPC_MAX_PRESIGS");
         std::env::remove_var("MPC_ENCRYPTION_KEY");
+        std::env::remove_var("MPC_ARC_API_KEY");
 
         let config = ProxyConfig::from_env().unwrap();
         assert_eq!(config.port, 3322);
@@ -142,5 +154,9 @@ mod tests {
         assert!(config.fee_threshold.is_none());
         assert_eq!(config.max_presignatures, 20);
         assert!(config.encryption_key.is_none());
+        assert_eq!(
+            config.arc_api_key,
+            "<REDACTED-ARC-API-KEY>"
+        );
     }
 }
