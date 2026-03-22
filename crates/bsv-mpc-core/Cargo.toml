@@ -9,12 +9,17 @@ description = "Core MPC threshold ECDSA signing protocol for BSV (wraps cggmp24)
 [dependencies]
 cggmp24.workspace = true
 cggmp24-keygen.workspace = true
+round-based.workspace = true
+generic-ec.workspace = true
 bsv.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+hex.workspace = true
 sha2.workspace = true
+hmac.workspace = true
 rand.workspace = true
 aes-gcm.workspace = true
+glass_pumpkin.workspace = true
 thiserror.workspace = true
 chrono.workspace = true
 tracing.workspace = true
@@ -22,3 +27,6 @@ tracing.workspace = true
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 tempfile.workspace = true
+futures.workspace = true
+pin-project.workspace = true
+round-based = { workspace = true, features = ["sim"] }

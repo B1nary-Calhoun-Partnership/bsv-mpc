@@ -20,6 +20,10 @@ repository = "https://github.com/anthropics/bsv-mpc"
 cggmp24 = { git = "https://github.com/LFDT-Lockness/cggmp21", features = ["curve-secp256k1", "hd-wallet", "hd-slip10"] }
 cggmp24-keygen = { git = "https://github.com/LFDT-Lockness/cggmp21", features = ["hd-wallet"] }
 
+# MPC protocol infrastructure (must match cggmp24's transitive deps)
+round-based = { version = "0.4.1", features = ["state-machine"] }
+generic-ec = { version = "0.4.1", features = ["curve-secp256k1", "serde"] }
+
 # BSV
 bsv = { package = "bsv-sdk", path = "../rust-sdk", features = ["transaction"] }
 
@@ -29,6 +33,7 @@ tokio = { version = "1", features = ["full"] }
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+hex = "0.4"
 
 # HTTP
 axum = { version = "0.8", features = ["ws"] }
@@ -36,8 +41,13 @@ reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-feature
 
 # Crypto
 sha2 = "0.10"
+hmac = "0.12"
 rand = "0.8"
 aes-gcm = "0.10"
+
+# Async utilities
+futures = "0.3"
+pin-project = "1"
 
 # Error handling
 thiserror = "2"
@@ -52,3 +62,13 @@ chrono = { version = "0.4", features = ["serde"] }
 
 # Temp/test
 tempfile = "3"
+
+# Pin glass_pumpkin to avoid rand_core 0.6/0.10 version conflict with fast-paillier.
+# See LESSONS.md for details. All POCs pin this individually; workspace must too.
+glass_pumpkin = "=1.9.0"
+
+# Optimize big-integer and crypto dependencies in dev mode.
+# Without this, num-bigint / Paillier operations are 10-100x slower, making
+# DKG aux_info_gen take minutes instead of seconds in tests.
+[profile.dev.package."*"]
+opt-level = 2
