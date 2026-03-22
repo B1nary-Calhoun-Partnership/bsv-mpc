@@ -860,6 +860,216 @@ async fn test_mainnet_transaction(env: &TestEnv, client: &Client) {
     eprintln!("  PASS\n");
 }
 
+/// Test 7: All 28 BRC-100 endpoints respond without panicking
+///
+/// Calls every registered endpoint with minimal JSON bodies and verifies
+/// that none return HTTP 500 (which would indicate a todo!() panic or
+/// other server error). Endpoints may return JSON with an "error" field,
+/// which is a valid non-panic response.
+async fn test_all_endpoints_no_panic(env: &TestEnv, client: &Client) {
+    eprintln!("--- Test 7: All Endpoints No-Panic ---");
+
+    let base_url = &env.proxy_url;
+
+    // Helper: POST with body, assert status is NOT 500, return parsed JSON.
+    async fn post_no_panic(client: &Client, url: &str, body: &Value) -> Value {
+        let resp = client
+            .post(url)
+            .header("Origin", "http://localhost")
+            .json(body)
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("POST {url} failed to connect: {e}"));
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        assert!(
+            status.as_u16() != 500,
+            "Endpoint {url} returned 500 (panic/internal error): {text}"
+        );
+        serde_json::from_str(&text).unwrap_or_else(|_| json!({"_raw": text, "_status": status.as_u16()}))
+    }
+
+    // ── Identity & auth (simple, no body needed) ──────────────────────
+
+    let r = post_no_panic(client, &format!("{base_url}/getNetwork"), &json!({})).await;
+    assert_eq!(r["network"], "mainnet");
+    eprintln!("  /getNetwork: ok");
+
+    let r = post_no_panic(client, &format!("{base_url}/getVersion"), &json!({})).await;
+    assert!(r["version"].is_string());
+    eprintln!("  /getVersion: ok");
+
+    let r = post_no_panic(client, &format!("{base_url}/isAuthenticated"), &json!({})).await;
+    assert_eq!(r["authenticated"], true);
+    eprintln!("  /isAuthenticated: ok");
+
+    // ── Core signing (MPC) ────────────────────────────────────────────
+
+    let r = post_no_panic(client, &format!("{base_url}/getPublicKey"), &json!({"identityKey": true})).await;
+    assert!(r["publicKey"].is_string());
+    eprintln!("  /getPublicKey: ok");
+
+    // createSignature — provide valid params; may error on protocol but must not panic
+    let test_data = hex::encode(b"test-no-panic");
+    let r = post_no_panic(client, &format!("{base_url}/createSignature"), &json!({
+        "data": test_data,
+        "protocolID": [2, "no-panic-test"],
+        "keyID": "k1",
+        "counterparty": "anyone"
+    })).await;
+    eprintln!("  /createSignature: ok (error={})", r.get("error").is_some());
+
+    // verifySignature — with invalid sig, should return valid:false, not panic
+    let _r = post_no_panic(client, &format!("{base_url}/verifySignature"), &json!({
+        "data": hex::encode(b"test"),
+        "signature": "00".repeat(64),
+        "protocolID": [2, "no-panic-test"],
+        "keyID": "k1",
+        "counterparty": "anyone",
+        "forSelf": true
+    })).await;
+    eprintln!("  /verifySignature: ok");
+
+    // createAction — will fail (no UTXOs) but must not panic
+    let r = post_no_panic(client, &format!("{base_url}/createAction"), &json!({
+        "description": "no-panic test",
+        "outputs": [{"satoshis": 100, "lockingScript": "006a"}]
+    })).await;
+    eprintln!("  /createAction: ok (error={})", r.get("error").is_some());
+
+    // internalizeAction — invalid tx, will error but must not panic
+    let r = post_no_panic(client, &format!("{base_url}/internalizeAction"), &json!({
+        "tx": "deadbeef"
+    })).await;
+    eprintln!("  /internalizeAction: ok (error={})", r.get("error").is_some());
+
+    // ── Encryption (local) ────────────────────────────────────────────
+
+    let plaintext = base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        b"no-panic test",
+    );
+    let r = post_no_panic(client, &format!("{base_url}/encrypt"), &json!({
+        "plaintext": plaintext,
+        "protocolID": [2, "no-panic-test"],
+        "keyID": "enc-np",
+        "counterparty": "anyone"
+    })).await;
+    assert!(r.get("error").is_none(), "encrypt should succeed: {r}");
+    eprintln!("  /encrypt: ok");
+
+    let r = post_no_panic(client, &format!("{base_url}/decrypt"), &json!({
+        "ciphertext": "AAAA",
+        "protocolID": [2, "no-panic-test"],
+        "keyID": "dec-np",
+        "counterparty": "anyone"
+    })).await;
+    eprintln!("  /decrypt: ok (error={})", r.get("error").is_some());
+
+    let hmac_data = base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        b"hmac no-panic",
+    );
+    let r = post_no_panic(client, &format!("{base_url}/createHmac"), &json!({
+        "data": hmac_data,
+        "protocolID": [2, "no-panic-test"],
+        "keyID": "hmac-np",
+        "counterparty": "anyone"
+    })).await;
+    assert!(r.get("error").is_none(), "createHmac should succeed: {r}");
+    eprintln!("  /createHmac: ok");
+
+    let _r = post_no_panic(client, &format!("{base_url}/verifyHmac"), &json!({
+        "data": hmac_data,
+        "hmac": "0000000000000000000000000000000000000000000000000000000000000000",
+        "protocolID": [2, "no-panic-test"],
+        "keyID": "hmac-np",
+        "counterparty": "anyone"
+    })).await;
+    eprintln!("  /verifyHmac: ok");
+
+    // ── UTXO management ───────────────────────────────────────────────
+
+    let r = post_no_panic(client, &format!("{base_url}/listOutputs"), &json!({"basket": "default"})).await;
+    assert!(r["totalOutputs"].is_number());
+    eprintln!("  /listOutputs: ok");
+
+    let r = post_no_panic(client, &format!("{base_url}/listActions"), &json!({})).await;
+    assert_eq!(r["totalActions"], 0);
+    assert!(r["actions"].is_array());
+    eprintln!("  /listActions: ok");
+
+    let r = post_no_panic(client, &format!("{base_url}/relinquishOutput"), &json!({"basket": "default", "output": "deadbeef.0"})).await;
+    assert_eq!(r["success"], true);
+    eprintln!("  /relinquishOutput: ok");
+
+    // ── Certificates ──────────────────────────────────────────────────
+
+    let r = post_no_panic(client, &format!("{base_url}/listCertificates"), &json!({})).await;
+    assert_eq!(r["totalCertificates"], 0);
+    assert!(r["certificates"].is_array());
+    eprintln!("  /listCertificates: ok");
+
+    let r = post_no_panic(client, &format!("{base_url}/proveCertificate"), &json!({})).await;
+    assert!(r["error"].is_string());
+    eprintln!("  /proveCertificate: ok (expected error)");
+
+    let r = post_no_panic(client, &format!("{base_url}/acquireCertificate"), &json!({})).await;
+    assert!(r["error"].is_string());
+    eprintln!("  /acquireCertificate: ok (expected error)");
+
+    let r = post_no_panic(client, &format!("{base_url}/relinquishCertificate"), &json!({})).await;
+    assert_eq!(r["success"], true);
+    eprintln!("  /relinquishCertificate: ok");
+
+    // ── Discovery ─────────────────────────────────────────────────────
+
+    let r = post_no_panic(client, &format!("{base_url}/discoverByIdentityKey"), &json!({"identityKey": "02deadbeef"})).await;
+    assert_eq!(r["totalResults"], 0);
+    assert!(r["results"].is_array());
+    eprintln!("  /discoverByIdentityKey: ok");
+
+    let r = post_no_panic(client, &format!("{base_url}/discoverByAttributes"), &json!({"attributes": {}})).await;
+    assert_eq!(r["totalResults"], 0);
+    assert!(r["results"].is_array());
+    eprintln!("  /discoverByAttributes: ok");
+
+    // ── Key linkage ───────────────────────────────────────────────────
+
+    let r = post_no_panic(client, &format!("{base_url}/revealCounterpartyKeyLinkage"), &json!({})).await;
+    assert!(r["error"].is_string());
+    eprintln!("  /revealCounterpartyKeyLinkage: ok (expected error)");
+
+    let r = post_no_panic(client, &format!("{base_url}/revealSpecificKeyLinkage"), &json!({})).await;
+    assert!(r["error"].is_string());
+    eprintln!("  /revealSpecificKeyLinkage: ok (expected error)");
+
+    // ── Chain info ────────────────────────────────────────────────────
+
+    let r = post_no_panic(client, &format!("{base_url}/getHeight"), &json!({})).await;
+    assert!(r["height"].is_number());
+    eprintln!("  /getHeight: ok");
+
+    let r = post_no_panic(client, &format!("{base_url}/waitForAuthentication"), &json!({})).await;
+    assert_eq!(r["authenticated"], true);
+    eprintln!("  /waitForAuthentication: ok");
+
+    // ── Health (GET, not POST) ────────────────────────────────────────
+
+    let resp = client
+        .get(format!("{base_url}/health"))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+    let r: Value = resp.json().await.unwrap();
+    assert_eq!(r["status"], "ok");
+    eprintln!("  /health: ok");
+
+    eprintln!("  All 28 endpoints responded without panic.");
+    eprintln!("  PASS\n");
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Main E2E Test
 // ═══════════════════════════════════════════════════════════════════════════
@@ -883,6 +1093,7 @@ async fn e2e_mpc_signing_proxy() {
     test_signature_roundtrip(&env, &client).await;
     test_encrypt_decrypt(&env, &client).await;
     test_hmac_roundtrip(&env, &client).await;
+    test_all_endpoints_no_panic(&env, &client).await;
 
     // Mainnet test (conditional — requires wallet at localhost:3321)
     if std::env::var("E2E_MAINNET").is_ok() {

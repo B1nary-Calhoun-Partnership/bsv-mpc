@@ -188,6 +188,12 @@ pub async fn run(config: ProxyConfig) -> anyhow::Result<()> {
             "/revealSpecificKeyLinkage",
             post(wallet_api::reveal_specific_key_linkage),
         )
+        // ── Chain info ────────────────────────────────────────────────────
+        .route("/getHeight", post(wallet_api::get_height))
+        .route(
+            "/waitForAuthentication",
+            post(wallet_api::wait_for_authentication),
+        )
         // ── Health ───────────────────────────────────────────────────────
         .route("/health", get(wallet_api::health))
         .with_state(state);

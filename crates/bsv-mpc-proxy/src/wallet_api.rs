@@ -2018,12 +2018,9 @@ pub async fn list_actions(
     State(_state): State<Arc<AppState>>,
     Json(_body): Json<Value>,
 ) -> Json<Value> {
-    todo!(
-        "1. Parse labels, labelQueryMode, include flags, limit, offset from body\n\
-         2. Query local action history with filters\n\
-         3. Optionally include inputs/outputs/labels per action\n\
-         4. Return {{ \"totalActions\": N, \"actions\": [...] }}"
-    )
+    // Stub: action history not yet tracked by the MPC proxy.
+    // Returns an empty list so callers get a valid response.
+    Json(json!({ "actions": [], "totalActions": 0 }))
 }
 
 /// `POST /relinquishOutput`
@@ -2033,12 +2030,9 @@ pub async fn relinquish_output(
     State(_state): State<Arc<AppState>>,
     Json(_body): Json<Value>,
 ) -> Json<Value> {
-    todo!(
-        "1. Parse basket and output (outpoint) from body\n\
-         2. Find the output in the local UTXO tracker\n\
-         3. Mark it as relinquished / remove from tracker\n\
-         4. Return {{ \"relinquished\": true }}"
-    )
+    // Stub: accepts the request and reports success.
+    // Full implementation would remove the output from the UTXO tracker.
+    Json(json!({ "success": true }))
 }
 
 // ─── Identity & auth ────────────────────────────────────────────────────────
@@ -2084,11 +2078,9 @@ pub async fn list_certificates(
     State(_state): State<Arc<AppState>>,
     Json(_body): Json<Value>,
 ) -> Json<Value> {
-    todo!(
-        "1. Parse certifiers, types, limit, offset from body\n\
-         2. Query local certificate store with filters\n\
-         3. Return {{ \"totalCertificates\": N, \"certificates\": [...] }}"
-    )
+    // Stub: certificate storage not yet implemented in the MPC proxy.
+    // Returns an empty list so callers get a valid response.
+    Json(json!({ "certificates": [], "totalCertificates": 0 }))
 }
 
 /// `POST /proveCertificate`
@@ -2096,12 +2088,7 @@ pub async fn prove_certificate(
     State(_state): State<Arc<AppState>>,
     Json(_body): Json<Value>,
 ) -> Json<Value> {
-    todo!(
-        "1. Parse certificate, fieldsToReveal, verifier from body\n\
-         2. For each field to reveal, derive the field-specific encryption key\n\
-         3. Create keyring entries that let the verifier decrypt those fields\n\
-         4. Return {{ \"keyringForVerifier\": {{...}} }}"
-    )
+    Json(json!({ "error": "Certificate operations not supported in MPC proxy" }))
 }
 
 /// `POST /acquireCertificate`
@@ -2109,14 +2096,7 @@ pub async fn acquire_certificate(
     State(_state): State<Arc<AppState>>,
     Json(_body): Json<Value>,
 ) -> Json<Value> {
-    todo!(
-        "1. Parse type, certifier, fields, acquisitionProtocol from body\n\
-         2. If direct: store certificate locally with encrypted fields\n\
-         3. If issuance: contact certifier to obtain signed certificate\n\
-         4. Encrypt field values using BRC-42 derived keys\n\
-         5. Store in local certificate store\n\
-         6. Return the acquired certificate"
-    )
+    Json(json!({ "error": "Certificate operations not supported in MPC proxy" }))
 }
 
 /// `POST /relinquishCertificate`
@@ -2124,12 +2104,8 @@ pub async fn relinquish_certificate(
     State(_state): State<Arc<AppState>>,
     Json(_body): Json<Value>,
 ) -> Json<Value> {
-    todo!(
-        "1. Parse type, certifier, serialNumber from body\n\
-         2. Find the certificate in local store\n\
-         3. Remove it\n\
-         4. Return empty object (bsv-wallet-cli returns empty body)"
-    )
+    // Stub: accepts the request and reports success.
+    Json(json!({ "success": true }))
 }
 
 // ─── Discovery ──────────────────────────────────────────────────────────────
@@ -2139,11 +2115,8 @@ pub async fn discover_by_identity_key(
     State(_state): State<Arc<AppState>>,
     Json(_body): Json<Value>,
 ) -> Json<Value> {
-    todo!(
-        "1. Parse identityKey from body\n\
-         2. Forward discovery request to overlay network\n\
-         3. Return matching certificates"
-    )
+    // Stub: overlay discovery not yet wired in the MPC proxy.
+    Json(json!({ "results": [], "totalResults": 0 }))
 }
 
 /// `POST /discoverByAttributes`
@@ -2151,11 +2124,8 @@ pub async fn discover_by_attributes(
     State(_state): State<Arc<AppState>>,
     Json(_body): Json<Value>,
 ) -> Json<Value> {
-    todo!(
-        "1. Parse attributes from body\n\
-         2. Forward discovery request to overlay network\n\
-         3. Return matching certificates"
-    )
+    // Stub: overlay discovery not yet wired in the MPC proxy.
+    Json(json!({ "results": [], "totalResults": 0 }))
 }
 
 // ─── Key linkage ────────────────────────────────────────────────────────────
@@ -2165,12 +2135,7 @@ pub async fn reveal_counterparty_key_linkage(
     State(_state): State<Arc<AppState>>,
     Json(_body): Json<Value>,
 ) -> Json<Value> {
-    todo!(
-        "1. Parse counterparty, verifier, protocolID, keyID from body\n\
-         2. Derive the counterparty linkage key from local share\n\
-         3. Encrypt the linkage key for the verifier\n\
-         4. Return revelation keyring"
-    )
+    Json(json!({ "error": "Key linkage not supported in MPC proxy" }))
 }
 
 /// `POST /revealSpecificKeyLinkage`
@@ -2178,12 +2143,31 @@ pub async fn reveal_specific_key_linkage(
     State(_state): State<Arc<AppState>>,
     Json(_body): Json<Value>,
 ) -> Json<Value> {
-    todo!(
-        "1. Parse counterparty, verifier, protocolID, keyID from body\n\
-         2. Derive the specific key linkage from local share\n\
-         3. Encrypt for the verifier\n\
-         4. Return revelation keyring"
-    )
+    Json(json!({ "error": "Key linkage not supported in MPC proxy" }))
+}
+
+// ─── Chain info ──────────────────────────────────────────────────────────────
+
+/// `POST /getHeight`
+///
+/// Returns the current block height. Stub returns 0 since the MPC proxy
+/// does not track chain state directly.
+pub async fn get_height(
+    State(_state): State<Arc<AppState>>,
+    Json(_body): Json<Value>,
+) -> Json<Value> {
+    Json(json!({ "height": 0 }))
+}
+
+/// `POST /waitForAuthentication`
+///
+/// Waits until the wallet is authenticated. The MPC proxy is always
+/// authenticated once the share is loaded at startup.
+pub async fn wait_for_authentication(
+    State(_state): State<Arc<AppState>>,
+    Json(_body): Json<Value>,
+) -> Json<Value> {
+    Json(json!({ "authenticated": true }))
 }
 
 // ─── Health ─────────────────────────────────────────────────────────────────

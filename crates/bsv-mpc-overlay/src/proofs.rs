@@ -30,12 +30,16 @@
 
 use bsv_mpc_core::types::ParticipationProof;
 use crate::error::OverlayError;
-use crate::types::{FeeSettlement, NodeFeeShare, OverlayProof, MPC_TOPIC};
+use crate::types::{FeeSettlement, NodeFeeShare, OverlayProof};
 
 /// Current proof serialization version.
+/// Used when proof publication is implemented (Beta milestone).
+#[allow(dead_code)]
 const PROOF_VERSION: u8 = 1;
 
 /// Protocol prefix for MPC participation proofs in OP_RETURN.
+/// Used when proof publication is implemented (Beta milestone).
+#[allow(dead_code)]
 const PROOF_PREFIX: &[u8] = b"mpc-proof";
 
 /// Publish a participation proof to the `tm_mpc_signing` overlay topic.
@@ -62,32 +66,15 @@ const PROOF_PREFIX: &[u8] = b"mpc-proof";
 /// Returns `OverlayError::SubmissionRejected` if the overlay rejects the proof
 /// transaction (e.g., invalid signature, duplicate proof).
 pub async fn publish_proof(
-    overlay_url: &str,
-    proof: &ParticipationProof,
+    _overlay_url: &str,
+    _proof: &ParticipationProof,
 ) -> Result<OverlayProof, OverlayError> {
-    todo!(
-        "1. Serialize the proof to OP_RETURN format:\n\
-             let mut data = Vec::new();\n\
-             data.extend_from_slice(PROOF_PREFIX);\n\
-             data.push(PROOF_VERSION);\n\
-             data.extend_from_slice(&proof.session_hash);  // 32 bytes\n\
-             data.extend_from_slice(&proof.agent_identity); // 33 bytes\n\
-             data.push(proof.participating_nodes.len() as u8);\n\
-             data.extend_from_slice(&proof.signing_hash);  // 32 bytes\n\
-             data.extend_from_slice(&proof.timestamp.timestamp().to_be_bytes()); // 8 bytes\n\
-         2. Sign the data with the agent's identity key (ECDSA/secp256k1)\n\
-         3. Append the DER signature to data\n\
-         4. Build OP_RETURN script: OP_FALSE OP_RETURN <data>\n\
-         5. Create a BSV transaction with this output (+ funding input)\n\
-         6. Submit to overlay:\n\
-             POST {overlay_url}/submit\n\
-             Body: {{\n\
-                 \"rawTx\": \"<hex tx>\",\n\
-                 \"topics\": [\"tm_mpc_signing\"]\n\
-             }}\n\
-         7. Parse response for txid\n\
-         8. Return OverlayProof {{ proof, txid, vout: 0, block_height: None }}"
-    )
+    // Proof publication deferred to Beta milestone.
+    // Requires: BRC-31 auth headers, funded UTXO for the OP_RETURN tx,
+    // and a live overlay node accepting tm_mpc_signing submissions.
+    Err(OverlayError::SubmissionRejected(
+        "proof publication deferred to Beta".into(),
+    ))
 }
 
 /// Query participation proofs for a specific node from the overlay.
@@ -105,28 +92,13 @@ pub async fn publish_proof(
 ///
 /// A vector of `OverlayProof` structs, sorted by timestamp ascending.
 pub async fn query_proofs(
-    overlay_url: &str,
-    node_identity: &str,
-    since: Option<chrono::DateTime<chrono::Utc>>,
+    _overlay_url: &str,
+    _node_identity: &str,
+    _since: Option<chrono::DateTime<chrono::Utc>>,
 ) -> Result<Vec<OverlayProof>, OverlayError> {
-    todo!(
-        "1. Build the lookup query:\n\
-             POST {overlay_url}/lookup\n\
-             Body: {{\n\
-                 \"service\": \"ls_mpc_proofs\",\n\
-                 \"query\": {{\n\
-                     \"node\": \"{node_identity}\",\n\
-                     \"since\": \"<since_iso8601>\"  // optional\n\
-                 }}\n\
-             }}\n\
-         2. Parse the response as a list of UTXO references\n\
-         3. For each UTXO, fetch the raw transaction\n\
-         4. Parse the OP_RETURN output to extract the ParticipationProof\n\
-         5. Verify the proof signature against the node's identity key\n\
-         6. Construct OverlayProof with txid and vout\n\
-         7. Sort by timestamp ascending\n\
-         8. Return the list"
-    )
+    // Proof querying deferred to Beta milestone.
+    // Returns empty results until overlay lookup integration is complete.
+    Ok(vec![])
 }
 
 /// Count participation proofs for multiple nodes over an epoch.
@@ -147,21 +119,17 @@ pub async fn query_proofs(
 /// A vector of (identity_key, proof_count) pairs. Nodes with zero proofs
 /// in the epoch are included with count 0.
 pub async fn count_proofs_by_node(
-    overlay_url: &str,
+    _overlay_url: &str,
     node_identities: &[String],
-    epoch_start: chrono::DateTime<chrono::Utc>,
-    epoch_end: chrono::DateTime<chrono::Utc>,
+    _epoch_start: chrono::DateTime<chrono::Utc>,
+    _epoch_end: chrono::DateTime<chrono::Utc>,
 ) -> Result<Vec<(String, u64)>, OverlayError> {
-    todo!(
-        "1. For each node_identity in node_identities:\n\
-             a. query_proofs(overlay_url, identity, Some(epoch_start)).await?\n\
-             b. Filter to proofs where timestamp < epoch_end\n\
-             c. Count the remaining proofs\n\
-         2. Return Vec<(identity_key, count)>\n\
-         \n\
-         Optimization: if the overlay supports batch queries, use a single\n\
-         request instead of N individual queries."
-    )
+    // Proof counting deferred to Beta milestone.
+    // Returns zero counts for all nodes until overlay lookup is implemented.
+    Ok(node_identities
+        .iter()
+        .map(|id| (id.clone(), 0u64))
+        .collect())
 }
 
 /// Calculate fee settlement for an epoch based on participation proof counts.
@@ -227,21 +195,10 @@ pub fn calculate_settlement(
 ///
 /// Returns `OverlayError::InvalidChipToken` if the script is not a valid
 /// MPC participation proof (wrong prefix, version, or invalid signature).
-pub fn parse_proof_from_script(script: &[u8]) -> Result<ParticipationProof, OverlayError> {
-    todo!(
-        "1. Verify script starts with OP_FALSE OP_RETURN\n\
-         2. Extract the data payload after OP_RETURN\n\
-         3. Verify prefix == PROOF_PREFIX (b\"mpc-proof\")\n\
-         4. Verify version == PROOF_VERSION (0x01)\n\
-         5. Extract fields:\n\
-             session_hash: bytes[offset..offset+32]\n\
-             agent_identity: bytes[offset..offset+33]\n\
-             participating_count: varint\n\
-             signing_hash: bytes[offset..offset+32]\n\
-             timestamp: i64 from 8 bytes big-endian\n\
-         6. Extract the DER signature (remaining bytes)\n\
-         7. Verify the signature against agent_identity pubkey\n\
-             over the concatenation of all preceding fields\n\
-         8. Construct and return ParticipationProof"
-    )
+pub fn parse_proof_from_script(_script: &[u8]) -> Result<ParticipationProof, OverlayError> {
+    // Proof parsing deferred to Beta milestone.
+    // Requires full OP_RETURN deserialization and ECDSA signature verification.
+    Err(OverlayError::InvalidProof(
+        "proof script parsing not yet implemented".into(),
+    ))
 }
