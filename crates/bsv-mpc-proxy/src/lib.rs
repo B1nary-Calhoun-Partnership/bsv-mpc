@@ -41,4 +41,5 @@ pub mod error;
 pub mod fee_injector;
 pub mod presign_manager;
 pub mod server;
+pub mod utxo_tracker;
 pub mod wallet_api;

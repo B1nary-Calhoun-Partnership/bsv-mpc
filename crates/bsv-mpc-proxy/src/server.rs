@@ -34,6 +34,7 @@ use crate::bridge::MpcBridge;
 use crate::config::ProxyConfig;
 use crate::fee_injector::FeeInjector;
 use crate::presign_manager::{self, PresignManager};
+use crate::utxo_tracker::UtxoTracker;
 use crate::wallet_api;
 
 /// Shared application state accessible from all route handlers.
@@ -59,6 +60,13 @@ pub struct AppState {
 
     /// Fee injector for adding MPC signing fees to transactions.
     pub fee_injector: FeeInjector,
+
+    /// Local UTXO tracker for outputs controlled by the proxy.
+    ///
+    /// Protected by `RwLock` — reads (listOutputs, balance checks) are
+    /// frequent, writes (createAction spending, internalizeAction adding)
+    /// are less frequent.
+    pub utxo_tracker: Arc<RwLock<UtxoTracker>>,
 }
 
 /// Start the BRC-100 HTTP server.
@@ -86,11 +94,14 @@ pub async fn run(config: ProxyConfig) -> anyhow::Result<()> {
         config.max_presignatures,
     )));
 
+    let utxo_tracker = Arc::new(RwLock::new(UtxoTracker::new()));
+
     let state = Arc::new(AppState {
         config: config.clone(),
         bridge,
         presign_manager: presign_manager.clone(),
         fee_injector,
+        utxo_tracker,
     });
 
     // Background presignature replenishment — runs forever, generating

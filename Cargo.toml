@@ -44,6 +44,7 @@ sha2 = "0.10"
 hmac = "0.12"
 rand = "0.8"
 aes-gcm = "0.10"
+base64 = "0.22"
 
 # Async utilities
 futures = "0.3"

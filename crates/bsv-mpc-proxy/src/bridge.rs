@@ -11,36 +11,31 @@
 //!
 //! ```text
 //! Proxy                          KSS
-//!   │── Round 1: commit ──────────►│
-//!   │◄── Round 1: commit ──────────│
-//!   │── Round 2: decommit ────────►│
-//!   │◄── Round 2: decommit ────────│
-//!   │── Round 3: proof ───────────►│
-//!   │◄── Round 3: proof ───────────│
-//!   │                               │
-//!   │  Presignature stored locally  │
+//!   │── presign/init ────────────►│
+//!   │◄── round_messages ─────────│
+//!   │── presign/round { r1 } ───►│
+//!   │◄── round_messages ─────────│
+//!   │── presign/round { r2 } ───►│
+//!   │◄── { complete } ───────────│
+//!   │                             │
+//!   │  Presignature stored locally│
 //! ```
 //!
-//! ### Online signing (1 round with presignature, 4 rounds without)
+//! ### Online signing (4 rounds without presignature)
 //!
 //! ```text
-//! # With presignature (fast path):
 //! Proxy                          KSS
-//!   │── sign(hash, presig) ───────►│
-//!   │◄── partial_sig ──────────────│
-//!   │  Combine → DER signature     │
-//!
-//! # Without presignature (full protocol):
-//! Proxy                          KSS
-//!   │── Round 1 ──────────────────►│
-//!   │◄── Round 1 ──────────────────│
-//!   │── Round 2 ──────────────────►│
-//!   │◄── Round 2 ──────────────────│
-//!   │── Round 3 ──────────────────►│
-//!   │◄── Round 3 ──────────────────│
-//!   │── Round 4 (sign) ──────────►│
-//!   │◄── partial_sig ──────────────│
-//!   │  Combine → DER signature     │
+//!   │── sign/init ──────────────►│
+//!   │◄── { round_message: R1 } ─│
+//!   │── sign/round { R1 } ──────►│  (proxy sends its R1)
+//!   │◄── { round_message: R2 } ─│
+//!   │── sign/round { R2 } ──────►│
+//!   │◄── { round_message: R3 } ─│
+//!   │── sign/round { R3 } ──────►│
+//!   │◄── { round_message: R4 } ─│
+//!   │── sign/round { R4 } ──────►│
+//!   │◄── { complete, signature } │
+//!   │  Combine → DER signature   │
 //! ```
 //!
 //! ## Security properties
@@ -53,159 +48,548 @@
 //!   signing and cannot be reused.
 
 use crate::config::ProxyConfig;
+use bsv_mpc_core::error::MpcError;
+use bsv_mpc_core::presigning::{PresigningManager, PresigningRoundResult};
+use bsv_mpc_core::signing::{SigningCoordinator, SigningRoundResult};
 use bsv_mpc_core::types::*;
+use serde::{Deserialize, Serialize};
+
+// ============================================================================
+// KSS HTTP API types (compatible with bsv-mpc-worker::api)
+// ============================================================================
+
+/// Request body for `POST /sign/init`.
+#[derive(Serialize, Deserialize, Debug)]
+struct SignInitRequest {
+    /// BRC-31 identity key of the requesting agent (33-byte hex).
+    agent_id: String,
+    /// The MPC session ID (from DKG completion).
+    session_id: String,
+    /// SHA-256d sighash to sign (32 bytes, hex-encoded).
+    sighash: String,
+    /// Whether to use a presignature for single-round signing.
+    use_presignature: bool,
+}
+
+/// Response from `POST /sign/init`.
+#[derive(Serialize, Deserialize, Debug)]
+struct SignInitResponse {
+    /// Ephemeral signing session identifier.
+    signing_session_id: String,
+    /// KSS's round 1 message.
+    round_message: RoundMessage,
+    /// Whether a presignature was consumed.
+    using_presignature: bool,
+    /// Total rounds expected.
+    total_rounds: u8,
+}
+
+/// Request body for `POST /sign/round`.
+#[derive(Serialize, Deserialize, Debug)]
+struct SignRoundRequest {
+    /// The signing session ID from `/sign/init`.
+    signing_session_id: String,
+    /// The proxy's round message.
+    round_message: RoundMessage,
+}
+
+/// Response from `POST /sign/round`.
+#[derive(Serialize, Deserialize, Debug)]
+struct SignRoundResponse {
+    /// The signing session ID.
+    signing_session_id: String,
+    /// KSS's response message (None when complete).
+    round_message: Option<RoundMessage>,
+    /// Whether signing is now complete.
+    complete: bool,
+}
+
+/// Request body for `POST /presign/init`.
+#[derive(Serialize, Deserialize, Debug)]
+struct PresignInitRequest {
+    /// BRC-31 identity key of the requesting agent.
+    agent_id: String,
+    /// The MPC session ID (from DKG completion).
+    session_id: String,
+    /// Number of presignatures to generate (always 1 for bridge).
+    count: u16,
+}
+
+/// Response from `POST /presign/init`.
+#[derive(Serialize, Deserialize, Debug)]
+struct PresignInitResponse {
+    /// Presigning session identifier.
+    presign_session_id: String,
+    /// KSS's round 1 messages.
+    round_messages: Vec<RoundMessage>,
+    /// Total rounds for presigning (always 3).
+    total_rounds: u8,
+}
+
+/// Request body for `POST /presign/round`.
+#[derive(Serialize, Deserialize, Debug)]
+struct PresignRoundRequest {
+    /// The presigning session ID from `/presign/init`.
+    presign_session_id: String,
+    /// The proxy's round messages.
+    round_messages: Vec<RoundMessage>,
+}
+
+/// Response from `POST /presign/round`.
+#[derive(Serialize, Deserialize, Debug)]
+struct PresignRoundResponse {
+    /// The presigning session ID.
+    presign_session_id: String,
+    /// KSS's response messages (None when complete).
+    round_messages: Option<Vec<RoundMessage>>,
+    /// Whether presigning is complete.
+    complete: bool,
+}
+
+// ============================================================================
+// Hex utilities
+// ============================================================================
+
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn hex_decode(hex: &str) -> std::result::Result<Vec<u8>, MpcError> {
+    if hex.len() % 2 != 0 {
+        return Err(MpcError::Protocol("hex string has odd length".into()));
+    }
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| {
+            u8::from_str_radix(&hex[i..i + 2], 16)
+                .map_err(|e| MpcError::Protocol(format!("invalid hex at position {i}: {e}")))
+        })
+        .collect()
+}
+
+// ============================================================================
+// HTTP helper
+// ============================================================================
+
+/// POST a JSON request to the KSS and deserialize the response.
+///
+/// Called from within `spawn_blocking` via `handle.block_on`.
+fn kss_post<Req: Serialize, Resp: serde::de::DeserializeOwned>(
+    handle: &tokio::runtime::Handle,
+    client: &reqwest::Client,
+    url: &str,
+    body: &Req,
+) -> std::result::Result<Resp, MpcError> {
+    handle.block_on(async {
+        // TODO: Add BRC-31 Authrite headers for KSS authentication
+        let resp = client
+            .post(url)
+            .json(body)
+            .send()
+            .await
+            .map_err(|e| MpcError::Protocol(format!("KSS request to {url} failed: {e}")))?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body_text = resp.text().await.unwrap_or_default();
+            return Err(MpcError::Protocol(format!(
+                "KSS returned {status} from {url}: {body_text}"
+            )));
+        }
+
+        resp.json::<Resp>()
+            .await
+            .map_err(|e| MpcError::Protocol(format!("KSS response parse error from {url}: {e}")))
+    })
+}
+
+// ============================================================================
+// MpcBridge
+// ============================================================================
 
 /// Bridges BRC-100 wallet calls to MPC threshold signing operations.
 ///
 /// Created once at startup from the proxy configuration. Holds the decrypted
-/// share in memory for the lifetime of the process.
+/// share in memory for the lifetime of the process. Signing and presigning
+/// operations create ephemeral coordinators that drive the multi-round
+/// protocols via HTTP to the KSS.
 pub struct MpcBridge {
     /// URL of the Key Share Service (the other MPC party).
     kss_url: String,
 
-    /// This party's decrypted key share.
+    /// This party's key share (ciphertext contains raw key share JSON).
     ///
-    /// Loaded from `config.share_path` and decrypted with `config.encryption_key`
-    /// (or a DKG-derived key) during `new()`. The share is a secp256k1 scalar
-    /// that, combined with the KSS's share, produces the joint signing key.
-    #[allow(dead_code)]
+    /// Note: Despite the name, the `ciphertext` field in `EncryptedShare`
+    /// holds raw serialized cggmp24 key share JSON — it is NOT AES-encrypted.
+    /// File-level encryption (if enabled) wraps the entire `DkgResult`.
     share: EncryptedShare,
 
     /// Joint public key computed during the DKG ceremony.
-    ///
-    /// This is the standard compressed secp256k1 public key that appears on-chain
-    /// in P2PKH outputs. It can be computed from either party's share + the other
-    /// party's public share component, or from the DKG transcript.
     joint_key: JointPublicKey,
 
     /// HTTP client for communicating with the KSS.
-    ///
-    /// Uses `reqwest` with TLS. The KSS authenticates requests using the
-    /// session ID established during initialization.
     client: reqwest::Client,
 
     /// Session identifier linking this proxy to a specific KSS session.
-    ///
-    /// Established during `new()` when the proxy registers with the KSS.
-    /// All subsequent signing requests include this session ID.
     session_id: SessionId,
+
+    /// Party indices participating in signing ceremonies.
+    /// For 2-of-2: `[0, 1]`. Derived from threshold config at init.
+    participants: Vec<u16>,
+
+    /// Agent identity (hex-encoded compressed joint public key).
+    /// Used for BRC-31 auth with the KSS.
+    agent_id: String,
 }
 
 impl MpcBridge {
     /// Initialize the MPC bridge.
     ///
-    /// This performs the following steps:
-    /// 1. Read the encrypted share file from `config.share_path`.
-    /// 2. Decrypt the share using `config.encryption_key` (or DKG-derived key).
-    /// 3. Validate the share (Feldman commitment check).
-    /// 4. Extract the joint public key from the share metadata.
-    /// 5. Establish a session with the KSS at `config.kss_url`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - The share file does not exist or cannot be read.
-    /// - Decryption fails (wrong key or corrupted file).
-    /// - Share validation fails (tampering detected).
-    /// - The KSS is unreachable or rejects the session.
+    /// 1. Reads the share file from `config.share_path` (JSON `DkgResult`).
+    /// 2. If `config.encryption_key` is set, decrypts the file first.
+    /// 3. Validates the share structure.
+    /// 4. Extracts the joint public key and session ID.
+    /// 5. Determines signing participants from the threshold config.
+    /// 6. Creates an HTTP client for KSS communication.
     pub async fn new(config: &ProxyConfig) -> anyhow::Result<Self> {
-        todo!(
-            "1. Read encrypted share from config.share_path\n\
-             2. Determine decryption key:\n\
-                a. If config.encryption_key is Some, decode hex → 32-byte AES key\n\
-                b. Otherwise, derive key from DKG session metadata in share header\n\
-             3. Decrypt share using AES-256-GCM (bsv_mpc_core::share::decrypt)\n\
-             4. Validate share against Feldman commitments\n\
-             5. Extract JointPublicKey from share metadata\n\
-             6. Create reqwest::Client with TLS\n\
-             7. POST to {kss_url}/session/init with our share's public component\n\
-             8. Receive SessionId from KSS\n\
-             9. Return initialized MpcBridge"
-        )
+        // 1. Read share file
+        let file_bytes = tokio::fs::read(&config.share_path).await.map_err(|e| {
+            anyhow::anyhow!(
+                "failed to read share file '{}': {e}",
+                config.share_path
+            )
+        })?;
+
+        // 2. Parse DkgResult (optionally decrypt first)
+        let dkg_result: DkgResult = if let Some(ref enc_key_hex) = config.encryption_key {
+            let key_bytes = hex_decode(enc_key_hex)
+                .map_err(|e| anyhow::anyhow!("invalid encryption key hex: {e}"))?;
+            if key_bytes.len() != 32 {
+                anyhow::bail!(
+                    "encryption key must be 32 bytes (64 hex chars), got {} bytes",
+                    key_bytes.len()
+                );
+            }
+            let mut key = [0u8; 32];
+            key.copy_from_slice(&key_bytes);
+
+            // File is a JSON EncryptedShare envelope wrapping encrypted DkgResult
+            let encrypted: EncryptedShare = serde_json::from_slice(&file_bytes)
+                .map_err(|e| anyhow::anyhow!("failed to parse encrypted share file: {e}"))?;
+            let plaintext = bsv_mpc_core::share::decrypt_share(&encrypted, &key)
+                .map_err(|e| anyhow::anyhow!("failed to decrypt share: {e}"))?;
+            serde_json::from_slice(&plaintext)
+                .map_err(|e| anyhow::anyhow!("failed to parse decrypted DkgResult: {e}"))?
+        } else {
+            // Plaintext DkgResult JSON
+            serde_json::from_slice(&file_bytes)
+                .map_err(|e| anyhow::anyhow!("failed to parse share file as DkgResult: {e}"))?
+        };
+
+        // 3. Validate share structure
+        bsv_mpc_core::share::validate_encrypted_share(&dkg_result.share)
+            .map_err(|e| anyhow::anyhow!("share validation failed: {e}"))?;
+
+        // 4. Determine participants
+        let tc = dkg_result.share.config;
+        let my_index = dkg_result.share.share_index.0;
+        let participants: Vec<u16> = if tc.threshold == tc.parties {
+            // All parties must participate (e.g., 2-of-2)
+            (0..tc.parties).collect()
+        } else {
+            // Need `threshold` parties: ourselves + first (threshold-1) others
+            // TODO: For multi-KSS setups, allow configuring which parties to sign with
+            let mut parts: Vec<u16> = (0..tc.parties)
+                .filter(|&i| i != my_index)
+                .take((tc.threshold - 1) as usize)
+                .collect();
+            parts.push(my_index);
+            parts.sort();
+            parts
+        };
+
+        let agent_id = hex_encode(&dkg_result.joint_key.compressed);
+
+        tracing::info!(
+            session_id = %dkg_result.session_id,
+            share_index = my_index,
+            threshold = tc.threshold,
+            parties = tc.parties,
+            participants = ?participants,
+            address = %dkg_result.joint_key.address,
+            kss_url = %config.kss_url,
+            "MPC bridge initialized"
+        );
+
+        // 5. Create HTTP client
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .map_err(|e| anyhow::anyhow!("failed to create HTTP client: {e}"))?;
+
+        // 6. Optional: check KSS health (non-blocking, don't fail on error)
+        let health_url = format!("{}/health", config.kss_url);
+        match client.get(&health_url).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                tracing::info!("KSS health check passed");
+            }
+            Ok(resp) => {
+                tracing::warn!(
+                    status = %resp.status(),
+                    "KSS health check returned non-OK — signing will fail until KSS is available"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "KSS unreachable — signing will fail until KSS is available"
+                );
+            }
+        }
+
+        Ok(Self {
+            kss_url: config.kss_url.clone(),
+            share: dkg_result.share,
+            joint_key: dkg_result.joint_key,
+            client,
+            session_id: dkg_result.session_id,
+            participants,
+            agent_id,
+        })
     }
 
     /// Sign a 32-byte message hash using 2-party threshold ECDSA.
     ///
-    /// If a `presignature` is provided, this performs single-round online
-    /// signing (~50-100ms). Without a presignature, it runs the full 4-round
-    /// interactive protocol (~300-500ms).
+    /// Creates an ephemeral `SigningCoordinator`, drives it through the 4-round
+    /// interactive protocol by exchanging messages with the KSS over HTTP.
     ///
-    /// The returned `SigningResult` contains:
-    /// - `signature`: DER-encoded ECDSA signature
-    /// - `participation_proof`: BRC-18 data for on-chain fee distribution
+    /// The coordinator runs in `spawn_blocking` because its internal SM bridge
+    /// uses synchronous `mpsc` channels. HTTP requests use `handle.block_on`
+    /// to bridge back to async.
     ///
     /// # Arguments
     ///
     /// - `message_hash` — The 32-byte SHA-256d sighash to sign.
-    /// - `presignature` — Optional presignature for single-round signing.
-    ///
-    /// # Errors
-    ///
-    /// - `MpcError::Signing` — Protocol error (invalid partial sig, abort).
-    /// - `ProxyError::KssError` — Network error communicating with KSS.
+    /// - `presignature` — Currently unused (presigned path not yet in coordinator).
     pub async fn sign(
         &self,
         message_hash: &[u8; 32],
         presignature: Option<Presignature>,
     ) -> bsv_mpc_core::error::Result<SigningResult> {
-        let _ = (message_hash, presignature);
-        todo!(
-            "If presignature is Some:\n\
-               1. Compute local partial signature using presignature + message_hash\n\
-               2. POST to {{kss_url}}/sign/online with:\n\
-                  - session_id\n\
-                  - presignature_id (from the presignature)\n\
-                  - partial_sig (our partial signature)\n\
-                  - message_hash\n\
-               3. Receive KSS's partial signature\n\
-               4. Combine partial signatures → full ECDSA signature\n\
-               5. Verify signature against joint_key and message_hash\n\
-               6. DER-encode and return SigningResult\n\
-             \n\
-             If presignature is None (full protocol):\n\
-               1. Round 1: Generate and exchange commitments with KSS\n\
-                  POST {{kss_url}}/sign/round/1 with commitment\n\
-               2. Round 2: Exchange decommitments\n\
-                  POST {{kss_url}}/sign/round/2 with decommitment\n\
-               3. Round 3: Exchange ZK proofs\n\
-                  POST {{kss_url}}/sign/round/3 with proof\n\
-               4. Round 4: Exchange partial signatures\n\
-                  POST {{kss_url}}/sign/round/4 with partial_sig + message_hash\n\
-               5. Combine → verify → DER-encode → return SigningResult"
-        )
+        let share = self.share.clone();
+        let session_id = self.session_id.clone();
+        let threshold_config = share.config;
+        let participants = self.participants.clone();
+        let kss_url = self.kss_url.clone();
+        let client = self.client.clone();
+        let agent_id = self.agent_id.clone();
+        let hash = *message_hash;
+
+        let handle = tokio::runtime::Handle::current();
+
+        tokio::task::spawn_blocking(move || {
+            // Create coordinator for this signing operation
+            let mut coord = SigningCoordinator::new(
+                session_id.clone(),
+                share,
+                threshold_config,
+                participants,
+            );
+
+            // Initialize signing → get proxy's Round 1 messages
+            let proxy_msgs = coord.sign(&hash, presignature)?;
+
+            tracing::debug!(
+                round = 1,
+                outgoing = proxy_msgs.len(),
+                "signing: initialized, starting KSS session"
+            );
+
+            // Start KSS signing session → get KSS's Round 1 message
+            let sign_init_url = format!("{}/sign/init", kss_url);
+            let init_resp: SignInitResponse = kss_post(
+                &handle,
+                &client,
+                &sign_init_url,
+                &SignInitRequest {
+                    agent_id,
+                    session_id: session_id.0.clone(),
+                    sighash: hex_encode(&hash),
+                    use_presignature: false,
+                },
+            )?;
+
+            tracing::debug!(
+                signing_session = %init_resp.signing_session_id,
+                total_rounds = init_resp.total_rounds,
+                "signing: KSS session started"
+            );
+
+            let signing_session_id = init_resp.signing_session_id;
+            let sign_round_url = format!("{}/sign/round", kss_url);
+
+            // State: proxy has proxy_R1 (to send), KSS returned KSS_R1 (to process)
+            let mut kss_msg = init_resp.round_message;
+            let mut proxy_msg = proxy_msgs
+                .into_iter()
+                .next()
+                .ok_or_else(|| MpcError::Signing("coordinator produced no initial messages".into()))?;
+
+            loop {
+                // Exchange: send proxy's current message to KSS, get KSS's next message
+                let round_resp: SignRoundResponse = kss_post(
+                    &handle,
+                    &client,
+                    &sign_round_url,
+                    &SignRoundRequest {
+                        signing_session_id: signing_session_id.clone(),
+                        round_message: proxy_msg,
+                    },
+                )?;
+
+                // Process: feed KSS's previous message to coordinator
+                match coord.process_round(vec![kss_msg])? {
+                    SigningRoundResult::NextRound(next_proxy_msgs) => {
+                        tracing::debug!(
+                            round = coord.current_round(),
+                            outgoing = next_proxy_msgs.len(),
+                            kss_complete = round_resp.complete,
+                            "signing: round complete"
+                        );
+
+                        if round_resp.complete {
+                            return Err(MpcError::Signing(
+                                "KSS completed but coordinator has more rounds".into(),
+                            ));
+                        }
+
+                        kss_msg = round_resp.round_message.ok_or_else(|| {
+                            MpcError::Signing(
+                                "KSS returned no round message but signing is not complete".into(),
+                            )
+                        })?;
+
+                        proxy_msg = next_proxy_msgs.into_iter().next().ok_or_else(|| {
+                            MpcError::Signing(
+                                "coordinator produced no messages for next round".into(),
+                            )
+                        })?;
+                    }
+                    SigningRoundResult::Complete(result) => {
+                        tracing::info!("signing: complete");
+                        return Ok(result);
+                    }
+                }
+            }
+        })
+        .await
+        .map_err(|e| MpcError::Signing(format!("signing task panicked: {e}")))?
     }
 
     /// Run the presigning protocol to generate a reusable presignature.
     ///
-    /// Presignatures are generated during idle time by the background
-    /// replenishment task. Each presignature enables single-round online
-    /// signing for one future signature request.
+    /// Creates an ephemeral `PresigningManager` with pool_size=1 and drives
+    /// the 3-round offline protocol by exchanging messages with the KSS.
     ///
-    /// The presigning protocol is 3 rounds:
-    /// 1. Commit — Exchange Paillier ciphertexts and commitments.
-    /// 2. Decommit — Reveal and verify commitments.
-    /// 3. Proof — Exchange ZK proofs of correctness.
-    ///
-    /// # Errors
-    ///
-    /// - `MpcError::Signing` — Protocol error during presigning.
-    /// - `ProxyError::KssError` — Network error communicating with KSS.
+    /// Called by the background replenishment task during idle time.
     pub async fn presign(&self) -> bsv_mpc_core::error::Result<Presignature> {
-        todo!(
-            "1. Round 1 (commit):\n\
-                a. Generate local presigning commitment\n\
-                b. POST to {{kss_url}}/presign/round/1 with commitment\n\
-                c. Receive KSS commitment\n\
-             2. Round 2 (decommit):\n\
-                a. Generate decommitment from Round 1 state\n\
-                b. POST to {{kss_url}}/presign/round/2 with decommitment\n\
-                c. Receive KSS decommitment, verify against Round 1 commitment\n\
-             3. Round 3 (proof):\n\
-                a. Generate ZK proof of correctness\n\
-                b. POST to {{kss_url}}/presign/round/3 with proof\n\
-                c. Receive KSS proof, verify\n\
-             4. Combine into Presignature and return"
-        )
+        let share = self.share.clone();
+        let session_id = self.session_id.clone();
+        let participants = self.participants.clone();
+        let kss_url = self.kss_url.clone();
+        let client = self.client.clone();
+        let agent_id = self.agent_id.clone();
+
+        let handle = tokio::runtime::Handle::current();
+
+        tokio::task::spawn_blocking(move || {
+            // Create a manager with pool_size=1 — we want exactly one presignature
+            let mut mgr = PresigningManager::new(session_id.clone(), share, participants, 1);
+
+            // Initialize presigning → get proxy's initial messages
+            let proxy_msgs = mgr.init_generate()?;
+
+            tracing::debug!(
+                outgoing = proxy_msgs.len(),
+                "presigning: initialized, starting KSS session"
+            );
+
+            // Start KSS presigning session → get KSS's initial messages
+            let presign_init_url = format!("{}/presign/init", kss_url);
+            let init_resp: PresignInitResponse = kss_post(
+                &handle,
+                &client,
+                &presign_init_url,
+                &PresignInitRequest {
+                    agent_id,
+                    session_id: session_id.0.clone(),
+                    count: 1,
+                },
+            )?;
+
+            tracing::debug!(
+                presign_session = %init_resp.presign_session_id,
+                total_rounds = init_resp.total_rounds,
+                kss_messages = init_resp.round_messages.len(),
+                "presigning: KSS session started"
+            );
+
+            let presign_session_id = init_resp.presign_session_id;
+            let presign_round_url = format!("{}/presign/round", kss_url);
+
+            // State: proxy has proxy_R1 messages, KSS returned KSS_R1 messages
+            let mut kss_msgs = init_resp.round_messages;
+            let mut proxy_wire_msgs = proxy_msgs;
+
+            loop {
+                // Exchange: send proxy messages to KSS, get next KSS messages
+                let round_resp: PresignRoundResponse = kss_post(
+                    &handle,
+                    &client,
+                    &presign_round_url,
+                    &PresignRoundRequest {
+                        presign_session_id: presign_session_id.clone(),
+                        round_messages: proxy_wire_msgs,
+                    },
+                )?;
+
+                // Process: feed KSS's previous messages to manager
+                match mgr.process_generate_round(kss_msgs)? {
+                    PresigningRoundResult::NextRound(next_msgs) => {
+                        tracing::debug!(
+                            outgoing = next_msgs.len(),
+                            kss_complete = round_resp.complete,
+                            "presigning: round complete"
+                        );
+
+                        if round_resp.complete {
+                            return Err(MpcError::Protocol(
+                                "KSS completed presigning but manager has more rounds".into(),
+                            ));
+                        }
+
+                        kss_msgs = round_resp.round_messages.ok_or_else(|| {
+                            MpcError::Protocol(
+                                "KSS returned no messages but presigning is not complete".into(),
+                            )
+                        })?;
+                        proxy_wire_msgs = next_msgs;
+                    }
+                    PresigningRoundResult::Complete => {
+                        // Presignature added to manager's internal pool — take it
+                        let presig = mgr.take().ok_or_else(|| {
+                            MpcError::Protocol(
+                                "presigning completed but no presignature in pool".into(),
+                            )
+                        })?;
+                        tracing::info!(presig_id = %presig.id, "presigning: complete");
+                        return Ok(presig);
+                    }
+                }
+            }
+        })
+        .await
+        .map_err(|e| MpcError::Protocol(format!("presigning task panicked: {e}")))?
     }
 
     /// Get the joint public key.
@@ -216,7 +600,7 @@ impl MpcBridge {
         &self.joint_key
     }
 
-    /// Get the current KSS session ID.
+    /// Get the current MPC session ID.
     pub fn session_id(&self) -> &SessionId {
         &self.session_id
     }
@@ -224,5 +608,268 @@ impl MpcBridge {
     /// Get the KSS URL.
     pub fn kss_url(&self) -> &str {
         &self.kss_url
+    }
+
+    /// Get the agent identity (hex-encoded compressed joint public key).
+    pub fn agent_id(&self) -> &str {
+        &self.agent_id
+    }
+
+    /// Create a bridge with a known joint key for testing.
+    /// No KSS connection is established — only `joint_public_key()` is usable.
+    #[cfg(test)]
+    pub fn new_for_test(joint_key: JointPublicKey) -> Self {
+        let agent_id = hex_encode(&joint_key.compressed);
+        Self {
+            kss_url: "http://localhost:9999".into(),
+            share: EncryptedShare {
+                nonce: vec![0u8; 12],
+                ciphertext: vec![0u8; 1],
+                session_id: SessionId("test".into()),
+                share_index: ShareIndex(0),
+                config: ThresholdConfig {
+                    threshold: 2,
+                    parties: 2,
+                },
+            },
+            joint_key,
+            client: reqwest::Client::new(),
+            session_id: SessionId("test".into()),
+            participants: vec![0, 1],
+            agent_id,
+        }
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hex_encode_empty() {
+        assert_eq!(hex_encode(&[]), "");
+    }
+
+    #[test]
+    fn hex_encode_known_values() {
+        assert_eq!(hex_encode(&[0x00]), "00");
+        assert_eq!(hex_encode(&[0xff]), "ff");
+        assert_eq!(hex_encode(&[0xde, 0xad, 0xbe, 0xef]), "deadbeef");
+        assert_eq!(
+            hex_encode(&[0u8; 32]),
+            "0000000000000000000000000000000000000000000000000000000000000000"
+        );
+    }
+
+    #[test]
+    fn hex_decode_known_values() {
+        assert_eq!(hex_decode("").unwrap(), Vec::<u8>::new());
+        assert_eq!(hex_decode("00").unwrap(), vec![0x00]);
+        assert_eq!(hex_decode("ff").unwrap(), vec![0xff]);
+        assert_eq!(hex_decode("deadbeef").unwrap(), vec![0xde, 0xad, 0xbe, 0xef]);
+        assert_eq!(hex_decode("FF").unwrap(), vec![0xff]);
+    }
+
+    #[test]
+    fn hex_decode_odd_length() {
+        assert!(hex_decode("abc").is_err());
+    }
+
+    #[test]
+    fn hex_decode_invalid_chars() {
+        assert!(hex_decode("zz").is_err());
+    }
+
+    #[test]
+    fn hex_roundtrip() {
+        let original = [0xde, 0xad, 0xbe, 0xef, 0xca, 0xfe];
+        let encoded = hex_encode(&original);
+        let decoded = hex_decode(&encoded).unwrap();
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn sign_init_request_serializes() {
+        let req = SignInitRequest {
+            agent_id: "02abc123".into(),
+            session_id: "sess-1".into(),
+            sighash: "ff".repeat(32),
+            use_presignature: false,
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["agent_id"], "02abc123");
+        assert_eq!(json["session_id"], "sess-1");
+        assert_eq!(json["use_presignature"], false);
+    }
+
+    #[test]
+    fn sign_round_response_deserializes_with_message() {
+        let json = serde_json::json!({
+            "signing_session_id": "sign-1",
+            "round_message": {
+                "session_id": "sess-1",
+                "round": 1,
+                "from": 0,
+                "to": null,
+                "payload": [1, 2, 3]
+            },
+            "complete": false
+        });
+        let resp: SignRoundResponse = serde_json::from_value(json).unwrap();
+        assert_eq!(resp.signing_session_id, "sign-1");
+        assert!(!resp.complete);
+        assert!(resp.round_message.is_some());
+    }
+
+    #[test]
+    fn sign_round_response_deserializes_complete() {
+        let json = serde_json::json!({
+            "signing_session_id": "sign-1",
+            "round_message": null,
+            "complete": true
+        });
+        let resp: SignRoundResponse = serde_json::from_value(json).unwrap();
+        assert!(resp.complete);
+        assert!(resp.round_message.is_none());
+    }
+
+    #[test]
+    fn presign_round_response_deserializes() {
+        let json = serde_json::json!({
+            "presign_session_id": "ps-1",
+            "round_messages": [{
+                "session_id": "sess-1",
+                "round": 1,
+                "from": 0,
+                "to": null,
+                "payload": [10, 20]
+            }],
+            "complete": false
+        });
+        let resp: PresignRoundResponse = serde_json::from_value(json).unwrap();
+        assert_eq!(resp.presign_session_id, "ps-1");
+        assert!(!resp.complete);
+        assert!(resp.round_messages.is_some());
+        assert_eq!(resp.round_messages.unwrap().len(), 1);
+    }
+
+    /// Test MpcBridge::new() with a plaintext DkgResult share file.
+    #[tokio::test]
+    async fn new_loads_plaintext_share() {
+        let dkg_result = DkgResult {
+            joint_key: JointPublicKey {
+                compressed: vec![
+                    0x02, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a,
+                    0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15,
+                    0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20,
+                ],
+                address: "1TestAddress".into(),
+            },
+            share: EncryptedShare {
+                nonce: vec![0u8; 12],
+                ciphertext: vec![1, 2, 3, 4, 5],
+                session_id: SessionId("test-session-123".into()),
+                share_index: ShareIndex(1),
+                config: ThresholdConfig {
+                    threshold: 2,
+                    parties: 2,
+                },
+            },
+            session_id: SessionId("test-session-123".into()),
+        };
+
+        let dir = std::env::temp_dir();
+        let share_path = dir.join("bridge_test_share.json");
+        let json = serde_json::to_vec_pretty(&dkg_result).unwrap();
+        tokio::fs::write(&share_path, &json).await.unwrap();
+
+        let config = ProxyConfig {
+            port: 3322,
+            kss_url: "http://localhost:9999".into(), // won't actually connect
+            share_path: share_path.to_string_lossy().to_string(),
+            fee_per_signing: 0,
+            fee_addresses: vec![],
+            fee_threshold: None,
+            max_presignatures: 5,
+            encryption_key: None,
+        };
+
+        let bridge = MpcBridge::new(&config).await.unwrap();
+        assert_eq!(bridge.joint_public_key().address, "1TestAddress");
+        assert_eq!(bridge.session_id().0, "test-session-123");
+        assert_eq!(bridge.kss_url(), "http://localhost:9999");
+        assert_eq!(bridge.participants, vec![0, 1]);
+
+        // Cleanup
+        let _ = tokio::fs::remove_file(&share_path).await;
+    }
+
+    /// Test MpcBridge::new() with a missing share file.
+    #[tokio::test]
+    async fn new_fails_on_missing_file() {
+        let config = ProxyConfig {
+            port: 3322,
+            kss_url: "http://localhost:9999".into(),
+            share_path: "/tmp/nonexistent_share_abc123.json".into(),
+            fee_per_signing: 0,
+            fee_addresses: vec![],
+            fee_threshold: None,
+            max_presignatures: 5,
+            encryption_key: None,
+        };
+
+        let result = MpcBridge::new(&config).await;
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.err().unwrap());
+        assert!(err_msg.contains("failed to read share file"));
+    }
+
+    /// Test that participants are derived correctly for different configs.
+    #[tokio::test]
+    async fn new_derives_participants_for_threshold() {
+        // 2-of-3 with share_index=2 → participants should be [0, 2]
+        let dkg_result = DkgResult {
+            joint_key: JointPublicKey {
+                compressed: vec![0x02; 33],
+                address: "1Test".into(),
+            },
+            share: EncryptedShare {
+                nonce: vec![0u8; 12],
+                ciphertext: vec![1, 2, 3],
+                session_id: SessionId("test".into()),
+                share_index: ShareIndex(2),
+                config: ThresholdConfig {
+                    threshold: 2,
+                    parties: 3,
+                },
+            },
+            session_id: SessionId("test".into()),
+        };
+
+        let dir = std::env::temp_dir();
+        let share_path = dir.join("bridge_test_2of3.json");
+        let json = serde_json::to_vec(&dkg_result).unwrap();
+        tokio::fs::write(&share_path, &json).await.unwrap();
+
+        let config = ProxyConfig {
+            port: 3322,
+            kss_url: "http://localhost:9999".into(),
+            share_path: share_path.to_string_lossy().to_string(),
+            fee_per_signing: 0,
+            fee_addresses: vec![],
+            fee_threshold: None,
+            max_presignatures: 5,
+            encryption_key: None,
+        };
+
+        let bridge = MpcBridge::new(&config).await.unwrap();
+        // For 2-of-3 with index 2: first non-self index is 0, so [0, 2]
+        assert_eq!(bridge.participants, vec![0, 2]);
+
+        let _ = tokio::fs::remove_file(&share_path).await;
     }
 }
