@@ -119,6 +119,14 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             }
             api::handle_presign_round(req, &ctx).await
         })
+        // ── Partial ECDH endpoint (BRC-31 protected) ───────────────
+        .post_async("/ecdh", |req, ctx| async move {
+            let config = auth::AuthConfig::from_env(&ctx.env)?;
+            if let Err(resp) = auth::verify_or_allow(&req, &config) {
+                return Ok(resp);
+            }
+            api::handle_ecdh(req, &ctx).await
+        })
         // ── Read-only endpoints (no auth required) ──────────────────
         .get_async("/health", |_req, ctx| async move {
             api::handle_health(&ctx).await

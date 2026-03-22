@@ -37,8 +37,7 @@ use axum::extract::State;
 use axum::Json;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use bsv::primitives::ec::{PublicKey, Signature};
-use bsv_mpc_core::hd::{compute_brc42_hmac, compute_invoice, derive_child_pubkey};
-use bsv_mpc_core::JointPublicKey;
+
 use hmac::{Hmac, Mac};
 use rand::rngs::OsRng;
 use rand::RngCore;
@@ -81,51 +80,21 @@ fn parse_protocol_params(body: &Value) -> Result<(u8, String, String, String), S
 /// Derive a 32-byte symmetric key for a given BRC-42 derivation path.
 ///
 /// For "anyone" counterparty: purely local (0 MPC round-trips).
-///   shared_secret = root_pubkey, key = HMAC-SHA256(compressed(root_pub), invoice)
+/// For "self"/"other": 2 partial ECDH rounds with KSS via bridge.
 ///
-/// For "self"/"other": requires bridge.partial_ecdh() (not yet implemented).
-///   These counterparty types need MPC cooperation to compute the ECDH shared
-///   secret, which will be added when bridge.rs is complete.
-///
-/// Pattern from POC 3 (key derivation) and POC 9 (encrypt/decrypt).
-fn derive_symmetric_key(
-    joint_key: &JointPublicKey,
+/// Returns a 32-byte key compatible with BSV SDK's `derive_symmetric_key`.
+/// Proven in POC 3 (key derivation) and POC 9 (encrypt/decrypt).
+async fn derive_symmetric_key(
+    bridge: &crate::bridge::MpcBridge,
     level: u8,
     protocol_name: &str,
     key_id: &str,
     counterparty: &str,
 ) -> Result<[u8; 32], String> {
-    let root_pub = PublicKey::from_bytes(&joint_key.compressed)
-        .map_err(|e| format!("invalid joint key: {}", e))?;
-    let invoice = compute_invoice(level, protocol_name, key_id);
-
-    match counterparty {
-        "anyone" => {
-            // For "anyone": shared_secret = root_pubkey (0 round-trips).
-            // The "anyone" counterparty private key is scalar 1, so
-            // ECDH(anyone_pub, root_priv) = G * root_priv = root_pubkey.
-            // Proven in POC 3, Test 1.
-            Ok(compute_brc42_hmac(&root_pub, &invoice))
-        }
-        "self" => {
-            // TODO: needs bridge.partial_ecdh() — will be added when bridge.rs is done.
-            // For "self": shared_secret = ECDH(root_pub, root_priv) requires MPC cooperation.
-            // Algorithm (from POC 9): 2 partial ECDH rounds with Lagrange interpolation.
-            Err(
-                "counterparty 'self' requires bridge.partial_ecdh() — not yet implemented"
-                    .to_string(),
-            )
-        }
-        _ => {
-            // Counterparty is a hex public key ("other" case).
-            // TODO: needs bridge.partial_ecdh() — will be added when bridge.rs is done.
-            // For "other(pk)": shared_secret = ECDH(other_pub, root_priv) requires MPC cooperation.
-            Err(format!(
-                "counterparty '{}' requires bridge.partial_ecdh() — not yet implemented",
-                counterparty
-            ))
-        }
-    }
+    bridge
+        .derive_symmetric_key(counterparty, level, protocol_name, key_id)
+        .await
+        .map_err(|e| format!("{e}"))
 }
 
 /// Derive the expected BRC-42 child public key for signature verification.
@@ -134,45 +103,19 @@ fn derive_symmetric_key(
 /// `for_self=false`: child = counterparty_pub + G * HMAC(shared_secret, invoice)
 ///
 /// For "anyone" counterparty, both paths are local. For "self"/"other",
-/// shared_secret computation requires bridge.partial_ecdh().
-fn derive_verification_pubkey(
-    joint_key: &JointPublicKey,
+/// shared_secret computation requires bridge.partial_ecdh() (1 MPC round).
+async fn derive_verification_pubkey(
+    bridge: &crate::bridge::MpcBridge,
     level: u8,
     protocol_name: &str,
     key_id: &str,
     counterparty: &str,
     for_self: bool,
 ) -> Result<PublicKey, String> {
-    let root_pub = PublicKey::from_bytes(&joint_key.compressed)
-        .map_err(|e| format!("invalid joint key: {}", e))?;
-    let invoice = compute_invoice(level, protocol_name, key_id);
-
-    match counterparty {
-        "anyone" => {
-            // For "anyone": shared_secret = root_pubkey (no MPC needed)
-            if for_self {
-                // child = root_pub + G * HMAC(root_pub, invoice)
-                derive_child_pubkey(&root_pub, &root_pub, &invoice)
-                    .map_err(|e| format!("key derivation failed: {}", e))
-            } else {
-                // child = anyone_pub + G * HMAC(root_pub, invoice)
-                // anyone_pub = G (generator, private key = 1)
-                let mut one = [0u8; 32];
-                one[31] = 1;
-                let anyone_pub = PublicKey::from_scalar_mul_generator(&one)
-                    .map_err(|e| format!("generator failed: {}", e))?;
-                derive_child_pubkey(&anyone_pub, &root_pub, &invoice)
-                    .map_err(|e| format!("key derivation failed: {}", e))
-            }
-        }
-        "self" => Err(
-            "counterparty 'self' requires bridge.partial_ecdh() — not yet implemented".to_string(),
-        ),
-        _ => Err(format!(
-            "counterparty '{}' requires bridge.partial_ecdh() — not yet implemented",
-            counterparty
-        )),
-    }
+    bridge
+        .derive_child_key(counterparty, level, protocol_name, key_id, for_self)
+        .await
+        .map_err(|e| format!("{e}"))
 }
 
 // ─── Transaction helpers ─────────────────────────────────────────────────────
@@ -553,13 +496,15 @@ pub async fn get_public_key(
 
     // Derive child public key via BRC-42
     match derive_verification_pubkey(
-        state.bridge.joint_public_key(),
+        &state.bridge,
         level,
         &protocol_name,
         &key_id,
         &counterparty,
         for_self,
-    ) {
+    )
+    .await
+    {
         Ok(pk) => Json(json!({ "publicKey": pk.to_hex() })),
         Err(e) => Json(json!({ "error": e })),
     }
@@ -735,13 +680,15 @@ pub async fn verify_signature(
 
     // Derive the expected public key via BRC-42
     let pubkey = match derive_verification_pubkey(
-        state.bridge.joint_public_key(),
+        &state.bridge,
         level,
         &protocol_name,
         &key_id,
         &counterparty,
         for_self,
-    ) {
+    )
+    .await
+    {
         Ok(pk) => pk,
         Err(e) => return Json(json!({ "error": e })),
     };
@@ -1197,12 +1144,14 @@ pub async fn encrypt(
 
     // Derive 32-byte symmetric key via BRC-42
     let sym_key = match derive_symmetric_key(
-        state.bridge.joint_public_key(),
+        &state.bridge,
         level,
         &protocol_name,
         &key_id,
         &counterparty,
-    ) {
+    )
+    .await
+    {
         Ok(key) => key,
         Err(e) => return Json(json!({ "error": e })),
     };
@@ -1275,12 +1224,14 @@ pub async fn decrypt(
 
     // Derive same symmetric key
     let sym_key = match derive_symmetric_key(
-        state.bridge.joint_public_key(),
+        &state.bridge,
         level,
         &protocol_name,
         &key_id,
         &counterparty,
-    ) {
+    )
+    .await
+    {
         Ok(key) => key,
         Err(e) => return Json(json!({ "error": e })),
     };
@@ -1334,12 +1285,14 @@ pub async fn create_hmac(
 
     // Derive HMAC key via BRC-42 (same derivation path as encrypt/decrypt)
     let hmac_key = match derive_symmetric_key(
-        state.bridge.joint_public_key(),
+        &state.bridge,
         level,
         &protocol_name,
         &key_id,
         &counterparty,
-    ) {
+    )
+    .await
+    {
         Ok(key) => key,
         Err(e) => return Json(json!({ "error": e })),
     };
@@ -1403,12 +1356,14 @@ pub async fn verify_hmac(
 
     // Derive HMAC key
     let hmac_key = match derive_symmetric_key(
-        state.bridge.joint_public_key(),
+        &state.bridge,
         level,
         &protocol_name,
         &key_id,
         &counterparty,
-    ) {
+    )
+    .await
+    {
         Ok(key) => key,
         Err(e) => return Json(json!({ "error": e })),
     };
@@ -1680,6 +1635,7 @@ mod tests {
     use crate::utxo_tracker::UtxoTracker;
     use bsv::primitives::ec::PrivateKey;
     use bsv::wallet::{Counterparty, KeyDeriver, Protocol, SecurityLevel};
+    use bsv_mpc_core::JointPublicKey;
     use tokio::sync::RwLock;
 
     /// Same test key as POC 3 / POC 9 / hd.rs tests.
@@ -1743,46 +1699,61 @@ mod tests {
         assert_eq!(cp, "self");
     }
 
-    #[test]
-    fn test_derive_symmetric_key_anyone() {
-        let jk = test_joint_key();
-        let key = derive_symmetric_key(&jk, 2, "test-proto", "key1", "anyone").unwrap();
+    #[tokio::test]
+    async fn test_derive_symmetric_key_anyone() {
+        let state = test_state();
+        let key = derive_symmetric_key(&state.bridge, 2, "test-proto", "key1", "anyone")
+            .await
+            .unwrap();
         assert_eq!(key.len(), 32);
         assert_ne!(key, [0u8; 32], "key should not be all zeros");
     }
 
-    #[test]
-    fn test_derive_symmetric_key_deterministic() {
-        let jk = test_joint_key();
-        let k1 = derive_symmetric_key(&jk, 2, "test-proto", "key1", "anyone").unwrap();
-        let k2 = derive_symmetric_key(&jk, 2, "test-proto", "key1", "anyone").unwrap();
+    #[tokio::test]
+    async fn test_derive_symmetric_key_deterministic() {
+        let state = test_state();
+        let k1 = derive_symmetric_key(&state.bridge, 2, "test-proto", "key1", "anyone")
+            .await
+            .unwrap();
+        let k2 = derive_symmetric_key(&state.bridge, 2, "test-proto", "key1", "anyone")
+            .await
+            .unwrap();
         assert_eq!(k1, k2, "same inputs must produce same key");
     }
 
-    #[test]
-    fn test_derive_symmetric_key_different_invoices() {
-        let jk = test_joint_key();
-        let k1 = derive_symmetric_key(&jk, 2, "test-proto", "key1", "anyone").unwrap();
-        let k2 = derive_symmetric_key(&jk, 2, "test-proto", "key2", "anyone").unwrap();
+    #[tokio::test]
+    async fn test_derive_symmetric_key_different_invoices() {
+        let state = test_state();
+        let k1 = derive_symmetric_key(&state.bridge, 2, "test-proto", "key1", "anyone")
+            .await
+            .unwrap();
+        let k2 = derive_symmetric_key(&state.bridge, 2, "test-proto", "key2", "anyone")
+            .await
+            .unwrap();
         assert_ne!(k1, k2, "different key IDs must produce different keys");
     }
 
-    #[test]
-    fn test_derive_symmetric_key_self_returns_error() {
-        let jk = test_joint_key();
-        let result = derive_symmetric_key(&jk, 2, "test-proto", "key1", "self");
+    #[tokio::test]
+    async fn test_derive_symmetric_key_self_errors_without_kss() {
+        // With test bridge (no real KSS), "self" counterparty should error
+        let state = test_state();
+        let result = derive_symmetric_key(&state.bridge, 2, "test-proto", "key1", "self").await;
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .contains("bridge.partial_ecdh()"));
     }
 
-    #[test]
-    fn test_derive_symmetric_key_other_returns_error() {
-        let jk = test_joint_key();
-        let result = derive_symmetric_key(&jk, 2, "test-proto", "key1", "02abcd");
+    #[tokio::test]
+    async fn test_derive_symmetric_key_other_errors_without_kss() {
+        // With test bridge (no real KSS), "other" counterparty should error
+        let state = test_state();
+        let result = derive_symmetric_key(
+            &state.bridge,
+            2,
+            "test-proto",
+            "key1",
+            "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+        )
+        .await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("bridge.partial_ecdh()"));
     }
 
     // ── Encrypt / Decrypt handler tests ─────────────────────────────────
@@ -1908,7 +1879,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_encrypt_self_counterparty_returns_error() {
+    async fn test_encrypt_self_counterparty_errors_without_kss() {
         let state = test_state();
         let body = json!({
             "plaintext": BASE64.encode(b"test"),
@@ -1917,8 +1888,8 @@ mod tests {
             "counterparty": "self"
         });
         let Json(resp) = encrypt(State(state), Json(body)).await;
+        // Without a real KSS, "self" counterparty fails (connection refused)
         assert!(resp.get("error").is_some());
-        assert!(resp["error"].as_str().unwrap().contains("partial_ecdh"));
     }
 
     // ── HMAC handler tests ──────────────────────────────────────────────
@@ -2081,7 +2052,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_verify_signature_self_returns_error() {
+    async fn test_verify_signature_self_errors_without_kss() {
         let state = test_state();
         let body = json!({
             "data": "00".repeat(32),
@@ -2091,8 +2062,8 @@ mod tests {
             "counterparty": "self"
         });
         let Json(resp) = verify_signature(State(state), Json(body)).await;
+        // Without a real KSS, "self" counterparty fails
         assert!(resp.get("error").is_some());
-        assert!(resp["error"].as_str().unwrap().contains("partial_ecdh"));
     }
 
     #[tokio::test]
@@ -2144,9 +2115,13 @@ mod tests {
     #[tokio::test]
     async fn test_hmac_and_encrypt_use_same_key_derivation() {
         // Both encrypt and createHmac should derive from the same BRC-42 path
-        let jk = test_joint_key();
-        let k1 = derive_symmetric_key(&jk, 2, "shared-proto", "shared-key", "anyone").unwrap();
-        let k2 = derive_symmetric_key(&jk, 2, "shared-proto", "shared-key", "anyone").unwrap();
+        let state = test_state();
+        let k1 = derive_symmetric_key(&state.bridge, 2, "shared-proto", "shared-key", "anyone")
+            .await
+            .unwrap();
+        let k2 = derive_symmetric_key(&state.bridge, 2, "shared-proto", "shared-key", "anyone")
+            .await
+            .unwrap();
         assert_eq!(k1, k2, "encrypt and HMAC use the same key derivation");
     }
 
@@ -2235,7 +2210,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_public_key_self_returns_error() {
+    async fn test_get_public_key_self_errors_without_kss() {
         let state = test_state();
         let body = json!({
             "protocolID": [2, "test"],
@@ -2243,8 +2218,8 @@ mod tests {
             "counterparty": "self",
         });
         let Json(resp) = get_public_key(State(state), Json(body)).await;
+        // Without a real KSS, "self" counterparty fails
         assert!(resp.get("error").is_some());
-        assert!(resp["error"].as_str().unwrap().contains("partial_ecdh"));
     }
 
     // ── Transaction helper tests ────────────────────────────────────────

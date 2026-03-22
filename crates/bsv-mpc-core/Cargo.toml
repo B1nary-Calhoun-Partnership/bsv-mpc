@@ -30,3 +30,4 @@ tempfile.workspace = true
 futures.workspace = true
 pin-project.workspace = true
 round-based = { workspace = true, features = ["sim"] }
+cggmp24 = { git = "https://github.com/LFDT-Lockness/cggmp21", features = ["curve-secp256k1", "hd-wallet", "hd-slip10", "spof"] }

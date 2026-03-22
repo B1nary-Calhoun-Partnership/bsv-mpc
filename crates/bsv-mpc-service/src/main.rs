@@ -101,6 +101,8 @@ async fn main() -> anyhow::Result<()> {
         // Signing protocol
         .route("/sign/init", post(handlers::handle_sign_init))
         .route("/sign/round", post(handlers::handle_sign_round))
+        // Partial ECDH (for BRC-42 key derivation)
+        .route("/ecdh", post(handlers::handle_ecdh))
         // Presigning protocol
         .route("/presign/init", post(handlers::handle_presign_init))
         .route("/presign/round", post(handlers::handle_presign_round))

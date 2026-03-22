@@ -173,6 +173,22 @@ pub struct PresignRoundResponse {
     pub presignatures_generated: Option<u16>,
 }
 
+/// Request body for `POST /ecdh`.
+#[derive(Debug, Deserialize)]
+pub struct EcdhRequest {
+    /// The agent requesting the partial ECDH (must own the share).
+    pub agent_id: String,
+    /// The counterparty public key (33-byte hex compressed secp256k1).
+    pub counterparty_pub: String,
+}
+
+/// Response from `POST /ecdh`.
+#[derive(Debug, Serialize)]
+pub struct EcdhResponse {
+    /// The partial ECDH result: counterparty_pub * share_scalar (33-byte hex).
+    pub partial: String,
+}
+
 /// Response from `GET /health`.
 #[derive(Debug, Serialize)]
 pub struct HealthResponse {
@@ -551,6 +567,51 @@ pub async fn handle_presign_round(
             }).unwrap_or_default()))
         }
     }
+}
+
+/// `POST /ecdh` — Compute partial ECDH for BRC-42 key derivation.
+///
+/// Returns `counterparty_pub * share_scalar` for the specified agent's share.
+pub async fn handle_ecdh(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<EcdhRequest>,
+) -> impl IntoResponse {
+    // TODO: Verify BRC-31 auth and agent authorization
+
+    // Parse counterparty public key
+    let cp_bytes = match hex::decode(&body.counterparty_pub) {
+        Ok(b) => b,
+        Err(e) => return err_response(StatusCode::BAD_REQUEST, format!("invalid counterparty_pub hex: {e}")),
+    };
+    let counterparty_pub = match bsv::primitives::ec::PublicKey::from_bytes(&cp_bytes) {
+        Ok(pk) => pk,
+        Err(e) => return err_response(StatusCode::BAD_REQUEST, format!("invalid counterparty_pub: {e}")),
+    };
+
+    // Load the agent's share
+    let share = match state.storage.read() {
+        Ok(storage) => match storage.get_share(&body.agent_id) {
+            Ok(Some(s)) => s,
+            Ok(None) => return err_response(StatusCode::NOT_FOUND, format!("No share for agent: {}", body.agent_id)),
+            Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e),
+        },
+        Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e),
+    };
+
+    // Extract scalar and compute partial ECDH
+    let scalar = match bsv_mpc_core::ecdh::parse_share_scalar(&share.ciphertext) {
+        Ok(s) => s,
+        Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, format!("failed to parse share scalar: {e}")),
+    };
+
+    let partial = match bsv_mpc_core::ecdh::compute_partial_ecdh_point(&counterparty_pub, &scalar) {
+        Ok(p) => p,
+        Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, format!("partial ECDH failed: {e}")),
+    };
+
+    (StatusCode::OK, Json(serde_json::to_value(EcdhResponse {
+        partial: hex::encode(partial.to_compressed()),
+    }).unwrap_or_default()))
 }
 
 /// `GET /health` — Liveness check with operational metrics.

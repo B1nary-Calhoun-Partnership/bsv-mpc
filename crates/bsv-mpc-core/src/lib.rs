@@ -46,6 +46,7 @@
 //! parties) is handled by `bsv-mpc-worker` and `bsv-mpc-service`.
 
 pub mod dkg;
+pub mod ecdh;
 pub mod error;
 pub mod hd;
 pub mod presigning;

@@ -49,8 +49,9 @@
 
 use crate::config::ProxyConfig;
 use bsv::primitives::ec::{PrivateKey, PublicKey};
+use bsv_mpc_core::ecdh;
 use bsv_mpc_core::error::MpcError;
-use bsv_mpc_core::hd::compute_invoice;
+use bsv_mpc_core::hd::{compute_invoice, derive_child_pubkey};
 use bsv_mpc_core::presigning::{PresigningManager, PresigningRoundResult};
 use bsv_mpc_core::signing::{SigningCoordinator, SigningRoundResult};
 use bsv_mpc_core::types::*;
@@ -147,6 +148,22 @@ struct PresignRoundResponse {
     round_messages: Option<Vec<RoundMessage>>,
     /// Whether presigning is complete.
     complete: bool,
+}
+
+/// Request body for `POST /ecdh`.
+#[derive(Serialize, Deserialize, Debug)]
+struct EcdhRequest {
+    /// BRC-31 identity key of the requesting agent (33-byte hex).
+    agent_id: String,
+    /// The counterparty public key to compute partial ECDH with (33-byte hex).
+    counterparty_pub: String,
+}
+
+/// Response from `POST /ecdh`.
+#[derive(Serialize, Deserialize, Debug)]
+struct EcdhResponse {
+    /// The partial ECDH result: counterparty_pub * share_A (33-byte hex).
+    partial: String,
 }
 
 // ============================================================================
@@ -438,6 +455,17 @@ pub struct MpcBridge {
     /// Joint public key computed during the DKG ceremony.
     joint_key: JointPublicKey,
 
+    /// Root BSV PublicKey parsed from joint_key.compressed.
+    root_pub: PublicKey,
+
+    /// This party's share scalar (32 bytes big-endian), extracted from the
+    /// cggmp24 IncompleteKeyShare. Used for local partial ECDH computation.
+    share_scalar: [u8; 32],
+
+    /// VSS evaluation points for all parties (one 32-byte scalar per party).
+    /// Needed for Lagrange interpolation when combining partial ECDH results.
+    vss_points: Vec<[u8; 32]>,
+
     /// HTTP client for communicating with the KSS.
     client: reqwest::Client,
 
@@ -525,6 +553,30 @@ impl MpcBridge {
 
         let agent_id = hex_encode(&dkg_result.joint_key.compressed);
 
+        // Parse root public key
+        let root_pub = PublicKey::from_bytes(&dkg_result.joint_key.compressed)
+            .map_err(|e| anyhow::anyhow!("invalid joint public key: {e}"))?;
+
+        // Extract share scalar and VSS evaluation points for partial ECDH.
+        // The ciphertext field holds raw cggmp24 key share JSON.
+        // If parsing fails (e.g., stub shares), partial_ecdh will fail at call time.
+        let (share_scalar, vss_points) =
+            match ecdh::parse_share_scalar(&dkg_result.share.ciphertext)
+                .and_then(|scalar| {
+                    ecdh::parse_share_vss_points(&dkg_result.share.ciphertext)
+                        .map(|pts| (scalar, pts))
+                }) {
+                Ok((scalar, pts)) => (scalar, pts),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "failed to parse share for partial ECDH — \
+                         encrypt/decrypt with 'self'/'other' counterparty will fail"
+                    );
+                    ([0u8; 32], vec![])
+                }
+            };
+
         tracing::info!(
             session_id = %dkg_result.session_id,
             share_index = my_index,
@@ -583,6 +635,9 @@ impl MpcBridge {
             kss_url: config.kss_url.clone(),
             share: dkg_result.share,
             joint_key: dkg_result.joint_key,
+            root_pub,
+            share_scalar,
+            vss_points,
             client,
             session_id: dkg_result.session_id,
             participants,
@@ -831,6 +886,204 @@ impl MpcBridge {
         .map_err(|e| MpcError::Protocol(format!("presigning task panicked: {e}")))?
     }
 
+    /// Compute ECDH(counterparty_pub, root_priv) without reconstructing root_priv.
+    ///
+    /// Uses threshold partial ECDH: each party computes `counterparty_pub * share_i`,
+    /// then results are combined with Lagrange interpolation at x=0.
+    ///
+    /// Flow (for 2-of-2):
+    /// 1. Proxy computes locally: `partial_B = counterparty_pub * share_B`
+    /// 2. Proxy sends counterparty_pub to KSS: `POST /ecdh`
+    /// 3. KSS computes: `partial_A = counterparty_pub * share_A`
+    /// 4. KSS returns: `partial_A`
+    /// 5. Proxy combines: `shared_secret = λ_0 * partial_A + λ_1 * partial_B`
+    ///
+    /// Proven in POC 3 (key derivation) and POC 8 (BRC-31 auth).
+    pub async fn partial_ecdh(
+        &self,
+        counterparty_pub: &PublicKey,
+    ) -> bsv_mpc_core::error::Result<PublicKey> {
+        let my_index = self.share.share_index.0 as usize;
+
+        // Build partials from all participating parties
+        let mut partials: Vec<(PublicKey, [u8; 32])> = Vec::new();
+
+        for &p in &self.participants {
+            let p_idx = p as usize;
+            if p_idx == my_index {
+                // Local computation: counterparty_pub * our_share_scalar
+                let partial =
+                    ecdh::compute_partial_ecdh_point(counterparty_pub, &self.share_scalar)?;
+                partials.push((partial, self.vss_points[p_idx]));
+            } else {
+                // Remote (KSS): POST /ecdh
+                let partial = self.kss_ecdh(counterparty_pub).await?;
+                partials.push((partial, self.vss_points[p_idx]));
+            }
+        }
+
+        // Combine with Lagrange interpolation
+        ecdh::combine_partials_lagrange(&partials)
+    }
+
+    /// Send a partial ECDH request to the KSS.
+    async fn kss_ecdh(
+        &self,
+        counterparty_pub: &PublicKey,
+    ) -> bsv_mpc_core::error::Result<PublicKey> {
+        let url = format!("{}/ecdh", self.kss_url);
+        let req = EcdhRequest {
+            agent_id: self.agent_id.clone(),
+            counterparty_pub: hex_encode(&counterparty_pub.to_compressed()),
+        };
+
+        let mut builder = self.client.post(&url).json(&req);
+
+        // Add BRC-31 auth headers if authenticated
+        {
+            let auth_guard = self
+                .auth
+                .lock()
+                .map_err(|e| MpcError::Protocol(format!("auth lock poisoned: {e}")))?;
+            if auth_guard.is_authenticated() {
+                builder = auth_guard.add_auth_headers(builder)?;
+            }
+        }
+
+        let resp = builder
+            .send()
+            .await
+            .map_err(|e| MpcError::Protocol(format!("KSS /ecdh request failed: {e}")))?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body_text = resp.text().await.unwrap_or_default();
+            return Err(MpcError::Protocol(format!(
+                "KSS /ecdh returned {status}: {body_text}"
+            )));
+        }
+
+        let ecdh_resp: EcdhResponse = resp
+            .json()
+            .await
+            .map_err(|e| MpcError::Protocol(format!("KSS /ecdh response parse: {e}")))?;
+
+        let partial_bytes = hex_decode(&ecdh_resp.partial)?;
+        PublicKey::from_bytes(&partial_bytes)
+            .map_err(|e| MpcError::Protocol(format!("KSS returned invalid partial point: {e}")))
+    }
+
+    /// Derive a BRC-42 symmetric key for any counterparty type.
+    ///
+    /// - `"anyone"`: Local computation only (0 KSS round-trips).
+    /// - `"self"`: 2 partial ECDH rounds with KSS.
+    /// - hex pubkey: 2 partial ECDH rounds with KSS.
+    ///
+    /// Returns a 32-byte symmetric key compatible with the BSV SDK's
+    /// `KeyDeriver::derive_symmetric_key()`. Proven in POC 9.
+    pub async fn derive_symmetric_key(
+        &self,
+        counterparty: &str,
+        level: u8,
+        protocol_name: &str,
+        key_id: &str,
+    ) -> bsv_mpc_core::error::Result<[u8; 32]> {
+        match counterparty {
+            "anyone" => ecdh::derive_symmetric_key_anyone(&self.root_pub, level, protocol_name, key_id),
+            _ => {
+                // For "self" and "other(hex_pubkey)": 2-round partial ECDH
+                let counterparty_pub = if counterparty == "self" {
+                    self.root_pub.clone()
+                } else {
+                    let bytes = hex_decode(counterparty)?;
+                    PublicKey::from_bytes(&bytes).map_err(|e| {
+                        MpcError::Protocol(format!("invalid counterparty pubkey: {e}"))
+                    })?
+                };
+
+                let invoice = compute_invoice(level, protocol_name, key_id);
+
+                // Round 1: base ECDH — counterparty_pub * root_priv
+                let shared_secret = self.partial_ecdh(&counterparty_pub).await?;
+
+                // Compute child_counter_pub = counterparty_pub + G * hmac
+                let child_counter_pub =
+                    derive_child_pubkey(&counterparty_pub, &shared_secret, &invoice)?;
+
+                // Round 2: root_priv * child_counter_pub
+                let root_times_child = self.partial_ecdh(&child_counter_pub).await?;
+
+                // Final local computation: combine into symmetric key
+                ecdh::derive_symmetric_key_from_partials(
+                    &counterparty_pub,
+                    &shared_secret,
+                    &root_times_child,
+                    &invoice,
+                )
+            }
+        }
+    }
+
+    /// Derive a BRC-42 child public key for any counterparty type.
+    ///
+    /// - `"anyone"`: Local derivation (0 KSS round-trips).
+    /// - `"self"` / hex pubkey: 1 partial ECDH round with KSS.
+    ///
+    /// Returns the derived public key. For `for_self=true`, derives from
+    /// root_pub. For `for_self=false`, derives from counterparty_pub.
+    pub async fn derive_child_key(
+        &self,
+        counterparty: &str,
+        level: u8,
+        protocol_name: &str,
+        key_id: &str,
+        for_self: bool,
+    ) -> bsv_mpc_core::error::Result<PublicKey> {
+        let invoice = compute_invoice(level, protocol_name, key_id);
+
+        match counterparty {
+            "anyone" => {
+                // shared_secret = root_pub for "anyone"
+                let base = if for_self {
+                    &self.root_pub
+                } else {
+                    // anyone_pub = G (generator, private key = 1)
+                    let mut one = [0u8; 32];
+                    one[31] = 1;
+                    &PublicKey::from_scalar_mul_generator(&one).map_err(|e| {
+                        MpcError::Protocol(format!("generator computation failed: {e}"))
+                    })?
+                };
+                derive_child_pubkey(base, &self.root_pub, &invoice)
+            }
+            _ => {
+                let counterparty_pub = if counterparty == "self" {
+                    self.root_pub.clone()
+                } else {
+                    let bytes = hex_decode(counterparty)?;
+                    PublicKey::from_bytes(&bytes).map_err(|e| {
+                        MpcError::Protocol(format!("invalid counterparty pubkey: {e}"))
+                    })?
+                };
+
+                // 1 partial ECDH round to get shared_secret
+                let shared_secret = self.partial_ecdh(&counterparty_pub).await?;
+
+                let base = if for_self {
+                    &self.root_pub
+                } else {
+                    &counterparty_pub
+                };
+                derive_child_pubkey(base, &shared_secret, &invoice)
+            }
+        }
+    }
+
+    /// Get the root BSV PublicKey.
+    pub fn root_pub(&self) -> &PublicKey {
+        &self.root_pub
+    }
+
     /// Get the joint public key.
     ///
     /// This is the secp256k1 compressed public key that can receive BSV
@@ -855,10 +1108,13 @@ impl MpcBridge {
     }
 
     /// Create a bridge with a known joint key for testing.
-    /// No KSS connection is established — only `joint_public_key()` is usable.
+    /// No KSS connection is established — only `joint_public_key()` and local
+    /// derivation methods are usable. Partial ECDH (requiring KSS) will fail.
     #[cfg(test)]
     pub fn new_for_test(joint_key: JointPublicKey) -> Self {
         let agent_id = hex_encode(&joint_key.compressed);
+        let root_pub = PublicKey::from_bytes(&joint_key.compressed)
+            .expect("test joint key must be valid");
         Self {
             kss_url: "http://localhost:9999".into(),
             share: EncryptedShare {
@@ -872,6 +1128,9 @@ impl MpcBridge {
                 },
             },
             joint_key,
+            root_pub,
+            share_scalar: [0u8; 32],
+            vss_points: vec![[0u8; 32]; 2],
             client: reqwest::Client::new(),
             session_id: SessionId("test".into()),
             participants: vec![0, 1],
@@ -1000,13 +1259,16 @@ mod tests {
     /// Test MpcBridge::new() with a plaintext DkgResult share file.
     #[tokio::test]
     async fn new_loads_plaintext_share() {
+        // Use a valid secp256k1 compressed pubkey (G * 1 = generator point)
+        let valid_pub = bsv::primitives::ec::PublicKey::from_scalar_mul_generator(&{
+            let mut one = [0u8; 32];
+            one[31] = 1;
+            one
+        })
+        .unwrap();
         let dkg_result = DkgResult {
             joint_key: JointPublicKey {
-                compressed: vec![
-                    0x02, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a,
-                    0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15,
-                    0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20,
-                ],
+                compressed: valid_pub.to_compressed().to_vec(),
                 address: "1TestAddress".into(),
             },
             share: EncryptedShare {

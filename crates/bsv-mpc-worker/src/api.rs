@@ -217,6 +217,22 @@ pub struct PresignRoundResponse {
     pub presignatures_generated: Option<u16>,
 }
 
+/// Request body for `POST /ecdh`.
+#[derive(Debug, Deserialize)]
+pub struct EcdhRequest {
+    /// The agent requesting the partial ECDH (must own the share).
+    pub agent_id: String,
+    /// The counterparty public key (33-byte hex compressed secp256k1).
+    pub counterparty_pub: String,
+}
+
+/// Response from `POST /ecdh`.
+#[derive(Debug, Serialize)]
+pub struct EcdhResponse {
+    /// The partial ECDH result: counterparty_pub * share_A (33-byte hex).
+    pub partial: String,
+}
+
 /// Response from `GET /health`.
 #[derive(Debug, Serialize)]
 pub struct HealthResponse {
@@ -669,6 +685,48 @@ pub async fn handle_presign_round(mut req: Request, _ctx: &RouteContext<()>) -> 
             Response::from_json(&response)
         }
     }
+}
+
+/// Handle `POST /ecdh` — compute partial ECDH for BRC-42 key derivation.
+///
+/// The proxy sends a counterparty public key, and the KSS returns the
+/// partial ECDH result: `counterparty_pub * share_A`.
+///
+/// This enables distributed BRC-42 key derivation without reconstructing
+/// the private key. Used by encrypt/decrypt/HMAC/getPublicKey for
+/// "self" and "other" counterparty types.
+///
+/// Proven in POC 3 (key derivation) and POC 9 (encrypt/decrypt).
+pub async fn handle_ecdh(mut req: Request, _ctx: &RouteContext<()>) -> Result<Response> {
+    // TODO: Verify BRC-31 auth and agent authorization
+    let body: EcdhRequest = req.json().await?;
+
+    // Parse the counterparty public key
+    let cp_bytes = hex::decode(&body.counterparty_pub)
+        .map_err(|e| Error::from(format!("invalid counterparty_pub hex: {e}")))?;
+    let counterparty_pub = bsv::primitives::ec::PublicKey::from_bytes(&cp_bytes)
+        .map_err(|e| Error::from(format!("invalid counterparty_pub: {e}")))?;
+
+    // Load the agent's share
+    let storage = ShareStorage::new();
+    let share = storage
+        .get_share(&body.agent_id)
+        .map_err(Error::from)?
+        .ok_or_else(|| Error::from(format!("No share found for agent: {}", body.agent_id)))?;
+
+    // Extract the share scalar
+    let scalar = bsv_mpc_core::ecdh::parse_share_scalar(&share.ciphertext)
+        .map_err(|e| Error::from(e.to_string()))?;
+
+    // Compute partial ECDH: counterparty_pub * share_scalar
+    let partial = bsv_mpc_core::ecdh::compute_partial_ecdh_point(&counterparty_pub, &scalar)
+        .map_err(|e| Error::from(e.to_string()))?;
+
+    let response = EcdhResponse {
+        partial: hex::encode(partial.to_compressed()),
+    };
+
+    Response::from_json(&response)
 }
 
 /// Handle `GET /health` — liveness check with operational metrics.
