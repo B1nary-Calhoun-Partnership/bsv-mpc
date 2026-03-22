@@ -1,17 +1,9 @@
-//! Local SQLite storage for encrypted MPC key shares.
+//! In-memory storage for encrypted MPC key shares (development/testing).
 //!
-//! This is the self-hosted equivalent of the Durable Object SQLite storage in
-//! `bsv-mpc-worker`. Uses a local SQLite database file for share persistence.
+//! Mirrors the storage pattern from `bsv-mpc-worker::storage` but for the
+//! standalone service. Production will use local SQLite (rusqlite).
 //!
-//! ## Database Location
-//!
-//! The database is stored at `{data_dir}/mpc-shares.db`. The data directory
-//! is specified via the `--data-dir` CLI flag or `MPC_DATA_DIR` environment
-//! variable (default: `./shares`).
-//!
-//! ## Schema
-//!
-//! Identical to the Worker version:
+//! ## Schema (planned SQLite, currently in-memory HashMap)
 //!
 //! ```sql
 //! CREATE TABLE IF NOT EXISTS shares (
@@ -66,19 +58,44 @@
 //!
 //! ## Thread Safety
 //!
-//! `SqliteShareStorage` is protected by `tokio::sync::RwLock` in the `AppState`.
-//! Read operations (get, list, count) acquire a read lock; write operations
-//! (store, delete, consume) acquire a write lock. This is safe for the expected
-//! concurrency level (one agent per share, low QPS).
+//! Storage is wrapped in `tokio::sync::RwLock` in the `AppState`.
+//! For the in-memory implementation, all state is inside the struct itself.
 
-use bsv_mpc_core::types::{EncryptedShare, ThresholdConfig};
+use std::collections::{HashMap, VecDeque};
+
+use bsv_mpc_core::types::EncryptedShare;
 use serde::{Deserialize, Serialize};
 
-/// SQLite-backed share storage for the self-hosted Key Share Service.
+/// In-memory share storage for the self-hosted Key Share Service.
+///
+/// Production will use `rusqlite::Connection` for persistent SQLite storage.
+/// This in-memory implementation matches the `bsv-mpc-worker::storage::ShareStorage`
+/// pattern but is instance-based (held in `AppState`) rather than global-static.
 pub struct SqliteShareStorage {
-    /// Path to the SQLite database file.
+    /// Path to the SQLite database file (for display/logging only; not yet used).
     pub db_path: String,
-    // In production: rusqlite::Connection or similar
+    /// Encrypted shares keyed by agent_id.
+    shares: HashMap<String, StoredShare>,
+    /// Protocol state keyed by session_id.
+    protocol_state: HashMap<String, Vec<u8>>,
+    /// Available presignatures keyed by agent_id (FIFO queue per agent).
+    presignatures: HashMap<String, VecDeque<StoredPresignature>>,
+}
+
+/// A stored encrypted share with metadata.
+struct StoredShare {
+    share: EncryptedShare,
+    created_at: String,
+    updated_at: String,
+}
+
+/// A stored presignature.
+#[allow(dead_code)] // fields used for audit/debugging in production SQLite
+struct StoredPresignature {
+    id: String,
+    session_id: String,
+    data: Vec<u8>,
+    created_at: String,
 }
 
 /// Metadata about a stored share (safe to return over the wire).
@@ -130,103 +147,119 @@ pub struct SigningSessionState {
     pub sighash: Vec<u8>,
 }
 
+#[allow(dead_code)] // methods form the public storage API
 impl SqliteShareStorage {
-    /// Open (or create) the SQLite database in the given data directory.
+    /// Open (or create) in-memory storage in the given data directory.
     ///
-    /// Creates all tables if they don't exist. Uses WAL journal mode for
-    /// better concurrent read performance.
+    /// Production will open a SQLite database at `{data_dir}/mpc-shares.db`
+    /// with WAL journal mode and foreign keys enabled.
     pub fn open(data_dir: &str) -> anyhow::Result<Self> {
         let db_path = format!("{data_dir}/mpc-shares.db");
-        todo!(
-            "1. Open SQLite connection at db_path\n\
-             2. PRAGMA journal_mode=WAL\n\
-             3. PRAGMA foreign_keys=ON\n\
-             4. CREATE TABLE IF NOT EXISTS for all 5 tables\n\
-             5. Return SqliteShareStorage {{ db_path }}"
-        )
+        Ok(SqliteShareStorage {
+            db_path,
+            shares: HashMap::new(),
+            protocol_state: HashMap::new(),
+            presignatures: HashMap::new(),
+        })
     }
 
     // ── Share CRUD ────────────────────────────────────────────────────
 
     /// Store an encrypted key share for an agent (upsert).
-    pub fn store_share(&self, agent_id: &str, share: &EncryptedShare) -> anyhow::Result<()> {
-        todo!(
-            "INSERT OR REPLACE INTO shares \
-             (agent_id, session_id, share_index, encrypted_share, config_json, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, datetime('now'), datetime('now'))"
-        )
+    pub fn store_share(&mut self, agent_id: &str, share: &EncryptedShare) -> anyhow::Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        self.shares.insert(
+            agent_id.to_string(),
+            StoredShare {
+                share: share.clone(),
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        );
+        Ok(())
     }
 
     /// Retrieve an encrypted key share for an agent.
     pub fn get_share(&self, agent_id: &str) -> anyhow::Result<Option<EncryptedShare>> {
-        todo!(
-            "SELECT session_id, share_index, encrypted_share, config_json \
-             FROM shares WHERE agent_id = ?"
-        )
+        Ok(self.shares.get(agent_id).map(|s| s.share.clone()))
     }
 
     /// Delete an agent's share and all associated state.
-    pub fn delete_share(&self, agent_id: &str) -> anyhow::Result<()> {
-        todo!(
-            "BEGIN;\n\
-             DELETE FROM presignatures WHERE agent_id = ?;\n\
-             DELETE FROM presigning_state WHERE agent_id = ?;\n\
-             DELETE FROM signing_state WHERE agent_id = ?;\n\
-             DELETE FROM dkg_state WHERE agent_id = ?;\n\
-             DELETE FROM shares WHERE agent_id = ?;\n\
-             COMMIT;"
-        )
+    pub fn delete_share(&mut self, agent_id: &str) -> anyhow::Result<()> {
+        self.shares.remove(agent_id);
+        self.presignatures.remove(agent_id);
+        // In production: also delete from dkg_state, signing_state, presigning_state
+        Ok(())
     }
 
     /// List all agent IDs with stored shares.
     pub fn list_agents(&self) -> anyhow::Result<Vec<String>> {
-        todo!("SELECT agent_id FROM shares ORDER BY created_at")
+        let mut agents: Vec<String> = self.shares.keys().cloned().collect();
+        agents.sort();
+        Ok(agents)
     }
 
     /// Count total shares.
     pub fn share_count(&self) -> anyhow::Result<usize> {
-        todo!("SELECT COUNT(*) FROM shares")
+        Ok(self.shares.len())
     }
 
     /// Get share metadata without exposing secrets.
     pub fn get_share_metadata(&self, agent_id: &str) -> anyhow::Result<Option<ShareMetadata>> {
-        todo!(
-            "SELECT s.*, \
-             (SELECT COUNT(*) FROM presignatures p WHERE p.agent_id = s.agent_id AND p.consumed = 0) \
-             FROM shares s WHERE s.agent_id = ?"
-        )
+        Ok(self.shares.get(agent_id).map(|stored| {
+            let presig_count = self
+                .presignatures
+                .get(agent_id)
+                .map(|q| q.len() as u64)
+                .unwrap_or(0);
+            ShareMetadata {
+                agent_id: agent_id.to_string(),
+                session_id: stored.share.session_id.0.clone(),
+                share_index: stored.share.share_index.0,
+                threshold: stored.share.config.threshold,
+                parties: stored.share.config.parties,
+                created_at: stored.created_at.clone(),
+                updated_at: stored.updated_at.clone(),
+                presignature_count: presig_count,
+            }
+        }))
     }
 
     // ── DKG State ─────────────────────────────────────────────────────
 
     /// Store intermediate DKG coordinator state between rounds.
-    pub fn store_dkg_state(&self, state: &DkgSessionState) -> anyhow::Result<()> {
-        todo!(
-            "INSERT OR REPLACE INTO dkg_state \
-             (session_id, agent_id, round, state, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, datetime('now'), datetime('now'))"
-        )
+    pub fn store_dkg_state(&mut self, state: &DkgSessionState) -> anyhow::Result<()> {
+        self.protocol_state
+            .insert(format!("dkg:{}", state.session_id), state.state.clone());
+        Ok(())
     }
 
     /// Load DKG coordinator state for a session.
     pub fn get_dkg_state(&self, session_id: &str) -> anyhow::Result<Option<DkgSessionState>> {
-        todo!("SELECT * FROM dkg_state WHERE session_id = ?")
+        Ok(self
+            .protocol_state
+            .get(&format!("dkg:{session_id}"))
+            .map(|state| DkgSessionState {
+                session_id: session_id.to_string(),
+                agent_id: String::new(), // TODO: store agent_id in protocol_state
+                round: 0,
+                state: state.clone(),
+            }))
     }
 
     /// Delete DKG state after ceremony completes (or on error).
-    pub fn delete_dkg_state(&self, session_id: &str) -> anyhow::Result<()> {
-        todo!("DELETE FROM dkg_state WHERE session_id = ?")
+    pub fn delete_dkg_state(&mut self, session_id: &str) -> anyhow::Result<()> {
+        self.protocol_state.remove(&format!("dkg:{session_id}"));
+        Ok(())
     }
 
     // ── Signing State ─────────────────────────────────────────────────
 
     /// Store intermediate signing coordinator state between rounds.
-    pub fn store_signing_state(&self, state: &SigningSessionState) -> anyhow::Result<()> {
-        todo!(
-            "INSERT OR REPLACE INTO signing_state \
-             (session_id, agent_id, round, state, sighash, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, datetime('now'), datetime('now'))"
-        )
+    pub fn store_signing_state(&mut self, state: &SigningSessionState) -> anyhow::Result<()> {
+        self.protocol_state
+            .insert(format!("sign:{}", state.session_id), state.state.clone());
+        Ok(())
     }
 
     /// Load signing coordinator state for a session.
@@ -234,29 +267,37 @@ impl SqliteShareStorage {
         &self,
         session_id: &str,
     ) -> anyhow::Result<Option<SigningSessionState>> {
-        todo!("SELECT * FROM signing_state WHERE session_id = ?")
+        Ok(self
+            .protocol_state
+            .get(&format!("sign:{session_id}"))
+            .map(|state| SigningSessionState {
+                session_id: session_id.to_string(),
+                agent_id: String::new(),
+                round: 0,
+                state: state.clone(),
+                sighash: Vec::new(),
+            }))
     }
 
     /// Delete signing state after signing completes.
-    pub fn delete_signing_state(&self, session_id: &str) -> anyhow::Result<()> {
-        todo!("DELETE FROM signing_state WHERE session_id = ?")
+    pub fn delete_signing_state(&mut self, session_id: &str) -> anyhow::Result<()> {
+        self.protocol_state.remove(&format!("sign:{session_id}"));
+        Ok(())
     }
 
     // ── Presigning ────────────────────────────────────────────────────
 
     /// Store intermediate presigning state for a round.
     pub fn store_presigning_state(
-        &self,
+        &mut self,
         agent_id: &str,
         session_id: &str,
         round: u8,
         state: &[u8],
     ) -> anyhow::Result<()> {
-        todo!(
-            "INSERT OR REPLACE INTO presigning_state \
-             (id, agent_id, session_id, round, state, created_at) \
-             VALUES (agent_id || ':' || round, ?, ?, ?, ?, datetime('now'))"
-        )
+        let key = format!("presign:{agent_id}:{session_id}:{round}");
+        self.protocol_state.insert(key, state.to_vec());
+        Ok(())
     }
 
     /// Retrieve presigning state for a specific round.
@@ -265,59 +306,61 @@ impl SqliteShareStorage {
         agent_id: &str,
         round: u8,
     ) -> anyhow::Result<Option<Vec<u8>>> {
-        todo!(
-            "SELECT state FROM presigning_state \
-             WHERE agent_id = ? AND round = ?"
-        )
+        // Find matching key by prefix (since session_id is embedded)
+        let prefix = format!("presign:{agent_id}:");
+        for (key, val) in &self.protocol_state {
+            if key.starts_with(&prefix) && key.ends_with(&format!(":{round}")) {
+                return Ok(Some(val.clone()));
+            }
+        }
+        Ok(None)
     }
 
     /// Store a completed presignature.
     pub fn store_presignature(
-        &self,
+        &mut self,
         agent_id: &str,
         session_id: &str,
         presig_id: &str,
         data: &[u8],
     ) -> anyhow::Result<()> {
-        todo!(
-            "INSERT INTO presignatures (id, agent_id, session_id, data, created_at, consumed) \
-             VALUES (?, ?, ?, ?, datetime('now'), 0)"
-        )
+        let queue = self
+            .presignatures
+            .entry(agent_id.to_string())
+            .or_default();
+        queue.push_back(StoredPresignature {
+            id: presig_id.to_string(),
+            session_id: session_id.to_string(),
+            data: data.to_vec(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+        });
+        Ok(())
     }
 
     /// Consume a presignature for online signing (FIFO, atomic).
-    pub fn consume_presignature(&self, agent_id: &str) -> anyhow::Result<Option<Vec<u8>>> {
-        todo!(
-            "BEGIN;\n\
-             SELECT id, data FROM presignatures \
-             WHERE agent_id = ? AND consumed = 0 \
-             ORDER BY created_at ASC LIMIT 1;\n\
-             UPDATE presignatures SET consumed = 1 WHERE id = ?;\n\
-             COMMIT;\n\
-             Return data"
-        )
+    pub fn consume_presignature(&mut self, agent_id: &str) -> anyhow::Result<Option<Vec<u8>>> {
+        Ok(self
+            .presignatures
+            .get_mut(agent_id)
+            .and_then(|q| q.pop_front())
+            .map(|p| p.data))
     }
 
     /// Count available (unconsumed) presignatures for an agent.
     pub fn presignature_count(&self, agent_id: &str) -> anyhow::Result<u64> {
-        todo!(
-            "SELECT COUNT(*) FROM presignatures \
-             WHERE agent_id = ? AND consumed = 0"
-        )
+        Ok(self
+            .presignatures
+            .get(agent_id)
+            .map(|q| q.len() as u64)
+            .unwrap_or(0))
     }
 
     /// Clean up consumed presignatures older than the given duration.
-    ///
-    /// Consumed presignatures are kept for audit purposes but can be pruned
-    /// after the retention period (default: 30 days).
+    /// No-op for in-memory storage (consumed presignatures are already removed).
     pub fn prune_consumed_presignatures(
         &self,
-        older_than: chrono::Duration,
+        _older_than: chrono::Duration,
     ) -> anyhow::Result<u64> {
-        todo!(
-            "DELETE FROM presignatures \
-             WHERE consumed = 1 AND created_at < datetime('now', '-N days')\n\
-             Return number of rows deleted"
-        )
+        Ok(0)
     }
 }

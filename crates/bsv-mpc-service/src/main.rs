@@ -49,11 +49,10 @@ mod storage;
 use std::sync::Arc;
 
 use axum::{
-    extract::State,
     routing::{get, post},
     Router,
 };
-use tokio::sync::RwLock;
+use std::sync::RwLock;
 
 use crate::storage::SqliteShareStorage;
 

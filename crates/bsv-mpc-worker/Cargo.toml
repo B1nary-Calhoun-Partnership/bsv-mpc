@@ -12,6 +12,7 @@ serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 chrono.workspace = true
+hex.workspace = true
 worker = "0.4"
 getrandom = { version = "0.2", features = ["js"] }
 

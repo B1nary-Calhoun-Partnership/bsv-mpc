@@ -67,6 +67,9 @@ pub struct AppState {
     /// frequent, writes (createAction spending, internalizeAction adding)
     /// are less frequent.
     pub utxo_tracker: Arc<RwLock<UtxoTracker>>,
+
+    /// Shared HTTP client for broadcasting transactions and other outbound requests.
+    pub http_client: reqwest::Client,
 }
 
 /// Start the BRC-100 HTTP server.
@@ -96,12 +99,17 @@ pub async fn run(config: ProxyConfig) -> anyhow::Result<()> {
 
     let utxo_tracker = Arc::new(RwLock::new(UtxoTracker::new()));
 
+    let http_client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?;
+
     let state = Arc::new(AppState {
         config: config.clone(),
         bridge,
         presign_manager: presign_manager.clone(),
         fee_injector,
         utxo_tracker,
+        http_client,
     });
 
     // Background presignature replenishment — runs forever, generating

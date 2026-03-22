@@ -1,70 +1,66 @@
-//! Durable Object SQLite storage for encrypted MPC key shares.
+//! In-memory storage for MPC key shares (development/testing).
 //!
-//! Each agent's key share is stored encrypted in a Durable Object that provides
-//! per-agent isolation. The Durable Object uses SQLite (CF D1-compatible API)
-//! for structured storage of shares, presigning state, and session metadata.
+//! Replaces Durable Object SQLite for local development and native testing.
+//! Production CF Worker deployment will use DO SQLite for persistent storage
+//! across Worker restarts.
 //!
-//! ## Schema
+//! ## Storage Model
 //!
-//! ```sql
-//! CREATE TABLE IF NOT EXISTS shares (
-//!     agent_id       TEXT PRIMARY KEY,
-//!     session_id     TEXT NOT NULL,
-//!     share_index    INTEGER NOT NULL,
-//!     encrypted_share BLOB NOT NULL,
-//!     config_json    TEXT NOT NULL,
-//!     created_at     TEXT NOT NULL,
-//!     updated_at     TEXT NOT NULL
-//! );
+//! Three logical stores backed by `HashMap` / `VecDeque`:
 //!
-//! CREATE TABLE IF NOT EXISTS presigning_state (
-//!     id         TEXT PRIMARY KEY,
-//!     agent_id   TEXT NOT NULL,
-//!     session_id TEXT NOT NULL,
-//!     round      INTEGER NOT NULL,
-//!     state      BLOB NOT NULL,
-//!     created_at TEXT NOT NULL,
-//!     FOREIGN KEY (agent_id) REFERENCES shares(agent_id)
-//! );
+//! - **Shares**: Encrypted key shares keyed by `agent_id` (one share per agent).
+//! - **Protocol state**: Serialized coordinator state keyed by `session_id`
+//!   (persisted between HTTP round-trip requests during DKG/signing/presigning).
+//! - **Presignatures**: Completed presignatures per agent (FIFO consumption).
 //!
-//! CREATE TABLE IF NOT EXISTS presignatures (
-//!     id         TEXT PRIMARY KEY,
-//!     agent_id   TEXT NOT NULL,
-//!     session_id TEXT NOT NULL,
-//!     data       BLOB NOT NULL,
-//!     created_at TEXT NOT NULL,
-//!     consumed   INTEGER NOT NULL DEFAULT 0,
-//!     FOREIGN KEY (agent_id) REFERENCES shares(agent_id)
-//! );
-//! ```
-//!
-//! ## Security
-//!
-//! - Shares are stored encrypted (AES-256-GCM with BRC-42 derived keys).
-//! - The encryption key never touches this Worker — shares arrive pre-encrypted
-//!   from the DKG protocol and are returned encrypted for the signing protocol.
-//! - Presigning state is also stored encrypted.
-//! - The `config_json` field stores the threshold configuration as plaintext
-//!   (it contains no secret data — just t, n values).
+//! All data lives in a global `Mutex<InnerStorage>` and is lost on Worker restart.
+//! This is acceptable for development; production uses DO SQLite which survives restarts.
+
+use std::collections::{HashMap, VecDeque};
+use std::sync::{LazyLock, Mutex};
 
 use bsv_mpc_core::types::EncryptedShare;
-use worker::*;
+use serde::{Deserialize, Serialize};
 
-/// Wrapper around Durable Object storage providing typed access to MPC share data.
+/// Global in-memory storage instance.
 ///
-/// All methods operate on the Durable Object's SQLite backend, which provides
-/// single-writer consistency and survives Worker restarts.
-pub struct ShareStorage {
-    /// Reference to the Durable Object's transactional storage API.
-    ///
-    /// In production this wraps `worker::durable_object::State::storage()`.
-    /// The storage handle provides both key-value and SQL interfaces;
-    /// we use the SQL interface for structured queries.
-    _marker: std::marker::PhantomData<()>,
+/// In production, this will be replaced by Durable Object SQLite.
+/// Using a global static allows the storage to persist across
+/// HTTP requests within the same Worker invocation.
+static STORAGE: LazyLock<Mutex<InnerStorage>> = LazyLock::new(|| {
+    Mutex::new(InnerStorage::default())
+});
+
+/// Internal storage state behind the mutex.
+#[derive(Default)]
+#[allow(dead_code)] // protocol_state is used by handlers via store/get/delete_protocol_state
+struct InnerStorage {
+    /// Encrypted shares keyed by agent_id.
+    shares: HashMap<String, StoredShare>,
+    /// Protocol state (coordinator serialized bytes) keyed by session_id.
+    protocol_state: HashMap<String, Vec<u8>>,
+    /// Available presignatures keyed by agent_id (FIFO queue per agent).
+    presignatures: HashMap<String, VecDeque<StoredPresignature>>,
+}
+
+/// A stored encrypted share with metadata.
+struct StoredShare {
+    share: EncryptedShare,
+    created_at: String,
+    updated_at: String,
+}
+
+/// A stored presignature.
+#[allow(dead_code)] // fields used for audit/debugging in production DO SQLite
+struct StoredPresignature {
+    id: String,
+    session_id: String,
+    data: Vec<u8>,
+    created_at: String,
 }
 
 /// Metadata about a stored share (safe to return over the wire — no secret data).
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShareMetadata {
     /// The agent this share belongs to (BRC-31 identity key, hex).
     pub agent_id: String,
@@ -84,175 +80,399 @@ pub struct ShareMetadata {
     pub presignature_count: u64,
 }
 
+/// In-memory share storage wrapper.
+///
+/// All methods access the global `STORAGE` static. The struct itself is a
+/// zero-sized marker that provides typed method access.
+///
+/// In production, this will wrap a Durable Object's transactional storage API
+/// with SQLite tables for shares, presigning_state, and presignatures.
+pub struct ShareStorage;
+
+#[allow(dead_code)] // methods form the public storage API, called by handlers and tests
 impl ShareStorage {
-    /// Create a new ShareStorage wrapping the Durable Object's storage context.
+    /// Create a new ShareStorage instance.
     ///
-    /// Initializes the SQLite schema if the tables do not already exist.
-    /// Uses IF NOT EXISTS so this is safe to call on every request.
-    pub async fn new(_ctx: &RouteContext<()>) -> Result<Self> {
-        todo!(
-            "1. Get storage handle from Durable Object state\n\
-             2. Execute CREATE TABLE IF NOT EXISTS for shares, presigning_state, presignatures\n\
-             3. Return ShareStorage instance wrapping the storage handle"
-        )
+    /// For the in-memory implementation, this is a no-op.
+    /// In production, this will initialize the DO SQLite schema.
+    pub fn new() -> Self {
+        ShareStorage
     }
 
-    /// Store an encrypted key share for an agent.
+    // ── Share CRUD ────────────────────────────────────────────────────
+
+    /// Store an encrypted key share for an agent (upsert).
     ///
     /// If the agent already has a share, this replaces it (used during key refresh).
-    /// The share is stored encrypted — this method does not perform any
-    /// encryption/decryption; it trusts that the caller (DKG protocol) has
-    /// already encrypted the share with the appropriate BRC-42 derived key.
-    pub async fn store_share(
-        &self,
-        agent_id: &str,
-        share: &EncryptedShare,
-    ) -> Result<()> {
-        todo!(
-            "INSERT OR REPLACE INTO shares (agent_id, session_id, share_index, \
-             encrypted_share, config_json, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, datetime('now'), datetime('now'))\n\
-             \n\
-             config_json = serde_json::to_string(&share.config)"
-        )
+    pub fn store_share(&self, agent_id: &str, share: &EncryptedShare) -> Result<(), String> {
+        let mut storage = STORAGE.lock().map_err(|e| format!("lock poisoned: {e}"))?;
+        let now = chrono::Utc::now().to_rfc3339();
+        storage.shares.insert(
+            agent_id.to_string(),
+            StoredShare {
+                share: share.clone(),
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        );
+        Ok(())
     }
 
     /// Retrieve an encrypted key share for an agent.
     ///
-    /// Returns `None` if the agent has no share stored (e.g., DKG has not been
-    /// run yet). The returned share is encrypted — the caller must decrypt it
-    /// with the appropriate BRC-42 derived key.
-    pub async fn get_share(
-        &self,
-        agent_id: &str,
-    ) -> Result<Option<EncryptedShare>> {
-        todo!(
-            "SELECT session_id, share_index, encrypted_share, config_json \
-             FROM shares WHERE agent_id = ?\n\
-             \n\
-             Parse config_json back to ThresholdConfig\n\
-             Reconstruct EncryptedShare from columns"
-        )
+    /// Returns `None` if the agent has no share stored (DKG not yet run).
+    pub fn get_share(&self, agent_id: &str) -> Result<Option<EncryptedShare>, String> {
+        let storage = STORAGE.lock().map_err(|e| format!("lock poisoned: {e}"))?;
+        Ok(storage.shares.get(agent_id).map(|s| s.share.clone()))
     }
 
-    /// Delete an agent's key share.
-    ///
-    /// Used when an agent is decommissioned or when performing a full key rotation.
-    /// Also deletes all presigning state and presignatures for the agent.
-    pub async fn delete_share(&self, agent_id: &str) -> Result<()> {
-        todo!(
-            "BEGIN TRANSACTION;\n\
-             DELETE FROM presignatures WHERE agent_id = ?;\n\
-             DELETE FROM presigning_state WHERE agent_id = ?;\n\
-             DELETE FROM shares WHERE agent_id = ?;\n\
-             COMMIT;"
-        )
+    /// Delete an agent's key share and all associated data (cascading).
+    pub fn delete_share(&self, agent_id: &str) -> Result<bool, String> {
+        let mut storage = STORAGE.lock().map_err(|e| format!("lock poisoned: {e}"))?;
+        let existed = storage.shares.remove(agent_id).is_some();
+        storage.presignatures.remove(agent_id);
+        Ok(existed)
     }
 
-    /// List all agent IDs that have shares stored in this Durable Object.
-    ///
-    /// Returns just the identity keys, not the share data itself.
-    /// Used by the `/health` endpoint and for inventory management.
-    pub async fn list_agents(&self) -> Result<Vec<String>> {
-        todo!("SELECT agent_id FROM shares ORDER BY created_at")
+    /// List all agent IDs that have shares stored.
+    pub fn list_agents(&self) -> Result<Vec<String>, String> {
+        let storage = STORAGE.lock().map_err(|e| format!("lock poisoned: {e}"))?;
+        let mut agents: Vec<String> = storage.shares.keys().cloned().collect();
+        agents.sort();
+        Ok(agents)
     }
 
     /// Count the total number of shares stored.
-    ///
-    /// Lightweight query for the health endpoint.
-    pub async fn share_count(&self) -> Result<usize> {
-        todo!("SELECT COUNT(*) FROM shares")
+    pub fn share_count(&self) -> Result<usize, String> {
+        let storage = STORAGE.lock().map_err(|e| format!("lock poisoned: {e}"))?;
+        Ok(storage.shares.len())
     }
 
     /// Get metadata about a share without exposing any secret data.
-    ///
-    /// Returns the agent ID, session ID, share index, threshold config,
-    /// timestamps, and presignature count. Safe to return over the wire.
-    pub async fn get_share_metadata(
-        &self,
-        agent_id: &str,
-    ) -> Result<Option<ShareMetadata>> {
-        todo!(
-            "SELECT s.agent_id, s.session_id, s.share_index, s.config_json, \
-             s.created_at, s.updated_at, \
-             (SELECT COUNT(*) FROM presignatures p WHERE p.agent_id = s.agent_id AND p.consumed = 0) \
-             AS presig_count \
-             FROM shares s WHERE s.agent_id = ?"
-        )
+    pub fn get_share_metadata(&self, agent_id: &str) -> Result<Option<ShareMetadata>, String> {
+        let storage = STORAGE.lock().map_err(|e| format!("lock poisoned: {e}"))?;
+        Ok(storage.shares.get(agent_id).map(|stored| {
+            let presig_count = storage
+                .presignatures
+                .get(agent_id)
+                .map(|q| q.len() as u64)
+                .unwrap_or(0);
+            ShareMetadata {
+                agent_id: agent_id.to_string(),
+                session_id: stored.share.session_id.0.clone(),
+                share_index: stored.share.share_index.0,
+                threshold: stored.share.config.threshold,
+                parties: stored.share.config.parties,
+                created_at: stored.created_at.clone(),
+                updated_at: stored.updated_at.clone(),
+                presignature_count: presig_count,
+            }
+        }))
     }
 
-    /// Store intermediate presigning state for a round.
+    // ── Protocol State ────────────────────────────────────────────────
+
+    /// Store intermediate protocol state (DKG or signing coordinator).
     ///
-    /// During the 3-round presigning protocol, each round's output must be
-    /// persisted so that the next round can pick up where it left off.
-    /// This is necessary because the CF Worker may restart between rounds.
-    pub async fn store_presigning_state(
-        &self,
-        agent_id: &str,
-        session_id: &str,
-        round: u8,
-        state: &[u8],
-    ) -> Result<()> {
-        todo!(
-            "INSERT OR REPLACE INTO presigning_state (id, agent_id, session_id, round, state, created_at) \
-             VALUES (agent_id || ':' || round, ?, ?, ?, ?, datetime('now'))"
-        )
+    /// Keyed by session_id. Used to persist coordinator state between
+    /// HTTP round-trip requests during multi-round protocols.
+    pub fn store_protocol_state(&self, session_id: &str, state: Vec<u8>) -> Result<(), String> {
+        let mut storage = STORAGE.lock().map_err(|e| format!("lock poisoned: {e}"))?;
+        storage
+            .protocol_state
+            .insert(session_id.to_string(), state);
+        Ok(())
     }
 
-    /// Retrieve presigning state for a specific round.
-    pub async fn get_presigning_state(
-        &self,
-        agent_id: &str,
-        round: u8,
-    ) -> Result<Option<Vec<u8>>> {
-        todo!(
-            "SELECT state FROM presigning_state \
-             WHERE agent_id = ? AND round = ?"
-        )
+    /// Retrieve stored protocol state.
+    pub fn get_protocol_state(&self, session_id: &str) -> Result<Option<Vec<u8>>, String> {
+        let storage = STORAGE.lock().map_err(|e| format!("lock poisoned: {e}"))?;
+        Ok(storage.protocol_state.get(session_id).cloned())
     }
 
-    /// Store a completed presignature.
-    ///
-    /// Presignatures are generated in the offline phase and consumed one-at-a-time
-    /// during online signing. Each presignature can be used exactly once.
-    pub async fn store_presignature(
+    /// Delete protocol state after ceremony completion or on error.
+    pub fn delete_protocol_state(&self, session_id: &str) -> Result<(), String> {
+        let mut storage = STORAGE.lock().map_err(|e| format!("lock poisoned: {e}"))?;
+        storage.protocol_state.remove(session_id);
+        Ok(())
+    }
+
+    // ── Presignatures ─────────────────────────────────────────────────
+
+    /// Store a completed presignature for an agent.
+    pub fn store_presignature(
         &self,
         agent_id: &str,
         session_id: &str,
         presig_id: &str,
-        data: &[u8],
-    ) -> Result<()> {
-        todo!(
-            "INSERT INTO presignatures (id, agent_id, session_id, data, created_at, consumed) \
-             VALUES (?, ?, ?, ?, datetime('now'), 0)"
-        )
+        data: Vec<u8>,
+    ) -> Result<(), String> {
+        let mut storage = STORAGE.lock().map_err(|e| format!("lock poisoned: {e}"))?;
+        let queue = storage
+            .presignatures
+            .entry(agent_id.to_string())
+            .or_default();
+        queue.push_back(StoredPresignature {
+            id: presig_id.to_string(),
+            session_id: session_id.to_string(),
+            data,
+            created_at: chrono::Utc::now().to_rfc3339(),
+        });
+        Ok(())
     }
 
-    /// Consume a presignature for online signing.
+    /// Consume the oldest presignature for an agent (FIFO).
     ///
-    /// Atomically marks the presignature as consumed and returns its data.
-    /// Returns `None` if no unconsumed presignatures are available.
-    /// The oldest presignature is consumed first (FIFO).
-    pub async fn consume_presignature(
-        &self,
-        agent_id: &str,
-    ) -> Result<Option<Vec<u8>>> {
-        todo!(
-            "BEGIN TRANSACTION;\n\
-             SELECT id, data FROM presignatures \
-             WHERE agent_id = ? AND consumed = 0 \
-             ORDER BY created_at ASC LIMIT 1;\n\
-             UPDATE presignatures SET consumed = 1 WHERE id = ?;\n\
-             COMMIT;\n\
-             Return the data"
-        )
+    /// Atomically removes and returns the oldest unconsumed presignature.
+    /// Returns `None` if no presignatures are available.
+    pub fn consume_presignature(&self, agent_id: &str) -> Result<Option<Vec<u8>>, String> {
+        let mut storage = STORAGE.lock().map_err(|e| format!("lock poisoned: {e}"))?;
+        Ok(storage
+            .presignatures
+            .get_mut(agent_id)
+            .and_then(|q| q.pop_front())
+            .map(|p| p.data))
     }
 
-    /// Count available (unconsumed) presignatures for an agent.
-    pub async fn presignature_count(&self, agent_id: &str) -> Result<u64> {
-        todo!(
-            "SELECT COUNT(*) FROM presignatures \
-             WHERE agent_id = ? AND consumed = 0"
-        )
+    /// Count available presignatures for an agent.
+    pub fn presignature_count(&self, agent_id: &str) -> Result<u64, String> {
+        let storage = STORAGE.lock().map_err(|e| format!("lock poisoned: {e}"))?;
+        Ok(storage
+            .presignatures
+            .get(agent_id)
+            .map(|q| q.len() as u64)
+            .unwrap_or(0))
+    }
+
+    /// Count total presignatures across all agents.
+    pub fn total_presignature_count(&self) -> Result<u64, String> {
+        let storage = STORAGE.lock().map_err(|e| format!("lock poisoned: {e}"))?;
+        Ok(storage
+            .presignatures
+            .values()
+            .map(|q| q.len() as u64)
+            .sum())
+    }
+
+    /// Reset all storage (for tests).
+    #[cfg(test)]
+    pub fn reset(&self) {
+        if let Ok(mut storage) = STORAGE.lock() {
+            storage.shares.clear();
+            storage.protocol_state.clear();
+            storage.presignatures.clear();
+        }
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bsv_mpc_core::types::{SessionId, ShareIndex, ThresholdConfig};
+
+    fn make_test_share(agent_id: &str) -> EncryptedShare {
+        EncryptedShare {
+            nonce: vec![0u8; 12],
+            ciphertext: vec![1, 2, 3, 4],
+            session_id: SessionId(format!("session-{agent_id}")),
+            share_index: ShareIndex(0),
+            config: ThresholdConfig { threshold: 2, parties: 2 },
+        }
+    }
+
+    #[test]
+    fn store_and_get_share() {
+        let storage = ShareStorage::new();
+        storage.reset();
+
+        let share = make_test_share("agent-1");
+        storage.store_share("agent-1", &share).unwrap();
+
+        let retrieved = storage.get_share("agent-1").unwrap();
+        assert!(retrieved.is_some());
+        let retrieved = retrieved.unwrap();
+        assert_eq!(retrieved.session_id.0, "session-agent-1");
+        assert_eq!(retrieved.share_index.0, 0);
+    }
+
+    #[test]
+    fn get_nonexistent_share() {
+        let storage = ShareStorage::new();
+        storage.reset();
+
+        let result = storage.get_share("nonexistent").unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn delete_share_cascading() {
+        let storage = ShareStorage::new();
+        storage.reset();
+
+        let share = make_test_share("agent-del");
+        storage.store_share("agent-del", &share).unwrap();
+        storage
+            .store_presignature("agent-del", "sess", "presig-1", vec![10, 20])
+            .unwrap();
+
+        assert_eq!(storage.presignature_count("agent-del").unwrap(), 1);
+
+        let deleted = storage.delete_share("agent-del").unwrap();
+        assert!(deleted);
+        assert!(storage.get_share("agent-del").unwrap().is_none());
+        assert_eq!(storage.presignature_count("agent-del").unwrap(), 0);
+    }
+
+    #[test]
+    fn delete_nonexistent_share() {
+        let storage = ShareStorage::new();
+        storage.reset();
+
+        let deleted = storage.delete_share("nonexistent").unwrap();
+        assert!(!deleted);
+    }
+
+    #[test]
+    fn list_agents_and_count() {
+        let storage = ShareStorage::new();
+        storage.reset();
+
+        assert_eq!(storage.share_count().unwrap(), 0);
+        assert!(storage.list_agents().unwrap().is_empty());
+
+        storage.store_share("bob", &make_test_share("bob")).unwrap();
+        storage.store_share("alice", &make_test_share("alice")).unwrap();
+
+        assert_eq!(storage.share_count().unwrap(), 2);
+        let agents = storage.list_agents().unwrap();
+        assert_eq!(agents, vec!["alice", "bob"]); // sorted
+    }
+
+    #[test]
+    fn share_metadata() {
+        let storage = ShareStorage::new();
+        storage.reset();
+
+        assert!(storage.get_share_metadata("agent-m").unwrap().is_none());
+
+        storage
+            .store_share("agent-m", &make_test_share("agent-m"))
+            .unwrap();
+        storage
+            .store_presignature("agent-m", "sess", "p1", vec![1])
+            .unwrap();
+        storage
+            .store_presignature("agent-m", "sess", "p2", vec![2])
+            .unwrap();
+
+        let meta = storage.get_share_metadata("agent-m").unwrap().unwrap();
+        assert_eq!(meta.agent_id, "agent-m");
+        assert_eq!(meta.session_id, "session-agent-m");
+        assert_eq!(meta.share_index, 0);
+        assert_eq!(meta.threshold, 2);
+        assert_eq!(meta.parties, 2);
+        assert_eq!(meta.presignature_count, 2);
+    }
+
+    #[test]
+    fn protocol_state_round_trip() {
+        let storage = ShareStorage::new();
+        storage.reset();
+
+        let state_bytes = vec![42u8; 100];
+        storage
+            .store_protocol_state("dkg-session-1", state_bytes.clone())
+            .unwrap();
+
+        let loaded = storage
+            .get_protocol_state("dkg-session-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded, state_bytes);
+
+        storage.delete_protocol_state("dkg-session-1").unwrap();
+        assert!(storage
+            .get_protocol_state("dkg-session-1")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn presignature_fifo_consumption() {
+        let storage = ShareStorage::new();
+        storage.reset();
+
+        storage
+            .store_presignature("agent-fifo", "s1", "p1", vec![1])
+            .unwrap();
+        storage
+            .store_presignature("agent-fifo", "s1", "p2", vec![2])
+            .unwrap();
+        storage
+            .store_presignature("agent-fifo", "s1", "p3", vec![3])
+            .unwrap();
+
+        assert_eq!(storage.presignature_count("agent-fifo").unwrap(), 3);
+
+        // FIFO: oldest first
+        assert_eq!(
+            storage.consume_presignature("agent-fifo").unwrap(),
+            Some(vec![1])
+        );
+        assert_eq!(
+            storage.consume_presignature("agent-fifo").unwrap(),
+            Some(vec![2])
+        );
+        assert_eq!(storage.presignature_count("agent-fifo").unwrap(), 1);
+
+        assert_eq!(
+            storage.consume_presignature("agent-fifo").unwrap(),
+            Some(vec![3])
+        );
+        assert_eq!(storage.presignature_count("agent-fifo").unwrap(), 0);
+
+        // Empty: returns None
+        assert!(storage
+            .consume_presignature("agent-fifo")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn total_presignature_count() {
+        let storage = ShareStorage::new();
+        storage.reset();
+
+        storage
+            .store_presignature("a1", "s", "p1", vec![1])
+            .unwrap();
+        storage
+            .store_presignature("a1", "s", "p2", vec![2])
+            .unwrap();
+        storage
+            .store_presignature("a2", "s", "p3", vec![3])
+            .unwrap();
+
+        assert_eq!(storage.total_presignature_count().unwrap(), 3);
+    }
+
+    #[test]
+    fn store_share_upsert() {
+        let storage = ShareStorage::new();
+        storage.reset();
+
+        let share1 = make_test_share("agent-up");
+        storage.store_share("agent-up", &share1).unwrap();
+
+        // Upsert with different data
+        let mut share2 = make_test_share("agent-up");
+        share2.ciphertext = vec![99, 98, 97];
+        storage.store_share("agent-up", &share2).unwrap();
+
+        let retrieved = storage.get_share("agent-up").unwrap().unwrap();
+        assert_eq!(retrieved.ciphertext, vec![99, 98, 97]);
+        assert_eq!(storage.share_count().unwrap(), 1);
     }
 }

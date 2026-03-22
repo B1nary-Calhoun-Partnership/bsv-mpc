@@ -2,18 +2,19 @@
 //!
 //! These handlers are functionally identical to the CF Worker handlers in
 //! `bsv-mpc-worker::api`, but use axum extractors instead of `worker::Request`
-//! and local SQLite instead of Durable Object SQLite.
+//! and local storage instead of Durable Object SQLite.
 //!
 //! ## Shared Protocol Logic
 //!
 //! Both the Worker and self-hosted versions delegate to `bsv-mpc-core` for
 //! the actual MPC protocol logic. The only differences are:
 //!
-//! 1. **Storage backend**: SQLite file vs. Durable Object SQLite
-//! 2. **HTTP framework**: axum vs. `worker` crate
-//! 3. **Auth context**: Both use BRC-31, but session storage differs
+//! 1. **Storage backend**: In-memory HashMap (production: local SQLite) vs DO SQLite
+//! 2. **HTTP framework**: axum vs `worker` crate
+//! 3. **State management**: `Arc<AppState>` with `RwLock` vs global statics
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use axum::{
     extract::{Path, State},
@@ -21,10 +22,36 @@ use axum::{
     response::IntoResponse,
     Json,
 };
-use bsv_mpc_core::types::{RoundMessage, ThresholdConfig};
+use bsv_mpc_core::dkg::{DkgCoordinator, DkgRoundResult};
+use bsv_mpc_core::presigning::{PresigningManager, PresigningRoundResult};
+use bsv_mpc_core::signing::{SigningCoordinator, SigningRoundResult};
+use bsv_mpc_core::types::{RoundMessage, SessionId, ShareIndex, ThresholdConfig};
 use serde::{Deserialize, Serialize};
+use sha2::Digest;
 
 use crate::AppState;
+
+// ── Live Coordinator State ────────────────────────────────────────────────
+//
+// Same pattern as bsv-mpc-worker: coordinators contain threads and channels,
+// so they're kept alive in memory between requests.
+
+/// Wrapper to hold live coordinator sessions.
+/// In production, these could be stored in AppState or use a session manager.
+struct CoordinatorStore {
+    dkg: HashMap<String, DkgCoordinator>,
+    signing: HashMap<String, SigningCoordinator>,
+    presigning: HashMap<String, PresigningManager>,
+}
+
+static COORDINATOR_STORE: std::sync::LazyLock<Mutex<CoordinatorStore>> =
+    std::sync::LazyLock::new(|| {
+        Mutex::new(CoordinatorStore {
+            dkg: HashMap::new(),
+            signing: HashMap::new(),
+            presigning: HashMap::new(),
+        })
+    });
 
 // ── Request / Response Types ──────────────────────────────────────────────
 //
@@ -34,6 +61,7 @@ use crate::AppState;
 
 /// Request body for `POST /dkg/init`.
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct DkgInitRequest {
     /// BRC-31 identity key of the requesting agent (33-byte hex).
     pub agent_id: String,
@@ -74,6 +102,7 @@ pub struct DkgRoundResponse {
 
 /// Request body for `POST /sign/init`.
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct SignInitRequest {
     /// Agent requesting signing.
     pub agent_id: String,
@@ -112,6 +141,7 @@ pub struct SignRoundResponse {
 
 /// Request body for `POST /presign/init`.
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct PresignInitRequest {
     pub agent_id: String,
     pub session_id: String,
@@ -154,28 +184,116 @@ pub struct HealthResponse {
     pub data_dir: String,
 }
 
+// ── Helpers ───────────────────────────────────────────────────────────────
+
+/// Generate a unique session ID with the given prefix.
+fn generate_session_id(prefix: &str) -> Result<String, String> {
+    let mut buf = [0u8; 32];
+    getrandom::getrandom(&mut buf).map_err(|e| format!("entropy error: {e}"))?;
+    let hash = sha2::Sha256::digest(buf);
+    Ok(format!("{}-{}", prefix, hex::encode(&hash[..16])))
+}
+
+/// Helper to create a typed error response.
+fn err_response(
+    status: StatusCode,
+    msg: impl std::fmt::Display,
+) -> (StatusCode, Json<serde_json::Value>) {
+    (status, Json(serde_json::json!({"error": msg.to_string()})))
+}
+
+/// Bundle multiple outgoing RoundMessages into a single transport RoundMessage.
+fn bundle_outgoing_messages(messages: &[RoundMessage]) -> Result<RoundMessage, String> {
+    if messages.is_empty() {
+        return Err("no outgoing messages to bundle".to_string());
+    }
+
+    let values: Vec<serde_json::Value> = messages
+        .iter()
+        .map(|m| {
+            serde_json::from_slice(&m.payload)
+                .map_err(|e| format!("failed to parse wire message: {e}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let bundled_payload = serde_json::to_vec(&values)
+        .map_err(|e| format!("failed to serialize bundled messages: {e}"))?;
+
+    let first = &messages[0];
+    Ok(RoundMessage {
+        session_id: first.session_id.clone(),
+        round: first.round,
+        from: first.from,
+        to: None,
+        payload: bundled_payload,
+    })
+}
+
+/// Unbundle an incoming transport RoundMessage into individual RoundMessages.
+fn unbundle_incoming_message(msg: &RoundMessage) -> Result<Vec<RoundMessage>, String> {
+    if msg.payload.first() == Some(&b'[') {
+        if let Ok(values) = serde_json::from_slice::<Vec<serde_json::Value>>(&msg.payload) {
+            return values
+                .into_iter()
+                .map(|v| {
+                    let payload = serde_json::to_vec(&v)
+                        .map_err(|e| format!("failed to re-serialize wire message: {e}"))?;
+                    Ok(RoundMessage {
+                        session_id: msg.session_id.clone(),
+                        round: msg.round,
+                        from: msg.from,
+                        to: msg.to,
+                        payload,
+                    })
+                })
+                .collect();
+        }
+    }
+
+    Ok(vec![msg.clone()])
+}
+
 // ── Handlers ──────────────────────────────────────────────────────────────
 
 /// `POST /dkg/init` — Start a Distributed Key Generation ceremony.
-///
-/// Validates BRC-31 auth, creates a DKG coordinator, generates round 1,
-/// persists intermediate state, and returns the round 1 message.
 pub async fn handle_dkg_init(
     State(state): State<Arc<AppState>>,
     Json(body): Json<DkgInitRequest>,
 ) -> impl IntoResponse {
-    todo!(
-        "1. Verify BRC-31 auth from request headers\n\
-         2. Validate config: threshold >= 2, threshold <= parties\n\
-         3. Create DKG coordinator: bsv_mpc_core::dkg::Coordinator::new(body.config)\n\
-         4. Generate round 1: coordinator.round1()\n\
-         5. Generate session_id (UUID or random)\n\
-         6. storage.write().store_dkg_state(state)\n\
-         7. Return (StatusCode::OK, Json(DkgInitResponse))"
-    );
+    // TODO: Verify BRC-31 auth
+    let config = match ThresholdConfig::new(body.config.threshold, body.config.parties) {
+        Ok(c) => c,
+        Err(e) => return err_response(StatusCode::BAD_REQUEST, e),
+    };
 
-    #[allow(unreachable_code)]
-    (StatusCode::OK, Json(serde_json::json!({})))
+    let session_id_str = match generate_session_id("dkg") {
+        Ok(id) => id,
+        Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e),
+    };
+
+    let session_id = SessionId(session_id_str.clone());
+    let mut coordinator = DkgCoordinator::new(session_id, config, ShareIndex(0));
+
+    let messages = match coordinator.init() {
+        Ok(msgs) => msgs,
+        Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e),
+    };
+
+    let round_message = match bundle_outgoing_messages(&messages) {
+        Ok(rm) => rm,
+        Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e),
+    };
+
+    if let Ok(mut store) = COORDINATOR_STORE.lock() {
+        store.dkg.insert(session_id_str.clone(), coordinator);
+    }
+
+    let _ = state; // AppState available for future use
+    (StatusCode::OK, Json(serde_json::to_value(DkgInitResponse {
+        session_id: session_id_str,
+        round_message,
+        total_rounds: 4,
+    }).unwrap_or_default()))
 }
 
 /// `POST /dkg/round` — Process a DKG round message.
@@ -183,24 +301,58 @@ pub async fn handle_dkg_round(
     State(state): State<Arc<AppState>>,
     Json(body): Json<DkgRoundRequest>,
 ) -> impl IntoResponse {
-    todo!(
-        "1. Verify BRC-31 auth\n\
-         2. Load DKG state: storage.read().get_dkg_state(&body.session_id)\n\
-         3. Reconstruct coordinator from persisted state\n\
-         4. Process round: coordinator.process_round(body.round_message)\n\
-         5. If complete:\n\
-              a. Finalize: coordinator.finalize() -> DkgResult\n\
-              b. Store share: storage.write().store_share(agent_id, &result.share)\n\
-              c. Clean up: storage.write().delete_dkg_state(&body.session_id)\n\
-              d. Return DkgRoundResponse {{ complete: true, joint_pubkey: Some(...) }}\n\
-         6. Else:\n\
-              a. Generate next round message\n\
-              b. Persist updated state\n\
-              c. Return DkgRoundResponse {{ round_message: Some(...), complete: false }}"
-    );
+    let incoming = match unbundle_incoming_message(&body.round_message) {
+        Ok(msgs) => msgs,
+        Err(e) => return err_response(StatusCode::BAD_REQUEST, e),
+    };
 
-    #[allow(unreachable_code)]
-    (StatusCode::OK, Json(serde_json::json!({})))
+    let result = {
+        let mut store = match COORDINATOR_STORE.lock() {
+            Ok(s) => s,
+            Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e),
+        };
+
+        let coordinator = match store.dkg.get_mut(&body.session_id) {
+            Some(c) => c,
+            None => return err_response(StatusCode::NOT_FOUND, format!("DKG session not found: {}", body.session_id)),
+        };
+
+        match coordinator.process_round(incoming) {
+            Ok(r) => r,
+            Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e),
+        }
+    };
+
+    match result {
+        DkgRoundResult::NextRound(messages) => {
+            let round_message = match bundle_outgoing_messages(&messages) {
+                Ok(rm) => rm,
+                Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e),
+            };
+            (StatusCode::OK, Json(serde_json::to_value(DkgRoundResponse {
+                session_id: body.session_id,
+                round_message: Some(round_message),
+                complete: false,
+                joint_pubkey: None,
+            }).unwrap_or_default()))
+        }
+        DkgRoundResult::Complete(dkg_result) => {
+            // Store share
+            if let Ok(mut storage) = state.storage.write() {
+                let _ = storage.store_share(&dkg_result.session_id.0, &dkg_result.share);
+            }
+            // Clean up coordinator
+            if let Ok(mut store) = COORDINATOR_STORE.lock() {
+                store.dkg.remove(&body.session_id);
+            }
+            (StatusCode::OK, Json(serde_json::to_value(DkgRoundResponse {
+                session_id: dkg_result.session_id.0.clone(),
+                round_message: None,
+                complete: true,
+                joint_pubkey: Some(dkg_result.joint_key),
+            }).unwrap_or_default()))
+        }
+    }
 }
 
 /// `POST /sign/init` — Start a threshold signing ceremony.
@@ -208,46 +360,109 @@ pub async fn handle_sign_init(
     State(state): State<Arc<AppState>>,
     Json(body): Json<SignInitRequest>,
 ) -> impl IntoResponse {
-    todo!(
-        "1. Verify BRC-31 auth, check agent owns the share\n\
-         2. Load share: storage.read().get_share(&body.agent_id)\n\
-         3. Parse sighash: hex::decode(&body.sighash), verify 32 bytes\n\
-         4. If use_presignature:\n\
-              a. Try storage.write().consume_presignature(&body.agent_id)\n\
-              b. If Some(presig): create online signing coordinator (1 round)\n\
-              c. If None: fall back to full protocol (4 rounds)\n\
-         5. Else: create full signing coordinator\n\
-         6. Generate round 1 message\n\
-         7. Persist signing state\n\
-         8. Return SignInitResponse"
-    );
+    let share = match state.storage.read() {
+        Ok(storage) => match storage.get_share(&body.agent_id) {
+            Ok(Some(s)) => s,
+            Ok(None) => return err_response(StatusCode::NOT_FOUND, format!("No share for agent: {}", body.agent_id)),
+            Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e),
+        },
+        Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e),
+    };
 
-    #[allow(unreachable_code)]
-    (StatusCode::OK, Json(serde_json::json!({})))
+    let sighash_bytes = match hex::decode(&body.sighash) {
+        Ok(b) => b,
+        Err(e) => return err_response(StatusCode::BAD_REQUEST, format!("invalid sighash hex: {e}")),
+    };
+    if sighash_bytes.len() != 32 {
+        return err_response(StatusCode::BAD_REQUEST, format!("sighash must be 32 bytes, got {}", sighash_bytes.len()));
+    }
+    let mut sighash = [0u8; 32];
+    sighash.copy_from_slice(&sighash_bytes);
+
+    let signing_session_id = match generate_session_id("sign") {
+        Ok(id) => id,
+        Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e),
+    };
+
+    let session_id = SessionId(body.session_id);
+    let config = share.config;
+    let participants: Vec<u16> = (0..config.parties).collect();
+    let mut coordinator = SigningCoordinator::new(session_id, share, config, participants);
+
+    let messages = match coordinator.sign(&sighash, None) {
+        Ok(msgs) => msgs,
+        Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e),
+    };
+
+    let round_message = match bundle_outgoing_messages(&messages) {
+        Ok(rm) => rm,
+        Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e),
+    };
+
+    if let Ok(mut store) = COORDINATOR_STORE.lock() {
+        store.signing.insert(signing_session_id.clone(), coordinator);
+    }
+
+    (StatusCode::OK, Json(serde_json::to_value(SignInitResponse {
+        signing_session_id,
+        round_message,
+        using_presignature: false,
+        total_rounds: 4,
+    }).unwrap_or_default()))
 }
 
 /// `POST /sign/round` — Process a signing round message.
 pub async fn handle_sign_round(
-    State(state): State<Arc<AppState>>,
+    State(_state): State<Arc<AppState>>,
     Json(body): Json<SignRoundRequest>,
 ) -> impl IntoResponse {
-    todo!(
-        "1. Verify BRC-31 auth\n\
-         2. Load signing state\n\
-         3. Process round message\n\
-         4. If complete:\n\
-              a. Extract signature (DER, r, s, recovery_id)\n\
-              b. Generate participation proof\n\
-              c. Clean up signing state\n\
-              d. Return SignRoundResponse {{ complete: true, signature: Some(...) }}\n\
-         5. Else:\n\
-              a. Generate next round message\n\
-              b. Persist updated state\n\
-              c. Return SignRoundResponse {{ round_message: Some(...), complete: false }}"
-    );
+    let incoming = match unbundle_incoming_message(&body.round_message) {
+        Ok(msgs) => msgs,
+        Err(e) => return err_response(StatusCode::BAD_REQUEST, e),
+    };
 
-    #[allow(unreachable_code)]
-    (StatusCode::OK, Json(serde_json::json!({})))
+    let result = {
+        let mut store = match COORDINATOR_STORE.lock() {
+            Ok(s) => s,
+            Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e),
+        };
+
+        let coordinator = match store.signing.get_mut(&body.signing_session_id) {
+            Some(c) => c,
+            None => return err_response(StatusCode::NOT_FOUND, format!("Signing session not found: {}", body.signing_session_id)),
+        };
+
+        match coordinator.process_round(incoming) {
+            Ok(r) => r,
+            Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e),
+        }
+    };
+
+    match result {
+        SigningRoundResult::NextRound(messages) => {
+            let round_message = match bundle_outgoing_messages(&messages) {
+                Ok(rm) => rm,
+                Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e),
+            };
+            (StatusCode::OK, Json(serde_json::to_value(SignRoundResponse {
+                signing_session_id: body.signing_session_id,
+                round_message: Some(round_message),
+                complete: false,
+                signature: None,
+            }).unwrap_or_default()))
+        }
+        SigningRoundResult::Complete(signing_result) => {
+            if let Ok(mut store) = COORDINATOR_STORE.lock() {
+                store.signing.remove(&body.signing_session_id);
+            }
+            (StatusCode::OK, Json(serde_json::to_value(SignRoundResponse {
+                signing_session_id: body.signing_session_id,
+                round_message: None,
+                complete: true,
+                signature: Some(signing_result),
+            }).unwrap_or_default()))
+        }
+    }
 }
 
 /// `POST /presign/init` — Start a presigning batch.
@@ -255,41 +470,87 @@ pub async fn handle_presign_init(
     State(state): State<Arc<AppState>>,
     Json(body): Json<PresignInitRequest>,
 ) -> impl IntoResponse {
-    todo!(
-        "1. Verify BRC-31 auth\n\
-         2. Validate count <= 100\n\
-         3. Load share\n\
-         4. Create presigning coordinators (one per requested presig)\n\
-         5. Generate round 1 messages for each\n\
-         6. Persist coordinator states\n\
-         7. Return PresignInitResponse"
-    );
+    if body.count == 0 || body.count > 100 {
+        return err_response(StatusCode::BAD_REQUEST, "count must be between 1 and 100");
+    }
 
-    #[allow(unreachable_code)]
-    (StatusCode::OK, Json(serde_json::json!({})))
+    let share = match state.storage.read() {
+        Ok(storage) => match storage.get_share(&body.agent_id) {
+            Ok(Some(s)) => s,
+            Ok(None) => return err_response(StatusCode::NOT_FOUND, format!("No share for agent: {}", body.agent_id)),
+            Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e),
+        },
+        Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e),
+    };
+
+    let presign_session_id = match generate_session_id("presign") {
+        Ok(id) => id,
+        Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e),
+    };
+
+    let session_id = SessionId(body.session_id);
+    let participants: Vec<u16> = (0..share.config.parties).collect();
+    let mut manager = PresigningManager::new(session_id, share, participants, body.count as usize);
+
+    let messages = match manager.init_generate() {
+        Ok(msgs) => msgs,
+        Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e),
+    };
+
+    if let Ok(mut store) = COORDINATOR_STORE.lock() {
+        store.presigning.insert(presign_session_id.clone(), manager);
+    }
+
+    (StatusCode::OK, Json(serde_json::to_value(PresignInitResponse {
+        presign_session_id,
+        round_messages: messages,
+        total_rounds: 3,
+    }).unwrap_or_default()))
 }
 
 /// `POST /presign/round` — Process a presigning round.
 pub async fn handle_presign_round(
-    State(state): State<Arc<AppState>>,
+    State(_state): State<Arc<AppState>>,
     Json(body): Json<PresignRoundRequest>,
 ) -> impl IntoResponse {
-    todo!(
-        "1. Verify BRC-31 auth\n\
-         2. Load presigning coordinator states\n\
-         3. Process round messages for each coordinator\n\
-         4. If all complete:\n\
-              a. Store completed presignatures\n\
-              b. Clean up intermediate state\n\
-              c. Return PresignRoundResponse {{ complete: true, presignatures_generated: Some(n) }}\n\
-         5. Else:\n\
-              a. Generate next round messages\n\
-              b. Persist updated states\n\
-              c. Return PresignRoundResponse {{ round_messages: Some(...), complete: false }}"
-    );
+    let result = {
+        let mut store = match COORDINATOR_STORE.lock() {
+            Ok(s) => s,
+            Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e),
+        };
 
-    #[allow(unreachable_code)]
-    (StatusCode::OK, Json(serde_json::json!({})))
+        let manager = match store.presigning.get_mut(&body.presign_session_id) {
+            Some(m) => m,
+            None => return err_response(StatusCode::NOT_FOUND, format!("Presigning session not found: {}", body.presign_session_id)),
+        };
+
+        match manager.process_generate_round(body.round_messages) {
+            Ok(r) => r,
+            Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e),
+        }
+    };
+
+    match result {
+        PresigningRoundResult::NextRound(messages) => {
+            (StatusCode::OK, Json(serde_json::to_value(PresignRoundResponse {
+                presign_session_id: body.presign_session_id,
+                round_messages: Some(messages),
+                complete: false,
+                presignatures_generated: None,
+            }).unwrap_or_default()))
+        }
+        PresigningRoundResult::Complete => {
+            if let Ok(mut store) = COORDINATOR_STORE.lock() {
+                store.presigning.remove(&body.presign_session_id);
+            }
+            (StatusCode::OK, Json(serde_json::to_value(PresignRoundResponse {
+                presign_session_id: body.presign_session_id,
+                round_messages: None,
+                complete: true,
+                presignatures_generated: Some(1),
+            }).unwrap_or_default()))
+        }
+    }
 }
 
 /// `GET /health` — Liveness check with operational metrics.
@@ -298,11 +559,22 @@ pub async fn handle_health(State(state): State<Arc<AppState>>) -> impl IntoRespo
         .signed_duration_since(state.started_at)
         .num_seconds();
 
+    let (share_count, total_presignatures) = match state.storage.read() {
+        Ok(storage) => (
+            storage.share_count().unwrap_or(0),
+            // Sum presignature counts across all agents
+            storage.list_agents().unwrap_or_default().iter()
+                .map(|a| storage.presignature_count(a).unwrap_or(0))
+                .sum(),
+        ),
+        Err(_) => (0, 0),
+    };
+
     let response = HealthResponse {
         status: "ok".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
-        share_count: 0, // TODO: state.storage.read().share_count().unwrap_or(0)
-        total_presignatures: 0, // TODO: sum across all agents
+        share_count,
+        total_presignatures,
         uptime_seconds: uptime,
         data_dir: state.data_dir.clone(),
     };
@@ -315,31 +587,29 @@ pub async fn handle_get_share_metadata(
     State(state): State<Arc<AppState>>,
     Path(agent_id): Path<String>,
 ) -> impl IntoResponse {
-    todo!(
-        "1. Verify BRC-31 auth, check requester == agent_id\n\
-         2. storage.read().get_share_metadata(&agent_id)\n\
-         3. Return 200 with ShareMetadata or 404 if not found"
-    );
-
-    #[allow(unreachable_code)]
-    (StatusCode::OK, Json(serde_json::json!({})))
+    // TODO: Verify BRC-31 auth, check requester == agent_id
+    match state.storage.read() {
+        Ok(storage) => match storage.get_share_metadata(&agent_id) {
+            Ok(Some(metadata)) => (StatusCode::OK, Json(serde_json::to_value(metadata).unwrap_or_default())),
+            Ok(None) => err_response(StatusCode::NOT_FOUND, format!("No share for agent: {agent_id}")),
+            Err(e) => err_response(StatusCode::INTERNAL_SERVER_ERROR, e),
+        },
+        Err(e) => err_response(StatusCode::INTERNAL_SERVER_ERROR, e),
+    }
 }
 
-/// `POST /.well-known/auth` — BRC-31 Authrite handshake.
-///
-/// Mutual authentication key exchange. The client sends its identity key and
-/// nonce; the server responds with its own identity key and nonce.
+/// `POST /.well-known/auth` — BRC-31 Authrite handshake (stub).
 pub async fn handle_authrite(
     State(_state): State<Arc<AppState>>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    todo!(
-        "1. Extract client identityKey and nonce from body\n\
-         2. Generate server nonce (32 bytes, crypto random)\n\
-         3. Store auth session: (client_key, client_nonce, server_nonce, timestamp)\n\
-         4. Return {{ identityKey: server_key, nonce: server_nonce, certificates: [] }}"
-    );
+    let _client_key = body.get("identityKey").and_then(|v| v.as_str()).unwrap_or("");
+    let _client_nonce = body.get("nonce").and_then(|v| v.as_str()).unwrap_or("");
 
-    #[allow(unreachable_code)]
-    (StatusCode::OK, Json(serde_json::json!({})))
+    // TODO: Implement full BRC-31 handshake
+    (StatusCode::OK, Json(serde_json::json!({
+        "identityKey": "000000000000000000000000000000000000000000000000000000000000000000",
+        "nonce": "development-stub-nonce",
+        "certificates": []
+    })))
 }
