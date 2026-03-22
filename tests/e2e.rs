@@ -704,29 +704,47 @@ async fn test_mainnet_transaction(env: &TestEnv, client: &Client) {
         hex::encode(&mpc_pubkey_hash)
     );
 
-    let fund_resp = post_json(
-        client,
-        "http://localhost:3321/createAction",
-        &json!({
+    // Wallet at :3321 requires Origin: http://admin.com and outputDescription
+    let fund_resp = match client
+        .post("http://localhost:3321/createAction")
+        .header("Origin", "http://admin.com")
+        .json(&json!({
             "description": "Fund MPC E2E test",
             "outputs": [{
                 "satoshis": 5000,
-                "lockingScript": locking_script
+                "lockingScript": locking_script,
+                "outputDescription": "Fund MPC E2E test address"
             }]
-        }),
-    )
-    .await;
-    if fund_resp.get("error").is_some() {
-        eprintln!("  SKIP: Could not fund MPC address (wallet not running?): {fund_resp}");
+        }))
+        .send()
+        .await
+    {
+        Ok(r) => r.json::<Value>().await.unwrap_or_default(),
+        Err(e) => {
+            eprintln!("  SKIP: Wallet not reachable: {e}");
+            return;
+        }
+    };
+    if fund_resp.get("txid").is_none() {
+        eprintln!("  SKIP: Could not fund MPC address: {fund_resp}");
         return;
     }
     let fund_txid = fund_resp["txid"].as_str().expect("funding txid");
-    let fund_raw_tx = fund_resp["rawTx"].as_str().expect("funding rawTx");
-    eprintln!("  Funded: txid={fund_txid}");
+    // Wallet returns tx as AtomicBEEF byte array, convert to hex
+    let fund_raw_tx = if let Some(raw) = fund_resp["rawTx"].as_str() {
+        raw.to_string()
+    } else if let Some(arr) = fund_resp["tx"].as_array() {
+        let bytes: Vec<u8> = arr.iter().map(|v| v.as_u64().unwrap_or(0) as u8).collect();
+        hex::encode(&bytes)
+    } else {
+        eprintln!("  SKIP: No rawTx or tx in response: {fund_resp}");
+        return;
+    };
+    eprintln!("  Funded: txid={fund_txid} ({} bytes)", fund_raw_tx.len() / 2);
 
     // Step 2: Internalize the funding transaction
     // Find the output index that pays to our locking script
-    let _fund_tx_bytes = hex::decode(fund_raw_tx).expect("decode rawTx");
+    let _fund_tx_bytes = hex::decode(&fund_raw_tx).expect("decode rawTx");
     let mut vout: u64 = 0;
     // Try each output index to find the one paying to our script
     for i in 0..10 {
@@ -760,12 +778,16 @@ async fn test_mainnet_transaction(env: &TestEnv, client: &Client) {
 
     // Step 4: Create a transaction (send back to wallet)
     // Get wallet's public key for the return address
-    let wallet_pk_resp = post_json(
-        client,
-        "http://localhost:3321/getPublicKey",
-        &json!({"identityKey": true}),
-    )
-    .await;
+    let wallet_pk_resp = client
+        .post("http://localhost:3321/getPublicKey")
+        .header("Origin", "http://admin.com")
+        .json(&json!({"identityKey": true}))
+        .send()
+        .await
+        .expect("wallet getPublicKey")
+        .json::<Value>()
+        .await
+        .unwrap_or_default();
     let wallet_pk_hex = wallet_pk_resp["publicKey"]
         .as_str()
         .unwrap_or("02000000000000000000000000000000000000000000000000000000000000000001");
