@@ -166,12 +166,17 @@ fn build_p2pkh_unlocking_script(sig_checksig: &[u8], compressed_pubkey: &[u8; 33
     script
 }
 
-/// Estimate mining fee based on transaction size (1 sat/byte, conservative).
+/// Estimate mining fee based on transaction size.
 ///
+/// BSV fee rate: just over 100 sats/KB (~0.1 sat/byte).
 /// P2PKH input: ~149 bytes, P2PKH output: ~34 bytes, overhead: ~10 bytes.
+const FEE_RATE_SATS_PER_KB: u64 = 110; // just over 100 sats/KB
+
 fn estimate_mining_fee(num_inputs: usize, num_outputs: usize) -> u64 {
     let estimated_size = 10 + (num_inputs * 149) + (num_outputs * 34);
-    std::cmp::max(estimated_size as u64, 100)
+    // fee = ceil(size_bytes * rate_per_kb / 1000)
+    let fee = (estimated_size as u64 * FEE_RATE_SATS_PER_KB + 999) / 1000;
+    std::cmp::max(fee, 1)
 }
 
 /// Write a Bitcoin varint to a buffer.
@@ -409,9 +414,9 @@ async fn broadcast_tx(
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
         }
 
-        // Try ARC broadcasters first (they return detailed status info).
+        // Try ARC broadcasters first. GorillaPool doesn't require auth.
+        // TAAL requires Bearer token — skip unless configured.
         let arc_endpoints = [
-            "https://arc.taal.com",
             "https://arc.gorillapool.io",
         ];
 
@@ -2535,7 +2540,9 @@ mod tests {
         let fee_1_2 = estimate_mining_fee(1, 2);
         let fee_2_3 = estimate_mining_fee(2, 3);
 
-        assert!(fee_1_1 >= 100, "minimum 100 sats");
+        // 1 input + 1 output = ~193 bytes. At 110 sats/KB: ceil(193 * 110 / 1000) = 22 sats
+        assert!(fee_1_1 >= 1, "minimum 1 sat");
+        assert!(fee_1_1 < 50, "fee should be ~22 sats for small tx at 110 sats/KB, got {fee_1_1}");
         assert!(fee_1_2 > fee_1_1, "more outputs = higher fee");
         assert!(fee_2_3 > fee_1_2, "more inputs = higher fee");
     }
