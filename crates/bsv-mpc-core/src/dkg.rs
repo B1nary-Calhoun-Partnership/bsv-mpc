@@ -731,6 +731,7 @@ fn run_keygen_sm(
     });
 
     let mut msg_id: u64 = 0;
+    let mut wire_buffer: std::collections::VecDeque<WireMessage> = std::collections::VecDeque::new();
 
     loop {
         match sm.proceed() {
@@ -758,50 +759,50 @@ fn run_keygen_sm(
                 }
             }
             ProceedResult::NeedsOneMoreMessage => {
-                // Tell coordinator we need input
-                if outbound_tx.send(SmOutbound::NeedsMessage).is_err() {
-                    return;
-                }
-
-                // Wait for incoming message from coordinator
-                let inbound = match inbound_rx.recv() {
-                    Ok(msg) => msg,
-                    Err(_) => return, // Channel closed, coordinator is done
-                };
-
-                match inbound {
-                    SmInbound::IncomingMessage(wire_bytes) => {
-                        msg_id += 1;
-                        let wire: WireMessage = match serde_json::from_slice(&wire_bytes) {
-                            Ok(w) => w,
-                            Err(e) => {
-                                let _ = outbound_tx.send(SmOutbound::Error(
-                                    format!("keygen: failed to deserialize incoming: {e}"),
-                                ));
-                                return;
-                            }
-                        };
-                        let incoming = match wire_to_incoming(wire, msg_id) {
-                            Ok(inc) => inc,
-                            Err(e) => {
-                                let _ = outbound_tx.send(SmOutbound::Error(
-                                    format!("keygen: failed to parse incoming message: {e}"),
-                                ));
-                                return;
-                            }
-                        };
-                        if sm.received_msg(incoming).is_err() {
-                            let _ = outbound_tx.send(SmOutbound::Error(
-                                "keygen: SM rejected incoming message".into(),
-                            ));
-                            return;
+                let wire = if let Some(w) = wire_buffer.pop_front() {
+                    w
+                } else {
+                    if outbound_tx.send(SmOutbound::NeedsMessage).is_err() {
+                        return;
+                    }
+                    let inbound = match inbound_rx.recv() {
+                        Ok(msg) => msg,
+                        Err(_) => return,
+                    };
+                    match inbound {
+                        SmInbound::IncomingMessage(wire_bytes) => {
+                            let mut wires: std::collections::VecDeque<WireMessage> =
+                                if wire_bytes.first() == Some(&b'[') {
+                                    match serde_json::from_slice::<Vec<WireMessage>>(&wire_bytes) {
+                                        Ok(v) => v.into(),
+                                        Err(e) => { let _ = outbound_tx.send(SmOutbound::Error(format!("keygen: failed to deserialize bundled incoming: {e}"))); return; }
+                                    }
+                                } else {
+                                    match serde_json::from_slice::<WireMessage>(&wire_bytes) {
+                                        Ok(w) => { let mut d = std::collections::VecDeque::new(); d.push_back(w); d }
+                                        Err(e) => { let _ = outbound_tx.send(SmOutbound::Error(format!("keygen: failed to deserialize incoming: {e}"))); return; }
+                                    }
+                                };
+                            let first = match wires.pop_front() {
+                                Some(w) => w,
+                                None => { let _ = outbound_tx.send(SmOutbound::Error("keygen: empty bundle".into())); return; }
+                            };
+                            wire_buffer.extend(wires);
+                            first
                         }
                     }
+                };
+                msg_id += 1;
+                let incoming = match wire_to_incoming(wire, msg_id) {
+                    Ok(inc) => inc,
+                    Err(e) => { let _ = outbound_tx.send(SmOutbound::Error(format!("keygen: failed to parse incoming message: {e}"))); return; }
+                };
+                if sm.received_msg(incoming).is_err() {
+                    let _ = outbound_tx.send(SmOutbound::Error("keygen: SM rejected incoming message".into()));
+                    return;
                 }
             }
-            ProceedResult::Yielded => {
-                // SM made progress but isn't done yet — keep looping
-            }
+            ProceedResult::Yielded => {}
             ProceedResult::Output(result) => {
                 match result {
                     Ok(incomplete_share) => {
@@ -876,6 +877,7 @@ fn run_aux_info_sm(
     });
 
     let mut msg_id: u64 = 0;
+    let mut wire_buffer: std::collections::VecDeque<WireMessage> = std::collections::VecDeque::new();
 
     loop {
         match sm.proceed() {
@@ -903,43 +905,47 @@ fn run_aux_info_sm(
                 }
             }
             ProceedResult::NeedsOneMoreMessage => {
-                if outbound_tx.send(SmOutbound::NeedsMessage).is_err() {
-                    return;
-                }
-
-                let inbound = match inbound_rx.recv() {
-                    Ok(msg) => msg,
-                    Err(_) => return,
-                };
-
-                match inbound {
-                    SmInbound::IncomingMessage(wire_bytes) => {
-                        msg_id += 1;
-                        let wire: WireMessage = match serde_json::from_slice(&wire_bytes) {
-                            Ok(w) => w,
-                            Err(e) => {
-                                let _ = outbound_tx.send(SmOutbound::Error(
-                                    format!("auxinfo: failed to deserialize incoming: {e}"),
-                                ));
-                                return;
-                            }
-                        };
-                        let incoming = match wire_to_incoming(wire, msg_id) {
-                            Ok(inc) => inc,
-                            Err(e) => {
-                                let _ = outbound_tx.send(SmOutbound::Error(
-                                    format!("auxinfo: failed to parse incoming message: {e}"),
-                                ));
-                                return;
-                            }
-                        };
-                        if sm.received_msg(incoming).is_err() {
-                            let _ = outbound_tx.send(SmOutbound::Error(
-                                "auxinfo: SM rejected incoming message".into(),
-                            ));
-                            return;
+                let wire = if let Some(w) = wire_buffer.pop_front() {
+                    w
+                } else {
+                    if outbound_tx.send(SmOutbound::NeedsMessage).is_err() {
+                        return;
+                    }
+                    let inbound = match inbound_rx.recv() {
+                        Ok(msg) => msg,
+                        Err(_) => return,
+                    };
+                    match inbound {
+                        SmInbound::IncomingMessage(wire_bytes) => {
+                            let mut wires: std::collections::VecDeque<WireMessage> =
+                                if wire_bytes.first() == Some(&b'[') {
+                                    match serde_json::from_slice::<Vec<WireMessage>>(&wire_bytes) {
+                                        Ok(v) => v.into(),
+                                        Err(e) => { let _ = outbound_tx.send(SmOutbound::Error(format!("auxinfo: failed to deserialize bundled incoming: {e}"))); return; }
+                                    }
+                                } else {
+                                    match serde_json::from_slice::<WireMessage>(&wire_bytes) {
+                                        Ok(w) => { let mut d = std::collections::VecDeque::new(); d.push_back(w); d }
+                                        Err(e) => { let _ = outbound_tx.send(SmOutbound::Error(format!("auxinfo: failed to deserialize incoming: {e}"))); return; }
+                                    }
+                                };
+                            let first = match wires.pop_front() {
+                                Some(w) => w,
+                                None => { let _ = outbound_tx.send(SmOutbound::Error("auxinfo: empty bundle".into())); return; }
+                            };
+                            wire_buffer.extend(wires);
+                            first
                         }
                     }
+                };
+                msg_id += 1;
+                let incoming = match wire_to_incoming(wire, msg_id) {
+                    Ok(inc) => inc,
+                    Err(e) => { let _ = outbound_tx.send(SmOutbound::Error(format!("auxinfo: failed to parse incoming message: {e}"))); return; }
+                };
+                if sm.received_msg(incoming).is_err() {
+                    let _ = outbound_tx.send(SmOutbound::Error("auxinfo: SM rejected incoming message".into()));
+                    return;
                 }
             }
             ProceedResult::Yielded => {}

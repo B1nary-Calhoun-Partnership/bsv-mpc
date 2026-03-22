@@ -73,6 +73,9 @@ struct SignInitRequest {
     sighash: String,
     /// Whether to use a presignature for single-round signing.
     use_presignature: bool,
+    /// Optional BRC-42 HMAC offset for derived key signing (32 bytes, hex).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hmac_offset: Option<String>,
 }
 
 /// Response from `POST /sign/init`.
@@ -432,6 +435,35 @@ fn kss_post<Req: Serialize, Resp: serde::de::DeserializeOwned>(
 }
 
 // ============================================================================
+// Wire format: bundle / unbundle
+// ============================================================================
+
+/// Bundle multiple outgoing `RoundMessage`s into a single transport `RoundMessage`.
+/// Payload becomes a JSON array of WireMessages.
+fn bundle_messages(messages: &[RoundMessage]) -> std::result::Result<RoundMessage, MpcError> {
+    if messages.is_empty() {
+        return Err(MpcError::Signing("no messages to bundle".into()));
+    }
+    let values: Vec<serde_json::Value> = messages
+        .iter()
+        .map(|m| {
+            serde_json::from_slice(&m.payload)
+                .map_err(|e| MpcError::Serialization(format!("failed to parse wire message for bundling: {e}")))
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let bundled_payload = serde_json::to_vec(&values)
+        .map_err(|e| MpcError::Serialization(format!("failed to serialize bundled messages: {e}")))?;
+    let first = &messages[0];
+    Ok(RoundMessage {
+        session_id: first.session_id.clone(),
+        round: first.round,
+        from: first.from,
+        to: None,
+        payload: bundled_payload,
+    })
+}
+
+// ============================================================================
 // MpcBridge
 // ============================================================================
 
@@ -659,10 +691,18 @@ impl MpcBridge {
     ///
     /// - `message_hash` — The 32-byte SHA-256d sighash to sign.
     /// - `presignature` — Currently unused (presigned path not yet in coordinator).
+    /// # Arguments
+    ///
+    /// - `message_hash` — The 32-byte SHA-256d sighash to sign.
+    /// - `presignature` — Currently unused (presigned path not yet in coordinator).
+    /// - `hmac_offset` — Optional BRC-42 HMAC offset for derived key signing.
+    ///   When set, the signing produces a signature for `root_pub + G * offset`
+    ///   rather than the root key. Both proxy and KSS must use the same offset.
     pub async fn sign(
         &self,
         message_hash: &[u8; 32],
         presignature: Option<Presignature>,
+        hmac_offset: Option<[u8; 32]>,
     ) -> bsv_mpc_core::error::Result<SigningResult> {
         let share = self.share.clone();
         let session_id = self.session_id.clone();
@@ -686,7 +726,7 @@ impl MpcBridge {
             );
 
             // Initialize signing → get proxy's Round 1 messages
-            let proxy_msgs = coord.sign(&hash, presignature)?;
+            let proxy_msgs = coord.sign(&hash, presignature, hmac_offset)?;
 
             tracing::debug!(
                 round = 1,
@@ -694,7 +734,8 @@ impl MpcBridge {
                 "signing: initialized, starting KSS session"
             );
 
-            // Start KSS signing session → get KSS's Round 1 message
+            // Start KSS signing session → get KSS's Round 1 message.
+            // Send the HMAC offset to KSS so it applies the same additive shift.
             let sign_init_url = format!("{}/sign/init", kss_url);
             let init_resp: SignInitResponse = kss_post(
                 &handle,
@@ -705,6 +746,7 @@ impl MpcBridge {
                     session_id: session_id.0.clone(),
                     sighash: hex_encode(&hash),
                     use_presignature: false,
+                    hmac_offset: hmac_offset.map(|o| hex_encode(&o)),
                 },
                 &auth,
             )?;
@@ -718,27 +760,28 @@ impl MpcBridge {
             let signing_session_id = init_resp.signing_session_id;
             let sign_round_url = format!("{}/sign/round", kss_url);
 
-            // State: proxy has proxy_R1 (to send), KSS returned KSS_R1 (to process)
+            // Bundle proxy's outgoing messages for KSS transport.
+            // The KSS bundles its responses too — we pass them directly to
+            // the coordinator as single RoundMessages with bundled payloads.
+            // The SM thread handles unbundling internally (JSON array of WireMessages).
             let mut kss_msg = init_resp.round_message;
-            let mut proxy_msg = proxy_msgs
-                .into_iter()
-                .next()
-                .ok_or_else(|| MpcError::Signing("coordinator produced no initial messages".into()))?;
+            let mut proxy_bundle = bundle_messages(&proxy_msgs)?;
 
             loop {
-                // Exchange: send proxy's current message to KSS, get KSS's next message
+                // Exchange: send proxy's bundled message to KSS, get KSS's next bundled message
                 let round_resp: SignRoundResponse = kss_post(
                     &handle,
                     &client,
                     &sign_round_url,
                     &SignRoundRequest {
                         signing_session_id: signing_session_id.clone(),
-                        round_message: proxy_msg,
+                        round_message: proxy_bundle,
                     },
                     &auth,
                 )?;
 
-                // Process: feed KSS's previous message to coordinator
+                // Process: feed KSS's bundled message directly to coordinator.
+                // The SM thread handles unbundling the JSON array payload internally.
                 match coord.process_round(vec![kss_msg])? {
                     SigningRoundResult::NextRound(next_proxy_msgs) => {
                         tracing::debug!(
@@ -760,11 +803,7 @@ impl MpcBridge {
                             )
                         })?;
 
-                        proxy_msg = next_proxy_msgs.into_iter().next().ok_or_else(|| {
-                            MpcError::Signing(
-                                "coordinator produced no messages for next round".into(),
-                            )
-                        })?;
+                        proxy_bundle = bundle_messages(&next_proxy_msgs)?;
                     }
                     SigningRoundResult::Complete(result) => {
                         tracing::info!("signing: complete");
@@ -1198,6 +1237,7 @@ mod tests {
             session_id: "sess-1".into(),
             sighash: "ff".repeat(32),
             use_presignature: false,
+            hmac_offset: None,
         };
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(json["agent_id"], "02abc123");

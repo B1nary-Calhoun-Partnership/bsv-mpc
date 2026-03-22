@@ -216,10 +216,11 @@ impl SigningCoordinator {
         &mut self,
         message_hash: &[u8; 32],
         _presignature: Option<Presignature>,
+        hmac_offset: Option<[u8; 32]>,
     ) -> Result<Vec<RoundMessage>> {
         // TODO: When cggmp24 `insecure-assume-preimage-known` feature is enabled,
         // implement the presigned path here using issue_partial_signature + combine.
-        self.init_round(message_hash)
+        self.init_round(message_hash, hmac_offset)
     }
 
     /// Start the signing protocol (Round 1).
@@ -234,7 +235,11 @@ impl SigningCoordinator {
     /// # Returns
     ///
     /// A vector of [`RoundMessage`]s to broadcast to all participating signers.
-    pub fn init_round(&mut self, message_hash: &[u8; 32]) -> Result<Vec<RoundMessage>> {
+    pub fn init_round(
+        &mut self,
+        message_hash: &[u8; 32],
+        hmac_offset: Option<[u8; 32]>,
+    ) -> Result<Vec<RoundMessage>> {
         if self.mode != SigningMode::NotStarted {
             return Err(MpcError::Signing(
                 "init_round() called but signing already started".into(),
@@ -257,7 +262,7 @@ impl SigningCoordinator {
         self.mode = SigningMode::FullProtocol;
         self.current_round = 1;
 
-        self.start_signing_sm(message_hash)?;
+        self.start_signing_sm(message_hash, hmac_offset)?;
         self.collect_outgoing_messages()
     }
 
@@ -317,7 +322,11 @@ impl SigningCoordinator {
     // Internal: Start the signing state machine in a background thread
     // -----------------------------------------------------------------------
 
-    fn start_signing_sm(&mut self, message_hash: &[u8; 32]) -> Result<()> {
+    fn start_signing_sm(
+        &mut self,
+        message_hash: &[u8; 32],
+        hmac_offset: Option<[u8; 32]>,
+    ) -> Result<()> {
         let (inbound_tx, inbound_rx) = mpsc::channel::<SmInbound>();
         let (outbound_tx, outbound_rx) = mpsc::channel::<SmOutbound>();
 
@@ -345,6 +354,7 @@ impl SigningCoordinator {
                     participants,
                     key_share_json,
                     msg_hash,
+                    hmac_offset,
                     inbound_rx,
                     outbound_tx,
                 );
@@ -516,6 +526,7 @@ fn run_signing_sm(
     participants: Vec<u16>,
     key_share_json: Vec<u8>,
     message_hash: [u8; 32],
+    hmac_offset: Option<[u8; 32]>,
     inbound_rx: mpsc::Receiver<SmInbound>,
     outbound_tx: mpsc::Sender<SmOutbound>,
 ) {
@@ -539,15 +550,29 @@ fn run_signing_sm(
 
     let eid = ExecutionId::new(&eid_bytes);
 
+    // Build the signing protocol, optionally with a BRC-42 additive shift.
+    // When hmac_offset is set, the signing produces a signature for the
+    // derived child key (root_pub + G * offset) rather than the root key.
+    let mut builder = cggmp24::signing(eid, my_signing_index, &participants, &key_share);
+    if let Some(offset_bytes) = hmac_offset {
+        let offset_scalar = Scalar::<Secp256k1>::from_be_bytes_mod_order(offset_bytes);
+        builder = builder.set_additive_shift(offset_scalar);
+    }
+
     // Create the signing state machine via wrap_protocol.
     // sign() accepts &dyn AnyDataToSign which PrehashedDataToSign implements.
     let mut sm = round_based::state_machine::wrap_protocol(|party| async move {
-        cggmp24::signing(eid, my_signing_index, &participants, &key_share)
+        builder
             .sign(&mut rand::rngs::OsRng, party, &data_to_sign)
             .await
     });
 
     let mut msg_id: u64 = 0;
+    // Local buffer for bundled messages. When the KSS sends a JSON array of
+    // WireMessages in a single payload, we consume the first and buffer the
+    // rest. Subsequent NeedsOneMoreMessage calls drain the buffer before
+    // requesting more from the coordinator.
+    let mut wire_buffer: std::collections::VecDeque<WireMessage> = std::collections::VecDeque::new();
 
     loop {
         match sm.proceed() {
@@ -574,54 +599,81 @@ fn run_signing_sm(
                     .send(SmOutbound::OutgoingMessage(wire_bytes))
                     .is_err()
                 {
-                    return; // Coordinator dropped its receiver
+                    return;
                 }
             }
             ProceedResult::NeedsOneMoreMessage => {
-                // Tell coordinator we need input
-                if outbound_tx.send(SmOutbound::NeedsMessage).is_err() {
-                    return;
-                }
-
-                // Wait for incoming message from coordinator
-                let inbound = match inbound_rx.recv() {
-                    Ok(msg) => msg,
-                    Err(_) => return, // Channel closed, coordinator is done
-                };
-
-                match inbound {
-                    SmInbound::IncomingMessage(wire_bytes) => {
-                        msg_id += 1;
-                        let wire: WireMessage = match serde_json::from_slice(&wire_bytes) {
-                            Ok(w) => w,
-                            Err(e) => {
-                                let _ = outbound_tx.send(SmOutbound::Error(format!(
-                                    "signing: failed to deserialize incoming: {e}"
-                                )));
-                                return;
-                            }
-                        };
-                        let incoming = match wire_to_incoming(wire, msg_id) {
-                            Ok(inc) => inc,
-                            Err(e) => {
-                                let _ = outbound_tx.send(SmOutbound::Error(format!(
-                                    "signing: failed to parse incoming message: {e}"
-                                )));
-                                return;
-                            }
-                        };
-                        if sm.received_msg(incoming).is_err() {
-                            let _ = outbound_tx.send(SmOutbound::Error(
-                                "signing: SM rejected incoming message".into(),
-                            ));
-                            return;
+                // Check local buffer first — if bundled messages remain, consume
+                // one without signaling the coordinator.
+                let wire = if let Some(w) = wire_buffer.pop_front() {
+                    w
+                } else {
+                    // Buffer empty — tell coordinator we need input and wait.
+                    if outbound_tx.send(SmOutbound::NeedsMessage).is_err() {
+                        return;
+                    }
+                    let inbound = match inbound_rx.recv() {
+                        Ok(msg) => msg,
+                        Err(_) => return,
+                    };
+                    match inbound {
+                        SmInbound::IncomingMessage(wire_bytes) => {
+                            // Parse: single WireMessage or bundled JSON array.
+                            let mut wires: std::collections::VecDeque<WireMessage> =
+                                if wire_bytes.first() == Some(&b'[') {
+                                    match serde_json::from_slice::<Vec<WireMessage>>(&wire_bytes) {
+                                        Ok(v) => v.into(),
+                                        Err(e) => {
+                                            let _ = outbound_tx.send(SmOutbound::Error(format!(
+                                                "signing: failed to deserialize bundled incoming: {e}"
+                                            )));
+                                            return;
+                                        }
+                                    }
+                                } else {
+                                    match serde_json::from_slice::<WireMessage>(&wire_bytes) {
+                                        Ok(w) => { let mut d = std::collections::VecDeque::new(); d.push_back(w); d }
+                                        Err(e) => {
+                                            let _ = outbound_tx.send(SmOutbound::Error(format!(
+                                                "signing: failed to deserialize incoming: {e}"
+                                            )));
+                                            return;
+                                        }
+                                    }
+                                };
+                            let first = match wires.pop_front() {
+                                Some(w) => w,
+                                None => {
+                                    let _ = outbound_tx.send(SmOutbound::Error(
+                                        "signing: received empty bundled message".into(),
+                                    ));
+                                    return;
+                                }
+                            };
+                            wire_buffer.extend(wires);
+                            first
                         }
                     }
+                };
+
+                msg_id += 1;
+                let incoming = match wire_to_incoming(wire, msg_id) {
+                    Ok(inc) => inc,
+                    Err(e) => {
+                        let _ = outbound_tx.send(SmOutbound::Error(format!(
+                            "signing: failed to parse incoming message: {e}"
+                        )));
+                        return;
+                    }
+                };
+                if sm.received_msg(incoming).is_err() {
+                    let _ = outbound_tx.send(SmOutbound::Error(
+                        "signing: SM rejected incoming message".into(),
+                    ));
+                    return;
                 }
             }
-            ProceedResult::Yielded => {
-                // SM made progress but isn't done yet — keep looping
-            }
+            ProceedResult::Yielded => {}
             ProceedResult::Output(result) => {
                 match result {
                     Ok(sig) => {
@@ -970,7 +1022,7 @@ mod tests {
             vec![0, 1],
         );
 
-        let result = coord.init_round(&[0u8; 32]);
+        let result = coord.init_round(&[0u8; 32], None);
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
@@ -1230,10 +1282,10 @@ mod tests {
 
         // Step 3: Init both coordinators
         let msgs0 = coord0
-            .init_round(&message_hash)
+            .init_round(&message_hash, None)
             .expect("coord0 init should succeed");
         let msgs1 = coord1
-            .init_round(&message_hash)
+            .init_round(&message_hash, None)
             .expect("coord1 init should succeed");
 
         assert!(!msgs0.is_empty(), "coord0 should produce outgoing messages");
@@ -1353,10 +1405,10 @@ mod tests {
 
         // sign() without presig = init_round()
         let msgs0 = coord0
-            .sign(&message_hash, None)
+            .sign(&message_hash, None, None)
             .expect("coord0 sign should succeed");
         let msgs1 = coord1
-            .init_round(&message_hash)
+            .init_round(&message_hash, None)
             .expect("coord1 init should succeed");
 
         assert!(!msgs0.is_empty());

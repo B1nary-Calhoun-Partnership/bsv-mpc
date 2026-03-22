@@ -112,6 +112,11 @@ pub struct SignInitRequest {
     pub sighash: String,
     /// Whether to consume a presignature for single-round signing.
     pub use_presignature: bool,
+    /// Optional BRC-42 HMAC offset for derived key signing (32 bytes, hex).
+    /// When set, the signing produces a signature for the derived child key
+    /// (root_pub + G * offset) rather than the root key.
+    #[serde(default)]
+    pub hmac_offset: Option<String>,
 }
 
 /// Response from `POST /sign/init`.
@@ -317,10 +322,9 @@ pub async fn handle_dkg_round(
     State(state): State<Arc<AppState>>,
     Json(body): Json<DkgRoundRequest>,
 ) -> impl IntoResponse {
-    let incoming = match unbundle_incoming_message(&body.round_message) {
-        Ok(msgs) => msgs,
-        Err(e) => return err_response(StatusCode::BAD_REQUEST, e),
-    };
+    // Pass the bundled message directly — the SM thread handles unbundling
+    // JSON array payloads internally (same pattern as signing).
+    let incoming = vec![body.round_message];
 
     let result = {
         let mut store = match COORDINATOR_STORE.lock() {
@@ -400,12 +404,29 @@ pub async fn handle_sign_init(
         Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e),
     };
 
+    // Parse optional BRC-42 HMAC offset for derived key signing
+    let hmac_offset: Option<[u8; 32]> = match &body.hmac_offset {
+        Some(hex_str) => {
+            let bytes = match hex::decode(hex_str) {
+                Ok(b) => b,
+                Err(e) => return err_response(StatusCode::BAD_REQUEST, format!("invalid hmac_offset hex: {e}")),
+            };
+            if bytes.len() != 32 {
+                return err_response(StatusCode::BAD_REQUEST, format!("hmac_offset must be 32 bytes, got {}", bytes.len()));
+            }
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&bytes);
+            Some(arr)
+        }
+        None => None,
+    };
+
     let session_id = SessionId(body.session_id);
     let config = share.config;
     let participants: Vec<u16> = (0..config.parties).collect();
     let mut coordinator = SigningCoordinator::new(session_id, share, config, participants);
 
-    let messages = match coordinator.sign(&sighash, None) {
+    let messages = match coordinator.sign(&sighash, None, hmac_offset) {
         Ok(msgs) => msgs,
         Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e),
     };
@@ -432,10 +453,9 @@ pub async fn handle_sign_round(
     State(_state): State<Arc<AppState>>,
     Json(body): Json<SignRoundRequest>,
 ) -> impl IntoResponse {
-    let incoming = match unbundle_incoming_message(&body.round_message) {
-        Ok(msgs) => msgs,
-        Err(e) => return err_response(StatusCode::BAD_REQUEST, e),
-    };
+    // Pass the bundled message directly to the coordinator — the SM thread
+    // handles unbundling JSON array payloads internally via VecDeque buffer.
+    let incoming = vec![body.round_message];
 
     let result = {
         let mut store = match COORDINATOR_STORE.lock() {

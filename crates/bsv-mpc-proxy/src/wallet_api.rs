@@ -585,16 +585,35 @@ pub async fn create_signature(
         h
     };
 
-    // Note: BRC-42 derived key signing requires applying the HMAC offset to
-    // the MPC share before signing. This is not yet implemented — for M2, we
-    // sign with the root key only. The offset will be added when bridge.rs
-    // supports share derivation.
-    if body.get("protocolID").is_some() {
-        tracing::warn!(
-            "createSignature with protocolID — signing with root key \
-             (derived key signing requires share offset, not yet implemented)"
-        );
-    }
+    // Compute BRC-42 HMAC offset for derived key signing.
+    // For "anyone" counterparty: offset = HMAC(root_pub, invoice) — fully local.
+    // For "self"/"other": would need partial ECDH for shared_secret (not yet supported).
+    let hmac_offset: Option<[u8; 32]> = if body.get("protocolID").is_some() {
+        let (level, protocol_name, key_id, counterparty) = match parse_protocol_params(&body) {
+            Ok(params) => params,
+            Err(e) => return Json(json!({ "error": e })),
+        };
+
+        match counterparty.as_str() {
+            "anyone" => {
+                let invoice = bsv_mpc_core::hd::compute_invoice(level, &protocol_name, &key_id);
+                let hmac = bsv_mpc_core::hd::compute_brc42_hmac(state.bridge.root_pub(), &invoice);
+                Some(hmac)
+            }
+            _ => {
+                // "self" and "other" counterparties require partial ECDH to compute
+                // the shared secret before HMAC. Not yet wired for signing.
+                tracing::warn!(
+                    counterparty = %counterparty,
+                    "createSignature: derived key signing for non-anyone counterparty \
+                     not yet implemented — signing with root key"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     // Try to get a presignature from the pool for single-round signing
     let presig = {
@@ -603,7 +622,7 @@ pub async fn create_signature(
     };
 
     // Sign via MPC bridge (2PC with KSS)
-    let signing_result = match state.bridge.sign(&msg_hash, presig).await {
+    let signing_result = match state.bridge.sign(&msg_hash, presig, hmac_offset).await {
         Ok(result) => result,
         Err(e) => return Json(json!({ "error": format!("MPC signing failed: {}", e) })),
     };
@@ -644,7 +663,7 @@ pub async fn verify_signature(
         Err(e) => return Json(json!({ "error": e })),
     };
 
-    // Parse data (hex-encoded 32-byte hash)
+    // Parse data and compute hash (same as createSignature)
     let data_hex = match body.get("data").and_then(|v| v.as_str()) {
         Some(s) => s,
         None => return Json(json!({ "error": "missing data" })),
@@ -653,11 +672,29 @@ pub async fn verify_signature(
         Ok(bytes) => bytes,
         Err(e) => return Json(json!({ "error": format!("invalid hex data: {}", e) })),
     };
-    if data_bytes.len() != 32 {
-        return Json(json!({ "error": format!("data must be 32 bytes, got {}", data_bytes.len()) }));
+    if data_bytes.is_empty() {
+        return Json(json!({ "error": "data is empty" }));
     }
-    let mut msg_hash = [0u8; 32];
-    msg_hash.copy_from_slice(&data_bytes);
+
+    // Hash the data with SHA-256 (matching createSignature behavior)
+    let hash_to_directly_sign = body
+        .get("hashToDirectlySign")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let msg_hash: [u8; 32] = if hash_to_directly_sign {
+        if data_bytes.len() != 32 {
+            return Json(json!({ "error": format!("hashToDirectlySign requires 32 bytes, got {}", data_bytes.len()) }));
+        }
+        let mut h = [0u8; 32];
+        h.copy_from_slice(&data_bytes);
+        h
+    } else {
+        let hash = Sha256::digest(&data_bytes);
+        let mut h = [0u8; 32];
+        h.copy_from_slice(&hash);
+        h
+    };
 
     // Parse DER signature
     let sig_hex = match body.get("signature").and_then(|v| v.as_str()) {
@@ -889,8 +926,9 @@ pub async fn create_action(
             mgr.take()
         };
 
-        // MPC sign via bridge (2PC with KSS)
-        let signing_result = match state.bridge.sign(&sighash, presig).await {
+        // MPC sign via bridge (2PC with KSS) — root key for now
+        // TODO: derive child key offset for BRC-42 input derivation paths
+        let signing_result = match state.bridge.sign(&sighash, presig, None).await {
             Ok(result) => result,
             Err(e) => {
                 return Json(
