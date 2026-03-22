@@ -2050,12 +2050,13 @@ mod tests {
             .derive_private_key(&protocol, "sig-key", &Counterparty::Anyone)
             .expect("derivation should work");
 
-        // Sign a message hash
-        let msg_hash = [0x42u8; 32];
+        // The handler SHA-256 hashes data before verifying, so sign the hash
+        let data = [0x42u8; 32];
+        let msg_hash: [u8; 32] = Sha256::digest(&data).into();
         let signature = child_priv.sign(&msg_hash).expect("signing should work");
 
         let body = json!({
-            "data": hex::encode(msg_hash),
+            "data": hex::encode(data),
             "signature": hex::encode(signature.to_der()),
             "protocolID": [2, "test sig"],
             "keyID": "sig-key",
@@ -2107,12 +2108,14 @@ mod tests {
     #[tokio::test]
     async fn test_verify_signature_bad_data_length() {
         let state = test_state();
+        // With hashToDirectlySign=true, data must be exactly 32 bytes
         let body = json!({
             "data": "aabb",
             "signature": "3044022000",
             "protocolID": [2, "test"],
             "keyID": "k",
-            "counterparty": "anyone"
+            "counterparty": "anyone",
+            "hashToDirectlySign": true
         });
         let Json(resp) = verify_signature(State(state), Json(body)).await;
         assert!(resp.get("error").is_some());
@@ -2185,11 +2188,13 @@ mod tests {
             .derive_private_key(&protocol, "for-self-false", &Counterparty::Other(root_pub))
             .expect("derivation should work");
 
-        let msg_hash = [0x55u8; 32];
+        // The handler SHA-256 hashes data before verifying, so sign the hash
+        let data = [0x55u8; 32];
+        let msg_hash: [u8; 32] = Sha256::digest(&data).into();
         let signature = child_priv.sign(&msg_hash).unwrap();
 
         let body = json!({
-            "data": hex::encode(msg_hash),
+            "data": hex::encode(data),
             "signature": hex::encode(signature.to_der()),
             "protocolID": [2, "test sig"],
             "keyID": "for-self-false",
