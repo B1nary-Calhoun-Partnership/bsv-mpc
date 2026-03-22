@@ -76,7 +76,61 @@ pub fn create_participation_proof(
     nodes: &[Vec<u8>],
     signing_hash: &[u8; 32],
     fee_txid: Option<&str>,
-) -> ParticipationProof {
+) -> crate::Result<ParticipationProof> {
+    // Validate agent key is a 33-byte compressed secp256k1 pubkey.
+    if agent_key.len() != 33 {
+        return Err(crate::MpcError::Protocol(format!(
+            "agent_key must be 33 bytes, got {}",
+            agent_key.len()
+        )));
+    }
+    if agent_key[0] != 0x02 && agent_key[0] != 0x03 {
+        return Err(crate::MpcError::Protocol(format!(
+            "agent_key must start with 0x02 or 0x03, got 0x{:02x}",
+            agent_key[0]
+        )));
+    }
+
+    // Validate participating nodes are non-empty.
+    if nodes.is_empty() {
+        return Err(crate::MpcError::Protocol(
+            "participating nodes must not be empty".into(),
+        ));
+    }
+
+    // Validate each node key is a 33-byte compressed pubkey.
+    for (i, node) in nodes.iter().enumerate() {
+        if node.len() != 33 {
+            return Err(crate::MpcError::Protocol(format!(
+                "node {i} key must be 33 bytes, got {}",
+                node.len()
+            )));
+        }
+        if node[0] != 0x02 && node[0] != 0x03 {
+            return Err(crate::MpcError::Protocol(format!(
+                "node {i} key must start with 0x02 or 0x03, got 0x{:02x}",
+                node[0]
+            )));
+        }
+    }
+
+    // Check for duplicate nodes.
+    let mut seen = HashSet::new();
+    for node in nodes {
+        if !seen.insert(node.as_slice()) {
+            return Err(crate::MpcError::Protocol(
+                "duplicate node in participating_nodes".into(),
+            ));
+        }
+    }
+
+    // Agent must be in participants.
+    if !nodes.iter().any(|n| n.as_slice() == agent_key) {
+        return Err(crate::MpcError::Protocol(
+            "agent_key must appear in participating_nodes".into(),
+        ));
+    }
+
     // Compute session_hash = SHA-256(session_id string bytes).
     // This binds the proof to a specific DKG session.
     let session_hash = {
@@ -85,14 +139,14 @@ pub fn create_participation_proof(
         hasher.finalize().to_vec()
     };
 
-    ParticipationProof {
+    Ok(ParticipationProof {
         session_hash,
         agent_identity: agent_key.to_vec(),
         participating_nodes: nodes.to_vec(),
         signing_hash: signing_hash.to_vec(),
         fee_txid: fee_txid.map(String::from),
         timestamp: chrono::Utc::now(),
-    }
+    })
 }
 
 /// Push data onto a script buffer using proper Bitcoin PUSHDATA encoding.
@@ -330,6 +384,7 @@ mod tests {
         let agent = fake_pubkey(0xAA);
         let nodes = vec![fake_pubkey(0xAA), fake_pubkey(0xBB)];
         create_participation_proof(&session, &agent, &nodes, &fake_hash(0x11), Some(fake_txid()))
+            .expect("valid_proof helper should not fail")
     }
 
     // ----------------------------------------------------------------
@@ -349,7 +404,8 @@ mod tests {
             &nodes,
             &signing_hash,
             Some(fake_txid()),
-        );
+        )
+        .expect("should succeed with valid inputs");
 
         assert_eq!(proof.session_hash.len(), 32);
         assert_eq!(proof.agent_identity, agent);
@@ -366,7 +422,8 @@ mod tests {
         let nodes = vec![fake_pubkey(0x01)];
         let signing_hash = fake_hash(0xAA);
 
-        let proof = create_participation_proof(&session, &agent, &nodes, &signing_hash, None);
+        let proof = create_participation_proof(&session, &agent, &nodes, &signing_hash, None)
+            .expect("should succeed without fee txid");
 
         assert!(proof.fee_txid.is_none());
     }
@@ -378,7 +435,8 @@ mod tests {
         let nodes = vec![fake_pubkey(0x01)];
         let signing_hash = fake_hash(0x00);
 
-        let proof = create_participation_proof(&session, &agent, &nodes, &signing_hash, None);
+        let proof = create_participation_proof(&session, &agent, &nodes, &signing_hash, None)
+            .expect("should succeed");
 
         // Independently compute expected hash.
         let mut hasher = Sha256::new();
@@ -503,7 +561,8 @@ mod tests {
         let agent = fake_pubkey_03(0xCC);
         let nodes = vec![fake_pubkey_03(0xCC), fake_pubkey(0xDD)];
         let proof =
-            create_participation_proof(&session, &agent, &nodes, &fake_hash(0x22), None);
+            create_participation_proof(&session, &agent, &nodes, &fake_hash(0x22), None)
+                .expect("should succeed with 0x03 prefix");
         assert!(verify_participation_proof(&proof));
     }
 
@@ -559,7 +618,8 @@ mod tests {
         let agent = fake_pubkey(0x01);
         let nodes = vec![fake_pubkey(0x01)];
         let proof =
-            create_participation_proof(&session, &agent, &nodes, &fake_hash(0x00), None);
+            create_participation_proof(&session, &agent, &nodes, &fake_hash(0x00), None)
+                .expect("should succeed");
         let script = proof_to_op_return(&proof);
 
         // The script should still be well-formed with an OP_0 for the fee_txid.
@@ -691,7 +751,8 @@ mod tests {
         let signing_hash = fake_hash(0xCC);
 
         let proof =
-            create_participation_proof(&session, &agent, &nodes, &signing_hash, Some(fake_txid()));
+            create_participation_proof(&session, &agent, &nodes, &signing_hash, Some(fake_txid()))
+                .expect("should succeed");
 
         assert!(
             verify_participation_proof(&proof),
@@ -712,7 +773,8 @@ mod tests {
             &nodes,
             &signing_hash,
             Some(fake_txid()),
-        );
+        )
+        .expect("should succeed");
 
         // Verify the proof passes structural validation.
         assert!(verify_participation_proof(&proof));
@@ -739,10 +801,11 @@ mod tests {
         }
 
         let proof =
-            create_participation_proof(&session, &agent, &nodes, &fake_hash(0xDD), None);
+            create_participation_proof(&session, &agent, &nodes, &fake_hash(0xDD), None)
+                .expect("should succeed with many nodes");
 
         assert!(verify_participation_proof(&proof));
         let script = proof_to_op_return(&proof);
-        assert!(script.len() > 0);
+        assert!(!script.is_empty());
     }
 }

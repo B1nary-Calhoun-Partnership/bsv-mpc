@@ -81,20 +81,24 @@ pub struct WireMessage {
 }
 
 /// Convert a cggmp24 `Outgoing` message to a `WireMessage` for transport.
-fn outgoing_to_wire<M: Serialize>(sender: u16, out: round_based::Outgoing<M>) -> WireMessage {
-    WireMessage {
+pub(crate) fn outgoing_to_wire<M: Serialize>(
+    sender: u16,
+    out: round_based::Outgoing<M>,
+) -> std::result::Result<WireMessage, MpcError> {
+    Ok(WireMessage {
         sender,
         is_broadcast: out.recipient.is_broadcast(),
-        msg: serde_json::to_value(&out.msg).expect("protocol message must serialize"),
-    }
+        msg: serde_json::to_value(&out.msg)
+            .map_err(|e| MpcError::Serialization(format!("failed to serialize outgoing message: {e}")))?,
+    })
 }
 
 /// Convert a `WireMessage` back to a cggmp24 `Incoming` message.
-fn wire_to_incoming<M: serde::de::DeserializeOwned>(
+pub(crate) fn wire_to_incoming<M: serde::de::DeserializeOwned>(
     wire: WireMessage,
     id: u64,
-) -> round_based::Incoming<M> {
-    round_based::Incoming {
+) -> std::result::Result<round_based::Incoming<M>, MpcError> {
+    Ok(round_based::Incoming {
         id,
         sender: wire.sender,
         msg_type: if wire.is_broadcast {
@@ -102,8 +106,9 @@ fn wire_to_incoming<M: serde::de::DeserializeOwned>(
         } else {
             round_based::MessageType::P2P
         },
-        msg: serde_json::from_value(wire.msg).expect("protocol message must deserialize"),
-    }
+        msg: serde_json::from_value(wire.msg)
+            .map_err(|e| MpcError::Serialization(format!("failed to deserialize incoming message: {e}")))?,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -635,8 +640,18 @@ impl DkgCoordinator {
         // Encrypt the key share for persistent storage.
         // We use a placeholder encryption key here — the caller should re-encrypt
         // with a proper BRC-42 derived key before persisting.
+        // NOTE: The ciphertext is NOT actually encrypted here — it contains
+        // the raw serialized KeyShare JSON. The caller (proxy layer) must
+        // re-encrypt with a BRC-42 derived key before persisting.
+        // We use a random nonce (not zeros) so that any accidental attempt
+        // to decrypt with a real key fails cleanly with GCM auth tag mismatch.
         let share = EncryptedShare {
-            nonce: vec![0u8; 12], // Placeholder — caller must re-encrypt
+            nonce: {
+                use rand::RngCore;
+                let mut nonce = vec![0u8; 12];
+                rand::rngs::OsRng.fill_bytes(&mut nonce);
+                nonce
+            },
             ciphertext: key_share_json,
             session_id: self.session_id.clone(),
             share_index: self.my_index,
@@ -720,7 +735,15 @@ fn run_keygen_sm(
     loop {
         match sm.proceed() {
             ProceedResult::SendMsg(outgoing) => {
-                let wire = outgoing_to_wire(my_index, outgoing);
+                let wire = match outgoing_to_wire(my_index, outgoing) {
+                    Ok(w) => w,
+                    Err(e) => {
+                        let _ = outbound_tx.send(SmOutbound::Error(
+                            format!("keygen: failed to create wire message: {e}"),
+                        ));
+                        return;
+                    }
+                };
                 let wire_bytes = match serde_json::to_vec(&wire) {
                     Ok(b) => b,
                     Err(e) => {
@@ -758,7 +781,15 @@ fn run_keygen_sm(
                                 return;
                             }
                         };
-                        let incoming = wire_to_incoming(wire, msg_id);
+                        let incoming = match wire_to_incoming(wire, msg_id) {
+                            Ok(inc) => inc,
+                            Err(e) => {
+                                let _ = outbound_tx.send(SmOutbound::Error(
+                                    format!("keygen: failed to parse incoming message: {e}"),
+                                ));
+                                return;
+                            }
+                        };
                         if sm.received_msg(incoming).is_err() {
                             let _ = outbound_tx.send(SmOutbound::Error(
                                 "keygen: SM rejected incoming message".into(),
@@ -849,7 +880,15 @@ fn run_aux_info_sm(
     loop {
         match sm.proceed() {
             ProceedResult::SendMsg(outgoing) => {
-                let wire = outgoing_to_wire(my_index, outgoing);
+                let wire = match outgoing_to_wire(my_index, outgoing) {
+                    Ok(w) => w,
+                    Err(e) => {
+                        let _ = outbound_tx.send(SmOutbound::Error(
+                            format!("auxinfo: failed to create wire message: {e}"),
+                        ));
+                        return;
+                    }
+                };
                 let wire_bytes = match serde_json::to_vec(&wire) {
                     Ok(b) => b,
                     Err(e) => {
@@ -885,7 +924,15 @@ fn run_aux_info_sm(
                                 return;
                             }
                         };
-                        let incoming = wire_to_incoming(wire, msg_id);
+                        let incoming = match wire_to_incoming(wire, msg_id) {
+                            Ok(inc) => inc,
+                            Err(e) => {
+                                let _ = outbound_tx.send(SmOutbound::Error(
+                                    format!("auxinfo: failed to parse incoming message: {e}"),
+                                ));
+                                return;
+                            }
+                        };
                         if sm.received_msg(incoming).is_err() {
                             let _ = outbound_tx.send(SmOutbound::Error(
                                 "auxinfo: SM rejected incoming message".into(),
