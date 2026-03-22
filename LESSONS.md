@@ -42,6 +42,51 @@ Each NeedsOneMoreMessage → HTTP POST to /recv
 Protocol messages serialize cleanly with serde_json
 ```
 
+### Production DKG implementation (M1: dkg.rs)
+
+**Protocol state management — thread + channel bridge:**
+- cggmp24's `StateMachine` is `!Send` — cannot cross tokio task boundaries
+- Solution: run each SM in a dedicated `std::thread`, bridge with `std::sync::mpsc` channels
+- Coordinator sends `SmInbound::IncomingMessage(wire_bytes)` to SM thread
+- SM thread sends `SmOutbound::OutgoingMessage`, `NeedsMessage`, `KeygenComplete`, `AuxInfoComplete`, or `Error` back
+- This avoids the complexity of async pinning while keeping the coordinator `Send`-safe
+
+**Two-phase lifecycle (keygen → aux_info → combine):**
+- DKG is NOT a single protocol run — it requires two sequential sub-protocols
+- Phase 1: `cggmp24::keygen()` → produces `IncompleteKeyShare` (has the secret share + joint pubkey but no Paillier params)
+- Phase 2: `cggmp24::aux_info_gen()` → produces `AuxInfo` (Paillier moduli + Pedersen params)
+- Phase 3: `KeyShare::from_parts((incomplete, aux_info))` → complete share ready for signing
+- The coordinator handles the transition automatically: when keygen completes, it stores the `IncompleteKeyShare`, starts the aux_info SM, and continues round exchange
+
+**Execution ID derivation:**
+- EID must be unique per protocol execution AND agreed upon by all parties
+- Solution: `SHA-256("bsv-mpc-dkg-keygen-" || session_id)` for keygen, `SHA-256("bsv-mpc-dkg-auxinfo-" || session_id)` for aux info
+- Deterministic from session_id — no extra coordination needed
+
+**Blum primes vs safe primes:**
+- `PregeneratedPrimes::generate(&mut OsRng)` creates safe primes (correct, 30-60s per party)
+- POC Blum prime shortcut: `Integer::generate_prime()` + `mod_u(4) == 3` filter (~5-15s per party)
+- Production coordinator accepts optional pre-generated primes via `set_pregenerated_primes()`
+- Recommendation: generate primes in a background job at coordinator creation time, not during DKG
+
+**Wire message serialization:**
+- `WireMessage { sender: u16, is_broadcast: bool, msg: serde_json::Value }` wraps each protocol message
+- `outgoing_to_wire()` / `wire_to_incoming()` handle conversion to/from round_based's `Outgoing`/`Incoming`
+- Serialized to JSON bytes and packed into `RoundMessage.payload` for HTTP transport
+- `ValidateFromParts` trait import is NOT needed — it's re-exported through cggmp24's public API
+
+**WASM compatibility:**
+- `std::thread` is used for the SM, which does NOT compile to wasm32-unknown-unknown
+- However, the core types and serialization DO compile to WASM
+- For CF Worker (WASM), the SM must use a different approach: `into_state_machine()` + manual stepping (POC 2/10 pattern)
+- The `WireMessage` type and serialization functions are fully WASM-compatible
+
+**Testing approach:**
+- Unit tests: coordinator creation, validation, EID determinism, wire message round-trip (instant)
+- Simulation tests: `round_based::sim::run()` for full DKG (27-53s with optimized deps)
+- Coordinator integration test: two coordinators exchanging messages (24s with Blum primes)
+- `[profile.dev.package."*"] opt-level = 2` in workspace Cargo.toml is CRITICAL — without it, num-bigint ops are 10-100x slower
+
 ### Scaling (POC 12: 3-of-5)
 - 5-party DKG: 138ms (vs ~80ms for 2-party)
 - Aux info is the bottleneck: 130s for 5 sets of Paillier primes (one-time)

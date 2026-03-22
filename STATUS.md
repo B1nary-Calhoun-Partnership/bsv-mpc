@@ -100,7 +100,7 @@ The capstone (POC 15) validated the full flow but used shortcuts that must be re
 ## Implementation Order (Revised Post-POC)
 
 ### M1: Core MPC Library (Mar 21-28)
-1. **#8 DKG coordinator** — port POC 1 DKG patterns to `dkg.rs` (2-3 days)
+1. **#8 DKG coordinator** — **DONE** — Full 2-phase DKG (keygen + aux_info_gen + combine). Thread-based SM with channel bridge. WireMessage serialization for HTTP transport. 12 tests (unit + integration + 2-party coordinator exchange). WASM-compilable.
 2. **#9 Signing coordinator** — port POC 1 signing + POC 5 HTTP SM to `signing.rs` (2-3 days)
 3. **#10 Presigning manager** — integrate cggmp24 presign with existing pool (1-2 days)
 4. **#11 Share encryption** — AES-256-GCM **DONE** (encrypt/decrypt/derive_key implemented + 22 tests)
