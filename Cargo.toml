@@ -70,6 +70,7 @@ cggmp24-keygen = { git = "https://github.com/LFDT-Lockness/cggmp21", features = 
 # MPC protocol infrastructure (must match cggmp24's transitive deps)
 round-based = { version = "0.4.1", features = ["state-machine"] }
 generic-ec = { version = "0.4.1", features = ["curve-secp256k1", "serde"] }
+generic-ec-zkp = { version = "0.4", features = ["alloc"] }
 
 # BSV
 bsv = { package = "bsv-sdk", path = "../rust-sdk", features = ["transaction", "wallet"] }

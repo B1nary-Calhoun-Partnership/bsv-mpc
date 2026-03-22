@@ -51,12 +51,14 @@ pub mod error;
 pub mod hd;
 pub mod presigning;
 pub mod proof;
+pub mod refresh;
 pub mod share;
 pub mod signing;
 pub mod types;
 
 // Re-export key public types for ergonomic imports.
 pub use error::{MpcError, Result};
+pub use refresh::RefreshResult;
 pub use types::{
     DkgResult, EncryptedShare, JointPublicKey, ParticipationProof, Presignature, RoundMessage,
     SessionId, ShareIndex, SigningResult, ThresholdConfig,

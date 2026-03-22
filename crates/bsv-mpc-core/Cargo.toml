@@ -11,6 +11,7 @@ cggmp24.workspace = true
 cggmp24-keygen.workspace = true
 round-based.workspace = true
 generic-ec.workspace = true
+generic-ec-zkp.workspace = true
 bsv.workspace = true
 serde.workspace = true
 serde_json.workspace = true
