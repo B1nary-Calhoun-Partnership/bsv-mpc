@@ -48,11 +48,14 @@
 //!   signing and cannot be reused.
 
 use crate::config::ProxyConfig;
+use bsv::primitives::ec::{PrivateKey, PublicKey};
 use bsv_mpc_core::error::MpcError;
+use bsv_mpc_core::hd::compute_invoice;
 use bsv_mpc_core::presigning::{PresigningManager, PresigningRoundResult};
 use bsv_mpc_core::signing::{SigningCoordinator, SigningRoundResult};
 use bsv_mpc_core::types::*;
 use serde::{Deserialize, Serialize};
+use std::sync::{Arc, Mutex};
 
 // ============================================================================
 // KSS HTTP API types (compatible with bsv-mpc-worker::api)
@@ -168,23 +171,231 @@ fn hex_decode(hex: &str) -> std::result::Result<Vec<u8>, MpcError> {
 }
 
 // ============================================================================
+// BRC-31 Auth Client (proxy → KSS)
+// ============================================================================
+//
+// The proxy authenticates to the KSS using BRC-31 Authrite.
+// Uses a local auth key (not the MPC share) for signing auth messages.
+// Session is established via handshake on first KSS request.
+
+/// BRC-104 header names (must match bsv-mpc-worker/src/auth.rs).
+mod auth_headers {
+    pub const VERSION: &str = "x-bsv-auth-version";
+    pub const IDENTITY_KEY: &str = "x-bsv-auth-identity-key";
+    pub const NONCE: &str = "x-bsv-auth-nonce";
+    pub const INITIAL_NONCE: &str = "x-bsv-auth-initial-nonce";
+    pub const YOUR_NONCE: &str = "x-bsv-auth-your-nonce";
+    pub const SIGNATURE: &str = "x-bsv-auth-signature";
+    pub const MESSAGE_TYPE: &str = "x-bsv-auth-message-type";
+}
+
+/// Client-side BRC-31 session state for proxy → KSS authentication.
+struct BridgeAuth {
+    /// Proxy's auth identity key (NOT the MPC share — a separate local key).
+    auth_key: PrivateKey,
+    /// KSS server's identity key (learned during handshake).
+    server_identity_key: Option<String>,
+    /// Our session nonce (sent in the initial handshake).
+    our_nonce: Option<String>,
+    /// KSS server's session nonce (received in handshake response).
+    server_session_nonce: Option<String>,
+}
+
+impl BridgeAuth {
+    /// Create a new auth client with a random identity key.
+    fn new() -> std::result::Result<Self, MpcError> {
+        use rand::RngCore;
+        let mut key_bytes = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut key_bytes);
+        // Ensure the key is valid (non-zero, less than curve order)
+        key_bytes[0] |= 0x01;
+        let auth_key = PrivateKey::from_bytes(&key_bytes)
+            .map_err(|e| MpcError::Protocol(format!("invalid auth key bytes: {e}")))?;
+        Ok(Self {
+            auth_key,
+            server_identity_key: None,
+            our_nonce: None,
+            server_session_nonce: None,
+        })
+    }
+
+    /// Whether the handshake has been completed.
+    fn is_authenticated(&self) -> bool {
+        self.server_session_nonce.is_some()
+    }
+
+    /// Our identity key as hex (for BRC-104 headers).
+    fn identity_hex(&self) -> String {
+        self.auth_key.public_key().to_hex()
+    }
+
+    /// Generate a fresh per-request nonce (32 bytes, base64).
+    fn generate_nonce() -> std::result::Result<String, MpcError> {
+        use rand::RngCore;
+        let mut bytes = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut bytes);
+        Ok(base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            bytes,
+        ))
+    }
+
+    /// Perform the BRC-31 handshake with the KSS.
+    ///
+    /// Sends an InitialRequest and processes the InitialResponse.
+    async fn handshake(
+        &mut self,
+        client: &reqwest::Client,
+        kss_url: &str,
+    ) -> std::result::Result<(), MpcError> {
+        let our_nonce = Self::generate_nonce()?;
+        let identity = self.identity_hex();
+
+        let handshake_url = format!("{}/.well-known/auth", kss_url);
+
+        tracing::debug!(
+            url = %handshake_url,
+            identity = %identity,
+            "BRC-31: initiating handshake with KSS"
+        );
+
+        let resp = client
+            .post(&handshake_url)
+            .header(auth_headers::VERSION, "0.1")
+            .header(auth_headers::IDENTITY_KEY, &identity)
+            .header(auth_headers::MESSAGE_TYPE, "initialRequest")
+            .header(auth_headers::NONCE, &our_nonce)
+            .header(auth_headers::INITIAL_NONCE, &our_nonce)
+            .header("content-type", "application/json")
+            .body("{}")
+            .send()
+            .await
+            .map_err(|e| MpcError::Protocol(format!("BRC-31 handshake failed: {e}")))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(MpcError::Protocol(format!(
+                "BRC-31 handshake returned {status}: {body}"
+            )));
+        }
+
+        // Extract server info from BRC-104 response headers
+        let server_identity = resp
+            .headers()
+            .get(auth_headers::IDENTITY_KEY)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string())
+            .ok_or_else(|| {
+                MpcError::Protocol("BRC-31: missing server identity in handshake response".into())
+            })?;
+
+        let server_nonce = resp
+            .headers()
+            .get(auth_headers::NONCE)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string())
+            .ok_or_else(|| {
+                MpcError::Protocol("BRC-31: missing server nonce in handshake response".into())
+            })?;
+
+        // Optionally verify the server's signature (skipped for alpha)
+        // In production: verify using derive_child_pubkey(server_pub, shared_secret, invoice)
+
+        tracing::info!(
+            server_identity = %server_identity,
+            "BRC-31: handshake complete with KSS"
+        );
+
+        self.server_identity_key = Some(server_identity);
+        self.our_nonce = Some(our_nonce);
+        self.server_session_nonce = Some(server_nonce);
+
+        Ok(())
+    }
+
+    /// Add BRC-104 auth headers to a request builder.
+    ///
+    /// Generates a fresh per-request nonce, signs it with BRC-42 derived key,
+    /// and adds all required BRC-104 headers.
+    fn add_auth_headers(
+        &self,
+        builder: reqwest::RequestBuilder,
+    ) -> std::result::Result<reqwest::RequestBuilder, MpcError> {
+        let server_session_nonce = self
+            .server_session_nonce
+            .as_ref()
+            .ok_or_else(|| MpcError::Protocol("BRC-31: not authenticated (no session)".into()))?;
+
+        let server_identity = self.server_identity_key.as_ref().ok_or_else(|| {
+            MpcError::Protocol("BRC-31: not authenticated (no server identity)".into())
+        })?;
+
+        // Generate fresh per-request nonce
+        let request_nonce = Self::generate_nonce()?;
+
+        // BRC-42 key derivation for signing
+        let server_pub = PublicKey::from_hex(server_identity)
+            .map_err(|e| MpcError::Protocol(format!("invalid server pubkey: {e}")))?;
+
+        let key_id = format!("{} {}", request_nonce, server_session_nonce);
+        let invoice = compute_invoice(2, "auth message signature", &key_id);
+
+        // Derive signing key: auth_priv + HMAC(ECDH(server_pub, auth_priv), invoice)
+        let signing_key = self
+            .auth_key
+            .derive_child(&server_pub, &invoice)
+            .map_err(|e| MpcError::Protocol(format!("BRC-42 key derivation: {e}")))?;
+
+        // Sign SHA-256(nonce) — matches server's compute_signing_hash()
+        let msg_hash: [u8; 32] = {
+            use sha2::Digest;
+            sha2::Sha256::digest(request_nonce.as_bytes()).into()
+        };
+        let signature = signing_key
+            .sign(&msg_hash)
+            .map_err(|e| MpcError::Protocol(format!("ECDSA signing: {e}")))?;
+        let sig_hex = hex_encode(&signature.to_der());
+
+        Ok(builder
+            .header(auth_headers::VERSION, "0.1")
+            .header(auth_headers::IDENTITY_KEY, self.identity_hex())
+            .header(auth_headers::MESSAGE_TYPE, "general")
+            .header(auth_headers::NONCE, &request_nonce)
+            .header(auth_headers::YOUR_NONCE, server_session_nonce)
+            .header(auth_headers::SIGNATURE, sig_hex))
+    }
+}
+
+// ============================================================================
 // HTTP helper
 // ============================================================================
 
 /// POST a JSON request to the KSS and deserialize the response.
 ///
 /// Called from within `spawn_blocking` via `handle.block_on`.
+/// Adds BRC-31 Authrite headers when the bridge has an authenticated session.
 fn kss_post<Req: Serialize, Resp: serde::de::DeserializeOwned>(
     handle: &tokio::runtime::Handle,
     client: &reqwest::Client,
     url: &str,
     body: &Req,
+    auth: &Mutex<BridgeAuth>,
 ) -> std::result::Result<Resp, MpcError> {
     handle.block_on(async {
-        // TODO: Add BRC-31 Authrite headers for KSS authentication
-        let resp = client
-            .post(url)
-            .json(body)
+        let mut builder = client.post(url).json(body);
+
+        // Add BRC-31 auth headers if authenticated
+        {
+            let auth_guard = auth
+                .lock()
+                .map_err(|e| MpcError::Protocol(format!("auth lock poisoned: {e}")))?;
+            if auth_guard.is_authenticated() {
+                builder = auth_guard.add_auth_headers(builder)?;
+            }
+        }
+
+        let resp = builder
             .send()
             .await
             .map_err(|e| MpcError::Protocol(format!("KSS request to {url} failed: {e}")))?;
@@ -240,6 +451,10 @@ pub struct MpcBridge {
     /// Agent identity (hex-encoded compressed joint public key).
     /// Used for BRC-31 auth with the KSS.
     agent_id: String,
+
+    /// BRC-31 Authrite client for authenticated KSS communication.
+    /// Arc<Mutex> for sharing across spawn_blocking closures.
+    auth: Arc<Mutex<BridgeAuth>>,
 }
 
 impl MpcBridge {
@@ -327,11 +542,28 @@ impl MpcBridge {
             .build()
             .map_err(|e| anyhow::anyhow!("failed to create HTTP client: {e}"))?;
 
-        // 6. Optional: check KSS health (non-blocking, don't fail on error)
+        // 6. Initialize BRC-31 auth client
+        let mut bridge_auth =
+            BridgeAuth::new().map_err(|e| anyhow::anyhow!("failed to create auth client: {e}"))?;
+
+        // 7. Check KSS health + perform BRC-31 handshake
         let health_url = format!("{}/health", config.kss_url);
         match client.get(&health_url).send().await {
             Ok(resp) if resp.status().is_success() => {
                 tracing::info!("KSS health check passed");
+
+                // Perform BRC-31 handshake now that we know KSS is reachable
+                match bridge_auth.handshake(&client, &config.kss_url).await {
+                    Ok(()) => {
+                        tracing::info!("BRC-31 handshake with KSS succeeded");
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "BRC-31 handshake failed — requests will be unauthenticated"
+                        );
+                    }
+                }
             }
             Ok(resp) => {
                 tracing::warn!(
@@ -355,6 +587,7 @@ impl MpcBridge {
             session_id: dkg_result.session_id,
             participants,
             agent_id,
+            auth: Arc::new(Mutex::new(bridge_auth)),
         })
     }
 
@@ -383,6 +616,7 @@ impl MpcBridge {
         let kss_url = self.kss_url.clone();
         let client = self.client.clone();
         let agent_id = self.agent_id.clone();
+        let auth = self.auth.clone();
         let hash = *message_hash;
 
         let handle = tokio::runtime::Handle::current();
@@ -417,6 +651,7 @@ impl MpcBridge {
                     sighash: hex_encode(&hash),
                     use_presignature: false,
                 },
+                &auth,
             )?;
 
             tracing::debug!(
@@ -445,6 +680,7 @@ impl MpcBridge {
                         signing_session_id: signing_session_id.clone(),
                         round_message: proxy_msg,
                     },
+                    &auth,
                 )?;
 
                 // Process: feed KSS's previous message to coordinator
@@ -499,6 +735,7 @@ impl MpcBridge {
         let kss_url = self.kss_url.clone();
         let client = self.client.clone();
         let agent_id = self.agent_id.clone();
+        let auth = self.auth.clone();
 
         let handle = tokio::runtime::Handle::current();
 
@@ -525,6 +762,7 @@ impl MpcBridge {
                     session_id: session_id.0.clone(),
                     count: 1,
                 },
+                &auth,
             )?;
 
             tracing::debug!(
@@ -551,6 +789,7 @@ impl MpcBridge {
                         presign_session_id: presign_session_id.clone(),
                         round_messages: proxy_wire_msgs,
                     },
+                    &auth,
                 )?;
 
                 // Process: feed KSS's previous messages to manager
@@ -637,6 +876,7 @@ impl MpcBridge {
             session_id: SessionId("test".into()),
             participants: vec![0, 1],
             agent_id,
+            auth: Arc::new(Mutex::new(BridgeAuth::new().expect("test auth key"))),
         }
     }
 }

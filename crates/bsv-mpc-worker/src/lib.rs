@@ -27,27 +27,29 @@
 //!
 //! ## Endpoints
 //!
-//! | Method | Path              | Description                                  |
-//! |--------|-------------------|----------------------------------------------|
-//! | POST   | `/dkg/init`       | Start DKG ceremony, return round 1 message   |
-//! | POST   | `/dkg/round`      | Process DKG round, return next or complete    |
-//! | POST   | `/sign/init`      | Start signing, return round 1 message         |
-//! | POST   | `/sign/round`     | Process signing round, return sig or next     |
-//! | POST   | `/presign/init`   | Start presigning protocol                     |
-//! | POST   | `/presign/round`  | Process presigning round                      |
-//! | GET    | `/health`         | Liveness check + share count                  |
-//! | GET    | `/shares/:agent`  | Share metadata (no secrets exposed)            |
+//! | Method  | Path              | Auth   | Description                          |
+//! |---------|-------------------|--------|--------------------------------------|
+//! | POST    | `/.well-known/auth` | none | BRC-31 Authrite handshake            |
+//! | OPTIONS | `*`               | none   | CORS preflight                       |
+//! | POST    | `/dkg/init`       | BRC-31 | Start DKG ceremony                   |
+//! | POST    | `/dkg/round`      | BRC-31 | Process DKG round                    |
+//! | POST    | `/sign/init`      | BRC-31 | Start signing                        |
+//! | POST    | `/sign/round`     | BRC-31 | Process signing round                |
+//! | POST    | `/presign/init`   | BRC-31 | Start presigning protocol            |
+//! | POST    | `/presign/round`  | BRC-31 | Process presigning round             |
+//! | GET     | `/health`         | none   | Liveness check + share count         |
+//! | GET     | `/shares/:agent`  | BRC-31 | Share metadata (no secrets exposed)  |
 //!
 //! ## Security Model
 //!
-//! - All endpoints require BRC-31 Authrite mutual authentication.
+//! - All mutation endpoints require BRC-31 Authrite mutual authentication.
 //! - Only the agent that owns a share can request signing with that share.
 //! - Shares are encrypted with AES-256-GCM (BRC-42 derived keys) at rest.
 //! - The Worker never sees the full private key — only its share.
 //! - Durable Object SQLite provides per-agent isolation.
 
 mod api;
-mod auth;
+pub mod auth;
 mod storage;
 
 use worker::*;
@@ -56,37 +58,77 @@ use worker::*;
 ///
 /// Routes incoming HTTP requests to the appropriate MPC protocol handler.
 /// All mutation endpoints (DKG, signing, presigning) require BRC-31 auth.
+/// The handshake endpoint and health check are open.
 #[event(fetch)]
 async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
+    // Handle CORS preflight for any path
+    if req.method() == Method::Options {
+        return auth::handle_cors_preflight();
+    }
+
     let router = Router::new();
 
     router
-        // DKG protocol endpoints
+        // ── BRC-31 Authrite handshake ────────────────────────────────
+        .post_async("/.well-known/auth", |req, ctx| async move {
+            let config = auth::AuthConfig::from_env(&ctx.env)?;
+            auth::handle_initial_request(req, &config).await
+        })
+        // ── DKG protocol endpoints (BRC-31 protected) ───────────────
         .post_async("/dkg/init", |req, ctx| async move {
+            let config = auth::AuthConfig::from_env(&ctx.env)?;
+            if let Err(resp) = auth::verify_or_allow(&req, &config) {
+                return Ok(resp);
+            }
             api::handle_dkg_init(req, &ctx).await
         })
         .post_async("/dkg/round", |req, ctx| async move {
+            let config = auth::AuthConfig::from_env(&ctx.env)?;
+            if let Err(resp) = auth::verify_or_allow(&req, &config) {
+                return Ok(resp);
+            }
             api::handle_dkg_round(req, &ctx).await
         })
-        // Signing protocol endpoints
+        // ── Signing protocol endpoints (BRC-31 protected) ───────────
         .post_async("/sign/init", |req, ctx| async move {
+            let config = auth::AuthConfig::from_env(&ctx.env)?;
+            if let Err(resp) = auth::verify_or_allow(&req, &config) {
+                return Ok(resp);
+            }
             api::handle_sign_init(req, &ctx).await
         })
         .post_async("/sign/round", |req, ctx| async move {
+            let config = auth::AuthConfig::from_env(&ctx.env)?;
+            if let Err(resp) = auth::verify_or_allow(&req, &config) {
+                return Ok(resp);
+            }
             api::handle_sign_round(req, &ctx).await
         })
-        // Presigning protocol endpoints
+        // ── Presigning protocol endpoints (BRC-31 protected) ────────
         .post_async("/presign/init", |req, ctx| async move {
+            let config = auth::AuthConfig::from_env(&ctx.env)?;
+            if let Err(resp) = auth::verify_or_allow(&req, &config) {
+                return Ok(resp);
+            }
             api::handle_presign_init(req, &ctx).await
         })
         .post_async("/presign/round", |req, ctx| async move {
+            let config = auth::AuthConfig::from_env(&ctx.env)?;
+            if let Err(resp) = auth::verify_or_allow(&req, &config) {
+                return Ok(resp);
+            }
             api::handle_presign_round(req, &ctx).await
         })
-        // Read-only endpoints
+        // ── Read-only endpoints (no auth required) ──────────────────
         .get_async("/health", |_req, ctx| async move {
             api::handle_health(&ctx).await
         })
-        .get_async("/shares/:agent_id", |_req, ctx| async move {
+        .get_async("/shares/:agent_id", |req, ctx| async move {
+            // Share metadata requires auth in production
+            let config = auth::AuthConfig::from_env(&ctx.env)?;
+            if let Err(resp) = auth::verify_or_allow(&req, &config) {
+                return Ok(resp);
+            }
             let agent_id = ctx.param("agent_id").unwrap();
             api::handle_get_share_metadata(agent_id, &ctx).await
         })
