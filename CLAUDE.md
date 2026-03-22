@@ -93,8 +93,9 @@ bsv-mpc/
   SPECS.md                           # Plain English specifications
   INTEGRATION.md                     # bsv-worm integration, wallet-cli architecture
   STATUS.md                          # Implementation status and timeline
-  POCS.md                            # 7 POC validation plan
+  POCS.md                            # 7 POC validation plan (all 15 completed)
   TESTING.md                         # Test strategy (unit / integration / E2E)
+  LESSONS.md                         # Technical findings from all 15 POCs
   HANDOFF.md                         # Quick-start for new sessions
   crates/
     bsv-mpc-core/src/                # 9 files, ~1.3K LOC
@@ -102,12 +103,22 @@ bsv-mpc/
     bsv-mpc-worker/src/              # 4 files, ~1.0K LOC
     bsv-mpc-service/src/             # 4 files, ~0.8K LOC
     bsv-mpc-overlay/src/             # 6 files, ~0.9K LOC
-  poc/
-    poc1-cggmp24-signing/            # VALIDATED — DKG + signing on secp256k1
-    poc2-wasm/                       # VALIDATED — compiles to wasm32-unknown-unknown
-    poc3-key-derivation/             # VALIDATED — SLIP-10/BIP-32 compatibility
-    poc10-cf-worker-https/           # VALIDATED — MPC signing over real HTTPS to deployed CF Worker
-    poc11-fee-settlement/            # VALIDATED — 2-of-3 nodes co-sign settlement tx on mainnet
+  poc/                               # 15 POCs, all VALIDATED (~12,300 LOC)
+    poc1-cggmp24-signing/            # DKG + signing on secp256k1
+    poc2-wasm/                       # Compiles to wasm32-unknown-unknown (636KB)
+    poc3-key-derivation/             # BRC-42 compatible with all counterparty types
+    poc4-real-tx/                    # MPC-signed mainnet tx + BEEF internalization
+    poc5-http-latency/               # 359µs presigned, 135µs HTTP RTT
+    poc6-toolbox-dep/                # Toolbox reuse validated, ~30-line fork
+    poc7-fee-injection/              # 3-output tx on mainnet (recipient+change+fee)
+    poc8-brc31-auth/                 # BRC-31 auth via partial ECDH + share offset
+    poc9-encrypt-decrypt/            # Byte-identical keys, zero migration data loss
+    poc10-cf-worker-https/           # 1069KB WASM, 16ms RTT, deployed CF Worker
+    poc11-fee-settlement/            # 2-of-3 settlement on mainnet
+    poc12-three-of-five/             # 5-party DKG, any 3 sign, 4.4ms presig
+    poc13-key-refresh/               # Threshold resharing (~50 LOC), 0 on-chain cost
+    poc14-overlay-discovery/         # 4/4 SLAP trackers live, production-ready
+    poc15-capstone/                  # bsv-worm think "2+2" through MPC proxy
   brc-drafts/                        # 4 BRC specification drafts (~2K lines total)
   contracts/mpc-fee-pool/            # sCrypt fee covenant (deferred to Phase 2)
   research/                          # Strategic analysis docs
@@ -134,6 +145,7 @@ Four POCs validated — the critical crypto path is fully de-risked:
 | POC 11: Fee settlement | Can MPC nodes co-sign a settlement tx using their own threshold signing? | **PASS** — 2-of-3 DKG among nodes, proportional split (45/35/20%), all 3 subsets sign, below-threshold rejected. [TXID](https://whatsonchain.com/tx/afbb7ecd746bf75c346303e863e9e6a4bd17184d8149ac68f0bdcc1003e485d7) |
 | POC 10: CF Worker HTTPS | Does MPC signing work over real HTTPS to a deployed CF Worker? | **PASS** — 1069KB WASM, 1ms startup, 16ms HTTPS RTT p50, DKG in 52ms (2 requests), signing verified by BSV SDK. DO storage works. No CORS/header issues. |
 | POC 14: Overlay discovery | Does SHIP/SLAP work for MPC node registration? | **PASS** — 4/4 mainnet SLAP trackers alive (BSV Association + Babbage). Live SHIP host discovered. tm_mpc_signing query works (0 results = nobody registered yet). No fallback needed — overlay is production-ready. |
+| POC 15: Capstone integration | Does bsv-worm work unchanged through MPC proxy? | **PASS** — `bsv-worm status` + `bsv-worm think "what is 2+2"` both work. Full x402 payment via MPC threshold signing. [TXID](https://whatsonchain.com/tx/4653d09a9a0baca057d954237a5cbc0f6d95c385d1e4aa2e98fa1113283349b1). 8/28 BRC-100 endpoints functional, rest stubbed. |
 
 ### Critical Lessons from POC 3 + POC 4
 
@@ -229,23 +241,49 @@ Four POCs validated — the critical crypto path is fully de-risked:
 - **BEEF needs full ancestry** — chain of unconfirmed txs back to a confirmed ancestor with BUMP
 - **Full loop cost: 188 sats** (~$0.00009) for: wallet → fund MPC → MPC sign → return to wallet
 
-Remaining POCs (5-14): HTTP latency, wallet-toolbox, fee injection, BRC-31 auth, encrypt/decrypt, CF Worker HTTPS, fee settlement, key refresh, 3-of-5, overlay, capstone integration. See GitHub issues.
+**All 15 POCs PASSED.** See `LESSONS.md` for comprehensive technical findings organized by topic.
+
+**Capstone integration (POC 15):**
+- bsv-worm status + think both work through MPC proxy (port 3323)
+- Full x402 payment: BRC-31 handshake → createAction → MPC signing → broadcast → refund internalized
+- 8/28 BRC-100 endpoints functional (`isAuthenticated`, `getPublicKey`, `getNetwork`, `getVersion`, `createSignature`, `createAction`, `internalizeAction`, `listOutputs`)
+- POC shortcuts to fix in production: BRC-31 auth uses reconstructed key (needs share offsets), encrypt/decrypt uses reconstructed key (needs partial ECDH), UTXO management queries WoC per request (needs local tracker)
 
 ## Implementation Status
 
-~15% implemented. Scaffolding is complete. All protocol logic is `todo!()`.
+~15% production code + ~12,300 LOC POC code. Scaffolding complete. All protocol logic is `todo!()` in crates but **fully proven in POCs**.
 
 | Layer | Status | Notes |
 |-------|--------|-------|
 | Types + errors (core, proxy, overlay) | **Complete** | All types defined, all error enums done |
 | Config + routing (proxy, service, worker) | **Complete** | Axum/CF Worker routers wired, env config working |
 | Pool management (presign_manager) | **Complete** | FIFO take/add/replenish, background loop |
-| MPC protocol (DKG, signing, presigning) | **Stub** | All `todo!()` — requires cggmp24 integration |
+| POC validation (15 POCs) | **Complete** | 15/15 passed, ~12,300 LOC, all risks de-risked |
+| MPC protocol (DKG, signing, presigning) | **POC-proven** | Patterns in poc1, poc5, poc12. Port to crates. |
 | Share encryption (AES-256-GCM) | **Stub** | Validation done, encrypt/decrypt `todo!()` |
-| BRC-100 handlers (24 of 28) | **Stub** | Detailed pseudocode in each handler |
+| BRC-42 key derivation | **POC-proven** | poc3, poc8, poc9 cover all counterparty types |
+| Transaction signing | **POC-proven** | poc4 mainnet tx, poc6 toolbox integration, poc15 full flow |
+| BRC-100 handlers (24 of 28) | **Stub** | 8 working in poc15, pseudocode in crate stubs |
+| CF Worker KSS | **POC-proven** | poc10 deployed, 16ms RTT, DO storage validated |
+| Fee injection | **POC-proven** | poc7 mainnet 3-output tx, lib.rs nearly production-ready |
+| Fee settlement | **POC-proven** | poc11 mainnet settlement, 2-of-3 validated |
+| BRC-31 auth | **POC-proven** | poc8 full chain, partial ECDH + share offset |
+| Encrypt/decrypt | **POC-proven** | poc9 byte-identical keys, all protocols |
+| Key refresh | **POC-proven** | poc13 ~50 LOC resharing, same key |
+| Overlay discovery | **POC-proven** | poc14 live SLAP trackers, production-ready |
 | KSS storage (SQLite) | **Stub** | Schema documented, methods `todo!()` |
-| Overlay (chip, discovery, proofs) | **Partial** | Types + settlement math done, protocols `todo!()` |
-| BRC-31 auth | **Partial** | Agent authorization check done, full flow `todo!()` |
+
+### Revised Timeline
+
+| Milestone | Due | Status |
+|---|---|---|
+| M0: POC Validation | Mar 21 | **DONE** (15/15) |
+| M1: Core MPC Library | Mar 28 | Next |
+| M2: Signing Proxy | Apr 4 | |
+| M3: CF Worker Deployment | Apr 8 | |
+| M4: Fee System | Apr 11 | |
+| M5: Integration & BRCs | Apr 14 | |
+| Beta: Overlay & Hardening | Apr 25 | |
 
 ## Key Dependencies
 
