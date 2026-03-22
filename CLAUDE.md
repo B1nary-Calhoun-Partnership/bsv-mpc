@@ -5,6 +5,23 @@
 > Valid ECDSA signatures require t+1 parties to cooperate. Neither party alone can sign.
 > Nodes are discoverable via BSV overlay network. Fees distributed on-chain.
 
+## CRITICAL: POCs are the source of truth — use BRC standards, not BIPs
+
+**Every implementation must be ported from proven POC code.** We validated 15 POCs on mainnet. The POC code in `poc/` is the authoritative source for how things work. If a stub description contradicts a POC, **the POC is correct** — fix the stub.
+
+**BSV uses BRC standards**, not Bitcoin BIPs. Key standards:
+- **Key derivation: BRC-42** (`~/bsv/BRCs/key-derivation/0042.md`) — ECDH + HMAC-SHA256 with invoice strings (protocolID, keyID, counterparty). NOT BIP-32/SLIP-10.
+- **Auth: BRC-31** (`~/bsv/BRCs/peer-to-peer/0031.md`) — Authrite mutual auth. NOT generic ECDSA.
+- **Wallet API: BRC-100** (`~/bsv/BRCs/wallet/0100.md`)
+- **Overlay: BRC-22/23/24/25** — SHIP/SLAP/CHIP
+- **Proofs: BRC-18** — OP_RETURN data format
+
+**Before implementing ANY function:**
+1. Find the corresponding POC that proves the pattern
+2. Read the POC code line-by-line
+3. Read the relevant BRC spec from `~/bsv/BRCs/`
+4. Port the POC pattern, don't invent alternatives
+
 ## IMPORTANT: This is a 100% Rust project
 
 **Everything is Rust.** All 5 crates, all tests, the CF Worker (Rust -> WASM), the standalone service, the overlay integration — all Rust. No TypeScript, no Go, no Python, no JavaScript. The only exception is the sCrypt fee covenant (contracts/mpc-fee-pool/) which is deferred to Phase 2.
@@ -40,12 +57,12 @@ bsv-worm requires ZERO code changes. The MPC Signing Proxy is a drop-in replacem
 
 #### bsv-mpc-core
 Core MPC protocol layer wrapping cggmp24 for threshold ECDSA on secp256k1.
-- `dkg.rs` — DKG coordinator (4-round CGGMP'24 EC-DKG). `DkgCoordinator` struct with `init()` and `process_round()`. Bodies: `todo!()`.
+- `dkg.rs` — **Implemented.** DKG coordinator (4-round CGGMP'24). Thread-based SM bridge. 12 tests incl 2-of-2 and 2-of-3 integration.
 - `signing.rs` — Threshold signing (1 round with presig, 4 without). `SigningCoordinator` with `sign()`, `init_round()`, `process_round()`. Bodies: `todo!()`.
 - `presigning.rs` — Presignature pool. `PresigningManager` with **working** pool management (take/add/should_replenish). `generate()`: `todo!()`.
-- `share.rs` — AES-256-GCM share encryption. `validate_encrypted_share()` **implemented**. encrypt/decrypt/derive: `todo!()`.
-- `hd.rs` — SLIP-10/BIP-32 HD derivation from MPC shares. `todo!()`.
-- `proof.rs` — BRC-18 participation proofs. `todo!()`.
+- `share.rs` — **Implemented.** AES-256-GCM share encryption + HMAC-SHA256 BRC-42 key derivation. 22 tests.
+- `hd.rs` — **Implemented.** BRC-42 key derivation (NOT BIP-32). `derive_child_pubkey`, `derive_anyone_pubkey`, `compute_invoice`, `compute_brc42_hmac`. Matches POC 3/8/9. 24 tests incl BRC-42 spec vectors.
+- `proof.rs` — **Implemented.** BRC-18 participation proofs — create, OP_RETURN serialize, verify. 33 tests.
 - `types.rs` — **Complete.** All 10 core types: SessionId, ShareIndex, ThresholdConfig, JointPublicKey, EncryptedShare, Presignature, ParticipationProof, RoundMessage, DkgResult, SigningResult.
 - `error.rs` — **Complete.** MpcError enum with 9 variants + From impls.
 
@@ -259,9 +276,10 @@ Four POCs validated — the critical crypto path is fully de-risked:
 | Config + routing (proxy, service, worker) | **Complete** | Axum/CF Worker routers wired, env config working |
 | Pool management (presign_manager) | **Complete** | FIFO take/add/replenish, background loop |
 | POC validation (15 POCs) | **Complete** | 15/15 passed, ~12,300 LOC, all risks de-risked |
-| MPC protocol (DKG, signing, presigning) | **POC-proven** | Patterns in poc1, poc5, poc12. Port to crates. |
-| Share encryption (AES-256-GCM) | **Stub** | Validation done, encrypt/decrypt `todo!()` |
-| BRC-42 key derivation | **POC-proven** | poc3, poc8, poc9 cover all counterparty types |
+| MPC protocol (DKG) | **Implemented** | dkg.rs: 4-round CGGMP'24, thread-based SM, 12 tests incl 2-of-2 and 2-of-3 |
+| MPC protocol (signing, presigning) | **POC-proven** | Patterns in poc1, poc5, poc12. Port to crates next. |
+| Share encryption (AES-256-GCM) | **Implemented** | share.rs: encrypt/decrypt/derive_key, 22 tests |
+| BRC-42 key derivation | **Implemented** | hd.rs: derive_child_pubkey, derive_anyone_pubkey, compute_brc42_hmac. 24 tests match BSV SDK KeyDeriver. |
 | Transaction signing | **POC-proven** | poc4 mainnet tx, poc6 toolbox integration, poc15 full flow |
 | BRC-100 handlers (24 of 28) | **Stub** | 8 working in poc15, pseudocode in crate stubs |
 | CF Worker KSS | **POC-proven** | poc10 deployed, 16ms RTT, DO storage validated |
@@ -315,7 +333,7 @@ Four POCs validated — the critical crypto path is fully de-risked:
 | Production | Powers Dfns signing infrastructure |
 | TSSHOCK | Fixed (CVE-2025-66017) |
 | secp256k1 | Native support (Bitcoin's curve) |
-| HD wallets | SLIP-10/BIP-32 confirmed via POC 3 |
+| HD wallets | BRC-42 key derivation confirmed via POC 3 |
 
 ## Conventions
 

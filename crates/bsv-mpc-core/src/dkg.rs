@@ -646,10 +646,6 @@ impl DkgCoordinator {
         let joint_key = JointPublicKey {
             compressed: compressed_bytes.to_vec(),
             address,
-            // Chain code for HD derivation will be set from the DKG transcript
-            // hash in production. For now, derive_child_key falls back to
-            // SHA-256(compressed_pubkey) when this is None.
-            chain_code: None,
         };
 
         // Compute session ID as SHA-256 of the joint public key bytes
@@ -1321,7 +1317,6 @@ mod tests {
         let joint_key = JointPublicKey {
             compressed: compressed.to_vec(),
             address: result_address.clone(),
-            chain_code: None,
         };
         assert_eq!(joint_key.compressed.len(), 33);
         assert!(joint_key.address.starts_with('1'));

@@ -75,25 +75,31 @@ pub use types::{
 
 | Function | Status | Description |
 |----------|--------|-------------|
-| `encrypt_share(bytes, key) -> EncryptedShare` | Stub | AES-256-GCM encrypt with random 12-byte nonce |
-| `decrypt_share(encrypted, key) -> Vec<u8>` | Stub | AES-256-GCM decrypt, verifies auth tag |
-| `derive_share_encryption_key(root_key, session_id) -> [u8; 32]` | Stub | `HMAC-SHA256(root_key, "bsv-mpc-share" \|\| session_id)` |
-| `validate_encrypted_share(share) -> Result<()>` | **Working** | Checks nonce=12 bytes, ciphertext non-empty, index < parties, threshold valid |
+| `encrypt_share(bytes, key) -> EncryptedShare` | **Done** | AES-256-GCM encrypt with random 12-byte nonce |
+| `decrypt_share(encrypted, key) -> Vec<u8>` | **Done** | AES-256-GCM decrypt, verifies auth tag |
+| `derive_share_encryption_key(root_key, session_id) -> [u8; 32]` | **Done** | `HMAC-SHA256(root_key, "bsv-mpc-share" \|\| session_id)` |
+| `validate_encrypted_share(share) -> Result<()>` | **Done** | Checks nonce=12 bytes, ciphertext non-empty, index < parties, threshold valid |
 
-### HD Functions (`hd.rs`)
+### BRC-42 Key Derivation Functions (`hd.rs`)
+
+Uses BRC-42 (~/bsv/BRCs/key-derivation/0042.md), NOT BIP-32. Proven in POC 3, 8, 9.
 
 | Function | Status | Description |
 |----------|--------|-------------|
-| `derive_child_key(joint_key, path) -> JointPublicKey` | Stub | BIP-32/SLIP-10 derivation; non-hardened only (hardened needs MPC rounds) |
-| `parse_derivation_path(path) -> Vec<(u32, bool)>` | Stub | Parses `"m/44'/236'/0'/0/0"` into index+hardened tuples |
+| `derive_child_pubkey(root_pub, shared_secret, invoice) -> PublicKey` | **Done** | Core BRC-42: `root_pub + G * HMAC-SHA256(shared_secret, invoice)` |
+| `compute_brc42_hmac(shared_secret, invoice) -> [u8; 32]` | **Done** | HMAC scalar for MPC share offset addition |
+| `compute_invoice(security_level, protocol_name, key_id) -> String` | **Done** | Builds `"{level}-{protocol}-{key_id}"` |
+| `derive_anyone_pubkey(root_pub, protocol, key_id, level) -> PublicKey` | **Done** | Anyone counterparty (0 MPC round-trips) |
+| `derive_anyone_joint_key(joint_key, protocol, key_id, level) -> JointPublicKey` | **Done** | Convenience wrapper with BSV address |
+| `derive_joint_key_with_secret(joint_key, secret, protocol, key_id, level) -> JointPublicKey` | **Done** | For Self_/Other after MPC partial ECDH |
 
 ### Proof Functions (`proof.rs`)
 
 | Function | Status | Description |
 |----------|--------|-------------|
-| `create_participation_proof(session_id, agent_key, nodes, signing_hash, fee_txid) -> ParticipationProof` | Stub | Constructs proof with SHA-256 session hash |
-| `proof_to_op_return(proof) -> Vec<u8>` | Stub | Serializes to `OP_FALSE OP_RETURN` with Bitcoin PUSHDATA opcodes |
-| `verify_participation_proof(proof) -> bool` | Stub | Structural validation: field lengths, compressed pubkey prefixes, no duplicates, agent in participants |
+| `create_participation_proof(session_id, agent_key, nodes, signing_hash, fee_txid) -> ParticipationProof` | **Done** | Constructs proof with SHA-256 session hash |
+| `proof_to_op_return(proof) -> Vec<u8>` | **Done** | Serializes to `OP_FALSE OP_RETURN` with Bitcoin PUSHDATA opcodes |
+| `verify_participation_proof(proof) -> bool` | **Done** | Structural validation: field lengths, compressed pubkey prefixes, no duplicates, agent in participants |
 
 ## Protocol Round Counts
 
