@@ -107,6 +107,8 @@ decisions (#87,#137,#49,#31,#29)  worm #36+#38 templates
 
 **Parallel execution note:** Worm sessions C/D/E/F shared a working directory without worktree isolation. All work ended up on one branch (round1-session-F). In Round 2, use worktree isolation for worm sessions too, or accept single-branch merge.
 
+**Archived branch:** `archive/round0-overlay-proofs` (tag on origin) contains 4 unmerged commits from pre-Round-1 work: proof publishing (`publish_proof`, `query_proofs`, `count_proofs_by_node`, `parse_proof_from_script`), settlement tx building (ported from POC 11), CHIP/SLAP overlay merge, and key refresh integration. ~2.6K lines across overlay, core, proxy, service, worker. **19 commits behind main** — will need rework against current `_impl` handler pattern, but the overlay proof logic is directly reusable. Reference this branch when implementing overlay proof publication (mpc M4/M5 scope).
+
 ---
 
 ## Round 2 — Core Features (Day 3-5)
