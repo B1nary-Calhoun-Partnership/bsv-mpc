@@ -491,7 +491,7 @@ pub async fn handle_sign_init(mut req: Request, _ctx: &RouteContext<()>) -> Resu
     // Start signing — produces round 1 messages
     // Note: presignature support is future work (requires cggmp24 feature flag)
     let messages = coordinator
-        .sign(&sighash, None)
+        .sign(&sighash, None, None)
         .map_err(|e| Error::from(e.to_string()))?;
 
     let round_message = bundle_outgoing_messages(&messages).map_err(Error::from)?;

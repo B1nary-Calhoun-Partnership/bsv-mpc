@@ -15,7 +15,7 @@ thiserror.workspace = true
 chrono.workspace = true
 hex.workspace = true
 base64.workspace = true
-worker = "0.4"
+worker = "0.7"
 getrandom = { version = "0.2", features = ["js"] }
 
 [lib]
