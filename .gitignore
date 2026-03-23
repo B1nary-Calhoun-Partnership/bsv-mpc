@@ -6,3 +6,11 @@
 *.enc
 working/
 Cargo.lock
+secrets.md
+ROUND-1-PROMPTS.md
+.claude-docs-logs/
+
+# CF Worker deployment (private — never commit)
+wrangler.toml
+.dev.vars
+build/

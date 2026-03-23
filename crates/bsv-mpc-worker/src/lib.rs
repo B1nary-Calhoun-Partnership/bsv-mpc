@@ -54,6 +54,34 @@ mod storage;
 
 use worker::*;
 
+// ── Durable Object: MpcStorage ──────────────────────────────────────────────
+//
+// Stores key shares and protocol state in DO storage.
+// Required by wrangler for the MPC_STORAGE binding declared in wrangler.toml.
+// Currently a stub — protocol state is held in-memory (static HashMap/Mutex).
+// Future: migrate to DO SQLite for persistence across Worker restarts.
+
+#[durable_object]
+pub struct MpcStorage {
+    #[allow(dead_code)]
+    state: State,
+    #[allow(dead_code)]
+    env: Env,
+}
+
+impl DurableObject for MpcStorage {
+    fn new(state: State, env: Env) -> Self {
+        Self { state, env }
+    }
+
+    async fn fetch(&self, _req: Request) -> Result<Response> {
+        Response::from_json(&serde_json::json!({
+            "status": "ok",
+            "message": "MpcStorage Durable Object"
+        }))
+    }
+}
+
 /// CF Worker fetch event handler.
 ///
 /// Routes incoming HTTP requests to the appropriate MPC protocol handler.
