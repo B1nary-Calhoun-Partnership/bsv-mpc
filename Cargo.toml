@@ -40,7 +40,7 @@ round-based = { version = "0.4.1", features = ["sim", "state-machine"] }
 generic-ec = { version = "0.4.1", features = ["curve-secp256k1", "serde"] }
 
 # BSV SDK
-bsv = { package = "bsv-sdk", path = "../rust-sdk", features = ["transaction", "wallet"] }
+bsv = { package = "bsv-rs", version = "0.3.0", features = ["transaction", "wallet"] }
 
 # HTTP + async
 axum = { version = "0.8" }
@@ -76,7 +76,7 @@ generic-ec = { version = "0.4.1", features = ["curve-secp256k1", "serde"] }
 generic-ec-zkp = { version = "0.4", features = ["alloc"] }
 
 # BSV
-bsv = { package = "bsv-sdk", path = "../rust-sdk", features = ["transaction", "wallet"] }
+bsv = { package = "bsv-rs", version = "0.3.0", features = ["transaction", "wallet"] }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -118,6 +118,9 @@ tempfile = "3"
 # Pin glass_pumpkin to avoid rand_core 0.6/0.10 version conflict with fast-paillier.
 # See LESSONS.md for details. All POCs pin this individually; workspace must too.
 glass_pumpkin = "=1.9.0"
+
+[patch.crates-io]
+bsv-rs = { path = "../bsv-rs" }
 
 # Override cggmp24 with local fork that exposes set_additive_shift() for BRC-42.
 # See ~/bsv/cggmp21-fork/cggmp24/src/signing.rs (brc42-additive-shift branch).

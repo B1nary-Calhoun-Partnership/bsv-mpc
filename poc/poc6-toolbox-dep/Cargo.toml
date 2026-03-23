@@ -11,7 +11,7 @@ publish = false
 bsv-wallet-toolbox = { path = "../../../rust-wallet-toolbox", features = ["sqlite"] }
 
 # BSV SDK (same version toolbox uses)
-bsv = { package = "bsv-sdk", path = "../../../rust-sdk", features = ["full", "http"] }
+bsv = { package = "bsv-rs", version = "0.3.0", features = ["full", "http"] }
 
 # MPC threshold ECDSA (from POC 1)
 cggmp24 = { git = "https://github.com/LFDT-Lockness/cggmp21", features = ["curve-secp256k1", "backend-num-bigint"] }
@@ -42,6 +42,9 @@ glass_pumpkin = "=1.9.0"
 
 # Temp file for SQLite DB
 tempfile = "3"
+
+[patch.crates-io]
+bsv-rs = { path = "../../../bsv-rs" }
 
 # Optimize big integer in dev mode (otherwise DKG too slow)
 [profile.dev.package]

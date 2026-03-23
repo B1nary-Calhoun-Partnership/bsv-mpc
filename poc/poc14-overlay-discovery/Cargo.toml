@@ -8,7 +8,7 @@ publish = false
 
 [dependencies]
 # BSV SDK — overlay module (SHIP/SLAP) + HTTP facilitators + transaction/script
-bsv = { package = "bsv-sdk", path = "../../../rust-sdk", features = [
+bsv = { package = "bsv-rs", version = "0.3.0", features = [
     "overlay",
     "http",
     "transaction",
@@ -30,3 +30,6 @@ serde_json = "1"
 # Crypto / encoding
 rand = "0.8"
 hex = "0.4"
+
+[patch.crates-io]
+bsv-rs = { path = "../../../bsv-rs" }

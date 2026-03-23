@@ -16,7 +16,7 @@ cggmp24 = { git = "https://github.com/LFDT-Lockness/cggmp21", features = [
 cggmp24-keygen = { git = "https://github.com/LFDT-Lockness/cggmp21" }
 
 # BSV SDK — wallet key derivation + signature verification
-bsv = { package = "bsv-sdk", path = "../../../rust-sdk", features = ["transaction", "wallet"] }
+bsv = { package = "bsv-rs", version = "0.3.0", features = ["transaction", "wallet"] }
 
 # Async
 tokio = { version = "1", features = ["full"] }
@@ -48,6 +48,9 @@ reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-feature
 
 # Pin to avoid rand_core version conflict
 glass_pumpkin = "=1.9.0"
+
+[patch.crates-io]
+bsv-rs = { path = "../../../bsv-rs" }
 
 # Optimize big integer in dev mode (otherwise too slow)
 [profile.dev.package]

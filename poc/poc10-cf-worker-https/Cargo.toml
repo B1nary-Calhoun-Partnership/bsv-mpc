@@ -12,7 +12,7 @@ cggmp24 = { git = "https://github.com/LFDT-Lockness/cggmp21", features = ["curve
 cggmp24-keygen = { git = "https://github.com/LFDT-Lockness/cggmp21" }
 
 # BSV SDK for signature verification
-bsv = { package = "bsv-sdk", path = "../../../rust-sdk", features = ["transaction"] }
+bsv = { package = "bsv-rs", version = "0.3.0", features = ["transaction"] }
 
 # HTTP client
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
@@ -38,6 +38,9 @@ pin-project = "1"
 # Prime generation
 glass_pumpkin = "=1.9.0"
 hex = "0.4"
+
+[patch.crates-io]
+bsv-rs = { path = "../../../bsv-rs" }
 
 # Optimize ALL dependencies in dev mode (crypto is too slow without it)
 [profile.dev.package."*"]
