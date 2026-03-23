@@ -1,0 +1,3 @@
+[submodule "cggmp21-fork"]
+	path = cggmp21-fork
+	url = git@github.com:Calgooon/cggmp21-fork.git
