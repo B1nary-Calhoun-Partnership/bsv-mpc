@@ -34,7 +34,7 @@ use crate::bridge::MpcBridge;
 use crate::config::ProxyConfig;
 use crate::fee_injector::FeeInjector;
 use crate::presign_manager::{self, PresignManager};
-use crate::utxo_tracker::UtxoTracker;
+use crate::storage::{InMemoryBackend, StorageBackend};
 use crate::wallet_api;
 
 /// Shared application state accessible from all route handlers.
@@ -61,12 +61,12 @@ pub struct AppState {
     /// Fee injector for adding MPC signing fees to transactions.
     pub fee_injector: FeeInjector,
 
-    /// Local UTXO tracker for outputs controlled by the proxy.
+    /// Storage backend for UTXO management.
     ///
-    /// Protected by `RwLock` — reads (listOutputs, balance checks) are
-    /// frequent, writes (createAction spending, internalizeAction adding)
-    /// are less frequent.
-    pub utxo_tracker: Arc<RwLock<UtxoTracker>>,
+    /// In standalone mode this is an [`InMemoryBackend`] wrapping the
+    /// [`UtxoTracker`]. In hosted mode it delegates to wallet-infra's
+    /// `StorageClient`. The backend handles its own locking internally.
+    pub storage: Arc<dyn StorageBackend>,
 
     /// Shared HTTP client for broadcasting transactions and other outbound requests.
     pub http_client: reqwest::Client,
@@ -94,7 +94,7 @@ pub struct ProxyBuilder {
     bridge: Option<MpcBridge>,
     fee_injector: Option<FeeInjector>,
     presign_manager: Option<PresignManager>,
-    utxo_tracker: Option<UtxoTracker>,
+    storage: Option<Arc<dyn StorageBackend>>,
     http_client: Option<reqwest::Client>,
 }
 
@@ -106,7 +106,7 @@ impl ProxyBuilder {
             bridge: None,
             fee_injector: None,
             presign_manager: None,
-            utxo_tracker: None,
+            storage: None,
             http_client: None,
         }
     }
@@ -129,9 +129,11 @@ impl ProxyBuilder {
         self
     }
 
-    /// Override the UTXO tracker.
-    pub fn with_utxo_tracker(mut self, tracker: UtxoTracker) -> Self {
-        self.utxo_tracker = Some(tracker);
+    /// Override the storage backend.
+    ///
+    /// Defaults to [`InMemoryBackend`] if not specified.
+    pub fn with_storage(mut self, storage: impl StorageBackend + 'static) -> Self {
+        self.storage = Some(Arc::new(storage));
         self
     }
 
@@ -164,9 +166,9 @@ impl ProxyBuilder {
                 .unwrap_or_else(|| PresignManager::new(self.config.max_presignatures)),
         ));
 
-        let utxo_tracker = Arc::new(RwLock::new(
-            self.utxo_tracker.unwrap_or_default(),
-        ));
+        let storage: Arc<dyn StorageBackend> = self
+            .storage
+            .unwrap_or_else(|| Arc::new(InMemoryBackend::new()));
 
         let http_client = match self.http_client {
             Some(c) => c,
@@ -180,7 +182,7 @@ impl ProxyBuilder {
             bridge,
             presign_manager,
             fee_injector,
-            utxo_tracker,
+            storage,
             http_client,
         }))
     }
@@ -211,7 +213,7 @@ pub async fn run(config: ProxyConfig) -> anyhow::Result<()> {
         config.max_presignatures,
     )));
 
-    let utxo_tracker = Arc::new(RwLock::new(UtxoTracker::new()));
+    let storage: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new());
 
     let http_client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
@@ -222,7 +224,7 @@ pub async fn run(config: ProxyConfig) -> anyhow::Result<()> {
         bridge,
         presign_manager: presign_manager.clone(),
         fee_injector,
-        utxo_tracker,
+        storage,
         http_client,
     });
 

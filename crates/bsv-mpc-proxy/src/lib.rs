@@ -55,6 +55,7 @@
 //! - [`fee_injector`] — Adds MPC signing fee outputs to transactions
 //! - [`presign_manager`] — Background presignature pool management
 //! - [`utxo_tracker`] — In-memory UTXO tracking
+//! - [`storage`] — Storage backend abstraction (in-memory or wallet-infra)
 //! - [`error`] — Proxy-specific error types
 
 pub mod bridge;
@@ -63,6 +64,7 @@ pub mod error;
 pub mod fee_injector;
 pub mod presign_manager;
 pub mod server;
+pub mod storage;
 pub mod utxo_tracker;
 pub mod wallet_api;
 
@@ -77,4 +79,5 @@ pub use error::{ProxyError, ProxyResult};
 pub use fee_injector::{FeeInjectionInfo, FeeInjector};
 pub use presign_manager::PresignManager;
 pub use server::{AppState, ProxyBuilder};
+pub use storage::{InMemoryBackend, StorageBackend, WalletInfraBackend};
 pub use utxo_tracker::{TrackedOutput, UtxoTracker};

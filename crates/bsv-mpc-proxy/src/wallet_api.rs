@@ -1322,9 +1322,9 @@ pub async fn create_action_impl(state: &AppState, body: Value) -> Value {
     let est_mining_fee = estimate_mining_fee(1, est_num_outputs);
     let est_total = total_user_output + mpc_fee + est_mining_fee;
 
-    let (selected_utxos, total_input) = {
-        let tracker = state.utxo_tracker.read().await;
-        tracker.select_utxos(est_total)
+    let (selected_utxos, total_input) = match state.storage.select_utxos(est_total).await {
+        Ok(result) => result,
+        Err(e) => return json!({"error": format!("storage error: {e}")}),
     };
 
     if selected_utxos.is_empty() {
@@ -1497,17 +1497,17 @@ pub async fn create_action_impl(state: &AppState, body: Value) -> Value {
 
     // ── 12. Update UTXO tracker ──────────────────────────────────────────
     {
-        let mut tracker = state.utxo_tracker.write().await;
-
         // Mark inputs as spent
         for utxo in &selected_utxos {
-            tracker.mark_spent(&utxo.txid, utxo.vout, &txid);
+            if let Err(e) = state.storage.mark_spent(&utxo.txid, utxo.vout, &txid).await {
+                tracing::warn!(txid = %utxo.txid, vout = utxo.vout, error = %e, "Failed to mark UTXO as spent");
+            }
         }
 
         // Track change output (if non-dust)
         let change_sats = outputs[change_index].0;
         if change_sats > 0 {
-            tracker.add_output(TrackedOutput {
+            if let Err(e) = state.storage.add_output(TrackedOutput {
                 txid: txid.clone(),
                 vout: change_index as u32,
                 satoshis: change_sats,
@@ -1516,7 +1516,9 @@ pub async fn create_action_impl(state: &AppState, body: Value) -> Value {
                 basket: Some("default".into()),
                 tags: vec![],
                 created_at: chrono::Utc::now(),
-            });
+            }).await {
+                tracing::warn!(error = %e, "Failed to track change output");
+            }
         }
     }
 
@@ -1637,8 +1639,7 @@ pub async fn internalize_action_impl(state: &AppState, body: Value) -> Value {
                 );
             }
 
-            let mut tracker = state.utxo_tracker.write().await;
-            tracker.add_output(TrackedOutput {
+            if let Err(e) = state.storage.add_output(TrackedOutput {
                 txid: txid.clone(),
                 vout: output_index as u32,
                 satoshis,
@@ -1647,15 +1648,16 @@ pub async fn internalize_action_impl(state: &AppState, body: Value) -> Value {
                 basket: Some(basket.to_string()),
                 tags: vec![],
                 created_at: chrono::Utc::now(),
-            });
+            }).await {
+                tracing::warn!(output_index, error = %e, "Failed to track internalized output");
+            }
             accepted_count += 1;
         }
     } else {
         // No specific outputs — scan all outputs for ones matching our root key
         for (vout, (satoshis, script)) in tx_outputs.iter().enumerate() {
             if *script == our_script {
-                let mut tracker = state.utxo_tracker.write().await;
-                tracker.add_output(TrackedOutput {
+                if let Err(e) = state.storage.add_output(TrackedOutput {
                     txid: txid.clone(),
                     vout: vout as u32,
                     satoshis: *satoshis,
@@ -1664,7 +1666,9 @@ pub async fn internalize_action_impl(state: &AppState, body: Value) -> Value {
                     basket: Some(basket.to_string()),
                     tags: vec![],
                     created_at: chrono::Utc::now(),
-                });
+                }).await {
+                    tracing::warn!(vout, error = %e, "Failed to track scanned output");
+                }
                 accepted_count += 1;
             }
         }
@@ -2074,8 +2078,10 @@ pub async fn list_outputs_impl(state: &AppState, body: Value) -> Value {
     let limit = body["limit"].as_u64().unwrap_or(100) as usize;
     let offset = body["offset"].as_u64().unwrap_or(0) as usize;
 
-    let tracker = state.utxo_tracker.read().await;
-    let unspent = tracker.list_unspent(basket, tags.as_deref());
+    let unspent = match state.storage.list_unspent(basket, tags.as_deref()).await {
+        Ok(u) => u,
+        Err(e) => return json!({"error": format!("storage error: {e}"), "totalOutputs": 0, "outputs": []}),
+    };
 
     let total = unspent.len();
 
@@ -2362,7 +2368,7 @@ mod tests {
     use crate::bridge::MpcBridge;
     use crate::fee_injector::FeeInjector;
     use crate::presign_manager::PresignManager;
-    use crate::utxo_tracker::UtxoTracker;
+    use crate::storage::InMemoryBackend;
     use bsv::primitives::ec::PrivateKey;
     use bsv::wallet::{Counterparty, KeyDeriver, Protocol, SecurityLevel};
     use bsv_mpc_core::JointPublicKey;
@@ -2392,7 +2398,7 @@ mod tests {
             bridge,
             presign_manager: Arc::new(RwLock::new(PresignManager::new(20))),
             fee_injector: FeeInjector::new(0, vec![], None),
-            utxo_tracker: Arc::new(RwLock::new(UtxoTracker::new())),
+            storage: Arc::new(InMemoryBackend::new()),
             http_client: reqwest::Client::new(),
         })
     }
@@ -3121,9 +3127,8 @@ mod tests {
         assert_eq!(resp["accepted"], true);
         assert_eq!(resp["txid"].as_str().unwrap(), txid);
 
-        // Verify UTXO tracker has both outputs
-        let tracker = state.utxo_tracker.read().await;
-        let unspent = tracker.list_unspent(None, None);
+        // Verify storage has both outputs
+        let unspent = state.storage.list_unspent(None, None).await.unwrap();
         assert_eq!(unspent.len(), 2);
         assert_eq!(unspent[0].satoshis, 5000);
         assert_eq!(unspent[1].satoshis, 3000);
@@ -3154,8 +3159,7 @@ mod tests {
         let Json(resp) = internalize_action(State(state.clone()), Json(body)).await;
         assert_eq!(resp["accepted"], true);
 
-        let tracker = state.utxo_tracker.read().await;
-        let unspent = tracker.list_unspent(None, None);
+        let unspent = state.storage.list_unspent(None, None).await.unwrap();
         assert_eq!(unspent.len(), 2); // only our outputs
         let total: u64 = unspent.iter().map(|o| o.satoshis).sum();
         assert_eq!(total, 11000); // 7000 + 4000
