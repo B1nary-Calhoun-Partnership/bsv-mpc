@@ -12,19 +12,22 @@ BRC-100 client ──HTTP──► bsv-mpc-proxy ──HTTPS──► KSS (remot
                      presig pool + fee injector
 ```
 
+Usable as a library or binary. `ProxyBuilder` constructs an `AppState` programmatically; `_impl` handler variants accept `&AppState` + `Value` directly (no HTTP).
+
 ## Files
 
 | File | Lines | Status | Purpose |
 |------|-------|--------|---------|
-| `lib.rs` | 45 | Complete | Module declarations and crate-level docs |
+| `lib.rs` | 83 | Complete | Module declarations, crate-level docs, public re-exports (`AppState`, `ProxyBuilder`, `MpcBridge`, `ProxyConfig`, `StorageBackend`, etc.) |
 | `main.rs` | 41 | Complete | Binary entry point — loads `ProxyConfig`, inits tracing, calls `server::run()` |
 | `config.rs` | 162 | Complete | `ProxyConfig` from `MPC_*` env vars (9 fields), with defaults and test |
 | `error.rs` | 125 | Complete | `ProxyError` enum (11 variants), HTTP status mapping, `From` impls |
-| `server.rs` | 202 | Complete | Axum router, `AppState` struct (6 fields), all 28 BRC-100 routes, background presig task |
-| `wallet_api.rs` | 3355 | **Implemented** | 28 handlers — 18 implemented, 10 `todo!()` stubs. BEEF construction + multi-tier broadcasting. 60+ tests. |
-| `bridge.rs` | 1420 | **Implemented** | `MpcBridge` with BRC-31 auth, sign/presign/partial_ecdh, key derivation. 15+ tests. |
-| `fee_injector.rs` | 984 | **Implemented** | Fee injection with raw tx parse/serialize, P2PKH + P2MS scripts. 20+ tests. |
-| `presign_manager.rs` | 268 | Complete | `PresignManager` FIFO pool, `background_replenish()` loop with exponential backoff |
+| `server.rs` | 324 | Complete | `AppState`, `ProxyBuilder`, Axum router with all 30 BRC-100 routes, background presig task |
+| `storage.rs` | 471 | Complete | `StorageBackend` trait, `InMemoryBackend` (wraps `UtxoTracker`), `WalletInfraBackend` (stub). 10 tests. |
+| `wallet_api.rs` | 3788 | Complete | All 30 handlers implemented (dual Axum + `_impl` variants). BEEF construction + multi-tier broadcasting. 71 tests. |
+| `bridge.rs` | 1420 | Complete | `MpcBridge` with BRC-31 auth, sign/presign/partial_ecdh, key derivation. 13 tests. |
+| `fee_injector.rs` | 984 | Complete | Fee injection with raw tx parse/serialize, P2PKH + P2MS scripts. 29 tests. |
+| `presign_manager.rs` | 268 | Complete | `PresignManager` FIFO pool, `background_replenish()` loop with exponential backoff. 6 tests. |
 | `utxo_tracker.rs` | 403 | Complete | In-memory UTXO tracker with basket/tag filtering, greedy UTXO selection. 12 tests. |
 
 ## Key Exports
@@ -50,8 +53,34 @@ Shared state passed to all Axum handlers via `State<Arc<AppState>>`:
 - `bridge: MpcBridge` — holds decrypted share, joint key, BRC-31 auth session, reqwest client
 - `presign_manager: Arc<RwLock<PresignManager>>` — presignature pool (RwLock for concurrent reads)
 - `fee_injector: FeeInjector` — constructs fee outputs for `createAction` transactions
-- `utxo_tracker: Arc<RwLock<UtxoTracker>>` — local UTXO set for outputs controlled by the proxy
+- `storage: Arc<dyn StorageBackend>` — pluggable UTXO storage (in-memory or wallet-infra)
 - `http_client: reqwest::Client` — shared client for broadcasting and outbound requests (30s timeout)
+
+### `server::ProxyBuilder`
+Builder for constructing `AppState` programmatically (library usage):
+- `new(config)` — create builder from config
+- `with_bridge(bridge)` — override MPC bridge (skip KSS connection)
+- `with_fee_injector(injector)` — override fee injector
+- `with_presign_manager(manager)` — override presign pool
+- `with_storage(backend)` — override storage backend (default: `InMemoryBackend`)
+- `with_http_client(client)` — override HTTP client
+- `build() -> Result<Arc<AppState>>` — construct state, connecting to KSS if no bridge provided
+
+### `storage::StorageBackend`
+Async trait for UTXO management. All methods return boxed futures for dyn-compatibility (`Arc<dyn StorageBackend>`). Implementations must be `Send + Sync`.
+- `add_output(output)` — persist a new tracked output
+- `mark_spent(txid, vout, spending_txid) -> bool` — mark as spent
+- `list_unspent(basket, tags) -> Vec<TrackedOutput>` — filtered listing (tags use "any" matching)
+- `select_utxos(target_sats) -> (Vec<TrackedOutput>, u64)` — greedy largest-first selection
+- `total_balance() -> u64` — total unspent satoshis
+
+### `storage::InMemoryBackend`
+Default backend wrapping `UtxoTracker` with internal `RwLock`. For standalone/dev deployments.
+- `new()` — empty UTXO set
+- `from_tracker(tracker)` — wrap existing `UtxoTracker`
+
+### `storage::WalletInfraBackend`
+Stub for hosted mode where UTXOs live in rust-wallet-infra's `StorageClient`. Trait methods are defined but return errors pending integration.
 
 ### `bridge::MpcBridge`
 Core translation layer between BRC-100 API and MPC protocol. All methods fully implemented.
@@ -97,7 +126,7 @@ Adds MPC signing fee outputs to `createAction` transactions. Fully implemented.
 - Internal helpers: `resolve_address_to_p2pkh_script()` (supports hex pubkeys and Base58Check addresses), `build_p2ms_script()`, `split_fee_outputs()`, raw tx parser/serializer
 
 ### `utxo_tracker::UtxoTracker`
-In-memory UTXO tracker. Thread-safety via `Arc<RwLock<UtxoTracker>>` in `AppState`.
+In-memory UTXO tracker. Used inside `InMemoryBackend` (wrapped in `RwLock`).
 - `TrackedOutput` — struct with txid, vout, satoshis, locking_script, spending_txid, basket, tags, created_at
 - `add_output(output)` — add new tracked output
 - `mark_spent(txid, vout, spending_txid) -> bool` — mark as spent (returns false if not found or already spent)
@@ -123,30 +152,34 @@ Async loop that runs forever as a spawned Tokio task:
 
 ## Handler Categories
 
+Every handler has two forms: an Axum handler (`fn handler(State, Json) -> Json<Value>`) and a library variant (`fn handler_impl(&AppState, Value) -> Value`). The Axum handler delegates to `_impl`.
+
 ### MPC-routed (require KSS round-trips)
-| Handler | Route | Status |
-|---------|-------|--------|
-| `get_public_key` | `POST /getPublicKey` | **Implemented** — returns root joint key or BRC-42 derived child. "anyone" = local, "self"/"other" = 1 partial ECDH round. |
-| `create_signature` | `POST /createSignature` | **Implemented** — 2PC ECDSA with presig pool fast path. Supports `hashToDirectlySign`, BRC-42 HMAC offset for "anyone" counterparty. |
-| `create_action` | `POST /createAction` | **Implemented** — full pipeline: parse outputs → UTXO select → build tx → inject fee → BIP-143 sighash → MPC sign per input → construct BEEF → broadcast (ARC + WoC fallback) → update UTXO tracker. |
-| `internalize_action` | `POST /internalizeAction` | **Implemented** — handles both raw tx hex AND BEEF/AtomicBEEF format. Detects format via magic bytes, extracts tx using BSV SDK `Beef` parser. Accepts specific outputs or auto-scans for root-key P2PKH matches. |
+| Handler | Route | Description |
+|---------|-------|-------------|
+| `get_public_key` | `POST /getPublicKey` | Returns root joint key or BRC-42 derived child. "anyone" = local, "self"/"other" = 1 partial ECDH round. |
+| `create_signature` | `POST /createSignature` | 2PC ECDSA with presig pool fast path. Supports `hashToDirectlySign`, BRC-42 HMAC offset for "anyone" counterparty. |
+| `create_action` | `POST /createAction` | Full pipeline: parse outputs → UTXO select → build tx → inject fee → BIP-143 sighash → MPC sign per input → construct BEEF → broadcast (ARC + WoC fallback) → update UTXO tracker. |
+| `internalize_action` | `POST /internalizeAction` | Handles both raw tx hex AND BEEF/AtomicBEEF format. Detects format via magic bytes, extracts tx using BSV SDK `Beef` parser. Accepts specific outputs or auto-scans for root-key P2PKH matches. |
 
 ### Local-only (no MPC rounds)
-| Handler | Route | Status |
-|---------|-------|--------|
-| `encrypt` / `decrypt` | `POST /encrypt`, `/decrypt` | **Implemented** — AES-256-GCM with BRC-42 derived key. Random 12-byte nonce. All counterparty types supported via `derive_symmetric_key`. |
-| `create_hmac` / `verify_hmac` | `POST /createHmac`, `/verifyHmac` | **Implemented** — HMAC-SHA256 with BRC-42 derived key. `verify_hmac` uses constant-time comparison. |
-| `verify_signature` | `POST /verifySignature` | **Implemented** — ECDSA verify against BRC-42 derived pubkey. Supports `forSelf`, `hashToDirectlySign`. |
-| `list_outputs` | `POST /listOutputs` | **Implemented** — basket/tag filtering, pagination (limit/offset), optional locking script inclusion. |
-| `list_actions` | `POST /listActions` | todo!() |
-| `relinquish_output` | `POST /relinquishOutput` | todo!() |
-| `get_network` | `POST /getNetwork` | **Implemented** — returns `"mainnet"` |
-| `get_version` | `POST /getVersion` | **Implemented** — returns `"bsv-mpc-proxy {version}"` |
-| `is_authenticated` | `POST /isAuthenticated` | **Implemented** — returns `true` (share loaded at startup) |
-| `health` | `GET /health` | **Implemented** — status, version, presig count, KSS URL, fee |
-| Certificate handlers | 4 POST routes | todo!() |
-| Discovery handlers | 2 POST routes | todo!() |
-| Key linkage handlers | 2 POST routes | todo!() |
+| Handler | Route | Description |
+|---------|-------|-------------|
+| `encrypt` / `decrypt` | `POST /encrypt`, `/decrypt` | AES-256-GCM with BRC-42 derived key. Random 12-byte nonce. All counterparty types supported via `derive_symmetric_key`. |
+| `create_hmac` / `verify_hmac` | `POST /createHmac`, `/verifyHmac` | HMAC-SHA256 with BRC-42 derived key. `verify_hmac` uses constant-time comparison. |
+| `verify_signature` | `POST /verifySignature` | ECDSA verify against BRC-42 derived pubkey. Supports `forSelf`, `hashToDirectlySign`. |
+| `list_outputs` | `POST /listOutputs` | Basket/tag filtering, pagination (limit/offset), optional locking script inclusion. Uses `StorageBackend`. |
+| `list_actions` | `POST /listActions` | Stub — returns empty list. Action history not yet tracked. |
+| `relinquish_output` | `POST /relinquishOutput` | Stub — returns success. Full implementation would remove from storage. |
+| `get_network` | `POST /getNetwork` | Returns `"mainnet"` |
+| `get_version` | `POST /getVersion` | Returns `"bsv-mpc-proxy {version}"` |
+| `is_authenticated` | `POST /isAuthenticated` | Returns `true` (share loaded at startup) |
+| `get_height` | `POST /getHeight` | Stub — returns `{ height: 0 }` |
+| `wait_for_authentication` | `POST /waitForAuthentication` | Returns `{ authenticated: true }` immediately |
+| `health` | `GET /health` | Status, version, presig count, KSS URL, fee config |
+| Certificate handlers | 4 POST routes | Stubs — `listCertificates` returns empty, `proveCertificate`/`acquireCertificate` return error, `relinquishCertificate` returns success |
+| Discovery handlers | 2 POST routes | Stubs — return empty results. Overlay discovery not yet wired. |
+| Key linkage handlers | 2 POST routes | Stubs — return error. Not supported in MPC proxy. |
 
 ## Startup Flow
 
@@ -155,11 +188,11 @@ Async loop that runs forever as a spawned Tokio task:
    - `MpcBridge::new(&config)` — read share file, optionally decrypt, validate, parse root pubkey + share scalar + VSS points, determine participants, create HTTP client, BRC-31 handshake with KSS
    - Construct `FeeInjector` from config
    - Construct `PresignManager` with `max_presignatures` capacity
-   - Construct `UtxoTracker` (empty)
+   - Create `InMemoryBackend` as the default `StorageBackend`
    - Create shared `reqwest::Client` (30s timeout)
    - Bundle into `Arc<AppState>`
    - Spawn `background_replenish()` as a Tokio task
-   - Build Axum router with all 28 routes + `/health`
+   - Build Axum router with all 30 routes + `/health`
    - Bind `0.0.0.0:{port}` and serve
 
 ## `createAction` Pipeline
@@ -169,7 +202,7 @@ This is the most complex handler — called by bsv-worm for every on-chain opera
 1. Parse `outputs` array (each with `satoshis` and `lockingScript` hex)
 2. Compute P2PKH change script from root joint key
 3. Determine MPC fee amount and output count (multisig=1, split=N addresses)
-4. Select UTXOs via `utxo_tracker.select_utxos()` (greedy largest-first)
+4. Select UTXOs via `storage.select_utxos()` (greedy largest-first)
 5. Compute exact mining fee (`estimate_mining_fee`: 110 sats/KB, ceil division)
 6. Build output list: user outputs + change (change includes MPC fee, deducted next)
 7. `fee_injector.inject_fee_into_outputs()` — append fee output(s), reduce change
@@ -181,7 +214,7 @@ This is the most complex handler — called by bsv-worm for every on-chain opera
 9. Serialize signed transaction
 10. Construct BEEF (BRC-62/96) wrapping parent merkle proofs for ARC compliance
 11. Broadcast via multi-tier strategy (see Broadcasting below)
-12. Update UTXO tracker: mark inputs as spent, add change output
+12. Update storage: mark inputs as spent, add change output
 13. Return `{ txid, rawTx }` (includes rawTx even on broadcast failure for client retry)
 
 ## BEEF Construction + Broadcasting
@@ -235,18 +268,19 @@ Detects BEEF/AtomicBEEF by magic bytes (little-endian u32): AtomicBEEF `0x010101
 
 ## Tests
 
-Tests exist in `bridge.rs`, `wallet_api.rs`, `fee_injector.rs`, `presign_manager.rs`, `utxo_tracker.rs`, and `config.rs`:
+142 tests across 7 files:
 
 ```bash
 cargo test -p bsv-mpc-proxy
 ```
 
 - `config::tests` — 1 test: default env var parsing (including `arc_api_key`)
-- `bridge::tests` — 15 tests: hex encode/decode, API type serialization, share loading (plaintext, missing file, 2-of-3 participants)
-- `fee_injector::tests` — 20+ tests: enabled/disabled states, threshold parsing, inject into output list (single/split/multisig/remainder/insufficient/exact), raw tx round-trip injection, address resolution (hex pubkey, BSV address), P2MS script structure, split fee edge cases, balance equation verification
+- `bridge::tests` — 13 tests: hex encode/decode, API type serialization, share loading (plaintext, missing file, 2-of-3 participants)
+- `fee_injector::tests` — 29 tests: enabled/disabled states, threshold parsing, inject into output list (single/split/multisig/remainder/insufficient/exact), raw tx round-trip injection, address resolution (hex pubkey, BSV address), P2MS script structure, split fee edge cases, balance equation verification
 - `presign_manager::tests` — 6 tests: empty pool, take from empty, should_replenish, utilization, zero max, metrics
 - `utxo_tracker::tests` — 12 tests: empty tracker, add/list, mark spent (found/not found/already spent), basket filter, tag filter ("any" mode), greedy UTXO selection (exact/insufficient/skips spent), outpoint format
-- `wallet_api::tests` — 60+ tests: protocol param parsing, symmetric key derivation (anyone/deterministic/different invoices/self errors/other errors), encrypt/decrypt round-trip (normal/empty/large), nonce randomness, wrong key fails, short ciphertext rejected, self counterparty errors without KSS, HMAC create/verify (deterministic, valid, invalid, wrong data), verify_signature (valid anyone, invalid, self errors, bad data length, forSelf=false), getPublicKey (identity, no params, derived anyone, self errors), tx helpers (sha256d, P2PKH script, unlocking script, BIP-143 sighash deterministic/changes with output, serialize/parse roundtrip, txid, mining fee, varint roundtrip), internalizeAction (specific outputs, auto-scan, then list, invalid tx, missing tx, output out of range), BEEF detection (atomic/v1/v2/raw-tx-v1/raw-tx-v2/too-short), BEEF extraction (valid AtomicBEEF with real tx), input txid parsing (single/dedup/two-parents/real-tx/too-short/serialize-roundtrip), TSC merkle path (basic/duplicate/odd-index/empty-fails/roundtrip-binary)
+- `storage::tests` — 10 tests: InMemoryBackend (empty, add/list, mark spent, not found, basket filter, tag filter, select utxos, from_tracker), WalletInfraBackend stubs return error, dyn compatibility
+- `wallet_api::tests` — 71 tests: protocol param parsing, symmetric key derivation (anyone/deterministic/different invoices/self errors/other errors), encrypt/decrypt round-trip (normal/empty/large), nonce randomness, wrong key fails, short ciphertext rejected, self counterparty errors without KSS, HMAC create/verify (deterministic, valid, invalid, wrong data), verify_signature (valid anyone, invalid, self errors, bad data length, forSelf=false), getPublicKey (identity, no params, derived anyone, self errors), tx helpers (sha256d, P2PKH script, unlocking script, BIP-143 sighash deterministic/changes with output, serialize/parse roundtrip, txid, mining fee, varint roundtrip), internalizeAction (specific outputs, auto-scan, then list, invalid tx, missing tx, output out of range), BEEF detection (atomic/v1/v2/raw-tx-v1/raw-tx-v2/too-short), BEEF extraction (valid AtomicBEEF with real tx), input txid parsing (single/dedup/two-parents/real-tx/too-short/serialize-roundtrip), TSC merkle path (basic/duplicate/odd-index/empty-fails/roundtrip-binary)
 
 ## Related
 

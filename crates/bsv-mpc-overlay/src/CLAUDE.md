@@ -7,7 +7,7 @@ This crate handles the overlay-facing aspects of the MPC signing network: advert
 
 ## Implementation Status
 
-CHIP token creation/parsing and node discovery are **fully implemented** with comprehensive test coverage. Overlay publication (`publish_chip_token`) works but lacks BRC-31 auth headers. Proof publication and parsing remain `todo!()` stubs. Fee settlement calculation is implemented.
+CHIP token creation/parsing and node discovery are **fully implemented** with comprehensive test coverage. Overlay publication (`publish_chip_token`) works but lacks BRC-31 auth headers. Proof functions are graceful stubs deferred to Beta (return errors or empty results, no panics). Fee settlement calculation is implemented.
 
 | Area | Status |
 |------|--------|
@@ -19,9 +19,9 @@ CHIP token creation/parsing and node discovery are **fully implemented** with co
 | Node health checking | **Implemented** — HTTP GET `/health` with 5s timeout |
 | Node reputation | **Implemented** — proof count lookup via overlay |
 | Client-side filtering | **Implemented** — pure `filter_and_rank_nodes()` |
-| Proof publication | **Stub** — `todo!()` with detailed pseudocode |
-| Proof querying/counting | **Stub** — `todo!()` with detailed pseudocode |
-| Proof script parsing | **Stub** — `todo!()` with detailed pseudocode |
+| Proof publication | **Deferred** — returns `SubmissionRejected` error, deferred to Beta |
+| Proof querying/counting | **Deferred** — returns empty results / zero counts, deferred to Beta |
+| Proof script parsing | **Deferred** — returns `InvalidProof` error, deferred to Beta |
 | Fee settlement | **Implemented** — proportional integer distribution |
 
 ## Files

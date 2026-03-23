@@ -51,57 +51,58 @@ bsv-worm                          bsv-mpc
                                    +------------------+
 ```
 
-bsv-worm requires ZERO code changes. The MPC Signing Proxy is a drop-in replacement for bsv-wallet-cli.
+bsv-worm requires ZERO code changes. The MPC Signing Proxy is a drop-in replacement for bsv-wallet-cli. See [docs/ECOSYSTEM.md](docs/ECOSYSTEM.md) for the full component map.
 
 ### Crates
 
-#### bsv-mpc-core (~8K LOC, 11 files)
+#### bsv-mpc-core (~8K LOC, 12 files)
 Core MPC protocol layer wrapping cggmp24 for threshold ECDSA on secp256k1. **All protocol modules fully implemented — zero todo!() stubs.**
-- `dkg.rs` — **Implemented.** DKG coordinator (4-round CGGMP'24). Thread-based SM bridge. 12 tests incl 2-of-2 and 2-of-3 integration.
-- `signing.rs` — **Implemented.** Threshold signing (1 round with presig, 4 without). `SigningCoordinator` with full state machine management via `std::thread` + `mpsc` channels.
-- `presigning.rs` — **Implemented.** Background presignature generation (3-round protocol). FIFO pool management, exponential backoff on generation failures, utilization metrics.
-- `ecdh.rs` — **Implemented.** Partial ECDH for threshold key derivation. Lagrange interpolation reconstruction for "self"/"other" counterparty BRC-42 paths.
-- `refresh.rs` — **Implemented.** Key refresh via threshold resharing (ported from POC 13). Same joint key, 0 on-chain cost, old shares cryptographically invalidated.
-- `share.rs` — **Implemented.** AES-256-GCM share encryption + HMAC-SHA256 BRC-42 key derivation. 22 tests.
-- `hd.rs` — **Implemented.** BRC-42 key derivation (NOT BIP-32). `derive_child_pubkey`, `derive_anyone_pubkey`, `compute_invoice`, `compute_brc42_hmac`. 24 tests incl BRC-42 spec vectors.
-- `proof.rs` — **Implemented.** BRC-18 participation proofs — create, OP_RETURN serialize, verify. 33 tests.
-- `types.rs` — **Complete.** All 10 core types: SessionId, ShareIndex, ThresholdConfig, JointPublicKey, EncryptedShare, Presignature, ParticipationProof, RoundMessage, DkgResult, SigningResult.
-- `error.rs` — **Complete.** MpcError enum with 9 variants + From impls.
+- `dkg.rs` — DKG coordinator (4-round CGGMP'24). Thread-based SM bridge.
+- `signing.rs` — Threshold signing (1 round with presig, 4 without). BRC-42 additive offset support.
+- `presigning.rs` — Background presignature generation (3-round protocol). FIFO pool management.
+- `ecdh.rs` — Partial ECDH for threshold key derivation. Lagrange interpolation reconstruction.
+- `refresh.rs` — Key refresh via threshold resharing (ported from POC 13). Same joint key, 0 on-chain cost.
+- `share.rs` — AES-256-GCM share encryption + HMAC-SHA256 BRC-42 key derivation.
+- `hd.rs` — BRC-42 key derivation (NOT BIP-32). `derive_child_pubkey`, `derive_anyone_pubkey`, `compute_invoice`, `compute_brc42_hmac`.
+- `proof.rs` — BRC-18 participation proofs — create, OP_RETURN serialize, verify.
+- `types.rs` — All 10 core types: SessionId, ShareIndex, ThresholdConfig, JointPublicKey, EncryptedShare, Presignature, ParticipationProof, RoundMessage, DkgResult, SigningResult.
+- `error.rs` — MpcError enum with 9 variants + From impls.
 
-#### bsv-mpc-proxy (~7K LOC, 10 files)
-BRC-100 compatible signing proxy. Drop-in replacement for bsv-wallet-cli at localhost:3322.
-- `server.rs` — **Complete.** Axum router with all 28 BRC-100 endpoints, AppState, background presig task.
-- `wallet_api.rs` — 28 handlers. 18 working or partially implemented, **10 todo!() stubs** remaining (certificates, discovery, key linkage). 40+ tests.
-- `bridge.rs` — **Implemented.** MPC protocol bridge to KSS. HTTP client, share loading/decryption, BRC-31 auth, session management. 15+ tests.
-- `fee_injector.rs` — **Implemented.** Fee output injection into transactions. P2PKH split and bare multisig modes. 20+ tests.
-- `utxo_tracker.rs` — **Implemented.** In-memory UTXO tracking with FIFO management, spending status, basket/tag metadata. 12 tests.
-- `presign_manager.rs` — **Implemented.** FIFO pool management, background replenishment loop with exponential backoff.
-- `config.rs` — **Complete.** `ProxyConfig::from_env()` reads `MPC_*` env vars.
-- `error.rs` — **Complete.** ProxyError enum with HTTP status mapping.
-- `main.rs` — **Complete.** Binary entry point.
-- `lib.rs` — **Complete.** Module declarations.
+#### bsv-mpc-proxy (~8K LOC, 12 files)
+BRC-100 compatible signing proxy. Drop-in replacement for bsv-wallet-cli at localhost:3322. Usable as library or binary.
+- `server.rs` — Axum router with all 28 BRC-100 endpoints, AppState, background presig task.
+- `wallet_api.rs` — All 28 BRC-100 handlers implemented (~3.4K LOC).
+- `bridge.rs` — MPC protocol bridge to KSS. HTTP client, share loading/decryption, BRC-31 auth, session management.
+- `fee_injector.rs` — Fee output injection into transactions. P2PKH split and bare multisig modes.
+- `utxo_tracker.rs` — In-memory UTXO tracking with FIFO management, spending status, basket/tag metadata.
+- `presign_manager.rs` — FIFO pool management, background replenishment loop with exponential backoff.
+- `storage.rs` — Proxy-side storage layer.
+- `config.rs` — `ProxyConfig::from_env()` reads `MPC_*` env vars.
+- `error.rs` — ProxyError enum with HTTP status mapping.
+- `main.rs` — Binary entry point.
+- `lib.rs` — Module declarations + public API for library usage.
 
-#### bsv-mpc-worker (~2.5K LOC, 4 files)
+#### bsv-mpc-worker (~2.5K LOC, 5 files)
 Cloudflare Worker Key Share Service (Rust -> WASM). Holds share_A.
-- `lib.rs` — **Complete.** CF Worker router with all 8 endpoints.
-- `api.rs` — **Implemented.** All 8 handlers call bsv-mpc-core coordinators (DKG, signing, presigning, ECDH). 12 request/response types. BRC-31 auth verification is TODO on all mutation endpoints.
-- `storage.rs` — **Implemented.** ShareStorage struct + ShareMetadata. 3-table DO SQLite schema with working methods.
-- `auth.rs` — `verify_agent_authorization()` **implemented**. BRC-31 handshake (`verify_request`, `handle_authrite_handshake`) are TODO.
+- `lib.rs` — CF Worker router with all 8 endpoints.
+- `api.rs` — All 8 handlers call bsv-mpc-core coordinators (DKG, signing, presigning, ECDH). 12 request/response types.
+- `storage.rs` — ShareStorage struct + ShareMetadata. 3-table DO SQLite schema with working methods.
+- `auth.rs` — BRC-31 Authrite implementation including `verify_agent_authorization()`.
 
-#### bsv-mpc-service (~1.2K LOC, 4 files)
+#### bsv-mpc-service (~1.2K LOC, 5 files)
 Standalone Key Share Service binary. Same API as bsv-mpc-worker but backed by in-memory storage (planned: local SQLite).
-- `lib.rs` — **Complete.** AppState struct, `build_router()`, module exports.
-- `main.rs` — **Complete.** Axum server with all 10 routes, env config, tracing setup.
-- `handlers.rs` — **Implemented.** All 9 protocol handlers (DKG, signing, presigning, ECDH, health, share metadata) call bsv-mpc-core coordinators. BRC-31 auth verification is TODO. Authrite handshake is a stub.
-- `storage.rs` — **Implemented (in-memory).** HashMap/VecDeque storage for shares, protocol state, presignatures. 5-table SQL schema documented for future SQLite migration.
+- `lib.rs` — AppState struct, `build_router()`, module exports.
+- `main.rs` — Axum server with all 10 routes, env config, tracing setup.
+- `handlers.rs` — All 9 protocol handlers (DKG, signing, presigning, ECDH, health, share metadata) call bsv-mpc-core coordinators.
+- `storage.rs` — HashMap/VecDeque storage for shares, protocol state, presignatures.
 
-#### bsv-mpc-overlay (~1.9K LOC, 6 files)
+#### bsv-mpc-overlay (~1.9K LOC, 7 files)
 BSV overlay network integration for MPC node discovery.
-- `types.rs` — **Complete.** MpcNodeInfo, DiscoveryQuery, OverlayProof, FeeSettlement, NodeFeeShare, constants.
-- `error.rs` — **Complete.** OverlayError with 8 variants.
-- `proofs.rs` — `calculate_settlement()` **implemented** for proportional fee distribution. 3 todo!() stubs for proof publication/querying (publish_proof, query_proofs, count_proofs_by_node).
-- `chip.rs` — **Implemented.** CHIP token creation/parsing (BRC-23 PushDrop), overlay publication, SDK admin token wrappers. `revoke_chip_token` is a stub. 14 tests.
-- `discovery.rs` — **Implemented.** SLAP/CLAP node discovery via BSV SDK `LookupResolver`, health checking, reputation scoring, client-side filtering/ranking. 9 tests.
+- `types.rs` — MpcNodeInfo, DiscoveryQuery, OverlayProof, FeeSettlement, NodeFeeShare, constants.
+- `error.rs` — OverlayError with 8 variants.
+- `proofs.rs` — `calculate_settlement()` for proportional fee distribution. Proof publication/querying stubs remain.
+- `chip.rs` — CHIP token creation/parsing (BRC-23 PushDrop), overlay publication, SDK admin token wrappers.
+- `discovery.rs` — SLAP/CLAP node discovery via BSV SDK `LookupResolver`, health checking, reputation scoring, client-side filtering/ranking.
 - Topic: `tm_mpc_signing` on BRC-22 overlay.
 
 ## Project Layout
@@ -112,32 +113,38 @@ bsv-mpc/
   deny.toml                          # License/advisory policy (copyleft=deny)
   rust-toolchain.toml                # Stable + wasm32-unknown-unknown target
   CLAUDE.md                          # This file — full architecture context
+  DECISIONS.md                       # Architectural Decision Log (16 ADRs)
+  README.md                          # Project overview + quick start
   SPECS.md                           # Plain English specifications
   INTEGRATION.md                     # bsv-worm integration, wallet-cli architecture
   STATUS.md                          # Implementation status and timeline
+  EXECUTION-PLAN.md                  # Parallel sprint coordination
   POCS.md                            # POC validation plan (all 15 completed)
   TESTING.md                         # Test strategy (unit / integration / E2E)
   LESSONS.md                         # Technical findings from all 15 POCs
   HANDOFF.md                         # Quick-start for new sessions
   src/lib.rs                         # Root crate (exists solely to host integration tests)
   crates/
-    bsv-mpc-core/src/                # 11 files, ~8K LOC — all protocol modules implemented
-    bsv-mpc-proxy/src/               # 10 files, ~7K LOC — bridge + fee injector + 18/28 handlers
-    bsv-mpc-worker/src/              # 4 files, ~2.5K LOC — all handlers implemented, BRC-31 auth TODO
-    bsv-mpc-service/src/             # 4 files, ~1.2K LOC — all handlers implemented, in-memory storage
-    bsv-mpc-overlay/src/             # 6 files, ~1.9K LOC — chip + discovery implemented, proofs TODO
+    bsv-mpc-core/src/                # 12 files, ~8K LOC — all protocol modules implemented
+    bsv-mpc-proxy/src/               # 12 files, ~8K LOC — all 28 BRC-100 handlers implemented
+    bsv-mpc-worker/src/              # 5 files, ~2.5K LOC — all handlers + BRC-31 auth implemented
+    bsv-mpc-service/src/             # 5 files, ~1.2K LOC — all handlers implemented, in-memory storage
+    bsv-mpc-overlay/src/             # 7 files, ~1.9K LOC — chip + discovery implemented, proof pub TODO
+  cggmp21-fork/                      # Git submodule: local cggmp24 fork with set_additive_shift()
   poc/                               # 15 POCs, all VALIDATED (~12,300 LOC)
   tests/
     e2e.rs                           # E2E test suite: proxy + KSS over HTTP (6 scenarios)
+  docs/
+    ECOSYSTEM.md                     # How bsv-mpc fits into BSV agent infrastructure
+    THREAT-MODEL.md                  # Security threat analysis
+    THRESHOLD-ROADMAP.md             # Beta + GA deployment milestones
   brc-drafts/                        # 4 BRC specification drafts (~2K lines total)
   regulatory/                        # MPC regulatory analysis (5 files)
-    compute-service-position-paper.md  # MPC operators = compute providers, not MSBs
-    fee-model-evaluation.md            # 4 fee model comparison (per-tx, subscription, hybrid, tiered)
-    mpc-fee-network-analysis.md        # Business fundamentals analysis
-    action-items.md                    # Regulatory work items before Beta/GA
+  research/                          # JIT-MPC architecture + network analysis
   contracts/mpc-fee-pool/            # sCrypt fee covenant (deferred to Phase 2)
-  research/                          # Strategic analysis docs
 ```
+
+Each crate also has its own `CLAUDE.md` with crate-specific architecture and implementation details.
 
 ## POC Validation Results
 
@@ -149,7 +156,7 @@ All 15 POCs PASSED. See `LESSONS.md` for comprehensive technical findings.
 | POC 2: WASM compilation | cggmp24 compiles to wasm32-unknown-unknown | **PASS** — 636KB module |
 | POC 3: Key derivation | MPC-derived keys match standard HD wallets | **PASS** — Self_ needs partial ECDH |
 | POC 4: Real BSV transaction | MPC produces valid mainnet tx | **PASS** — mainnet tx confirmed |
-| POC 5: HTTP latency | MPC signing fast enough over HTTP | **PASS** — 359µs presigned, 135µs HTTP RTT |
+| POC 5: HTTP latency | MPC signing fast enough over HTTP | **PASS** — 359us presigned, 135us HTTP RTT |
 | POC 6: Wallet toolbox dep | Proxy can reuse rust-wallet-toolbox | **PASS** — ~30-line fork |
 | POC 7: Fee injection | Fee output injected without breaking tx | **PASS** — 3-output mainnet tx |
 | POC 8: BRC-31 auth | Authrite works through MPC | **PASS** — 1 KSS round-trip for partial ECDH |
@@ -171,56 +178,45 @@ All 15 POCs PASSED. See `LESSONS.md` for comprehensive technical findings.
 - **Key refresh**: Built from cggmp24 primitives (~50 LOC). Same joint key, 0 on-chain cost. cggmp24 lacks this natively.
 - **CF Worker**: worker crate 0.7 required. DO storage for key shares (10KB JSON). 16ms HTTPS RTT.
 - **Fee injection**: Must inject BEFORE sighash. Graceful failure when change < fee.
-- **cggmp24 fork**: Local fork at `../cggmp21-fork` exposes `set_additive_shift()` for BRC-42 derived key signing.
+- **cggmp24 fork**: Git submodule at `./cggmp21-fork` exposes `set_additive_shift()` for BRC-42 derived key signing.
 
 ## Implementation Status
 
-~21.5K LOC production code + ~12,300 LOC POC code. Core protocol and KSS handlers fully implemented. Remaining work: BRC-31 auth in KSS, 10 wallet API stubs, overlay proof publication, SQLite persistence.
+~21.7K LOC production code + ~12.3K LOC POC code. 258 tests across all crates. **Zero remaining `todo!()` stubs in production code.** Remaining work: overlay proof publication, SQLite persistence for bsv-mpc-service.
 
 | Layer | Status | Notes |
 |-------|--------|-------|
 | Types + errors (all crates) | **Complete** | All types defined, all error enums done |
 | Config + routing (proxy, service, worker) | **Complete** | Axum/CF Worker routers wired, env config working |
-| MPC protocol (DKG) | **Implemented** | dkg.rs: 4-round CGGMP'24, thread-based SM, 12 tests |
-| MPC protocol (signing) | **Implemented** | signing.rs: 1-round (presig) and 4-round (interactive) paths |
-| MPC protocol (presigning) | **Implemented** | presigning.rs: 3-round offline generation, FIFO pool |
-| Partial ECDH | **Implemented** | ecdh.rs: Lagrange interpolation for threshold key derivation |
-| Key refresh | **Implemented** | refresh.rs: threshold resharing, ported from POC 13 |
-| Share encryption (AES-256-GCM) | **Implemented** | share.rs: encrypt/decrypt/derive_key, 22 tests |
-| BRC-42 key derivation | **Implemented** | hd.rs: all counterparty types, 24 tests |
-| BRC-18 participation proofs | **Implemented** | proof.rs: create/serialize/verify, 33 tests |
-| MPC bridge (proxy → KSS) | **Implemented** | bridge.rs: HTTP client, share loading, session mgmt |
-| Fee injection | **Implemented** | fee_injector.rs: P2PKH + multisig modes, 7 tests |
-| UTXO tracking | **Implemented** | utxo_tracker.rs: in-memory FIFO management |
-| Presign pool management | **Implemented** | presign_manager.rs: FIFO + background replenishment |
-| BRC-100 handlers (18 of 28) | **Partial** | 10 todo!() stubs (certificates, discovery, key linkage) |
-| Fee settlement calculation | **Implemented** | proofs.rs: proportional distribution |
-| E2E test suite | **Implemented** | tests/e2e.rs: 6 scenarios incl mainnet tx signing |
-| KSS handlers (worker + service) | **Implemented** | All protocol handlers call bsv-mpc-core coordinators. BRC-31 auth TODO. |
-| CHIP tokens + discovery | **Implemented** | chip.rs: 14 tests, discovery.rs: 9 tests. Proof publication TODO. |
-| KSS storage (service) | **In-memory** | HashMap/VecDeque working. SQLite (rusqlite) not yet wired. |
-| KSS storage (worker) | **Implemented** | DO SQLite schema + methods working. |
-| BRC-31 auth (KSS) | **TODO** | verify_agent_authorization() done, full handshake TODO |
-
-### Timeline
-
-| Milestone | Due | Status |
-|---|---|---|
-| M0: POC Validation | Mar 21 | **DONE** (15/15) |
-| M1: Core MPC Library | Mar 28 | **DONE** — all protocol modules implemented |
-| M2: Signing Proxy | Apr 4 | In progress — bridge + fee injector done, wallet API 18/28 |
-| M3: CF Worker Deployment | Apr 8 | Mostly done — all handlers implemented, BRC-31 auth + deployment remaining |
-| M4: Fee System | Apr 11 | Partially done — settlement calc + CHIP/discovery implemented, proof pub TODO |
-| M5: Integration & BRCs | Apr 14 | |
-| Beta: Overlay & Hardening | Apr 25 | |
+| MPC protocol (DKG) | **Complete** | dkg.rs: 4-round CGGMP'24, thread-based SM |
+| MPC protocol (signing) | **Complete** | signing.rs: 1-round (presig) and 4-round (interactive) paths |
+| MPC protocol (presigning) | **Complete** | presigning.rs: 3-round offline generation, FIFO pool |
+| Partial ECDH | **Complete** | ecdh.rs: Lagrange interpolation for threshold key derivation |
+| Key refresh | **Complete** | refresh.rs: threshold resharing, ported from POC 13 |
+| Share encryption (AES-256-GCM) | **Complete** | share.rs: encrypt/decrypt/derive_key |
+| BRC-42 key derivation | **Complete** | hd.rs: all counterparty types |
+| BRC-18 participation proofs | **Complete** | proof.rs: create/serialize/verify |
+| MPC bridge (proxy -> KSS) | **Complete** | bridge.rs: HTTP client, share loading, session mgmt |
+| Fee injection | **Complete** | fee_injector.rs: P2PKH + multisig modes |
+| UTXO tracking | **Complete** | utxo_tracker.rs: in-memory FIFO management |
+| Presign pool management | **Complete** | presign_manager.rs: FIFO + background replenishment |
+| BRC-100 handlers (28 of 28) | **Complete** | All wallet API handlers implemented |
+| Fee settlement calculation | **Complete** | proofs.rs: proportional distribution |
+| E2E test suite | **Complete** | tests/e2e.rs: 6 scenarios incl mainnet tx signing |
+| KSS handlers (worker + service) | **Complete** | All protocol handlers call bsv-mpc-core coordinators |
+| BRC-31 auth (worker) | **Complete** | Authrite implementation in auth.rs |
+| CHIP tokens + discovery | **Complete** | chip.rs + discovery.rs |
+| KSS storage (worker) | **Complete** | DO SQLite schema + methods working |
+| KSS storage (service) | **In-memory** | HashMap/VecDeque working. SQLite not yet wired. |
+| Overlay proof publication | **TODO** | publish_proof, query_proofs, count_proofs_by_node |
 
 ## Key Dependencies
 
 | Crate | Version | Purpose |
 |-------|---------|---------|
-| cggmp24 | **local fork** (`../cggmp21-fork`) | CGGMP'24 threshold ECDSA + `set_additive_shift()` for BRC-42 |
-| cggmp24-keygen | **local fork** (same) | DKG protocol |
-| bsv | local path `../rust-sdk` | BSV primitives (features = ["transaction", "wallet"]) |
+| cggmp24 | **git submodule** (`./cggmp21-fork`) | CGGMP'24 threshold ECDSA + `set_additive_shift()` for BRC-42 |
+| cggmp24-keygen | **git submodule** (same) | DKG protocol |
+| bsv | **crates.io `bsv-rs` 0.3.0** (patched to `../bsv-rs`) | BSV primitives (features = ["transaction", "wallet"]) |
 | axum | 0.8 | HTTP server (proxy + service), WebSocket support |
 | reqwest | 0.12 | HTTP client (proxy to KSS), rustls-tls |
 | worker | 0.7 | CF Worker Rust SDK (bsv-mpc-worker only) |
@@ -242,11 +238,12 @@ All 15 POCs PASSED. See `LESSONS.md` for comprehensive technical findings.
 - **Share encryption**: BRC-42 HMAC-SHA256 key derivation to AES-256-GCM. Protocol ID: `[2, "mpc share"]`, key_id: session_id, counterparty: `"self"`.
 - **Protocol messages**: JSON over HTTP (proxy to KSS). Format: `{ session_id, round, from, to, payload }`.
 - **WASM target**: bsv-mpc-worker targets `wasm32-unknown-unknown`. Must use `getrandom/js` for entropy.
-- **BSV SDK**: Local path dependency at `../rust-sdk` with `features = ["transaction", "wallet"]`.
+- **BSV SDK**: Published crate `bsv-rs 0.3.0` from crates.io, patched to local `../bsv-rs` for development. Features: `["transaction", "wallet"]`.
 - **Config**: All via `MPC_*` environment variables (see proxy `config.rs`).
 - **License**: MIT OR Apache-2.0 (workspace-level). deny.toml enforces copyleft=deny.
 - **Rust edition**: 2021, minimum 1.85.
 - **Mainnet only**: Never testnet. BSV mainnet is the target.
+- **ADRs**: Architectural decisions are logged in [DECISIONS.md](DECISIONS.md) (16 ADRs).
 
 ## BRC-100 Proxy Endpoint Map
 
@@ -273,12 +270,12 @@ All 28 BRC-100 endpoints are routed in `server.rs`:
 
 Four BRC specification drafts exist in `brc-drafts/`:
 
-| Draft | Lines | Content |
-|-------|-------|---------|
-| brc-mpc-signing.md | ~470 | Threshold ECDSA protocol specification |
-| brc-mpc-discovery.md | ~490 | Node discovery via SHIP/SLAP + CHIP tokens |
-| brc-mpc-fees.md | ~650 | Fee distribution and settlement (3 levels) |
-| brc-mpc-proofs.md | ~450 | Participation proof format and verification |
+| Draft | Content |
+|-------|---------|
+| brc-mpc-signing.md | Threshold ECDSA protocol specification |
+| brc-mpc-discovery.md | Node discovery via SHIP/SLAP + CHIP tokens |
+| brc-mpc-fees.md | Fee distribution and settlement (3 levels) |
+| brc-mpc-proofs.md | Participation proof format and verification |
 
 ## Relationship to bsv-worm
 
@@ -293,8 +290,8 @@ bsv-mpc is a separate project that bsv-worm uses transparently. The proxy at `lo
 ### Key repos (all at ~/bsv/)
 | Repo | Path | Purpose |
 |------|------|---------|
-| **rust-sdk** | `~/bsv/rust-sdk` | BSV SDK — Transaction, Script, PublicKey, BRC-42, sighash, BEEF |
-| **cggmp21-fork** | `~/bsv/cggmp21-fork` | Local fork with `set_additive_shift()` for BRC-42 derived key signing |
+| **bsv-rs** | `~/bsv/bsv-rs` | BSV SDK — Transaction, Script, PublicKey, BRC-42, sighash, BEEF |
+| **cggmp21-fork** | `./cggmp21-fork` (submodule) | Local fork with `set_additive_shift()` for BRC-42 derived key signing |
 | **bsv-wallet-cli** | `~/bsv/bsv-wallet-cli` | Reference BRC-100 wallet daemon. Use for funding MPC addresses. |
 | **rust-wallet-toolbox** | `~/bsv/rust-wallet-toolbox` | Wallet engine — ProtoWallet, StorageSqlx, WalletSigner |
 | **rust-middleware** | `~/bsv/rust-middleware` | `bsv-auth-cloudflare` — USE THIS for BRC-31 auth in bsv-mpc-worker |
@@ -302,7 +299,7 @@ bsv-mpc is a separate project that bsv-worm uses transparently. The proxy at `lo
 | **BRCs** | `~/bsv/BRCs` | 114 BRC specifications (BRC-31, BRC-42, BRC-100, BRC-22/23/24/25) |
 
 ### Broadcasting
-Use built-in broadcasters from rust-sdk (`WhatsOnChainBroadcaster`, `ArcBroadcaster`) or rust-wallet-toolbox (`services.post_beef()` with failover). Do NOT write raw HTTP calls.
+Use built-in broadcasters from bsv-rs (`WhatsOnChainBroadcaster`, `ArcBroadcaster`) or rust-wallet-toolbox (`services.post_beef()` with failover). Do NOT write raw HTTP calls.
 
 ### Mainnet only
 Never testnet. BSV mainnet transactions cost fractions of a cent. Testnet has different behavior and hides real bugs.
@@ -311,7 +308,7 @@ Never testnet. BSV mainnet transactions cost fractions of a cent. Testnet has di
 
 ```bash
 cargo build                                                    # Build all crates
-cargo test                                                     # Run unit tests
+cargo test                                                     # Run all 258 unit tests
 cargo test --test e2e                                          # Run E2E test suite
 cargo test --test e2e -- --ignored --nocapture                 # Run mainnet E2E (needs E2E_MAINNET=1)
 cargo clippy                                                   # Lint (must be warning-free)
@@ -324,8 +321,10 @@ Required: `rustup target add wasm32-unknown-unknown` for WASM builds.
 
 ## Key Decisions
 
+See [DECISIONS.md](DECISIONS.md) for the full Architectural Decision Log (16 ADRs). Key choices:
+
 - **cggmp24 over cb-mpc**: Pure Rust, WASM-compatible, MIT, Kudelski-audited. cb-mpc is C++ (no WASM, GG18/GG20).
-- **cggmp24 local fork**: Adds `set_additive_shift()` for BRC-42 derived key signing. Patched in Cargo.toml.
+- **cggmp24 local fork**: Adds `set_additive_shift()` for BRC-42 derived key signing. Git submodule patched in Cargo.toml.
 - **`num-bigint` over `rug`**: Avoids LGPL contamination and enables WASM compilation.
 - **Drop-in proxy pattern**: Any BRC-100 client gets MPC signing with zero code changes.
 - **Presigning over on-demand**: Stockpile presigs in idle time (7ms effective) vs 4-round on-demand (180ms).
@@ -335,6 +334,7 @@ Required: `rustup target add wasm32-unknown-unknown` for WASM builds.
 - **Fee via multisig (Level 2)**: MPC nodes self-settle. Upgrade to sCrypt covenant (Level 3) for trustless enforcement.
 - **Overlay topic `tm_mpc_signing`**: Uses existing SHIP/SLAP infrastructure.
 - **Runar for covenants**: Rust-native BSV Script compiler instead of sCrypt TypeScript.
+- **BSV SDK from crates.io**: Primary dependency is `bsv-rs 0.3.0` from crates.io, with local path override for development.
 
 ## Open Questions
 
