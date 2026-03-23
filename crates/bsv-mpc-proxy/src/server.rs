@@ -72,6 +72,120 @@ pub struct AppState {
     pub http_client: reqwest::Client,
 }
 
+/// Builder for constructing an `AppState` with all required components.
+///
+/// This is the primary entry point for library consumers who want to
+/// construct an MPC signing proxy programmatically (without the HTTP server).
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use bsv_mpc_proxy::{ProxyBuilder, ProxyConfig};
+///
+/// # async fn example() -> anyhow::Result<()> {
+/// let config = ProxyConfig::from_env()?;
+/// let state = ProxyBuilder::new(config).build().await?;
+/// // Use state.bridge, state.fee_injector, etc. directly
+/// # Ok(())
+/// # }
+/// ```
+pub struct ProxyBuilder {
+    config: ProxyConfig,
+    bridge: Option<MpcBridge>,
+    fee_injector: Option<FeeInjector>,
+    presign_manager: Option<PresignManager>,
+    utxo_tracker: Option<UtxoTracker>,
+    http_client: Option<reqwest::Client>,
+}
+
+impl ProxyBuilder {
+    /// Create a new builder from a proxy configuration.
+    pub fn new(config: ProxyConfig) -> Self {
+        Self {
+            config,
+            bridge: None,
+            fee_injector: None,
+            presign_manager: None,
+            utxo_tracker: None,
+            http_client: None,
+        }
+    }
+
+    /// Override the MPC bridge (skips KSS connection during build).
+    pub fn with_bridge(mut self, bridge: MpcBridge) -> Self {
+        self.bridge = Some(bridge);
+        self
+    }
+
+    /// Override the fee injector.
+    pub fn with_fee_injector(mut self, injector: FeeInjector) -> Self {
+        self.fee_injector = Some(injector);
+        self
+    }
+
+    /// Override the presignature manager.
+    pub fn with_presign_manager(mut self, manager: PresignManager) -> Self {
+        self.presign_manager = Some(manager);
+        self
+    }
+
+    /// Override the UTXO tracker.
+    pub fn with_utxo_tracker(mut self, tracker: UtxoTracker) -> Self {
+        self.utxo_tracker = Some(tracker);
+        self
+    }
+
+    /// Override the HTTP client.
+    pub fn with_http_client(mut self, client: reqwest::Client) -> Self {
+        self.http_client = Some(client);
+        self
+    }
+
+    /// Build the `AppState`.
+    ///
+    /// If no bridge was provided, connects to the KSS using the config.
+    /// All other components use sensible defaults from the config if not overridden.
+    pub async fn build(self) -> anyhow::Result<Arc<AppState>> {
+        let bridge = match self.bridge {
+            Some(b) => b,
+            None => MpcBridge::new(&self.config).await?,
+        };
+
+        let fee_injector = self.fee_injector.unwrap_or_else(|| {
+            FeeInjector::new(
+                self.config.fee_per_signing,
+                self.config.fee_addresses.clone(),
+                self.config.fee_threshold.clone(),
+            )
+        });
+
+        let presign_manager = Arc::new(RwLock::new(
+            self.presign_manager
+                .unwrap_or_else(|| PresignManager::new(self.config.max_presignatures)),
+        ));
+
+        let utxo_tracker = Arc::new(RwLock::new(
+            self.utxo_tracker.unwrap_or_default(),
+        ));
+
+        let http_client = match self.http_client {
+            Some(c) => c,
+            None => reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()?,
+        };
+
+        Ok(Arc::new(AppState {
+            config: self.config,
+            bridge,
+            presign_manager,
+            fee_injector,
+            utxo_tracker,
+            http_client,
+        }))
+    }
+}
+
 /// Start the BRC-100 HTTP server.
 ///
 /// This function:

@@ -952,10 +952,8 @@ async fn broadcast_tx(
 /// For `identityKey: true`, returns the cached joint public key (no KSS call).
 /// For derived keys with "anyone" counterparty, derives locally using BRC-42.
 /// For "self"/"other" counterparties, needs bridge.partial_ecdh() (not yet implemented).
-pub async fn get_public_key(
-    State(state): State<Arc<AppState>>,
-    Json(body): Json<Value>,
-) -> Json<Value> {
+/// Library-callable version of `get_public_key`. Accepts parsed state and request body directly.
+pub async fn get_public_key_impl(state: &AppState, body: Value) -> Value {
     let identity_key = body
         .get("identityKey")
         .and_then(|v| v.as_bool())
@@ -964,13 +962,13 @@ pub async fn get_public_key(
     // If identityKey requested or no derivation params, return root joint key
     if identity_key || body.get("protocolID").is_none() {
         let pubkey_hex = hex::encode(&state.bridge.joint_public_key().compressed);
-        return Json(json!({ "publicKey": pubkey_hex }));
+        return json!({ "publicKey": pubkey_hex });
     }
 
     // Parse BRC-42 derivation params
     let (level, protocol_name, key_id, counterparty) = match parse_protocol_params(&body) {
         Ok(params) => params,
-        Err(e) => return Json(json!({ "error": e })),
+        Err(e) => return json!({ "error": e }),
     };
 
     let for_self = body
@@ -989,9 +987,17 @@ pub async fn get_public_key(
     )
     .await
     {
-        Ok(pk) => Json(json!({ "publicKey": pk.to_hex() })),
-        Err(e) => Json(json!({ "error": e })),
+        Ok(pk) => json!({ "publicKey": pk.to_hex() }),
+        Err(e) => json!({ "error": e }),
     }
+}
+
+/// Axum handler for `POST /getPublicKey`. Delegates to [`get_public_key_impl`].
+pub async fn get_public_key(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    Json(get_public_key_impl(&state, body).await)
 }
 
 /// `POST /createSignature`
@@ -1019,14 +1025,12 @@ pub async fn get_public_key(
 /// 3. Return the DER-encoded ECDSA signature.
 ///
 /// Presignature signing takes ~50-100ms. Full protocol takes ~300-500ms.
-pub async fn create_signature(
-    State(state): State<Arc<AppState>>,
-    Json(body): Json<Value>,
-) -> Json<Value> {
+/// Library-callable version of `create_signature`. Accepts parsed state and request body directly.
+pub async fn create_signature_impl(state: &AppState, body: Value) -> Value {
     // Parse the data to sign
     let data_value = match body.get("data") {
         Some(v) => v,
-        None => return Json(json!({ "error": "missing data" })),
+        None => return json!({ "error": "missing data" }),
     };
 
     let hash_to_directly_sign = body
@@ -1042,22 +1046,22 @@ pub async fn create_signature(
     } else if let Some(s) = data_value.as_str() {
         hex::decode(s).unwrap_or_else(|_| BASE64.decode(s).unwrap_or_default())
     } else {
-        return Json(json!({ "error": "data must be a string or byte array" }));
+        return json!({ "error": "data must be a string or byte array" });
     };
 
     if data_bytes.is_empty() {
-        return Json(json!({ "error": "data is empty" }));
+        return json!({ "error": "data is empty" });
     }
 
     // Compute 32-byte message hash
     let msg_hash: [u8; 32] = if hash_to_directly_sign {
         if data_bytes.len() != 32 {
-            return Json(json!({
+            return json!({
                 "error": format!(
                     "hashToDirectlySign requires exactly 32 bytes, got {}",
                     data_bytes.len()
                 )
-            }));
+            });
         }
         let mut h = [0u8; 32];
         h.copy_from_slice(&data_bytes);
@@ -1076,7 +1080,7 @@ pub async fn create_signature(
     let hmac_offset: Option<[u8; 32]> = if body.get("protocolID").is_some() {
         let (level, protocol_name, key_id, counterparty) = match parse_protocol_params(&body) {
             Ok(params) => params,
-            Err(e) => return Json(json!({ "error": e })),
+            Err(e) => return json!({ "error": e }),
         };
 
         match compute_signing_hmac_offset(
@@ -1090,9 +1094,9 @@ pub async fn create_signature(
         {
             Ok(offset) => Some(offset),
             Err(e) => {
-                return Json(json!({
+                return json!({
                     "error": format!("BRC-42 HMAC offset computation failed: {}", e)
-                }))
+                })
             }
         }
     } else {
@@ -1108,11 +1112,19 @@ pub async fn create_signature(
     // Sign via MPC bridge (2PC with KSS)
     let signing_result = match state.bridge.sign(&msg_hash, presig, hmac_offset).await {
         Ok(result) => result,
-        Err(e) => return Json(json!({ "error": format!("MPC signing failed: {}", e) })),
+        Err(e) => return json!({ "error": format!("MPC signing failed: {}", e) }),
     };
 
     // Return DER-encoded signature as hex
-    Json(json!({ "signature": hex::encode(&signing_result.signature) }))
+    json!({ "signature": hex::encode(&signing_result.signature) })
+}
+
+/// Axum handler for `POST /createSignature`. Delegates to [`create_signature_impl`].
+pub async fn create_signature(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    Json(create_signature_impl(&state, body).await)
 }
 
 /// `POST /verifySignature`
@@ -1137,27 +1149,25 @@ pub async fn create_signature(
 /// ```json
 /// { "valid": true }
 /// ```
-pub async fn verify_signature(
-    State(state): State<Arc<AppState>>,
-    Json(body): Json<Value>,
-) -> Json<Value> {
+/// Library-callable version of `verify_signature`. Accepts parsed state and request body directly.
+pub async fn verify_signature_impl(state: &AppState, body: Value) -> Value {
     // Parse protocol params
     let (level, protocol_name, key_id, counterparty) = match parse_protocol_params(&body) {
         Ok(params) => params,
-        Err(e) => return Json(json!({ "error": e })),
+        Err(e) => return json!({ "error": e }),
     };
 
     // Parse data and compute hash (same as createSignature)
     let data_hex = match body.get("data").and_then(|v| v.as_str()) {
         Some(s) => s,
-        None => return Json(json!({ "error": "missing data" })),
+        None => return json!({ "error": "missing data" }),
     };
     let data_bytes = match hex::decode(data_hex) {
         Ok(bytes) => bytes,
-        Err(e) => return Json(json!({ "error": format!("invalid hex data: {}", e) })),
+        Err(e) => return json!({ "error": format!("invalid hex data: {}", e) }),
     };
     if data_bytes.is_empty() {
-        return Json(json!({ "error": "data is empty" }));
+        return json!({ "error": "data is empty" });
     }
 
     // Hash the data with SHA-256 (matching createSignature behavior)
@@ -1168,7 +1178,7 @@ pub async fn verify_signature(
 
     let msg_hash: [u8; 32] = if hash_to_directly_sign {
         if data_bytes.len() != 32 {
-            return Json(json!({ "error": format!("hashToDirectlySign requires 32 bytes, got {}", data_bytes.len()) }));
+            return json!({ "error": format!("hashToDirectlySign requires 32 bytes, got {}", data_bytes.len()) });
         }
         let mut h = [0u8; 32];
         h.copy_from_slice(&data_bytes);
@@ -1183,15 +1193,15 @@ pub async fn verify_signature(
     // Parse DER signature
     let sig_hex = match body.get("signature").and_then(|v| v.as_str()) {
         Some(s) => s,
-        None => return Json(json!({ "error": "missing signature" })),
+        None => return json!({ "error": "missing signature" }),
     };
     let sig_bytes = match hex::decode(sig_hex) {
         Ok(bytes) => bytes,
-        Err(e) => return Json(json!({ "error": format!("invalid hex signature: {}", e) })),
+        Err(e) => return json!({ "error": format!("invalid hex signature: {}", e) }),
     };
     let signature = match Signature::from_der(&sig_bytes) {
         Ok(sig) => sig,
-        Err(e) => return Json(json!({ "error": format!("invalid DER signature: {}", e) })),
+        Err(e) => return json!({ "error": format!("invalid DER signature: {}", e) }),
     };
 
     let for_self = body
@@ -1211,11 +1221,19 @@ pub async fn verify_signature(
     .await
     {
         Ok(pk) => pk,
-        Err(e) => return Json(json!({ "error": e })),
+        Err(e) => return json!({ "error": e }),
     };
 
     let valid = pubkey.verify(&msg_hash, &signature);
-    Json(json!({ "valid": valid }))
+    json!({ "valid": valid })
+}
+
+/// Axum handler for `POST /verifySignature`. Delegates to [`verify_signature_impl`].
+pub async fn verify_signature(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    Json(verify_signature_impl(&state, body).await)
 }
 
 /// `POST /createAction`
@@ -1233,14 +1251,13 @@ pub async fn verify_signature(
 /// 6. **MPC signing**: For each input, derive the child key and run 2PC signing with KSS.
 /// 7. **Broadcast**: Submit the signed transaction to the BSV network.
 /// 8. **UTXO update**: Mark spent inputs, add new outputs to the local tracker.
-pub async fn create_action(
-    State(state): State<Arc<AppState>>,
-    Json(body): Json<Value>,
-) -> Json<Value> {
+///
+/// Library-callable version of `create_action`. Accepts parsed state and request body directly.
+pub async fn create_action_impl(state: &AppState, body: Value) -> Value {
     // ── 1. Parse request ─────────────────────────────────────────────────
     let outputs_json = match body.get("outputs").and_then(|v| v.as_array()) {
         Some(arr) if !arr.is_empty() => arr,
-        _ => return Json(json!({"error": "missing or empty outputs array"})),
+        _ => return json!({"error": "missing or empty outputs array"}),
     };
 
     let mut user_outputs: Vec<(u64, Vec<u8>)> = Vec::new();
@@ -1248,23 +1265,21 @@ pub async fn create_action(
         let sats = match o.get("satoshis").and_then(|v| v.as_u64()) {
             Some(s) => s,
             None => {
-                return Json(json!({"error": format!("output[{}]: missing satoshis", i)}))
+                return json!({"error": format!("output[{}]: missing satoshis", i)})
             }
         };
         let script_hex = match o.get("lockingScript").and_then(|v| v.as_str()) {
             Some(s) => s,
             None => {
-                return Json(
-                    json!({"error": format!("output[{}]: missing lockingScript", i)}),
-                )
+                return json!({"error": format!("output[{}]: missing lockingScript", i)})
             }
         };
         let script = match hex::decode(script_hex) {
             Ok(b) => b,
             Err(e) => {
-                return Json(json!({
+                return json!({
                     "error": format!("output[{}]: invalid lockingScript hex: {}", i, e)
-                }))
+                })
             }
         };
         user_outputs.push((sats, script));
@@ -1276,7 +1291,7 @@ pub async fn create_action(
     let joint_key = state.bridge.joint_public_key();
     let root_pubkey = match PublicKey::from_bytes(&joint_key.compressed) {
         Ok(pk) => pk,
-        Err(e) => return Json(json!({"error": format!("invalid joint key: {}", e)})),
+        Err(e) => return json!({"error": format!("invalid joint key: {}", e)}),
     };
     let change_script = p2pkh_locking_script_from_hash(&root_pubkey.hash160());
 
@@ -1313,7 +1328,7 @@ pub async fn create_action(
     };
 
     if selected_utxos.is_empty() {
-        return Json(json!({"error": "no UTXOs available"}));
+        return json!({"error": "no UTXOs available"});
     }
 
     // ── 5. Compute exact mining fee ──────────────────────────────────────
@@ -1323,12 +1338,12 @@ pub async fn create_action(
     let total_needed = total_user_output + mpc_fee + mining_fee;
 
     if total_input < total_needed {
-        return Json(json!({
+        return json!({
             "error": format!(
                 "insufficient funds: have {} sats, need {} (outputs: {}, mpc_fee: {}, mining_fee: {})",
                 total_input, total_needed, total_user_output, mpc_fee, mining_fee
             )
-        }));
+        });
     }
 
     // ── 6. Build output list ─────────────────────────────────────────────
@@ -1356,7 +1371,7 @@ pub async fn create_action(
                 );
             }
             Err(e) => {
-                return Json(json!({"error": format!("fee injection failed: {}", e)}))
+                return json!({"error": format!("fee injection failed: {}", e)})
             }
         }
     }
@@ -1367,9 +1382,7 @@ pub async fn create_action(
         let decoded = match hex::decode(&utxo.txid) {
             Ok(b) if b.len() == 32 => b,
             _ => {
-                return Json(
-                    json!({"error": format!("invalid txid hex: {}", utxo.txid)}),
-                )
+                return json!({"error": format!("invalid txid hex: {}", utxo.txid)})
             }
         };
         let mut txid_bytes = [0u8; 32];
@@ -1418,9 +1431,7 @@ pub async fn create_action(
         let signing_result = match state.bridge.sign(&sighash, presig, None).await {
             Ok(result) => result,
             Err(e) => {
-                return Json(
-                    json!({"error": format!("signing input {} failed: {}", i, e)}),
-                )
+                return json!({"error": format!("signing input {} failed: {}", i, e)})
             }
         };
 
@@ -1476,11 +1487,11 @@ pub async fn create_action(
         Err(e) => {
             // Return the raw tx even on broadcast failure so the caller can retry
             tracing::warn!(txid = %txid, error = %e, "Broadcast failed");
-            return Json(json!({
+            return json!({
                 "error": format!("broadcast failed: {}", e),
                 "txid": txid,
                 "rawTx": raw_tx_hex,
-            }));
+            });
         }
     }
 
@@ -1510,10 +1521,18 @@ pub async fn create_action(
     }
 
     // ── 13. Return ───────────────────────────────────────────────────────
-    Json(json!({
+    json!({
         "txid": txid,
         "rawTx": raw_tx_hex,
-    }))
+    })
+}
+
+/// Axum handler for `POST /createAction`. Delegates to [`create_action_impl`].
+pub async fn create_action(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    Json(create_action_impl(&state, body).await)
 }
 
 /// `POST /internalizeAction`
@@ -1525,10 +1544,8 @@ pub async fn create_action(
 /// The wallet at localhost:3321 returns `tx` as an AtomicBEEF byte array. We
 /// detect the format from magic bytes and extract the raw transaction using the
 /// BSV SDK's `Beef` parser.
-pub async fn internalize_action(
-    State(state): State<Arc<AppState>>,
-    Json(body): Json<Value>,
-) -> Json<Value> {
+/// Library-callable version of `internalize_action`. Accepts parsed state and request body directly.
+pub async fn internalize_action_impl(state: &AppState, body: Value) -> Value {
     // Parse the transaction (hex string from "tx" or "rawTx")
     let raw_tx_hex = match body
         .get("tx")
@@ -1536,12 +1553,12 @@ pub async fn internalize_action(
         .and_then(|v| v.as_str())
     {
         Some(s) => s,
-        None => return Json(json!({"error": "missing tx or rawTx field"})),
+        None => return json!({"error": "missing tx or rawTx field"}),
     };
 
     let input_bytes = match hex::decode(raw_tx_hex) {
         Ok(b) => b,
-        Err(e) => return Json(json!({"error": format!("invalid hex in tx: {}", e)})),
+        Err(e) => return json!({"error": format!("invalid hex in tx: {}", e)}),
     };
 
     // Detect whether input is BEEF/AtomicBEEF or a raw transaction.
@@ -1553,13 +1570,13 @@ pub async fn internalize_action(
     let (tx_outputs, txid) = if is_beef_format(&input_bytes) {
         match extract_tx_from_beef(&input_bytes) {
             Ok(result) => result,
-            Err(e) => return Json(json!({"error": format!("failed to parse BEEF: {}", e)})),
+            Err(e) => return json!({"error": format!("failed to parse BEEF: {}", e)}),
         }
     } else {
         // Raw transaction — parse directly
         let outputs = match parse_tx_outputs(&input_bytes) {
             Ok(o) => o,
-            Err(e) => return Json(json!({"error": format!("failed to parse tx: {}", e)})),
+            Err(e) => return json!({"error": format!("failed to parse tx: {}", e)}),
         };
         let txid = compute_txid(&input_bytes);
         (outputs, txid)
@@ -1575,7 +1592,7 @@ pub async fn internalize_action(
     // Build our expected P2PKH locking script for root key verification
     let root_pubkey = match PublicKey::from_bytes(&state.bridge.joint_public_key().compressed) {
         Ok(pk) => pk,
-        Err(e) => return Json(json!({"error": format!("invalid joint key: {}", e)})),
+        Err(e) => return json!({"error": format!("invalid joint key: {}", e)}),
     };
     let our_script = p2pkh_locking_script_from_hash(&root_pubkey.hash160());
 
@@ -1599,13 +1616,13 @@ pub async fn internalize_action(
             };
 
             if output_index >= tx_outputs.len() {
-                return Json(json!({
+                return json!({
                     "error": format!(
                         "outputIndex {} out of range (tx has {} outputs)",
                         output_index,
                         tx_outputs.len()
                     )
-                }));
+                });
             }
 
             let (satoshis, ref script) = tx_outputs[output_index];
@@ -1655,10 +1672,18 @@ pub async fn internalize_action(
 
     tracing::info!(txid = %txid, accepted_count, "Internalized action");
 
-    Json(json!({
+    json!({
         "accepted": true,
         "txid": txid,
-    }))
+    })
+}
+
+/// Axum handler for `POST /internalizeAction`. Delegates to [`internalize_action_impl`].
+pub async fn internalize_action(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    Json(internalize_action_impl(&state, body).await)
 }
 
 /// Detect whether bytes represent a BEEF/AtomicBEEF format (vs raw transaction).
@@ -1758,22 +1783,20 @@ fn extract_tx_from_beef(bytes: &[u8]) -> Result<(Vec<(u64, Vec<u8>)>, String), S
 ///
 /// Output is `nonce (12 bytes) || AES-GCM ciphertext || auth tag (16 bytes)`,
 /// base64-encoded. The nonce is randomly generated per encryption.
-pub async fn encrypt(
-    State(state): State<Arc<AppState>>,
-    Json(body): Json<Value>,
-) -> Json<Value> {
+/// Library-callable version of `encrypt`. Accepts parsed state and request body directly.
+pub async fn encrypt_impl(state: &AppState, body: Value) -> Value {
     let (level, protocol_name, key_id, counterparty) = match parse_protocol_params(&body) {
         Ok(params) => params,
-        Err(e) => return Json(json!({ "error": e })),
+        Err(e) => return json!({ "error": e }),
     };
 
     let plaintext_b64 = match body.get("plaintext").and_then(|v| v.as_str()) {
         Some(s) => s,
-        None => return Json(json!({ "error": "missing plaintext" })),
+        None => return json!({ "error": "missing plaintext" }),
     };
     let plaintext = match BASE64.decode(plaintext_b64) {
         Ok(bytes) => bytes,
-        Err(e) => return Json(json!({ "error": format!("invalid base64 plaintext: {}", e) })),
+        Err(e) => return json!({ "error": format!("invalid base64 plaintext: {}", e) }),
     };
 
     // Derive 32-byte symmetric key via BRC-42
@@ -1787,7 +1810,7 @@ pub async fn encrypt(
     .await
     {
         Ok(key) => key,
-        Err(e) => return Json(json!({ "error": e })),
+        Err(e) => return json!({ "error": e }),
     };
 
     // AES-256-GCM encrypt with random 12-byte nonce
@@ -1798,7 +1821,7 @@ pub async fn encrypt(
 
     let ciphertext = match cipher.encrypt(nonce, plaintext.as_ref()) {
         Ok(ct) => ct,
-        Err(e) => return Json(json!({ "error": format!("encryption failed: {}", e) })),
+        Err(e) => return json!({ "error": format!("encryption failed: {}", e) }),
     };
 
     // Output: nonce (12) || ciphertext || tag (16)
@@ -1807,7 +1830,15 @@ pub async fn encrypt(
     result.extend_from_slice(&nonce_bytes);
     result.extend_from_slice(&ciphertext);
 
-    Json(json!({ "ciphertext": BASE64.encode(&result) }))
+    json!({ "ciphertext": BASE64.encode(&result) })
+}
+
+/// Axum handler for `POST /encrypt`. Delegates to [`encrypt_impl`].
+pub async fn encrypt(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    Json(encrypt_impl(&state, body).await)
 }
 
 /// `POST /decrypt`
@@ -1830,27 +1861,25 @@ pub async fn encrypt(
 /// ```json
 /// { "plaintext": "<base64>" }
 /// ```
-pub async fn decrypt(
-    State(state): State<Arc<AppState>>,
-    Json(body): Json<Value>,
-) -> Json<Value> {
+/// Library-callable version of `decrypt`. Accepts parsed state and request body directly.
+pub async fn decrypt_impl(state: &AppState, body: Value) -> Value {
     let (level, protocol_name, key_id, counterparty) = match parse_protocol_params(&body) {
         Ok(params) => params,
-        Err(e) => return Json(json!({ "error": e })),
+        Err(e) => return json!({ "error": e }),
     };
 
     let ciphertext_b64 = match body.get("ciphertext").and_then(|v| v.as_str()) {
         Some(s) => s,
-        None => return Json(json!({ "error": "missing ciphertext" })),
+        None => return json!({ "error": "missing ciphertext" }),
     };
     let data = match BASE64.decode(ciphertext_b64) {
         Ok(bytes) => bytes,
-        Err(e) => return Json(json!({ "error": format!("invalid base64 ciphertext: {}", e) })),
+        Err(e) => return json!({ "error": format!("invalid base64 ciphertext: {}", e) }),
     };
 
     // Minimum: 12 (nonce) + 16 (GCM tag) = 28 bytes
     if data.len() < 28 {
-        return Json(json!({ "error": "ciphertext too short (need at least 28 bytes for nonce + tag)" }));
+        return json!({ "error": "ciphertext too short (need at least 28 bytes for nonce + tag)" });
     }
 
     let nonce = Nonce::from_slice(&data[..12]);
@@ -1867,17 +1896,25 @@ pub async fn decrypt(
     .await
     {
         Ok(key) => key,
-        Err(e) => return Json(json!({ "error": e })),
+        Err(e) => return json!({ "error": e }),
     };
 
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&sym_key));
 
     let plaintext = match cipher.decrypt(nonce, ciphertext) {
         Ok(pt) => pt,
-        Err(e) => return Json(json!({ "error": format!("decryption failed: {}", e) })),
+        Err(e) => return json!({ "error": format!("decryption failed: {}", e) }),
     };
 
-    Json(json!({ "plaintext": BASE64.encode(&plaintext) }))
+    json!({ "plaintext": BASE64.encode(&plaintext) })
+}
+
+/// Axum handler for `POST /decrypt`. Delegates to [`decrypt_impl`].
+pub async fn decrypt(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    Json(decrypt_impl(&state, body).await)
 }
 
 /// `POST /createHmac`
@@ -1899,22 +1936,20 @@ pub async fn decrypt(
 /// ```json
 /// { "hmac": "<hex>" }
 /// ```
-pub async fn create_hmac(
-    State(state): State<Arc<AppState>>,
-    Json(body): Json<Value>,
-) -> Json<Value> {
+/// Library-callable version of `create_hmac`. Accepts parsed state and request body directly.
+pub async fn create_hmac_impl(state: &AppState, body: Value) -> Value {
     let (level, protocol_name, key_id, counterparty) = match parse_protocol_params(&body) {
         Ok(params) => params,
-        Err(e) => return Json(json!({ "error": e })),
+        Err(e) => return json!({ "error": e }),
     };
 
     let data_b64 = match body.get("data").and_then(|v| v.as_str()) {
         Some(s) => s,
-        None => return Json(json!({ "error": "missing data" })),
+        None => return json!({ "error": "missing data" }),
     };
     let data = match BASE64.decode(data_b64) {
         Ok(bytes) => bytes,
-        Err(e) => return Json(json!({ "error": format!("invalid base64 data: {}", e) })),
+        Err(e) => return json!({ "error": format!("invalid base64 data: {}", e) }),
     };
 
     // Derive HMAC key via BRC-42 (same derivation path as encrypt/decrypt)
@@ -1928,7 +1963,7 @@ pub async fn create_hmac(
     .await
     {
         Ok(key) => key,
-        Err(e) => return Json(json!({ "error": e })),
+        Err(e) => return json!({ "error": e }),
     };
 
     // HMAC-SHA256
@@ -1937,7 +1972,15 @@ pub async fn create_hmac(
     mac.update(&data);
     let result = mac.finalize();
 
-    Json(json!({ "hmac": hex::encode(result.into_bytes()) }))
+    json!({ "hmac": hex::encode(result.into_bytes()) })
+}
+
+/// Axum handler for `POST /createHmac`. Delegates to [`create_hmac_impl`].
+pub async fn create_hmac(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    Json(create_hmac_impl(&state, body).await)
 }
 
 /// `POST /verifyHmac`
@@ -1961,31 +2004,29 @@ pub async fn create_hmac(
 /// ```json
 /// { "valid": true }
 /// ```
-pub async fn verify_hmac(
-    State(state): State<Arc<AppState>>,
-    Json(body): Json<Value>,
-) -> Json<Value> {
+/// Library-callable version of `verify_hmac`. Accepts parsed state and request body directly.
+pub async fn verify_hmac_impl(state: &AppState, body: Value) -> Value {
     let (level, protocol_name, key_id, counterparty) = match parse_protocol_params(&body) {
         Ok(params) => params,
-        Err(e) => return Json(json!({ "error": e })),
+        Err(e) => return json!({ "error": e }),
     };
 
     let data_b64 = match body.get("data").and_then(|v| v.as_str()) {
         Some(s) => s,
-        None => return Json(json!({ "error": "missing data" })),
+        None => return json!({ "error": "missing data" }),
     };
     let hmac_hex = match body.get("hmac").and_then(|v| v.as_str()) {
         Some(s) => s,
-        None => return Json(json!({ "error": "missing hmac" })),
+        None => return json!({ "error": "missing hmac" }),
     };
 
     let data = match BASE64.decode(data_b64) {
         Ok(bytes) => bytes,
-        Err(e) => return Json(json!({ "error": format!("invalid base64 data: {}", e) })),
+        Err(e) => return json!({ "error": format!("invalid base64 data: {}", e) }),
     };
     let expected_hmac = match hex::decode(hmac_hex) {
         Ok(bytes) => bytes,
-        Err(e) => return Json(json!({ "error": format!("invalid hex hmac: {}", e) })),
+        Err(e) => return json!({ "error": format!("invalid hex hmac: {}", e) }),
     };
 
     // Derive HMAC key
@@ -1999,7 +2040,7 @@ pub async fn verify_hmac(
     .await
     {
         Ok(key) => key,
-        Err(e) => return Json(json!({ "error": e })),
+        Err(e) => return json!({ "error": e }),
     };
 
     // Compute HMAC and verify with constant-time comparison
@@ -2010,19 +2051,21 @@ pub async fn verify_hmac(
     // verify_slice uses constant-time comparison (from subtle crate)
     let valid = mac.verify_slice(&expected_hmac).is_ok();
 
-    Json(json!({ "valid": valid }))
+    json!({ "valid": valid })
+}
+
+/// Axum handler for `POST /verifyHmac`. Delegates to [`verify_hmac_impl`].
+pub async fn verify_hmac(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    Json(verify_hmac_impl(&state, body).await)
 }
 
 // ─── UTXO management ────────────────────────────────────────────────────────
 
-/// `POST /listOutputs`
-///
-/// Query the local UTXO set. Supports filtering by basket (BRC-46), tags,
-/// and spending status.
-pub async fn list_outputs(
-    State(state): State<Arc<AppState>>,
-    Json(body): Json<Value>,
-) -> Json<Value> {
+/// Library-callable version of `list_outputs`. Accepts parsed state and request body directly.
+pub async fn list_outputs_impl(state: &AppState, body: Value) -> Value {
     let basket = body["basket"].as_str();
     let tags: Option<Vec<String>> = body["tags"]
         .as_array()
@@ -2059,187 +2102,256 @@ pub async fn list_outputs(
         })
         .collect();
 
-    Json(json!({
+    json!({
         "totalOutputs": total,
         "outputs": page,
-    }))
+    })
 }
 
-/// `POST /listActions`
-///
-/// Query the action (transaction) history.
-pub async fn list_actions(
-    State(_state): State<Arc<AppState>>,
-    Json(_body): Json<Value>,
+/// Axum handler for `POST /listOutputs`. Delegates to [`list_outputs_impl`].
+pub async fn list_outputs(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<Value>,
 ) -> Json<Value> {
+    Json(list_outputs_impl(&state, body).await)
+}
+
+/// Library-callable version of `list_actions`. Accepts parsed state and request body directly.
+pub async fn list_actions_impl(_state: &AppState, _body: Value) -> Value {
     // Stub: action history not yet tracked by the MPC proxy.
     // Returns an empty list so callers get a valid response.
-    Json(json!({ "actions": [], "totalActions": 0 }))
+    json!({ "actions": [], "totalActions": 0 })
 }
 
-/// `POST /relinquishOutput`
-///
-/// Mark an output as relinquished (no longer tracked).
-pub async fn relinquish_output(
-    State(_state): State<Arc<AppState>>,
-    Json(_body): Json<Value>,
+/// Axum handler for `POST /listActions`. Delegates to [`list_actions_impl`].
+pub async fn list_actions(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<Value>,
 ) -> Json<Value> {
+    Json(list_actions_impl(&state, body).await)
+}
+
+/// Library-callable version of `relinquish_output`. Accepts parsed state and request body directly.
+pub async fn relinquish_output_impl(_state: &AppState, _body: Value) -> Value {
     // Stub: accepts the request and reports success.
     // Full implementation would remove the output from the UTXO tracker.
-    Json(json!({ "success": true }))
+    json!({ "success": true })
+}
+
+/// Axum handler for `POST /relinquishOutput`. Delegates to [`relinquish_output_impl`].
+pub async fn relinquish_output(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    Json(relinquish_output_impl(&state, body).await)
 }
 
 // ─── Identity & auth ────────────────────────────────────────────────────────
 
-/// `POST /getNetwork`
-///
-/// Returns the BSV network this proxy operates on.
-pub async fn get_network(
-    State(_state): State<Arc<AppState>>,
-    Json(_body): Json<Value>,
-) -> Json<Value> {
+/// Library-callable version of `get_network`. Accepts parsed state and request body directly.
+pub async fn get_network_impl(_state: &AppState, _body: Value) -> Value {
     // Static response — MPC proxy always operates on mainnet.
-    Json(json!({ "network": "mainnet" }))
+    json!({ "network": "mainnet" })
 }
 
-/// `POST /getVersion`
-///
-/// Returns the proxy version, presenting itself as a BRC-100 wallet.
-pub async fn get_version(
-    State(_state): State<Arc<AppState>>,
-    Json(_body): Json<Value>,
+/// Axum handler for `POST /getNetwork`. Delegates to [`get_network_impl`].
+pub async fn get_network(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<Value>,
 ) -> Json<Value> {
-    Json(json!({
+    Json(get_network_impl(&state, body).await)
+}
+
+/// Library-callable version of `get_version`. Accepts parsed state and request body directly.
+pub async fn get_version_impl(_state: &AppState, _body: Value) -> Value {
+    json!({
         "version": format!("bsv-mpc-proxy {}", env!("CARGO_PKG_VERSION"))
-    }))
+    })
 }
 
-/// `POST /isAuthenticated`
-///
-/// Returns whether the proxy is initialized and ready to sign.
-pub async fn is_authenticated(
-    State(_state): State<Arc<AppState>>,
-    Json(_body): Json<Value>,
+/// Axum handler for `POST /getVersion`. Delegates to [`get_version_impl`].
+pub async fn get_version(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<Value>,
 ) -> Json<Value> {
+    Json(get_version_impl(&state, body).await)
+}
+
+/// Library-callable version of `is_authenticated`. Accepts parsed state and request body directly.
+pub async fn is_authenticated_impl(_state: &AppState, _body: Value) -> Value {
     // If we got this far, the share is loaded and the bridge is initialized.
-    Json(json!({ "authenticated": true }))
+    json!({ "authenticated": true })
+}
+
+/// Axum handler for `POST /isAuthenticated`. Delegates to [`is_authenticated_impl`].
+pub async fn is_authenticated(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    Json(is_authenticated_impl(&state, body).await)
 }
 
 // ─── Certificates ───────────────────────────────────────────────────────────
 
-/// `POST /listCertificates`
-pub async fn list_certificates(
-    State(_state): State<Arc<AppState>>,
-    Json(_body): Json<Value>,
-) -> Json<Value> {
+/// Library-callable version of `list_certificates`. Accepts parsed state and request body directly.
+pub async fn list_certificates_impl(_state: &AppState, _body: Value) -> Value {
     // Stub: certificate storage not yet implemented in the MPC proxy.
     // Returns an empty list so callers get a valid response.
-    Json(json!({ "certificates": [], "totalCertificates": 0 }))
+    json!({ "certificates": [], "totalCertificates": 0 })
 }
 
-/// `POST /proveCertificate`
+/// Axum handler for `POST /listCertificates`. Delegates to [`list_certificates_impl`].
+pub async fn list_certificates(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    Json(list_certificates_impl(&state, body).await)
+}
+
+/// Library-callable version of `prove_certificate`. Accepts parsed state and request body directly.
+pub async fn prove_certificate_impl(_state: &AppState, _body: Value) -> Value {
+    json!({ "error": "Certificate operations not supported in MPC proxy" })
+}
+
+/// Axum handler for `POST /proveCertificate`. Delegates to [`prove_certificate_impl`].
 pub async fn prove_certificate(
-    State(_state): State<Arc<AppState>>,
-    Json(_body): Json<Value>,
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<Value>,
 ) -> Json<Value> {
-    Json(json!({ "error": "Certificate operations not supported in MPC proxy" }))
+    Json(prove_certificate_impl(&state, body).await)
 }
 
-/// `POST /acquireCertificate`
+/// Library-callable version of `acquire_certificate`. Accepts parsed state and request body directly.
+pub async fn acquire_certificate_impl(_state: &AppState, _body: Value) -> Value {
+    json!({ "error": "Certificate operations not supported in MPC proxy" })
+}
+
+/// Axum handler for `POST /acquireCertificate`. Delegates to [`acquire_certificate_impl`].
 pub async fn acquire_certificate(
-    State(_state): State<Arc<AppState>>,
-    Json(_body): Json<Value>,
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<Value>,
 ) -> Json<Value> {
-    Json(json!({ "error": "Certificate operations not supported in MPC proxy" }))
+    Json(acquire_certificate_impl(&state, body).await)
 }
 
-/// `POST /relinquishCertificate`
-pub async fn relinquish_certificate(
-    State(_state): State<Arc<AppState>>,
-    Json(_body): Json<Value>,
-) -> Json<Value> {
+/// Library-callable version of `relinquish_certificate`. Accepts parsed state and request body directly.
+pub async fn relinquish_certificate_impl(_state: &AppState, _body: Value) -> Value {
     // Stub: accepts the request and reports success.
-    Json(json!({ "success": true }))
+    json!({ "success": true })
+}
+
+/// Axum handler for `POST /relinquishCertificate`. Delegates to [`relinquish_certificate_impl`].
+pub async fn relinquish_certificate(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    Json(relinquish_certificate_impl(&state, body).await)
 }
 
 // ─── Discovery ──────────────────────────────────────────────────────────────
 
-/// `POST /discoverByIdentityKey`
-pub async fn discover_by_identity_key(
-    State(_state): State<Arc<AppState>>,
-    Json(_body): Json<Value>,
-) -> Json<Value> {
+/// Library-callable version of `discover_by_identity_key`. Accepts parsed state and request body directly.
+pub async fn discover_by_identity_key_impl(_state: &AppState, _body: Value) -> Value {
     // Stub: overlay discovery not yet wired in the MPC proxy.
-    Json(json!({ "results": [], "totalResults": 0 }))
+    json!({ "results": [], "totalResults": 0 })
 }
 
-/// `POST /discoverByAttributes`
-pub async fn discover_by_attributes(
-    State(_state): State<Arc<AppState>>,
-    Json(_body): Json<Value>,
+/// Axum handler for `POST /discoverByIdentityKey`. Delegates to [`discover_by_identity_key_impl`].
+pub async fn discover_by_identity_key(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<Value>,
 ) -> Json<Value> {
+    Json(discover_by_identity_key_impl(&state, body).await)
+}
+
+/// Library-callable version of `discover_by_attributes`. Accepts parsed state and request body directly.
+pub async fn discover_by_attributes_impl(_state: &AppState, _body: Value) -> Value {
     // Stub: overlay discovery not yet wired in the MPC proxy.
-    Json(json!({ "results": [], "totalResults": 0 }))
+    json!({ "results": [], "totalResults": 0 })
+}
+
+/// Axum handler for `POST /discoverByAttributes`. Delegates to [`discover_by_attributes_impl`].
+pub async fn discover_by_attributes(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    Json(discover_by_attributes_impl(&state, body).await)
 }
 
 // ─── Key linkage ────────────────────────────────────────────────────────────
 
-/// `POST /revealCounterpartyKeyLinkage`
-pub async fn reveal_counterparty_key_linkage(
-    State(_state): State<Arc<AppState>>,
-    Json(_body): Json<Value>,
-) -> Json<Value> {
-    Json(json!({ "error": "Key linkage not supported in MPC proxy" }))
+/// Library-callable version of `reveal_counterparty_key_linkage`. Accepts parsed state and request body directly.
+pub async fn reveal_counterparty_key_linkage_impl(_state: &AppState, _body: Value) -> Value {
+    json!({ "error": "Key linkage not supported in MPC proxy" })
 }
 
-/// `POST /revealSpecificKeyLinkage`
-pub async fn reveal_specific_key_linkage(
-    State(_state): State<Arc<AppState>>,
-    Json(_body): Json<Value>,
+/// Axum handler for `POST /revealCounterpartyKeyLinkage`. Delegates to [`reveal_counterparty_key_linkage_impl`].
+pub async fn reveal_counterparty_key_linkage(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<Value>,
 ) -> Json<Value> {
-    Json(json!({ "error": "Key linkage not supported in MPC proxy" }))
+    Json(reveal_counterparty_key_linkage_impl(&state, body).await)
+}
+
+/// Library-callable version of `reveal_specific_key_linkage`. Accepts parsed state and request body directly.
+pub async fn reveal_specific_key_linkage_impl(_state: &AppState, _body: Value) -> Value {
+    json!({ "error": "Key linkage not supported in MPC proxy" })
+}
+
+/// Axum handler for `POST /revealSpecificKeyLinkage`. Delegates to [`reveal_specific_key_linkage_impl`].
+pub async fn reveal_specific_key_linkage(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    Json(reveal_specific_key_linkage_impl(&state, body).await)
 }
 
 // ─── Chain info ──────────────────────────────────────────────────────────────
 
-/// `POST /getHeight`
-///
-/// Returns the current block height. Stub returns 0 since the MPC proxy
-/// does not track chain state directly.
-pub async fn get_height(
-    State(_state): State<Arc<AppState>>,
-    Json(_body): Json<Value>,
-) -> Json<Value> {
-    Json(json!({ "height": 0 }))
+/// Library-callable version of `get_height`. Accepts parsed state and request body directly.
+pub async fn get_height_impl(_state: &AppState, _body: Value) -> Value {
+    json!({ "height": 0 })
 }
 
-/// `POST /waitForAuthentication`
-///
-/// Waits until the wallet is authenticated. The MPC proxy is always
-/// authenticated once the share is loaded at startup.
-pub async fn wait_for_authentication(
-    State(_state): State<Arc<AppState>>,
-    Json(_body): Json<Value>,
+/// Axum handler for `POST /getHeight`. Delegates to [`get_height_impl`].
+pub async fn get_height(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<Value>,
 ) -> Json<Value> {
-    Json(json!({ "authenticated": true }))
+    Json(get_height_impl(&state, body).await)
+}
+
+/// Library-callable version of `wait_for_authentication`. Accepts parsed state and request body directly.
+pub async fn wait_for_authentication_impl(_state: &AppState, _body: Value) -> Value {
+    json!({ "authenticated": true })
+}
+
+/// Axum handler for `POST /waitForAuthentication`. Delegates to [`wait_for_authentication_impl`].
+pub async fn wait_for_authentication(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    Json(wait_for_authentication_impl(&state, body).await)
 }
 
 // ─── Health ─────────────────────────────────────────────────────────────────
 
-/// `GET /health`
-///
-/// Liveness check for load balancers, monitoring systems, and bsv-worm's
-/// startup health check.
-pub async fn health(State(state): State<Arc<AppState>>) -> Json<Value> {
+/// Library-callable version of `health`. Accepts parsed state directly (no request body).
+pub async fn health_impl(state: &AppState) -> Value {
     let presig_count = state.presign_manager.read().await.len();
 
-    Json(json!({
+    json!({
         "status": "ok",
         "version": format!("bsv-mpc-proxy {}", env!("CARGO_PKG_VERSION")),
         "presignatures_available": presig_count,
         "kss_url": state.config.kss_url,
         "fee_per_signing_sats": state.config.fee_per_signing,
-    }))
+    })
+}
+
+/// Axum handler for `GET /health`. Delegates to [`health_impl`].
+pub async fn health(State(state): State<Arc<AppState>>) -> Json<Value> {
+    Json(health_impl(&state).await)
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
@@ -3613,5 +3725,60 @@ mod tests {
         let Json(verify_resp) = verify_signature(State(state), Json(verify_body)).await;
         assert_eq!(verify_resp["valid"], true,
             "verifySignature must agree with getPublicKey derivation");
+    }
+
+    // ── Library API smoke tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_library_exports_compile() {
+        // Verify that all public library types are accessible from the crate root.
+        use crate::{
+            AppState, FeeInjectionInfo, FeeInjector, MpcBridge, PresignManager,
+            ProxyBuilder, ProxyConfig, ProxyError, ProxyResult, TrackedOutput, UtxoTracker,
+        };
+
+        // Suppress unused import warnings by referencing the types.
+        let _ = std::mem::size_of::<ProxyConfig>();
+        let _ = std::mem::size_of::<FeeInjector>();
+        let _ = std::mem::size_of::<FeeInjectionInfo>();
+        let _ = std::mem::size_of::<PresignManager>();
+        let _ = std::mem::size_of::<UtxoTracker>();
+        let _ = std::mem::size_of::<TrackedOutput>();
+        let _ = std::mem::size_of::<ProxyError>();
+        let _ = std::any::type_name::<ProxyResult<()>>();
+        let _ = std::any::type_name::<AppState>();
+        let _ = std::any::type_name::<MpcBridge>();
+        let _ = std::any::type_name::<ProxyBuilder>();
+    }
+
+    #[tokio::test]
+    async fn test_impl_functions_callable_without_axum() {
+        // Verify that _impl functions can be called directly with &AppState + Value.
+        let state = test_state();
+
+        // Call a library handler directly — no Axum extractors.
+        let result = get_network_impl(&state, json!({})).await;
+        assert_eq!(result["network"], "mainnet");
+
+        let result = get_version_impl(&state, json!({})).await;
+        assert!(result["version"].as_str().unwrap().starts_with("bsv-mpc-proxy"));
+
+        let result = is_authenticated_impl(&state, json!({})).await;
+        assert_eq!(result["authenticated"], true);
+
+        let result = health_impl(&state).await;
+        assert_eq!(result["status"], "ok");
+
+        let result = list_outputs_impl(&state, json!({})).await;
+        assert_eq!(result["totalOutputs"], 0);
+
+        let result = list_actions_impl(&state, json!({})).await;
+        assert_eq!(result["totalActions"], 0);
+
+        let result = get_height_impl(&state, json!({})).await;
+        assert_eq!(result["height"], 0);
+
+        let result = list_certificates_impl(&state, json!({})).await;
+        assert_eq!(result["totalCertificates"], 0);
     }
 }
