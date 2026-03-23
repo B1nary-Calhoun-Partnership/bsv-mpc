@@ -165,3 +165,13 @@
 **Rationale:** rust-wallet-infra already has production-grade UTXO management (StorageSqlx). Duplicating this in the MPC proxy would be wasteful and error-prone. The JIT proxy pattern is orthogonal — it handles signing, not storage.
 
 **Date:** 2026-03 | **Status:** Accepted
+
+---
+
+## ADR-017: cggmp21-fork as git submodule
+
+**Decision:** Include cggmp21-fork as a git submodule at `./cggmp21-fork/` instead of relying on `../cggmp21-fork/` sibling path.
+
+**Rationale:** Relative parent paths (`../`) break in git worktrees (resolve to wrong directory) and CI (fork not present). Submodule ensures the fork is always available at a predictable path regardless of checkout location. `git clone --recurse-submodules` handles initial setup.
+
+**Date:** 2026-03-22 | **Status:** Accepted

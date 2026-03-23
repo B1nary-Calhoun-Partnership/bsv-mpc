@@ -15,6 +15,9 @@ members = [
     "crates/bsv-mpc-service",
     "crates/bsv-mpc-overlay",
 ]
+exclude = [
+    "cggmp21-fork",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -119,10 +122,10 @@ glass_pumpkin = "=1.9.0"
 # Override cggmp24 with local fork that exposes set_additive_shift() for BRC-42.
 # See ~/bsv/cggmp21-fork/cggmp24/src/signing.rs (brc42-additive-shift branch).
 [patch."https://github.com/LFDT-Lockness/cggmp21"]
-cggmp24 = { path = "../cggmp21-fork/cggmp24" }
-cggmp24-keygen = { path = "../cggmp21-fork/cggmp24-keygen" }
-key-share = { path = "../cggmp21-fork/key-share" }
-paillier-zk = { path = "../cggmp21-fork/paillier-zk" }
+cggmp24 = { path = "./cggmp21-fork/cggmp24" }
+cggmp24-keygen = { path = "./cggmp21-fork/cggmp24-keygen" }
+key-share = { path = "./cggmp21-fork/key-share" }
+paillier-zk = { path = "./cggmp21-fork/paillier-zk" }
 
 # Optimize big-integer and crypto dependencies in dev mode.
 # Without this, num-bigint / Paillier operations are 10-100x slower, making
