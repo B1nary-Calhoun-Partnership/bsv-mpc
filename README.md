@@ -51,6 +51,10 @@ let result = bsv_mpc_proxy::get_public_key_impl(&state, request).await;
 ## Quick Start
 
 ```bash
+# Clone with submodules (cggmp21-fork is required)
+git clone --recurse-submodules https://github.com/Calgooon/bsv-mpc.git
+cd bsv-mpc
+
 # Build
 cargo build
 
@@ -64,6 +68,20 @@ MPC_KSS_URL=https://kss.example.com cargo run -p bsv-mpc-proxy
 # Start standalone Key Share Service
 cargo run -p bsv-mpc-service -- --port 4322
 ```
+
+### Deploying the CF Worker KSS
+
+The worker manifest is gitignored so each operator manages their own. Copy the template and fill in your account:
+
+```bash
+cp crates/bsv-mpc-worker/wrangler.toml.example crates/bsv-mpc-worker/wrangler.toml
+# edit account_id, then:
+cd crates/bsv-mpc-worker && wrangler deploy
+```
+
+### Submodule access
+
+The `cggmp21-fork` submodule is currently a private repo on GitHub. Partner operators must be granted read access on `Calgooon/cggmp21-fork` before `git submodule update --init` will succeed. Use a GitHub personal access token (HTTPS) or SSH key registered with your account.
 
 ## Performance
 

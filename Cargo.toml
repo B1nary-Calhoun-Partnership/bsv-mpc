@@ -119,11 +119,13 @@ tempfile = "3"
 # See LESSONS.md for details. All POCs pin this individually; workspace must too.
 glass_pumpkin = "=1.9.0"
 
-[patch.crates-io]
-bsv-rs = { path = "../bsv-rs" }
+# For local bsv-rs development, add to ~/.cargo/config.toml or an untracked
+# Cargo.toml override:
+#   [patch.crates-io]
+#   bsv-rs = { path = "../bsv-rs" }
 
 # Override cggmp24 with local fork that exposes set_additive_shift() for BRC-42.
-# See ~/bsv/cggmp21-fork/cggmp24/src/signing.rs (brc42-additive-shift branch).
+# Submodule at ./cggmp21-fork (brc42-additive-shift branch).
 [patch."https://github.com/LFDT-Lockness/cggmp21"]
 cggmp24 = { path = "./cggmp21-fork/cggmp24" }
 cggmp24-keygen = { path = "./cggmp21-fork/cggmp24-keygen" }
