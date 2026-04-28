@@ -1374,9 +1374,11 @@ async fn main() {
     println!("  PHASE A: bsv-worm status");
     println!("========================================\n");
 
-    let worm_dir = std::path::Path::new("/Users/johncalhoun/bsv/rust-bsv-worm");
+    let worm_dir_str = std::env::var("WORM_DIR")
+        .unwrap_or_else(|_| "../rust-bsv-worm".to_string());
+    let worm_dir = std::path::Path::new(&worm_dir_str);
     if !worm_dir.exists() {
-        println!("  SKIP: rust-bsv-worm not found at {}", worm_dir.display());
+        println!("  SKIP: rust-bsv-worm not found at {} (set WORM_DIR to override)", worm_dir.display());
         println!("  Run manually: WORM_WALLET_URL=http://localhost:3323 cargo run -- status");
     } else {
         let status_output = std::process::Command::new("cargo")

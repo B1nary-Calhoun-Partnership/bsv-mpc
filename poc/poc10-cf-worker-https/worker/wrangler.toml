@@ -1,7 +1,7 @@
 name = "poc10-mpc-worker"
 main = "build/worker/shim.mjs"
 compatibility_date = "2024-12-01"
-account_id = "<REDACTED-CF-ID>"
+# account_id = "<your-cloudflare-account-id>"  # set via CLOUDFLARE_ACCOUNT_ID env or your own wrangler.toml override
 
 [build]
 command = "worker-build --release"

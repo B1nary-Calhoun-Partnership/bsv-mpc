@@ -8,7 +8,11 @@ working/
 Cargo.lock
 secrets.md
 ROUND-1-PROMPTS.md
+ROUND-2-PROMPTS.md
+ROUND3-PROMPT.md
 .claude-docs-logs/
+.claude/
+.playwright-mcp/
 
 # CF Worker deployment (private — never commit)
 wrangler.toml
