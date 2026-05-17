@@ -22,6 +22,8 @@
 //! | `MPC_MAX_PRESIGS` | `20` | Maximum presignatures to stockpile |
 //! | `MPC_ENCRYPTION_KEY` | (none) | Hex-encoded AES-256 key for share decryption |
 //! | `MPC_ARC_API_KEY` | TAAL mainnet key | ARC API key for TAAL broadcasting |
+//! | `MPC_THRESHOLD_CONFIGS` | `2-of-2,2-of-3` | Comma-separated threshold configs this cosigner supports (`/capabilities` advertises these) |
+//! | `MPC_MIN_BALANCE_SATS` | (none) | Optional minimum balance required before this cosigner will participate in DKG (`/capabilities` advertises this) |
 
 use serde::Deserialize;
 
@@ -85,6 +87,16 @@ pub struct ProxyConfig {
     /// TAAL requires this Bearer token for authentication.
     /// Defaults to a mainnet key if not set.
     pub arc_api_key: String,
+
+    /// Threshold configurations this cosigner advertises support for via
+    /// `GET /capabilities`. Default: `["2-of-2", "2-of-3"]`. Discovery
+    /// clients filter by these.
+    pub threshold_configs: Vec<String>,
+
+    /// Optional minimum balance (in satoshis) required before this cosigner
+    /// will participate in DKG. Advertised via `GET /capabilities`. `None`
+    /// means no minimum.
+    pub min_balance_sats: Option<u64>,
 }
 
 impl ProxyConfig {
@@ -123,6 +135,23 @@ impl ProxyConfig {
 
             arc_api_key: std::env::var("MPC_ARC_API_KEY")
                 .unwrap_or_else(|_| "<REDACTED-ARC-API-KEY>".into()),
+
+            threshold_configs: std::env::var("MPC_THRESHOLD_CONFIGS")
+                .map(|s| {
+                    s.split(',')
+                        .map(|c| c.trim().to_string())
+                        .filter(|c| !c.is_empty())
+                        .collect()
+                })
+                .unwrap_or_else(|_| vec!["2-of-2".to_string(), "2-of-3".to_string()]),
+
+            min_balance_sats: match std::env::var("MPC_MIN_BALANCE_SATS") {
+                Ok(s) => Some(
+                    s.parse()
+                        .map_err(|e| anyhow::anyhow!("Invalid MPC_MIN_BALANCE_SATS: {e}"))?,
+                ),
+                Err(_) => None,
+            },
         })
     }
 }
@@ -143,6 +172,8 @@ mod tests {
         std::env::remove_var("MPC_MAX_PRESIGS");
         std::env::remove_var("MPC_ENCRYPTION_KEY");
         std::env::remove_var("MPC_ARC_API_KEY");
+        std::env::remove_var("MPC_THRESHOLD_CONFIGS");
+        std::env::remove_var("MPC_MIN_BALANCE_SATS");
 
         let config = ProxyConfig::from_env().unwrap();
         assert_eq!(config.port, 3322);
@@ -154,5 +185,23 @@ mod tests {
         assert_eq!(config.max_presignatures, 20);
         assert!(config.encryption_key.is_none());
         assert_eq!(config.arc_api_key, "<REDACTED-ARC-API-KEY>");
+        assert_eq!(config.threshold_configs, vec!["2-of-2", "2-of-3"]);
+        assert!(config.min_balance_sats.is_none());
+    }
+
+    #[test]
+    fn threshold_configs_parses_comma_separated() {
+        std::env::set_var("MPC_THRESHOLD_CONFIGS", "2-of-3, 3-of-5,5-of-9 ");
+        let config = ProxyConfig::from_env().unwrap();
+        std::env::remove_var("MPC_THRESHOLD_CONFIGS");
+        assert_eq!(config.threshold_configs, vec!["2-of-3", "3-of-5", "5-of-9"]);
+    }
+
+    #[test]
+    fn min_balance_sats_parses_when_set() {
+        std::env::set_var("MPC_MIN_BALANCE_SATS", "10000");
+        let config = ProxyConfig::from_env().unwrap();
+        std::env::remove_var("MPC_MIN_BALANCE_SATS");
+        assert_eq!(config.min_balance_sats, Some(10_000));
     }
 }

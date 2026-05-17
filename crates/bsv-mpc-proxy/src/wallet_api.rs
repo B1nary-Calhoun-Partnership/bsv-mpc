@@ -2333,6 +2333,38 @@ pub async fn health(State(state): State<Arc<AppState>>) -> Json<Value> {
     Json(health_impl(&state).await)
 }
 
+// ─── Capabilities (Path A discovery side-channel) ───────────────────────────
+//
+// Per `MPC-Spec` Path A: CHIP tokens carry only (identity_key, domain).
+// MPC-specific capabilities — supported curves, threshold configs, fee,
+// version, optional limits — are served here so discovery clients fetch
+// them after validating a SHIP token. See bsv-mpc-overlay/src/chip.rs
+// module docs for the architecture rationale.
+//
+// Schema mirrors `bsv_mpc_overlay::types::MpcNodeInfo` minus the
+// identity_key + domain (those are in the token).
+
+/// Library-callable version of `capabilities`. Accepts parsed state directly.
+pub async fn capabilities_impl(state: &AppState) -> Value {
+    json!({
+        "curves": ["secp256k1"],
+        "threshold_configs": state.config.threshold_configs,
+        "fee_sats": state.config.fee_per_signing,
+        "version": env!("CARGO_PKG_VERSION"),
+        "max_presignatures": state.config.max_presignatures,
+        "min_balance_sats": state.config.min_balance_sats,
+    })
+}
+
+/// Axum handler for `GET /capabilities`. Delegates to [`capabilities_impl`].
+///
+/// Returns the MPC-specific node capabilities JSON consumed by overlay
+/// discovery clients per Path A. Stable, intentionally small, cacheable
+/// (clients SHOULD respect `Cache-Control: max-age=300`).
+pub async fn capabilities(State(state): State<Arc<AppState>>) -> Json<Value> {
+    Json(capabilities_impl(&state).await)
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -2406,6 +2438,42 @@ mod tests {
         });
         let (_, _, _, cp) = parse_protocol_params(&body).unwrap();
         assert_eq!(cp, "self");
+    }
+
+    #[tokio::test]
+    async fn capabilities_returns_path_a_schema() {
+        // Path A side-channel contract: response carries curves +
+        // threshold_configs + fee_sats + version + max_presignatures
+        // + min_balance_sats — and NOTHING ELSE that would re-introduce
+        // CHIP-token-embedded capabilities.
+        let state = test_state();
+        let body = capabilities_impl(&state).await;
+
+        assert_eq!(body["curves"], json!(["secp256k1"]));
+        assert_eq!(body["threshold_configs"], json!(["2-of-2", "2-of-3"]));
+        assert_eq!(body["fee_sats"], json!(state.config.fee_per_signing));
+        assert!(body["version"].is_string());
+        assert_eq!(
+            body["max_presignatures"],
+            json!(state.config.max_presignatures)
+        );
+        // min_balance_sats defaults to null (None) when MPC_MIN_BALANCE_SATS unset.
+        assert!(body["min_balance_sats"].is_null());
+
+        // Lock the field set: NO identity_key / domain / signature / pubkey
+        // should leak into the side-channel. Discovery clients get those
+        // from the SHIP token, not here.
+        let obj = body
+            .as_object()
+            .expect("capabilities returns a JSON object");
+        let forbidden = ["identity_key", "domain", "signature", "pubkey", "address"];
+        for f in forbidden {
+            assert!(
+                !obj.contains_key(f),
+                "capabilities response leaked forbidden field {f}: \
+                 belongs in the CHIP token, not the side-channel"
+            );
+        }
     }
 
     #[tokio::test]

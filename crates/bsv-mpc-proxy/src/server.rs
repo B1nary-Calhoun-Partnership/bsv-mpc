@@ -307,6 +307,11 @@ pub async fn run(config: ProxyConfig) -> anyhow::Result<()> {
         )
         // ── Health ───────────────────────────────────────────────────────
         .route("/health", get(wallet_api::health))
+        // ── Discovery side-channel (Path A) ──────────────────────────────
+        // Overlay discovery clients fetch MPC-specific node capabilities
+        // here after validating this cosigner's SHIP token. See
+        // bsv-mpc-overlay/src/chip.rs docs for architecture rationale.
+        .route("/capabilities", get(wallet_api::capabilities))
         .with_state(state);
 
     let addr = format!("0.0.0.0:{}", config.port);

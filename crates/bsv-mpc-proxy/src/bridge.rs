@@ -1337,6 +1337,8 @@ mod tests {
             max_presignatures: 5,
             encryption_key: None,
             arc_api_key: "test_key".into(),
+            threshold_configs: vec!["2-of-2".to_string()],
+            min_balance_sats: None,
         };
 
         let bridge = MpcBridge::new(&config).await.unwrap();
@@ -1362,6 +1364,8 @@ mod tests {
             max_presignatures: 5,
             encryption_key: None,
             arc_api_key: "test_key".into(),
+            threshold_configs: vec!["2-of-2".to_string()],
+            min_balance_sats: None,
         };
 
         let result = MpcBridge::new(&config).await;
@@ -1407,6 +1411,8 @@ mod tests {
             max_presignatures: 5,
             encryption_key: None,
             arc_api_key: "test_key".into(),
+            threshold_configs: vec!["2-of-2".to_string()],
+            min_balance_sats: None,
         };
 
         let bridge = MpcBridge::new(&config).await.unwrap();
