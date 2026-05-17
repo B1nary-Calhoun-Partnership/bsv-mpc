@@ -26,6 +26,9 @@
 //! canonical-wire module shipped in PR #1 (MessageEnvelope encode/decode,
 //! BRC-78, BRC-31) and the MessageBox transport here in #2.
 
+use std::sync::Arc;
+use std::time::Duration;
+
 use bsv::primitives::ec::PrivateKey;
 use bsv_mpc_core::envelope::{MessageEnvelope, ENVELOPE_VERSION_V1};
 use bsv_mpc_core::types::SessionId;
@@ -33,6 +36,9 @@ use bsv_mpc_messagebox::auth::MessageBoxAuth;
 use bsv_mpc_messagebox::http;
 use bsv_mpc_messagebox::types::{MessagePayload, SendMessageRequest, BOX_SIGN};
 use bsv_mpc_messagebox::wire;
+use bsv_mpc_messagebox::{
+    subscribe, InboundEnvelopeEvent, InboundVia, WsSubscription,
+};
 use rand::RngCore;
 
 fn relay_url() -> Option<String> {
@@ -175,4 +181,214 @@ async fn live_relay_round_trip_canonical_envelope() {
         .expect("POST /acknowledgeMessage MUST succeed");
     assert_eq!(ack_resp.status, "success");
     eprintln!("✔ acknowledged + deleted: {}", received.message_id);
+}
+
+/// Second live-relay scenario for the M1 sprint: WebSocket subscribe
+/// (task #13) end-to-end against the deployed Calhoun relay. Covers:
+///
+/// 1. Alice subscribes to `mpc-sign` via WS.
+/// 2. Bob (separate identity) sends a canonical envelope via HTTP
+///    `/sendMessage`; Alice receives it **live** over the WS push
+///    bridge within a tight deadline. `via == WsPush`. Byte-exact.
+/// 3. Alice drops the WS (`shutdown().await`).
+/// 4. Bob sends a second envelope while Alice is offline; the relay
+///    persists it in D1 but has no live socket to push to.
+/// 5. Alice re-subscribes. The pre-pump backfill drains the missed
+///    envelope via HTTP `/listMessages`. `via == Backfill`. Byte-exact.
+///
+/// This is the merge gate for task #13: any drift in the WS handshake,
+/// the BRC-31 upgrade-signing, the room-naming convention, the
+/// inbound-event parser, or the body-shape normalization fails here.
+#[tokio::test]
+async fn live_relay_ws_subscribe_receives_push_then_backfill() {
+    let Some(relay_url) = relay_url() else {
+        eprintln!("MESSAGEBOX_RELAY_URL not set — skipping WS subscribe proof.");
+        return;
+    };
+    let _ = tracing_subscriber::fmt::try_init();
+
+    // ----- Identities (Alice subscribes, Bob sends) -----
+    let alice = Arc::new(
+        MessageBoxAuth::new(&relay_url, fresh_priv()).expect("MessageBoxAuth::new(alice)"),
+    );
+    alice.start();
+    let alice_pub = alice.identity_hex().await.expect("alice identity_hex");
+
+    let bob =
+        MessageBoxAuth::new(&relay_url, fresh_priv()).expect("MessageBoxAuth::new(bob)");
+    bob.start();
+    let bob_pub = bob.identity_hex().await.expect("bob identity_hex");
+
+    eprintln!("✔ alice = {alice_pub}");
+    eprintln!("✔ bob   = {bob_pub}");
+
+    // ----- Scenario 1: live WS push -----
+    let mut sub: WsSubscription = subscribe(alice.clone(), vec![BOX_SIGN.to_string()])
+        .await
+        .expect("alice subscribe MUST succeed (backfill+connect+join inline)");
+    eprintln!("✔ alice subscribed to {BOX_SIGN} via WS (handshake done inline)");
+
+    let envelope1 = sample_envelope();
+    let envelope1_bytes = envelope1.encode_canonical();
+    let msg_id_1 = format!(
+        "ws-proof-push-{}",
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+    );
+    let send1 = http::send_message(
+        &bob,
+        &SendMessageRequest {
+            message: MessagePayload {
+                recipient: Some(alice_pub.clone()),
+                recipients: None,
+                message_box: BOX_SIGN.to_string(),
+                message_id: Some(msg_id_1.clone()),
+                body: wire::wrap_envelope_to_body(&envelope1),
+            },
+            payment: None,
+        },
+    )
+    .await
+    .expect("bob → alice send #1 MUST succeed");
+    assert_eq!(send1.status, "success");
+    eprintln!("✔ bob sent #1 to alice: message_id={msg_id_1}");
+
+    let event = wait_for(&mut sub, &msg_id_1, Duration::from_secs(10))
+        .await
+        .expect("WS push for #1 MUST arrive within 10s");
+    assert_eq!(
+        event.via,
+        InboundVia::WsPush,
+        "first envelope MUST arrive via live WS push (not backfill)"
+    );
+    assert_eq!(event.sender, bob_pub, "sender field MUST be bob");
+    assert_eq!(event.message_box, BOX_SIGN);
+    let round1 =
+        wire::unwrap_inbound_body(&event.body).expect("unwrap_inbound_body #1 MUST succeed");
+    assert_eq!(
+        round1, envelope1,
+        "WS-pushed envelope MUST round-trip byte-exact"
+    );
+    assert_eq!(
+        round1.encode_canonical(),
+        envelope1_bytes,
+        "byte-equivalent re-encode (§05.9.1) preserved across the live WS push"
+    );
+    eprintln!(
+        "✔ alice received #1 LIVE via WS push (via={:?}, {} bytes byte-exact)",
+        event.via,
+        envelope1_bytes.len()
+    );
+
+    // ACK the live one so it doesn't pollute the offline-then-reconnect
+    // backfill scenario below.
+    http::acknowledge_messages(&alice, std::slice::from_ref(&event.message_id))
+        .await
+        .expect("ack #1 MUST succeed");
+
+    // ----- Scenario 2: offline → reconnect → backfill -----
+    sub.shutdown().await;
+    eprintln!("✔ alice WS shut down (offline)");
+
+    let envelope2 = {
+        let mut e = sample_envelope();
+        e.session_id = SessionId([0x33; 32]);
+        e.inner = b"backfill-envelope-payload".to_vec();
+        e.correlation_id = Some("ws-proof-backfill".into());
+        e
+    };
+    let envelope2_bytes = envelope2.encode_canonical();
+    let msg_id_2 = format!(
+        "ws-proof-backfill-{}",
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+    );
+    let send2 = http::send_message(
+        &bob,
+        &SendMessageRequest {
+            message: MessagePayload {
+                recipient: Some(alice_pub.clone()),
+                recipients: None,
+                message_box: BOX_SIGN.to_string(),
+                message_id: Some(msg_id_2.clone()),
+                body: wire::wrap_envelope_to_body(&envelope2),
+            },
+            payment: None,
+        },
+    )
+    .await
+    .expect("bob → alice send #2 (alice offline) MUST succeed at the relay");
+    assert_eq!(send2.status, "success");
+    eprintln!("✔ bob sent #2 while alice offline: message_id={msg_id_2}");
+
+    let mut sub2: WsSubscription =
+        subscribe(alice.clone(), vec![BOX_SIGN.to_string()])
+            .await
+            .expect("alice re-subscribe MUST succeed");
+    eprintln!("✔ alice re-subscribed; backfill drained before pump started");
+
+    let event2 = wait_for(&mut sub2, &msg_id_2, Duration::from_secs(10))
+        .await
+        .expect("backfill for #2 MUST arrive within 10s of re-subscribe");
+    assert_eq!(
+        event2.via,
+        InboundVia::Backfill,
+        "missed-while-offline envelope MUST arrive via backfill (not WsPush)"
+    );
+    assert_eq!(event2.sender, bob_pub);
+    let round2 =
+        wire::unwrap_inbound_body(&event2.body).expect("unwrap_inbound_body #2 MUST succeed");
+    assert_eq!(
+        round2, envelope2,
+        "backfilled envelope MUST round-trip byte-exact"
+    );
+    assert_eq!(
+        round2.encode_canonical(),
+        envelope2_bytes,
+        "byte-equivalent re-encode (§05.9.1) preserved across the backfill path"
+    );
+    eprintln!(
+        "✔ alice received #2 via BACKFILL on reconnect (via={:?}, {} bytes byte-exact)",
+        event2.via,
+        envelope2_bytes.len()
+    );
+
+    // Clean up.
+    http::acknowledge_messages(&alice, std::slice::from_ref(&event2.message_id))
+        .await
+        .expect("ack #2 MUST succeed");
+    sub2.shutdown().await;
+    eprintln!("✔ done — WS subscribe + backfill scenarios both byte-exact");
+}
+
+/// Pull events off the subscription until we see one with the target
+/// `message_id`. Skips foreign messages (residue from a prior crashed
+/// run, dedup spillover from the other test in this file, etc.).
+/// Surfaces non-stream errors immediately.
+async fn wait_for(
+    sub: &mut WsSubscription,
+    want_message_id: &str,
+    timeout: Duration,
+) -> Result<InboundEnvelopeEvent, String> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(format!(
+                "timed out after {timeout:?} waiting for message_id={want_message_id}"
+            ));
+        }
+        let item = tokio::time::timeout(remaining, sub.inbound.recv())
+            .await
+            .map_err(|_| format!("timeout waiting for {want_message_id}"))?
+            .ok_or_else(|| {
+                format!("subscription stream closed before {want_message_id} arrived")
+            })?;
+        let event = item.map_err(|e| format!("subscription error: {e}"))?;
+        if event.message_id == want_message_id {
+            return Ok(event);
+        }
+        eprintln!(
+            "(skipping unrelated event: message_id={} via={:?})",
+            event.message_id, event.via
+        );
+    }
 }

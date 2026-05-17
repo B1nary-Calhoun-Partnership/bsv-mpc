@@ -13,6 +13,12 @@ pub enum MessageBoxError {
     #[error("WebSocket error: {0}")]
     WebSocket(String),
 
+    /// Timed out waiting for a WS milestone (`connected` greeting,
+    /// `joinedRoom` ack, post-frame send). Distinct from `WebSocket` so
+    /// the reconnect loop in `ws::run_loop` can branch on it.
+    #[error("WebSocket timeout: {0}")]
+    WsTimeout(String),
+
     /// BRC-31 mutual auth failure on the request or response side.
     #[error("BRC-31 auth error: {0}")]
     Auth(String),
