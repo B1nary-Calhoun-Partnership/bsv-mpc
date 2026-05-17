@@ -228,7 +228,7 @@ const FEE_RATE_SATS_PER_KB: u64 = 110; // just over 100 sats/KB
 fn estimate_mining_fee(num_inputs: usize, num_outputs: usize) -> u64 {
     let estimated_size = 10 + (num_inputs * 149) + (num_outputs * 34);
     // fee = ceil(size_bytes * rate_per_kb / 1000)
-    let fee = (estimated_size as u64 * FEE_RATE_SATS_PER_KB + 999) / 1000;
+    let fee = (estimated_size as u64 * FEE_RATE_SATS_PER_KB).div_ceil(1000);
     std::cmp::max(fee, 1)
 }
 
@@ -1709,11 +1709,15 @@ fn is_beef_format(bytes: &[u8]) -> bool {
         || magic == 0xEFBE0002  // BEEF_V2
 }
 
+/// `(outputs: Vec<(satoshis, locking_script_bytes)>, txid_hex)` extracted
+/// from a BEEF / AtomicBEEF envelope.
+type BeefExtractedTx = Result<(Vec<(u64, Vec<u8>)>, String), String>;
+
 /// Extract the target transaction's outputs and txid from BEEF/AtomicBEEF bytes.
 ///
 /// Uses the BSV SDK's `Beef::from_binary()` to parse the envelope, then extracts
 /// the target transaction (for AtomicBEEF: the atomic_txid; otherwise: the last tx).
-fn extract_tx_from_beef(bytes: &[u8]) -> Result<(Vec<(u64, Vec<u8>)>, String), String> {
+fn extract_tx_from_beef(bytes: &[u8]) -> BeefExtractedTx {
     use bsv::transaction::Beef;
 
     let beef = Beef::from_binary(bytes)
@@ -2603,7 +2607,7 @@ mod tests {
     async fn test_decrypt_short_ciphertext_rejected() {
         let state = test_state();
         // Less than 28 bytes (12 nonce + 16 tag)
-        let short_ct = BASE64.encode(&[0u8; 20]);
+        let short_ct = BASE64.encode([0u8; 20]);
         let body = json!({
             "ciphertext": short_ct,
             "protocolID": [2, "test"],
@@ -2750,7 +2754,7 @@ mod tests {
 
         // The handler SHA-256 hashes data before verifying, so sign the hash
         let data = [0x42u8; 32];
-        let msg_hash: [u8; 32] = Sha256::digest(&data).into();
+        let msg_hash: [u8; 32] = Sha256::digest(data).into();
         let signature = child_priv.sign(&msg_hash).expect("signing should work");
 
         let body = json!({
@@ -2888,7 +2892,7 @@ mod tests {
 
         // The handler SHA-256 hashes data before verifying, so sign the hash
         let data = [0x55u8; 32];
-        let msg_hash: [u8; 32] = Sha256::digest(&data).into();
+        let msg_hash: [u8; 32] = Sha256::digest(data).into();
         let signature = child_priv.sign(&msg_hash).unwrap();
 
         let body = json!({
@@ -3184,7 +3188,7 @@ mod tests {
             "tx": tx_hex,
             "outputs": [{"outputIndex": 0}, {"outputIndex": 1}],
         });
-        internalize_action(State(state.clone()), Json(body)).await;
+        let _ = internalize_action(State(state.clone()), Json(body)).await;
 
         // List outputs and verify
         let Json(list_resp) = list_outputs(State(state), Json(json!({}))).await;

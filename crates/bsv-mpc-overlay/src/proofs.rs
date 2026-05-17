@@ -159,13 +159,11 @@ pub fn calculate_settlement(
     let node_shares: Vec<NodeFeeShare> = proof_counts
         .iter()
         .map(|(identity_key, count)| {
-            let fee_sats = if total_proofs > 0 {
-                // Proportional distribution, rounding down.
-                // Remainder goes to the node with the most proofs.
-                (total_fees_sats * count) / total_proofs
-            } else {
-                0
-            };
+            // Proportional distribution, rounding down.
+            // Remainder goes to the node with the most proofs.
+            let fee_sats = (total_fees_sats * count)
+                .checked_div(total_proofs)
+                .unwrap_or(0);
             NodeFeeShare {
                 identity_key: identity_key.clone(),
                 proof_count: *count,

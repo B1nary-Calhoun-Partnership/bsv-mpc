@@ -328,7 +328,7 @@ mod tests {
         privkey: &PrivateKey,
     ) -> NonZero<SecretScalar<Secp256k1>> {
         let bytes = privkey.to_bytes();
-        let mut scalar = Scalar::<Secp256k1>::from_be_bytes(&bytes)
+        let mut scalar = Scalar::<Secp256k1>::from_be_bytes(bytes)
             .expect("valid scalar from private key bytes");
         let secret = SecretScalar::new(&mut scalar);
         NonZero::from_secret_scalar(secret).expect("non-zero scalar")

@@ -520,6 +520,13 @@ impl Drop for SigningCoordinator {
 /// This function blocks the thread, driving the SM via `proceed()` and
 /// communicating with the coordinator via channels. Same pattern as
 /// `run_keygen_sm` in `dkg.rs`.
+///
+/// The 8 args (one over the clippy default threshold of 7) are the
+/// natural SM-thread surface: cggmp24 protocol inputs (eid, party
+/// index, participants, key share, message hash, optional offset) plus
+/// the two channel ends for the bridge. Bundling them into a struct
+/// would add indirection without information.
+#[allow(clippy::too_many_arguments)]
 fn run_signing_sm(
     eid_bytes: [u8; 32],
     my_signing_index: u16,

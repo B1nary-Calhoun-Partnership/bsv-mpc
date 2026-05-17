@@ -427,13 +427,16 @@ mod tests {
 
     // ---- Helper: extract eval points and secret shares from DKG output ----
 
-    fn extract_share_data(
-        key_shares: &[cggmp24::KeyShare<Secp256k1, SecurityLevel128>],
-    ) -> (
+    /// (eval_points, secret_shares, all_eval_points)
+    type ExtractedShareData = (
         Vec<NonZero<Scalar<Secp256k1>>>,
         Vec<Scalar<Secp256k1>>,
         Vec<NonZero<Scalar<Secp256k1>>>,
-    ) {
+    );
+
+    fn extract_share_data(
+        key_shares: &[cggmp24::KeyShare<Secp256k1, SecurityLevel128>],
+    ) -> ExtractedShareData {
         let dirty0 = key_shares[0].clone().into_inner().core;
         let vss = dirty0
             .key_info
@@ -466,7 +469,8 @@ mod tests {
         new_n: u16,
     ) -> Vec<cggmp24::key_share::IncompleteKeyShare<Secp256k1>> {
         let dirty0 = original_key_shares[0].clone().into_inner().core;
-        let curve = dirty0.key_info.curve.clone();
+        // CurveName<_> is Copy; no clone needed.
+        let curve = dirty0.key_info.curve;
         let original_shared_pubkey = dirty0.key_info.shared_public_key;
 
         let new_nz_public_shares: Vec<NonZero<Point<Secp256k1>>> = new_public_shares
@@ -480,7 +484,7 @@ mod tests {
                 let dirty = DirtyIncompleteKeyShare {
                     i,
                     key_info: DirtyKeyInfo {
-                        curve: curve.clone(),
+                        curve,
                         shared_public_key: original_shared_pubkey,
                         public_shares: new_nz_public_shares.clone(),
                         vss_setup: Some(VssSetup {

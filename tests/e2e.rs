@@ -822,7 +822,7 @@ async fn test_mainnet_transaction(env: &TestEnv, client: &Client) {
     let mpc_pubkey_hash = mpc_pubkey.hash160();
     let locking_script = format!(
         "76a914{}88ac",
-        hex::encode(&mpc_pubkey_hash)
+        hex::encode(mpc_pubkey_hash)
     );
 
     // Wallet at :3321 requires Origin: http://admin.com and outputDescription
@@ -910,7 +910,7 @@ async fn test_mainnet_transaction(env: &TestEnv, client: &Client) {
         .unwrap_or("02000000000000000000000000000000000000000000000000000000000000000001");
     let wallet_pk = bsv::PublicKey::from_hex(wallet_pk_hex).expect("wallet pubkey");
     let wallet_hash = wallet_pk.hash160();
-    let return_script = format!("76a914{}88ac", hex::encode(&wallet_hash));
+    let return_script = format!("76a914{}88ac", hex::encode(wallet_hash));
 
     eprintln!("  Creating MPC-signed transaction...");
     let start = std::time::Instant::now();

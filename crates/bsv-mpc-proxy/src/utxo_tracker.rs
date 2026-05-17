@@ -123,7 +123,7 @@ impl UtxoTracker {
             .collect();
 
         // Sort by satoshis descending (largest first)
-        unspent.sort_by(|a, b| b.satoshis.cmp(&a.satoshis));
+        unspent.sort_by_key(|o| std::cmp::Reverse(o.satoshis));
 
         let mut selected = Vec::new();
         let mut total = 0u64;
