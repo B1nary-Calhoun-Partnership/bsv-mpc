@@ -175,7 +175,7 @@ impl SigningCoordinator {
         let eid_bytes = {
             let mut hasher = sha2::Sha256::new();
             hasher.update(b"bsv-mpc-signing-");
-            hasher.update(session_id.0.as_bytes());
+            hasher.update(session_id.as_bytes());
             let result = hasher.finalize();
             let mut bytes = [0u8; 32];
             bytes.copy_from_slice(&result);
@@ -482,7 +482,7 @@ impl SigningCoordinator {
             .map_err(|e| MpcError::Signing(format!("failed to parse wire message: {e}")))?;
 
         Ok(RoundMessage {
-            session_id: self.session_id.clone(),
+            session_id: self.session_id,
             round: self.current_round,
             from: ShareIndex(wire.sender),
             // For both broadcast and p2p messages, we set `to` to None.
@@ -743,7 +743,7 @@ fn sig_bytes_to_signing_result(
         session_hash: {
             let mut hasher = sha2::Sha256::new();
             hasher.update(b"bsv-mpc-signing-proof-");
-            hasher.update(session_id.0.as_bytes());
+            hasher.update(session_id.as_bytes());
             hasher.finalize().to_vec()
         },
         agent_identity: vec![0x02; 33], // placeholder
@@ -981,7 +981,7 @@ mod tests {
         EncryptedShare {
             nonce: vec![0u8; 12],
             ciphertext: key_share_json,
-            session_id: SessionId("test-signing-session".to_string()),
+            session_id: SessionId::from_str_hash("test-signing-session"),
             share_index: ShareIndex(index),
             config,
         }
@@ -997,13 +997,13 @@ mod tests {
         let share = EncryptedShare {
             nonce: vec![0u8; 12],
             ciphertext: vec![],
-            session_id: SessionId("test".to_string()),
+            session_id: SessionId::from_str_hash("test"),
             share_index: ShareIndex(0),
             config,
         };
 
         let coord =
-            SigningCoordinator::new(SessionId("test".to_string()), share, config, vec![0, 1]);
+            SigningCoordinator::new(SessionId::from_str_hash("test"), share, config, vec![0, 1]);
 
         assert_eq!(coord.current_round(), 0);
         assert_eq!(coord.config().threshold, 2);
@@ -1016,13 +1016,13 @@ mod tests {
         let share = EncryptedShare {
             nonce: vec![0u8; 12],
             ciphertext: vec![],
-            session_id: SessionId("test".to_string()),
+            session_id: SessionId::from_str_hash("test"),
             share_index: ShareIndex(5), // not in participants
             config,
         };
 
         let mut coord =
-            SigningCoordinator::new(SessionId("test".to_string()), share, config, vec![0, 1]);
+            SigningCoordinator::new(SessionId::from_str_hash("test"), share, config, vec![0, 1]);
 
         let result = coord.init_round(&[0u8; 32], None);
         assert!(result.is_err());
@@ -1039,13 +1039,13 @@ mod tests {
         let share = EncryptedShare {
             nonce: vec![0u8; 12],
             ciphertext: vec![],
-            session_id: SessionId("test".to_string()),
+            session_id: SessionId::from_str_hash("test"),
             share_index: ShareIndex(0),
             config,
         };
 
         let mut coord =
-            SigningCoordinator::new(SessionId("test".to_string()), share, config, vec![0, 1]);
+            SigningCoordinator::new(SessionId::from_str_hash("test"), share, config, vec![0, 1]);
 
         let result = coord.process_round(vec![]);
         assert!(result.is_err());
@@ -1062,19 +1062,19 @@ mod tests {
         let share = EncryptedShare {
             nonce: vec![0u8; 12],
             ciphertext: vec![],
-            session_id: SessionId("test".to_string()),
+            session_id: SessionId::from_str_hash("test"),
             share_index: ShareIndex(0),
             config,
         };
 
         let coord1 = SigningCoordinator::new(
-            SessionId("deterministic-test".to_string()),
+            SessionId::from_str_hash("deterministic-test"),
             share.clone(),
             config,
             vec![0, 1],
         );
         let coord2 = SigningCoordinator::new(
-            SessionId("deterministic-test".to_string()),
+            SessionId::from_str_hash("deterministic-test"),
             share,
             config,
             vec![0, 1],
@@ -1089,19 +1089,19 @@ mod tests {
         let share = EncryptedShare {
             nonce: vec![0u8; 12],
             ciphertext: vec![],
-            session_id: SessionId("test".to_string()),
+            session_id: SessionId::from_str_hash("test"),
             share_index: ShareIndex(0),
             config,
         };
 
         let coord1 = SigningCoordinator::new(
-            SessionId("session-a".to_string()),
+            SessionId::from_str_hash("session-a"),
             share.clone(),
             config,
             vec![0, 1],
         );
         let coord2 = SigningCoordinator::new(
-            SessionId("session-b".to_string()),
+            SessionId::from_str_hash("session-b"),
             share,
             config,
             vec![0, 1],
@@ -1251,14 +1251,14 @@ mod tests {
         let key_shares = dkg_key_shares(n, t);
 
         // Step 2: Create signing coordinators
-        let session = SessionId("signing-coordinator-test".to_string());
+        let session = SessionId::from_str_hash("signing-coordinator-test");
         let participants = vec![0u16, 1];
 
         let share0 = key_share_to_encrypted(&key_shares[0], 0, config);
         let share1 = key_share_to_encrypted(&key_shares[1], 1, config);
 
         let mut coord0 =
-            SigningCoordinator::new(session.clone(), share0, config, participants.clone());
+            SigningCoordinator::new(session, share0, config, participants.clone());
         let mut coord1 = SigningCoordinator::new(session, share1, config, participants);
 
         // Message hash to sign
@@ -1356,7 +1356,7 @@ mod tests {
         let config = ThresholdConfig::new(t, n).unwrap();
         let key_shares = dkg_key_shares(n, t);
 
-        let session = SessionId("sign-convenience-test".to_string());
+        let session = SessionId::from_str_hash("sign-convenience-test");
         let participants = vec![0u16, 1];
 
         let share0 = key_share_to_encrypted(&key_shares[0], 0, config);
@@ -1364,7 +1364,7 @@ mod tests {
 
         // Use sign() for coord0 and init_round() for coord1
         let mut coord0 =
-            SigningCoordinator::new(session.clone(), share0, config, participants.clone());
+            SigningCoordinator::new(session, share0, config, participants.clone());
         let mut coord1 = SigningCoordinator::new(session, share1, config, participants);
 
         let message_hash: [u8; 32] = {

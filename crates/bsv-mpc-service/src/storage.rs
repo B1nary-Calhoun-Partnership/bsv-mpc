@@ -214,7 +214,7 @@ impl SqliteShareStorage {
                 .unwrap_or(0);
             ShareMetadata {
                 agent_id: agent_id.to_string(),
-                session_id: stored.share.session_id.0.clone(),
+                session_id: stored.share.session_id.hex(),
                 share_index: stored.share.share_index.0,
                 threshold: stored.share.config.threshold,
                 parties: stored.share.config.parties,

@@ -1,0 +1,68 @@
+{
+  "spec_section": "04",
+  "spec_title": "Canonical SessionId",
+  "formula": "SessionId = SHA-256(\"calhoun-binary-mpc-session-v1\" (29B) || initiator_33B || sorted_participants_33B*n || threshold_u16_LE || kind_u8 || nonce_32B || payload_digest_32B)",
+  "output_length_bytes": 32,
+  "vectors": [
+    {
+      "name": "session-id-vector-A-sign-2of3",
+      "description": "Routine 2-of-3 sign ceremony, kind = 0x02",
+      "inputs": {
+        "domain_separator_ascii": "calhoun-binary-mpc-session-v1",
+        "domain_separator_hex": "63616c686f756e2d62696e6172792d6d70632d73657373696f6e2d7631",
+        "initiator_identity_hex": "020000000000000000000000000000000000000000000000000000000000000001",
+        "participants_hex_unsorted": [
+          "020000000000000000000000000000000000000000000000000000000000000001",
+          "020000000000000000000000000000000000000000000000000000000000000002",
+          "020000000000000000000000000000000000000000000000000000000000000003"
+        ],
+        "participants_hex_sorted": [
+          "020000000000000000000000000000000000000000000000000000000000000001",
+          "020000000000000000000000000000000000000000000000000000000000000002",
+          "020000000000000000000000000000000000000000000000000000000000000003"
+        ],
+        "threshold": 2,
+        "threshold_bytes_le_hex": "0200",
+        "ceremony_kind": 2,
+        "ceremony_kind_name": "sign",
+        "nonce_source": "SHA256(\"nonce-A\")",
+        "nonce_hex": "4e1ce45a65d9ba8655a1bacd9d9ec348dbf7a8ab2b719f1b1bb0cf3897c0a2ab",
+        "payload_digest_source": "SHA256(\"sighash-A\")",
+        "payload_digest_hex": "3bcda18f91ced5eade648ac7f132dbef019bd3590d204734af97713532b63525"
+      },
+      "preimage_hex": "63616c686f756e2d62696e6172792d6d70632d73657373696f6e2d76310200000000000000000000000000000000000000000000000000000000000000010200000000000000000000000000000000000000000000000000000000000000010200000000000000000000000000000000000000000000000000000000000000020200000000000000000000000000000000000000000000000000000000000000030200024e1ce45a65d9ba8655a1bacd9d9ec348dbf7a8ab2b719f1b1bb0cf3897c0a2ab3bcda18f91ced5eade648ac7f132dbef019bd3590d204734af97713532b63525",
+      "preimage_length_bytes": 228,
+      "expected": {
+        "session_id_hex": "5be3c18ab094f090c92be1bac47bee388ab8ead59b987679d9bef53547a16108"
+      }
+    },
+    {
+      "name": "session-id-vector-B-dkg-on-chain-anchor",
+      "description": "DKG ceremony with on-chain block anchor as nonce, empty policy manifest",
+      "inputs": {
+        "domain_separator_ascii": "calhoun-binary-mpc-session-v1",
+        "domain_separator_hex": "63616c686f756e2d62696e6172792d6d70632d73657373696f6e2d7631",
+        "initiator_identity_hex": "020000000000000000000000000000000000000000000000000000000000000001",
+        "participants_hex_sorted": [
+          "020000000000000000000000000000000000000000000000000000000000000001",
+          "020000000000000000000000000000000000000000000000000000000000000002",
+          "020000000000000000000000000000000000000000000000000000000000000003"
+        ],
+        "threshold": 2,
+        "threshold_bytes_le_hex": "0200",
+        "ceremony_kind": 1,
+        "ceremony_kind_name": "dkg",
+        "nonce_source": "SHA256(\"block-800000-anchor\")",
+        "nonce_hex": "39cd67fde05918566d9c5bac114b79af09d67edd50155a44e4b41603433c0210",
+        "payload_digest_source": "SHA256(\"genesis\" || canonical_cbor({})) where canonical_cbor({}) = 0xa0",
+        "empty_manifest_canonical_cbor_hex": "a0",
+        "payload_digest_hex": "f7dc1bd2af02a533ab389c8f67eb4c9c5c49d9c40932129bc2bf6f07b111f232"
+      },
+      "preimage_hex": "63616c686f756e2d62696e6172792d6d70632d73657373696f6e2d763102000000000000000000000000000000000000000000000000000000000000000102000000000000000000000000000000000000000000000000000000000000000102000000000000000000000000000000000000000000000000000000000000000202000000000000000000000000000000000000000000000000000000000000000302000139cd67fde05918566d9c5bac114b79af09d67edd50155a44e4b41603433c0210f7dc1bd2af02a533ab389c8f67eb4c9c5c49d9c40932129bc2bf6f07b111f232",
+      "preimage_length_bytes": 228,
+      "expected": {
+        "session_id_hex": "e0af05e32667e3553df110a1ff621a5fe7b449b5c515e6886b4b2e38270e6a0f"
+      }
+    }
+  ]
+}

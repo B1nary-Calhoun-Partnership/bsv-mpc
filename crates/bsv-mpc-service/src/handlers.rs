@@ -242,7 +242,7 @@ fn bundle_outgoing_messages(messages: &[RoundMessage]) -> Result<RoundMessage, S
 
     let first = &messages[0];
     Ok(RoundMessage {
-        session_id: first.session_id.clone(),
+        session_id: first.session_id,
         round: first.round,
         from: first.from,
         to: None,
@@ -268,7 +268,7 @@ pub async fn handle_dkg_init(
         Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e),
     };
 
-    let session_id = SessionId(session_id_str.clone());
+    let session_id = SessionId::from_str_hash(&session_id_str);
     let mut coordinator = DkgCoordinator::new(session_id, config, ShareIndex(0));
 
     let messages = match coordinator.init() {
@@ -352,7 +352,7 @@ pub async fn handle_dkg_round(
         DkgRoundResult::Complete(dkg_result) => {
             // Store share
             if let Ok(mut storage) = state.storage.write() {
-                let _ = storage.store_share(&dkg_result.session_id.0, &dkg_result.share);
+                let _ = storage.store_share(&dkg_result.session_id.hex(), &dkg_result.share);
             }
             // Clean up coordinator
             if let Ok(mut store) = COORDINATOR_STORE.lock() {
@@ -362,7 +362,7 @@ pub async fn handle_dkg_round(
                 StatusCode::OK,
                 Json(
                     serde_json::to_value(DkgRoundResponse {
-                        session_id: dkg_result.session_id.0.clone(),
+                        session_id: dkg_result.session_id.hex(),
                         round_message: None,
                         complete: true,
                         joint_pubkey: Some(dkg_result.joint_key),
@@ -438,7 +438,7 @@ pub async fn handle_sign_init(
         None => None,
     };
 
-    let session_id = SessionId(body.session_id);
+    let session_id = SessionId::from_str_hash(&body.session_id);
     let config = share.config;
     let participants: Vec<u16> = (0..config.parties).collect();
     let mut coordinator = SigningCoordinator::new(session_id, share, config, participants);
@@ -575,7 +575,7 @@ pub async fn handle_presign_init(
         Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e),
     };
 
-    let session_id = SessionId(body.session_id);
+    let session_id = SessionId::from_str_hash(&body.session_id);
     let participants: Vec<u16> = (0..share.config.parties).collect();
     let mut manager = PresigningManager::new(session_id, share, participants, body.count as usize);
 

@@ -135,7 +135,7 @@ pub fn create_participation_proof(
     // This binds the proof to a specific DKG session.
     let session_hash = {
         let mut hasher = Sha256::new();
-        hasher.update(session_id.0.as_bytes());
+        hasher.update(session_id.as_bytes());
         hasher.finalize().to_vec()
     };
 
@@ -384,7 +384,7 @@ mod tests {
 
     /// Helper: create a valid proof.
     fn valid_proof() -> ParticipationProof {
-        let session = SessionId("test-session".to_string());
+        let session = SessionId::from_str_hash("test-session");
         let agent = fake_pubkey(0xAA);
         let nodes = vec![fake_pubkey(0xAA), fake_pubkey(0xBB)];
         create_participation_proof(
@@ -403,7 +403,7 @@ mod tests {
 
     #[test]
     fn create_proof_with_valid_inputs() {
-        let session = SessionId("my-session-id".to_string());
+        let session = SessionId::from_str_hash("my-session-id");
         let agent = fake_pubkey(0x01);
         let nodes = vec![fake_pubkey(0x01), fake_pubkey(0x02)];
         let signing_hash = fake_hash(0xFF);
@@ -422,7 +422,7 @@ mod tests {
 
     #[test]
     fn create_proof_without_fee_txid() {
-        let session = SessionId("no-fee-session".to_string());
+        let session = SessionId::from_str_hash("no-fee-session");
         let agent = fake_pubkey(0x01);
         let nodes = vec![fake_pubkey(0x01)];
         let signing_hash = fake_hash(0xAA);
@@ -435,7 +435,7 @@ mod tests {
 
     #[test]
     fn session_hash_is_sha256_of_session_id() {
-        let session = SessionId("deterministic-session".to_string());
+        let session = SessionId::from_str_hash("deterministic-session");
         let agent = fake_pubkey(0x01);
         let nodes = vec![fake_pubkey(0x01)];
         let signing_hash = fake_hash(0x00);
@@ -443,9 +443,9 @@ mod tests {
         let proof = create_participation_proof(&session, &agent, &nodes, &signing_hash, None)
             .expect("should succeed");
 
-        // Independently compute expected hash.
+        // session_hash = SHA-256(session_id raw 32 bytes) — see proof.rs:138.
         let mut hasher = Sha256::new();
-        hasher.update(b"deterministic-session");
+        hasher.update(session.as_bytes());
         let expected = hasher.finalize().to_vec();
 
         assert_eq!(proof.session_hash, expected);
@@ -562,7 +562,7 @@ mod tests {
 
     #[test]
     fn verify_accepts_prefix_03_pubkeys() {
-        let session = SessionId("session-03".to_string());
+        let session = SessionId::from_str_hash("session-03");
         let agent = fake_pubkey_03(0xCC);
         let nodes = vec![fake_pubkey_03(0xCC), fake_pubkey(0xDD)];
         let proof = create_participation_proof(&session, &agent, &nodes, &fake_hash(0x22), None)
@@ -618,7 +618,7 @@ mod tests {
 
     #[test]
     fn op_return_without_fee_txid_uses_op_0() {
-        let session = SessionId("no-fee".to_string());
+        let session = SessionId::from_str_hash("no-fee");
         let agent = fake_pubkey(0x01);
         let nodes = vec![fake_pubkey(0x01)];
         let proof = create_participation_proof(&session, &agent, &nodes, &fake_hash(0x00), None)
@@ -748,7 +748,7 @@ mod tests {
 
     #[test]
     fn create_verify_round_trip() {
-        let session = SessionId("round-trip-test".to_string());
+        let session = SessionId::from_str_hash("round-trip-test");
         let agent = fake_pubkey(0x01);
         let nodes = vec![fake_pubkey(0x01), fake_pubkey(0x02), fake_pubkey(0x03)];
         let signing_hash = fake_hash(0xCC);
@@ -765,7 +765,7 @@ mod tests {
 
     #[test]
     fn create_serialize_and_verify_all_work_together() {
-        let session = SessionId("integration".to_string());
+        let session = SessionId::from_str_hash("integration");
         let agent = fake_pubkey_03(0x10);
         let nodes = vec![fake_pubkey_03(0x10), fake_pubkey(0x20)];
         let signing_hash = fake_hash(0x99);
@@ -791,7 +791,7 @@ mod tests {
 
     #[test]
     fn proof_with_many_nodes() {
-        let session = SessionId("many-nodes".to_string());
+        let session = SessionId::from_str_hash("many-nodes");
         let agent = fake_pubkey(0x01);
         let mut nodes = vec![fake_pubkey(0x01)];
         for i in 2..=10u8 {

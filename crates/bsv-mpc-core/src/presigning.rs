@@ -390,7 +390,7 @@ impl PresigningManager {
         let eid_bytes = {
             let mut hasher = sha2::Sha256::new();
             hasher.update(b"bsv-mpc-presigning-");
-            hasher.update(self.session_id.0.as_bytes());
+            hasher.update(self.session_id.as_bytes());
             hasher.update(self.eid_counter.to_be_bytes());
             let result = hasher.finalize();
             let mut bytes = [0u8; 32];
@@ -501,14 +501,14 @@ impl PresigningManager {
                     let presig_id = {
                         let mut hasher = sha2::Sha256::new();
                         hasher.update(b"presig-");
-                        hasher.update(self.session_id.0.as_bytes());
+                        hasher.update(self.session_id.as_bytes());
                         hasher.update(self.eid_counter.to_be_bytes());
                         hex::encode(hasher.finalize())
                     };
 
                     let presig = Presignature {
                         id: presig_id,
-                        session_id: self.session_id.clone(),
+                        session_id: self.session_id,
                         // Data is empty because cggmp24's PresignaturePublicData
                         // doesn't implement Serialize. The actual presig objects
                         // are stored in raw_pool.
@@ -540,7 +540,7 @@ impl PresigningManager {
             .map_err(|e| MpcError::Protocol(format!("failed to parse wire message: {e}")))?;
 
         Ok(RoundMessage {
-            session_id: self.session_id.clone(),
+            session_id: self.session_id,
             round: self.current_round,
             from: ShareIndex(wire.sender),
             to: None,
@@ -888,7 +888,7 @@ mod tests {
         EncryptedShare {
             nonce: vec![0u8; 12],
             ciphertext: key_share_json,
-            session_id: session_id.clone(),
+            session_id: *session_id,
             share_index: ShareIndex(index),
             config,
         }
@@ -898,12 +898,12 @@ mod tests {
 
     #[test]
     fn pool_management_basic() {
-        let session_id = SessionId("test-session".into());
+        let session_id = SessionId::from_str_hash("test-session");
         let config = ThresholdConfig::new(2, 2).unwrap();
         let share = EncryptedShare {
             nonce: vec![0u8; 12],
             ciphertext: vec![],
-            session_id: session_id.clone(),
+            session_id,
             share_index: ShareIndex(0),
             config,
         };
@@ -918,23 +918,23 @@ mod tests {
 
     #[test]
     fn pool_fifo_order() {
-        let session_id = SessionId("test-session".into());
+        let session_id = SessionId::from_str_hash("test-session");
         let config = ThresholdConfig::new(2, 2).unwrap();
         let share = EncryptedShare {
             nonce: vec![0u8; 12],
             ciphertext: vec![],
-            session_id: session_id.clone(),
+            session_id,
             share_index: ShareIndex(0),
             config,
         };
 
-        let mut mgr = PresigningManager::new(session_id.clone(), share, vec![0, 1], 10);
+        let mut mgr = PresigningManager::new(session_id, share, vec![0, 1], 10);
 
         // Add presignatures with different IDs
         for i in 0..3 {
             mgr.add(Presignature {
                 id: format!("presig-{i}"),
-                session_id: session_id.clone(),
+                session_id,
                 data: vec![i as u8],
                 created_at: chrono::Utc::now(),
             });
@@ -954,17 +954,17 @@ mod tests {
 
     #[test]
     fn should_replenish_threshold() {
-        let session_id = SessionId("test-session".into());
+        let session_id = SessionId::from_str_hash("test-session");
         let config = ThresholdConfig::new(2, 2).unwrap();
         let share = EncryptedShare {
             nonce: vec![0u8; 12],
             ciphertext: vec![],
-            session_id: session_id.clone(),
+            session_id,
             share_index: ShareIndex(0),
             config,
         };
 
-        let mut mgr = PresigningManager::new(session_id.clone(), share, vec![0, 1], 10);
+        let mut mgr = PresigningManager::new(session_id, share, vec![0, 1], 10);
 
         // Pool < 5 (half of 10) → should replenish
         assert!(mgr.should_replenish());
@@ -973,7 +973,7 @@ mod tests {
         for i in 0..5 {
             mgr.add(Presignature {
                 id: format!("presig-{i}"),
-                session_id: session_id.clone(),
+                session_id,
                 data: vec![],
                 created_at: chrono::Utc::now(),
             });
@@ -987,12 +987,12 @@ mod tests {
 
     #[test]
     fn init_generate_fails_when_already_generating() {
-        let session_id = SessionId("test-session".into());
+        let session_id = SessionId::from_str_hash("test-session");
         let config = ThresholdConfig::new(2, 2).unwrap();
         let share = EncryptedShare {
             nonce: vec![0u8; 12],
             ciphertext: vec![],
-            session_id: session_id.clone(),
+            session_id,
             share_index: ShareIndex(0),
             config,
         };
@@ -1012,12 +1012,12 @@ mod tests {
 
     #[test]
     fn process_generate_round_fails_when_idle() {
-        let session_id = SessionId("test-session".into());
+        let session_id = SessionId::from_str_hash("test-session");
         let config = ThresholdConfig::new(2, 2).unwrap();
         let share = EncryptedShare {
             nonce: vec![0u8; 12],
             ciphertext: vec![],
-            session_id: session_id.clone(),
+            session_id,
             share_index: ShareIndex(0),
             config,
         };
@@ -1038,7 +1038,7 @@ mod tests {
     async fn two_managers_generate_presignature() {
         let key_shares = run_dkg_2of2().await;
 
-        let session_id = SessionId("presign-test-session".into());
+        let session_id = SessionId::from_str_hash("presign-test-session");
         let config = ThresholdConfig::new(2, 2).unwrap();
         let participants = vec![0u16, 1u16];
 
@@ -1046,9 +1046,9 @@ mod tests {
         let share_1 = wrap_key_share(&key_shares[1], 1, config, &session_id);
 
         let mut mgr_0 =
-            PresigningManager::new(session_id.clone(), share_0, participants.clone(), 5);
+            PresigningManager::new(session_id, share_0, participants.clone(), 5);
         let mut mgr_1 =
-            PresigningManager::new(session_id.clone(), share_1, participants.clone(), 5);
+            PresigningManager::new(session_id, share_1, participants.clone(), 5);
 
         // Both managers start presigning
         let msgs_0 = mgr_0.init_generate().unwrap();
@@ -1129,7 +1129,7 @@ mod tests {
     async fn generate_multiple_presignatures() {
         let key_shares = run_dkg_2of2().await;
 
-        let session_id = SessionId("multi-presign-session".into());
+        let session_id = SessionId::from_str_hash("multi-presign-session");
         let config = ThresholdConfig::new(2, 2).unwrap();
         let participants = vec![0u16, 1u16];
 
@@ -1137,9 +1137,9 @@ mod tests {
         let share_1 = wrap_key_share(&key_shares[1], 1, config, &session_id);
 
         let mut mgr_0 =
-            PresigningManager::new(session_id.clone(), share_0, participants.clone(), 5);
+            PresigningManager::new(session_id, share_0, participants.clone(), 5);
         let mut mgr_1 =
-            PresigningManager::new(session_id.clone(), share_1, participants.clone(), 5);
+            PresigningManager::new(session_id, share_1, participants.clone(), 5);
 
         // Generate 2 presignatures
         for gen_idx in 0..2 {
