@@ -33,7 +33,7 @@ bsv-mpc-proxy = { path = "crates/bsv-mpc-proxy" }
 bsv-mpc-service = { path = "crates/bsv-mpc-service" }
 
 # MPC crypto (for DKG simulation in E2E tests)
-cggmp24 = { git = "https://github.com/LFDT-Lockness/cggmp21", features = ["curve-secp256k1", "backend-num-bigint"] }
+cggmp24 = { git = "https://github.com/LFDT-Lockness/cggmp21", features = ["curve-secp256k1", "backend-num-bigint", "insecure-assume-preimage-known"] }
 round-based = { version = "0.4.1", features = ["sim", "state-machine"] }
 generic-ec = { version = "0.5", features = ["curve-secp256k1", "serde"] }
 
@@ -64,8 +64,21 @@ pin-project = "1"
 futures = "0.3"
 
 [workspace.dependencies]
-# MPC crypto
-cggmp24 = { git = "https://github.com/LFDT-Lockness/cggmp21", features = ["curve-secp256k1", "hd-wallet", "hd-slip10"] }
+# MPC crypto. `insecure-assume-preimage-known` is REQUIRED for BSV-correct
+# signing — BSV sighashes are pre-hashed (sha256(sha256(sighash_preimage))),
+# and without this feature the only way to construct DataToSign is via
+# DataToSign::digest::<Sha256>(message) which re-hashes the sighash and
+# produces signatures that don't verify against any BSV transaction. The
+# feature unlocks PrehashedDataToSign::insecure_assume_preimage_known()
+# which is safe for our use because the "preimage" the security warning
+# is about IS the BSV transaction (always known to us, never adversary-
+# chosen) — see cggmp24/src/signing.rs:63-149 + eprint 2021/1330 §1.1.2
+# for the attack the warning protects against (signature forgery via
+# attacker-chosen raw hash + presignature public components — irrelevant
+# when the hash is a transaction sighash that requires SHA-256 preimage
+# resistance to forge). Also gates the 1-round presigned signing path
+# (signing.rs:221 TODO). Mirrors rust-mpc which already has it enabled.
+cggmp24 = { git = "https://github.com/LFDT-Lockness/cggmp21", features = ["curve-secp256k1", "hd-wallet", "hd-slip10", "insecure-assume-preimage-known"] }
 cggmp24-keygen = { git = "https://github.com/LFDT-Lockness/cggmp21", features = ["hd-wallet"] }
 
 # MPC protocol infrastructure (must match cggmp24's transitive deps)
