@@ -384,17 +384,27 @@ impl PresigningManager {
                 ))
             })? as u16;
 
-        // Generate a unique execution ID for this presigning invocation.
-        // Uses session_id + counter to ensure uniqueness across multiple generations.
+        // Canonical ExecutionId per MPC-Spec §02.2 with phase=Presign and
+        // the joint pubkey from the share. The eid_counter is mixed in via
+        // a per-generation per-pool nonce so multiple presig generations
+        // within the same session produce distinct EIDs.
+        //
+        // CGGMP'24 forbids EID reuse across protocol executions — so we
+        // sub-derive: canonical_eid_pre = canonical(Phase=Presign, joint_pk)
+        // and then mix in the counter via SHA-256.
         self.eid_counter += 1;
+        let canonical_eid =
+            crate::canonical::canonical_execution_id(&crate::canonical::ExecutionParams::new_v1(
+                crate::canonical::PhaseTag::Presign,
+                self.session_id,
+                crate::signing::share_joint_pubkey_or_zero(&self.share, "presigning"),
+            ));
         let eid_bytes = {
             let mut hasher = sha2::Sha256::new();
-            hasher.update(b"bsv-mpc-presigning-");
-            hasher.update(self.session_id.as_bytes());
+            hasher.update(canonical_eid);
             hasher.update(self.eid_counter.to_be_bytes());
-            let result = hasher.finalize();
             let mut bytes = [0u8; 32];
-            bytes.copy_from_slice(&result);
+            bytes.copy_from_slice(&hasher.finalize());
             bytes
         };
 
@@ -891,6 +901,7 @@ mod tests {
             session_id: *session_id,
             share_index: ShareIndex(index),
             config,
+            joint_pubkey_compressed: key_share.core.shared_public_key.to_bytes(true).to_vec(),
         }
     }
 
@@ -906,6 +917,7 @@ mod tests {
             session_id,
             share_index: ShareIndex(0),
             config,
+            joint_pubkey_compressed: Vec::new(),
         };
 
         let mut mgr = PresigningManager::new(session_id, share, vec![0, 1], 10);
@@ -926,6 +938,7 @@ mod tests {
             session_id,
             share_index: ShareIndex(0),
             config,
+            joint_pubkey_compressed: Vec::new(),
         };
 
         let mut mgr = PresigningManager::new(session_id, share, vec![0, 1], 10);
@@ -962,6 +975,7 @@ mod tests {
             session_id,
             share_index: ShareIndex(0),
             config,
+            joint_pubkey_compressed: Vec::new(),
         };
 
         let mut mgr = PresigningManager::new(session_id, share, vec![0, 1], 10);
@@ -995,6 +1009,7 @@ mod tests {
             session_id,
             share_index: ShareIndex(0),
             config,
+            joint_pubkey_compressed: Vec::new(),
         };
 
         let mut mgr = PresigningManager::new(session_id, share, vec![0, 1], 10);
@@ -1020,6 +1035,7 @@ mod tests {
             session_id,
             share_index: ShareIndex(0),
             config,
+            joint_pubkey_compressed: Vec::new(),
         };
 
         let mut mgr = PresigningManager::new(session_id, share, vec![0, 1], 10);

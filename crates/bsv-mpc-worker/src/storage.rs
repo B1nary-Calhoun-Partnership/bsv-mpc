@@ -288,6 +288,7 @@ mod tests {
                 threshold: 2,
                 parties: 2,
             },
+            joint_pubkey_compressed: Vec::new(),
         }
     }
 

@@ -235,8 +235,14 @@ pub struct DkgCoordinator {
     /// Stored between keygen completion and aux info start.
     incomplete_share_json: Option<Vec<u8>>,
 
-    /// Serialized execution ID bytes for protocol context binding.
-    /// Derived deterministically from the session ID.
+    /// Joint public key (33-byte compressed) — known only after keygen
+    /// completes. Used to derive the canonical ExecutionId for the auxinfo
+    /// phase per MPC-Spec §02.4 (joint_pubkey known for phases != keygen).
+    keygen_joint_pubkey: Option<[u8; 33]>,
+
+    /// Serialized execution ID bytes for the keygen phase (canonical, per
+    /// MPC-Spec §02.2 with phase=0x01 and joint_pubkey=all-zero carve-out
+    /// per §02.4).
     eid_bytes: [u8; 32],
 
     /// Optional pre-generated Paillier primes for aux info generation.
@@ -255,17 +261,15 @@ impl DkgCoordinator {
     /// * `config` -- Threshold configuration (t-of-n).
     /// * `my_index` -- This party's index, must be in `[0, config.parties)`.
     pub fn new(session_id: SessionId, config: ThresholdConfig, my_index: ShareIndex) -> Self {
-        // Derive a deterministic execution ID from the session ID.
-        // This ensures all parties using the same session_id get the same EID.
-        let eid_bytes = {
-            let mut hasher = sha2::Sha256::new();
-            hasher.update(b"bsv-mpc-dkg-keygen-");
-            hasher.update(session_id.as_bytes());
-            let result = hasher.finalize();
-            let mut bytes = [0u8; 32];
-            bytes.copy_from_slice(&result);
-            bytes
-        };
+        // Canonical ExecutionId per MPC-Spec §02.2 with phase=DkgKeygen and
+        // the all-zero joint_pubkey carve-out per §02.4 (keygen produces the
+        // joint key — it's not yet known here).
+        let eid_bytes =
+            crate::canonical::canonical_execution_id(&crate::canonical::ExecutionParams::new_v1(
+                crate::canonical::PhaseTag::DkgKeygen,
+                session_id,
+                [0u8; 33],
+            ));
 
         Self {
             session_id,
@@ -277,6 +281,7 @@ impl DkgCoordinator {
             sm_rx: None,
             sm_thread: None,
             incomplete_share_json: None,
+            keygen_joint_pubkey: None,
             eid_bytes,
             pregenerated_primes: None,
         }
@@ -433,16 +438,22 @@ impl DkgCoordinator {
         let (inbound_tx, inbound_rx) = mpsc::channel::<SmInbound>();
         let (outbound_tx, outbound_rx) = mpsc::channel::<SmOutbound>();
 
-        // Derive a different EID for aux info (must be unique per protocol execution)
-        let aux_eid_bytes = {
-            let mut hasher = sha2::Sha256::new();
-            hasher.update(b"bsv-mpc-dkg-auxinfo-");
-            hasher.update(self.session_id.as_bytes());
-            let result = hasher.finalize();
-            let mut bytes = [0u8; 32];
-            bytes.copy_from_slice(&result);
-            bytes
-        };
+        // Canonical ExecutionId per MPC-Spec §02.2 for phase=DkgAuxInfo.
+        // §02.4 requires the keygen-output joint pubkey here (auxinfo is
+        // a non-keygen phase, so the all-zero carve-out does NOT apply).
+        let joint_pubkey = self.keygen_joint_pubkey.ok_or_else(|| {
+            MpcError::Dkg(
+                "keygen joint pubkey not captured — start_aux_info_sm called \
+                 before KeygenComplete (internal error)"
+                    .into(),
+            )
+        })?;
+        let aux_eid_bytes =
+            crate::canonical::canonical_execution_id(&crate::canonical::ExecutionParams::new_v1(
+                crate::canonical::PhaseTag::DkgAuxInfo,
+                self.session_id,
+                joint_pubkey,
+            ));
 
         let my_index = self.my_index.0;
         let n = self.config.parties;
@@ -540,6 +551,28 @@ impl DkgCoordinator {
                         party = self.my_index.0,
                         "keygen phase complete, starting aux info generation"
                     );
+
+                    // Capture the joint pubkey from the keygen output so the
+                    // auxinfo phase can derive its canonical ExecutionId per
+                    // MPC-Spec §02.4. Deserialize just to peek at
+                    // `shared_public_key`; the bytes stay stored for
+                    // assemble_dkg_result.
+                    let peek: cggmp24::IncompleteKeyShare<Secp256k1> =
+                        serde_json::from_slice(&share_json).map_err(|e| {
+                            MpcError::Dkg(format!(
+                                "failed to peek joint pubkey from keygen output: {e}"
+                            ))
+                        })?;
+                    let compressed = peek.shared_public_key.to_bytes(true);
+                    if compressed.len() != 33 {
+                        return Err(MpcError::Dkg(format!(
+                            "keygen joint pubkey is not 33 bytes (got {})",
+                            compressed.len()
+                        )));
+                    }
+                    let mut jpk = [0u8; 33];
+                    jpk.copy_from_slice(&compressed);
+                    self.keygen_joint_pubkey = Some(jpk);
 
                     // Store the incomplete share and clean up keygen thread
                     self.incomplete_share_json = Some(share_json);
@@ -659,6 +692,7 @@ impl DkgCoordinator {
             session_id: self.session_id,
             share_index: self.my_index,
             config: self.config,
+            joint_pubkey_compressed: compressed_bytes.to_vec(),
         };
 
         let joint_key = JointPublicKey {

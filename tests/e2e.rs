@@ -221,7 +221,7 @@ fn key_share_to_dkg_result(
 
     DkgResult {
         joint_key: JointPublicKey {
-            compressed,
+            compressed: compressed.clone(),
             address,
         },
         share: EncryptedShare {
@@ -230,6 +230,7 @@ fn key_share_to_dkg_result(
             session_id,
             share_index: ShareIndex(party_index),
             config: ThresholdConfig { threshold, parties },
+            joint_pubkey_compressed: compressed,
         },
         session_id,
     }

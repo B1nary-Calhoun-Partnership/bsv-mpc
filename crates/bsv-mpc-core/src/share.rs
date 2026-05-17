@@ -91,6 +91,7 @@ pub fn encrypt_share(share_bytes: &[u8], encryption_key: &[u8; 32]) -> Result<En
             threshold: 0,
             parties: 0,
         }, // caller fills in
+        joint_pubkey_compressed: Vec::new(), // caller fills in
     })
 }
 
@@ -480,6 +481,7 @@ mod tests {
                 threshold: 2,
                 parties: 2,
             },
+            joint_pubkey_compressed: Vec::new(),
         };
         assert!(validate_encrypted_share(&share).is_err());
     }
@@ -495,6 +497,7 @@ mod tests {
                 threshold: 2,
                 parties: 2,
             },
+            joint_pubkey_compressed: Vec::new(),
         };
         assert!(validate_encrypted_share(&share).is_err());
     }
@@ -510,6 +513,7 @@ mod tests {
                 threshold: 2,
                 parties: 3,
             },
+            joint_pubkey_compressed: Vec::new(),
         };
         assert!(validate_encrypted_share(&share).is_err());
     }
@@ -525,6 +529,7 @@ mod tests {
                 threshold: 1, // < 2
                 parties: 3,
             },
+            joint_pubkey_compressed: Vec::new(),
         };
         assert!(validate_encrypted_share(&share).is_err());
     }
@@ -540,6 +545,7 @@ mod tests {
                 threshold: 4,
                 parties: 3, // threshold > parties
             },
+            joint_pubkey_compressed: Vec::new(),
         };
         assert!(validate_encrypted_share(&share).is_err());
     }
