@@ -286,11 +286,17 @@ pub async fn handle_dkg_init(
     }
 
     let _ = state; // AppState available for future use
-    (StatusCode::OK, Json(serde_json::to_value(DkgInitResponse {
-        session_id: session_id_str,
-        round_message,
-        total_rounds: 4,
-    }).unwrap_or_default()))
+    (
+        StatusCode::OK,
+        Json(
+            serde_json::to_value(DkgInitResponse {
+                session_id: session_id_str,
+                round_message,
+                total_rounds: 4,
+            })
+            .unwrap_or_default(),
+        ),
+    )
 }
 
 /// `POST /dkg/round` — Process a DKG round message.
@@ -310,7 +316,12 @@ pub async fn handle_dkg_round(
 
         let coordinator = match store.dkg.get_mut(&body.session_id) {
             Some(c) => c,
-            None => return err_response(StatusCode::NOT_FOUND, format!("DKG session not found: {}", body.session_id)),
+            None => {
+                return err_response(
+                    StatusCode::NOT_FOUND,
+                    format!("DKG session not found: {}", body.session_id),
+                )
+            }
         };
 
         match coordinator.process_round(incoming) {
@@ -325,12 +336,18 @@ pub async fn handle_dkg_round(
                 Ok(rm) => rm,
                 Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e),
             };
-            (StatusCode::OK, Json(serde_json::to_value(DkgRoundResponse {
-                session_id: body.session_id,
-                round_message: Some(round_message),
-                complete: false,
-                joint_pubkey: None,
-            }).unwrap_or_default()))
+            (
+                StatusCode::OK,
+                Json(
+                    serde_json::to_value(DkgRoundResponse {
+                        session_id: body.session_id,
+                        round_message: Some(round_message),
+                        complete: false,
+                        joint_pubkey: None,
+                    })
+                    .unwrap_or_default(),
+                ),
+            )
         }
         DkgRoundResult::Complete(dkg_result) => {
             // Store share
@@ -341,12 +358,18 @@ pub async fn handle_dkg_round(
             if let Ok(mut store) = COORDINATOR_STORE.lock() {
                 store.dkg.remove(&body.session_id);
             }
-            (StatusCode::OK, Json(serde_json::to_value(DkgRoundResponse {
-                session_id: dkg_result.session_id.0.clone(),
-                round_message: None,
-                complete: true,
-                joint_pubkey: Some(dkg_result.joint_key),
-            }).unwrap_or_default()))
+            (
+                StatusCode::OK,
+                Json(
+                    serde_json::to_value(DkgRoundResponse {
+                        session_id: dkg_result.session_id.0.clone(),
+                        round_message: None,
+                        complete: true,
+                        joint_pubkey: Some(dkg_result.joint_key),
+                    })
+                    .unwrap_or_default(),
+                ),
+            )
         }
     }
 }
@@ -359,7 +382,12 @@ pub async fn handle_sign_init(
     let share = match state.storage.read() {
         Ok(storage) => match storage.get_share(&body.agent_id) {
             Ok(Some(s)) => s,
-            Ok(None) => return err_response(StatusCode::NOT_FOUND, format!("No share for agent: {}", body.agent_id)),
+            Ok(None) => {
+                return err_response(
+                    StatusCode::NOT_FOUND,
+                    format!("No share for agent: {}", body.agent_id),
+                )
+            }
             Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e),
         },
         Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e),
@@ -367,10 +395,15 @@ pub async fn handle_sign_init(
 
     let sighash_bytes = match hex::decode(&body.sighash) {
         Ok(b) => b,
-        Err(e) => return err_response(StatusCode::BAD_REQUEST, format!("invalid sighash hex: {e}")),
+        Err(e) => {
+            return err_response(StatusCode::BAD_REQUEST, format!("invalid sighash hex: {e}"))
+        }
     };
     if sighash_bytes.len() != 32 {
-        return err_response(StatusCode::BAD_REQUEST, format!("sighash must be 32 bytes, got {}", sighash_bytes.len()));
+        return err_response(
+            StatusCode::BAD_REQUEST,
+            format!("sighash must be 32 bytes, got {}", sighash_bytes.len()),
+        );
     }
     let mut sighash = [0u8; 32];
     sighash.copy_from_slice(&sighash_bytes);
@@ -385,10 +418,18 @@ pub async fn handle_sign_init(
         Some(hex_str) => {
             let bytes = match hex::decode(hex_str) {
                 Ok(b) => b,
-                Err(e) => return err_response(StatusCode::BAD_REQUEST, format!("invalid hmac_offset hex: {e}")),
+                Err(e) => {
+                    return err_response(
+                        StatusCode::BAD_REQUEST,
+                        format!("invalid hmac_offset hex: {e}"),
+                    )
+                }
             };
             if bytes.len() != 32 {
-                return err_response(StatusCode::BAD_REQUEST, format!("hmac_offset must be 32 bytes, got {}", bytes.len()));
+                return err_response(
+                    StatusCode::BAD_REQUEST,
+                    format!("hmac_offset must be 32 bytes, got {}", bytes.len()),
+                );
             }
             let mut arr = [0u8; 32];
             arr.copy_from_slice(&bytes);
@@ -413,15 +454,23 @@ pub async fn handle_sign_init(
     };
 
     if let Ok(mut store) = COORDINATOR_STORE.lock() {
-        store.signing.insert(signing_session_id.clone(), coordinator);
+        store
+            .signing
+            .insert(signing_session_id.clone(), coordinator);
     }
 
-    (StatusCode::OK, Json(serde_json::to_value(SignInitResponse {
-        signing_session_id,
-        round_message,
-        using_presignature: false,
-        total_rounds: 4,
-    }).unwrap_or_default()))
+    (
+        StatusCode::OK,
+        Json(
+            serde_json::to_value(SignInitResponse {
+                signing_session_id,
+                round_message,
+                using_presignature: false,
+                total_rounds: 4,
+            })
+            .unwrap_or_default(),
+        ),
+    )
 }
 
 /// `POST /sign/round` — Process a signing round message.
@@ -441,7 +490,12 @@ pub async fn handle_sign_round(
 
         let coordinator = match store.signing.get_mut(&body.signing_session_id) {
             Some(c) => c,
-            None => return err_response(StatusCode::NOT_FOUND, format!("Signing session not found: {}", body.signing_session_id)),
+            None => {
+                return err_response(
+                    StatusCode::NOT_FOUND,
+                    format!("Signing session not found: {}", body.signing_session_id),
+                )
+            }
         };
 
         match coordinator.process_round(incoming) {
@@ -460,23 +514,35 @@ pub async fn handle_sign_round(
                     messages.into_iter().next().unwrap()
                 }))
             };
-            (StatusCode::OK, Json(serde_json::to_value(SignRoundResponse {
-                signing_session_id: body.signing_session_id,
-                round_message,
-                complete: false,
-                signature: None,
-            }).unwrap_or_default()))
+            (
+                StatusCode::OK,
+                Json(
+                    serde_json::to_value(SignRoundResponse {
+                        signing_session_id: body.signing_session_id,
+                        round_message,
+                        complete: false,
+                        signature: None,
+                    })
+                    .unwrap_or_default(),
+                ),
+            )
         }
         SigningRoundResult::Complete(signing_result) => {
             if let Ok(mut store) = COORDINATOR_STORE.lock() {
                 store.signing.remove(&body.signing_session_id);
             }
-            (StatusCode::OK, Json(serde_json::to_value(SignRoundResponse {
-                signing_session_id: body.signing_session_id,
-                round_message: None,
-                complete: true,
-                signature: Some(signing_result),
-            }).unwrap_or_default()))
+            (
+                StatusCode::OK,
+                Json(
+                    serde_json::to_value(SignRoundResponse {
+                        signing_session_id: body.signing_session_id,
+                        round_message: None,
+                        complete: true,
+                        signature: Some(signing_result),
+                    })
+                    .unwrap_or_default(),
+                ),
+            )
         }
     }
 }
@@ -493,7 +559,12 @@ pub async fn handle_presign_init(
     let share = match state.storage.read() {
         Ok(storage) => match storage.get_share(&body.agent_id) {
             Ok(Some(s)) => s,
-            Ok(None) => return err_response(StatusCode::NOT_FOUND, format!("No share for agent: {}", body.agent_id)),
+            Ok(None) => {
+                return err_response(
+                    StatusCode::NOT_FOUND,
+                    format!("No share for agent: {}", body.agent_id),
+                )
+            }
             Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e),
         },
         Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e),
@@ -517,11 +588,17 @@ pub async fn handle_presign_init(
         store.presigning.insert(presign_session_id.clone(), manager);
     }
 
-    (StatusCode::OK, Json(serde_json::to_value(PresignInitResponse {
-        presign_session_id,
-        round_messages: messages,
-        total_rounds: 3,
-    }).unwrap_or_default()))
+    (
+        StatusCode::OK,
+        Json(
+            serde_json::to_value(PresignInitResponse {
+                presign_session_id,
+                round_messages: messages,
+                total_rounds: 3,
+            })
+            .unwrap_or_default(),
+        ),
+    )
 }
 
 /// `POST /presign/round` — Process a presigning round.
@@ -537,7 +614,12 @@ pub async fn handle_presign_round(
 
         let manager = match store.presigning.get_mut(&body.presign_session_id) {
             Some(m) => m,
-            None => return err_response(StatusCode::NOT_FOUND, format!("Presigning session not found: {}", body.presign_session_id)),
+            None => {
+                return err_response(
+                    StatusCode::NOT_FOUND,
+                    format!("Presigning session not found: {}", body.presign_session_id),
+                )
+            }
         };
 
         match manager.process_generate_round(body.round_messages) {
@@ -547,24 +629,34 @@ pub async fn handle_presign_round(
     };
 
     match result {
-        PresigningRoundResult::NextRound(messages) => {
-            (StatusCode::OK, Json(serde_json::to_value(PresignRoundResponse {
-                presign_session_id: body.presign_session_id,
-                round_messages: Some(messages),
-                complete: false,
-                presignatures_generated: None,
-            }).unwrap_or_default()))
-        }
+        PresigningRoundResult::NextRound(messages) => (
+            StatusCode::OK,
+            Json(
+                serde_json::to_value(PresignRoundResponse {
+                    presign_session_id: body.presign_session_id,
+                    round_messages: Some(messages),
+                    complete: false,
+                    presignatures_generated: None,
+                })
+                .unwrap_or_default(),
+            ),
+        ),
         PresigningRoundResult::Complete => {
             if let Ok(mut store) = COORDINATOR_STORE.lock() {
                 store.presigning.remove(&body.presign_session_id);
             }
-            (StatusCode::OK, Json(serde_json::to_value(PresignRoundResponse {
-                presign_session_id: body.presign_session_id,
-                round_messages: None,
-                complete: true,
-                presignatures_generated: Some(1),
-            }).unwrap_or_default()))
+            (
+                StatusCode::OK,
+                Json(
+                    serde_json::to_value(PresignRoundResponse {
+                        presign_session_id: body.presign_session_id,
+                        round_messages: None,
+                        complete: true,
+                        presignatures_generated: Some(1),
+                    })
+                    .unwrap_or_default(),
+                ),
+            )
         }
     }
 }
@@ -581,18 +673,33 @@ pub async fn handle_ecdh(
     // Parse counterparty public key
     let cp_bytes = match hex::decode(&body.counterparty_pub) {
         Ok(b) => b,
-        Err(e) => return err_response(StatusCode::BAD_REQUEST, format!("invalid counterparty_pub hex: {e}")),
+        Err(e) => {
+            return err_response(
+                StatusCode::BAD_REQUEST,
+                format!("invalid counterparty_pub hex: {e}"),
+            )
+        }
     };
     let counterparty_pub = match bsv::primitives::ec::PublicKey::from_bytes(&cp_bytes) {
         Ok(pk) => pk,
-        Err(e) => return err_response(StatusCode::BAD_REQUEST, format!("invalid counterparty_pub: {e}")),
+        Err(e) => {
+            return err_response(
+                StatusCode::BAD_REQUEST,
+                format!("invalid counterparty_pub: {e}"),
+            )
+        }
     };
 
     // Load the agent's share
     let share = match state.storage.read() {
         Ok(storage) => match storage.get_share(&body.agent_id) {
             Ok(Some(s)) => s,
-            Ok(None) => return err_response(StatusCode::NOT_FOUND, format!("No share for agent: {}", body.agent_id)),
+            Ok(None) => {
+                return err_response(
+                    StatusCode::NOT_FOUND,
+                    format!("No share for agent: {}", body.agent_id),
+                )
+            }
             Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e),
         },
         Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e),
@@ -601,17 +708,33 @@ pub async fn handle_ecdh(
     // Extract scalar and compute partial ECDH
     let scalar = match bsv_mpc_core::ecdh::parse_share_scalar(&share.ciphertext) {
         Ok(s) => s,
-        Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, format!("failed to parse share scalar: {e}")),
+        Err(e) => {
+            return err_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to parse share scalar: {e}"),
+            )
+        }
     };
 
     let partial = match bsv_mpc_core::ecdh::compute_partial_ecdh_point(&counterparty_pub, &scalar) {
         Ok(p) => p,
-        Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, format!("partial ECDH failed: {e}")),
+        Err(e) => {
+            return err_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("partial ECDH failed: {e}"),
+            )
+        }
     };
 
-    (StatusCode::OK, Json(serde_json::to_value(EcdhResponse {
-        partial: hex::encode(partial.to_compressed()),
-    }).unwrap_or_default()))
+    (
+        StatusCode::OK,
+        Json(
+            serde_json::to_value(EcdhResponse {
+                partial: hex::encode(partial.to_compressed()),
+            })
+            .unwrap_or_default(),
+        ),
+    )
 }
 
 /// `GET /health` — Liveness check with operational metrics.
@@ -624,7 +747,10 @@ pub async fn handle_health(State(state): State<Arc<AppState>>) -> impl IntoRespo
         Ok(storage) => (
             storage.share_count().unwrap_or(0),
             // Sum presignature counts across all agents
-            storage.list_agents().unwrap_or_default().iter()
+            storage
+                .list_agents()
+                .unwrap_or_default()
+                .iter()
                 .map(|a| storage.presignature_count(a).unwrap_or(0))
                 .sum(),
         ),
@@ -651,8 +777,14 @@ pub async fn handle_get_share_metadata(
     // TODO: Verify BRC-31 auth, check requester == agent_id
     match state.storage.read() {
         Ok(storage) => match storage.get_share_metadata(&agent_id) {
-            Ok(Some(metadata)) => (StatusCode::OK, Json(serde_json::to_value(metadata).unwrap_or_default())),
-            Ok(None) => err_response(StatusCode::NOT_FOUND, format!("No share for agent: {agent_id}")),
+            Ok(Some(metadata)) => (
+                StatusCode::OK,
+                Json(serde_json::to_value(metadata).unwrap_or_default()),
+            ),
+            Ok(None) => err_response(
+                StatusCode::NOT_FOUND,
+                format!("No share for agent: {agent_id}"),
+            ),
             Err(e) => err_response(StatusCode::INTERNAL_SERVER_ERROR, e),
         },
         Err(e) => err_response(StatusCode::INTERNAL_SERVER_ERROR, e),
@@ -664,13 +796,19 @@ pub async fn handle_authrite(
     State(_state): State<Arc<AppState>>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    let _client_key = body.get("identityKey").and_then(|v| v.as_str()).unwrap_or("");
+    let _client_key = body
+        .get("identityKey")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     let _client_nonce = body.get("nonce").and_then(|v| v.as_str()).unwrap_or("");
 
     // TODO: Implement full BRC-31 handshake
-    (StatusCode::OK, Json(serde_json::json!({
-        "identityKey": "000000000000000000000000000000000000000000000000000000000000000000",
-        "nonce": "development-stub-nonce",
-        "certificates": []
-    })))
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "identityKey": "000000000000000000000000000000000000000000000000000000000000000000",
+            "nonce": "development-stub-nonce",
+            "certificates": []
+        })),
+    )
 }

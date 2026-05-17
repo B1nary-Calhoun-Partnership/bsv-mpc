@@ -299,9 +299,7 @@ fn bundle_outgoing_messages(
 ///
 /// Handles both bundled format (JSON array of wire messages) and single-message
 /// format (for backward compatibility).
-fn unbundle_incoming_message(
-    msg: &RoundMessage,
-) -> std::result::Result<Vec<RoundMessage>, String> {
+fn unbundle_incoming_message(msg: &RoundMessage) -> std::result::Result<Vec<RoundMessage>, String> {
     // Check if payload is a JSON array (bundled format)
     if msg.payload.first() == Some(&b'[') {
         if let Ok(values) = serde_json::from_slice::<Vec<serde_json::Value>>(&msg.payload) {
@@ -352,9 +350,7 @@ pub async fn handle_dkg_init(mut req: Request, _ctx: &RouteContext<()>) -> Resul
     let mut coordinator = DkgCoordinator::new(session_id, config, ShareIndex(0));
 
     // Initialize — produces round 1 messages (Feldman VSS commitments + ZK proofs)
-    let messages = coordinator
-        .init()
-        .map_err(|e| Error::from(e.to_string()))?;
+    let messages = coordinator.init().map_err(|e| Error::from(e.to_string()))?;
 
     // Bundle all round messages into a single transport message
     let round_message = bundle_outgoing_messages(&messages).map_err(Error::from)?;
@@ -467,10 +463,7 @@ pub async fn handle_sign_init(mut req: Request, _ctx: &RouteContext<()>) -> Resu
         hex::decode(&body.sighash).map_err(|e| Error::from(format!("invalid sighash hex: {e}")))?;
     if sighash_bytes.len() != 32 {
         return Response::error(
-            format!(
-                "sighash must be 32 bytes, got {}",
-                sighash_bytes.len()
-            ),
+            format!("sighash must be 32 bytes, got {}", sighash_bytes.len()),
             400,
         );
     }
@@ -603,12 +596,7 @@ pub async fn handle_presign_init(mut req: Request, _ctx: &RouteContext<()>) -> R
     let session_id = SessionId(body.session_id);
     let participants: Vec<u16> = (0..share.config.parties).collect();
 
-    let mut manager = PresigningManager::new(
-        session_id,
-        share,
-        participants,
-        body.count as usize,
-    );
+    let mut manager = PresigningManager::new(session_id, share, participants, body.count as usize);
 
     // Start presigning — produces round 1 messages
     let messages = manager
@@ -760,10 +748,7 @@ pub async fn handle_get_share_metadata(
     // TODO: Verify BRC-31 auth and check requester == agent_id
     let storage = ShareStorage::new();
 
-    match storage
-        .get_share_metadata(agent_id)
-        .map_err(Error::from)?
-    {
+    match storage.get_share_metadata(agent_id).map_err(Error::from)? {
         Some(metadata) => Response::from_json(&metadata),
         None => Response::error(format!("No share found for agent: {agent_id}"), 404),
     }
@@ -816,8 +801,7 @@ mod tests {
         assert_eq!(bundled.from, ShareIndex(0));
 
         // Payload should be a JSON array with one element
-        let values: Vec<serde_json::Value> =
-            serde_json::from_slice(&bundled.payload).unwrap();
+        let values: Vec<serde_json::Value> = serde_json::from_slice(&bundled.payload).unwrap();
         assert_eq!(values.len(), 1);
     }
 
@@ -839,8 +823,7 @@ mod tests {
         let msgs = vec![make_msg(0, true), make_msg(0, false)];
         let bundled = bundle_outgoing_messages(&msgs).unwrap();
 
-        let values: Vec<serde_json::Value> =
-            serde_json::from_slice(&bundled.payload).unwrap();
+        let values: Vec<serde_json::Value> = serde_json::from_slice(&bundled.payload).unwrap();
         assert_eq!(values.len(), 2);
     }
 

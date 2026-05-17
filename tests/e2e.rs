@@ -46,10 +46,7 @@ impl<M: Unpin, Inner: futures::Sink<M>> futures::Sink<M> for BufferedSink<M, Inn
         std::task::Poll::Ready(Ok(()))
     }
 
-    fn start_send(
-        self: std::pin::Pin<&mut Self>,
-        item: M,
-    ) -> Result<(), Self::Error> {
+    fn start_send(self: std::pin::Pin<&mut Self>, item: M) -> Result<(), Self::Error> {
         self.project().messages.get_mut().push_back(item);
         Ok(())
     }
@@ -156,8 +153,7 @@ async fn run_dkg_simulation() -> (
 
     assert_eq!(incomplete_shares.len(), 2);
     assert_eq!(
-        incomplete_shares[0].shared_public_key,
-        incomplete_shares[1].shared_public_key,
+        incomplete_shares[0].shared_public_key, incomplete_shares[1].shared_public_key,
         "both parties must agree on joint public key"
     );
     eprintln!("  [DKG] Keygen complete. Generating Paillier primes...");
@@ -193,7 +189,10 @@ async fn run_dkg_simulation() -> (
         .collect();
 
     let joint_pubkey = key_shares[0].core.shared_public_key;
-    eprintln!("  [DKG] Complete. Joint key: {:?}", hex::encode(joint_pubkey.to_bytes(true)));
+    eprintln!(
+        "  [DKG] Complete. Joint key: {:?}",
+        hex::encode(joint_pubkey.to_bytes(true))
+    );
 
     (key_shares, *joint_pubkey)
 }
@@ -217,13 +216,13 @@ fn key_share_to_dkg_result(
     let ciphertext = serde_json::to_vec(key_share).expect("key share serialization");
 
     // Deterministic session ID from joint key
-    let session_id = SessionId(format!(
-        "e2e-test-{}",
-        &hex::encode(&compressed[..8])
-    ));
+    let session_id = SessionId(format!("e2e-test-{}", &hex::encode(&compressed[..8])));
 
     DkgResult {
-        joint_key: JointPublicKey { compressed, address },
+        joint_key: JointPublicKey {
+            compressed,
+            address,
+        },
         share: EncryptedShare {
             nonce: vec![0u8; 12],
             ciphertext,
@@ -291,8 +290,8 @@ async fn setup() -> TestEnv {
     let kss_port = find_free_port().await;
     let kss_url = format!("http://127.0.0.1:{kss_port}");
 
-    let kss_storage = bsv_mpc_service::SqliteShareStorage::open("/tmp/e2e-kss")
-        .expect("open KSS storage");
+    let kss_storage =
+        bsv_mpc_service::SqliteShareStorage::open("/tmp/e2e-kss").expect("open KSS storage");
 
     // Pre-seed KSS with share_0 (keyed by agent_id = hex(joint_key))
     let mut kss_storage = kss_storage;
@@ -332,10 +331,10 @@ async fn setup() -> TestEnv {
         port: proxy_port,
         kss_url: kss_url.clone(),
         share_path: share_file.path().to_string_lossy().to_string(),
-        fee_per_signing: 0,     // No fee for tests
+        fee_per_signing: 0, // No fee for tests
         fee_addresses: vec![],
         fee_threshold: None,
-        max_presignatures: 0,   // Disable background presigning
+        max_presignatures: 0, // Disable background presigning
         encryption_key: None,
         arc_api_key: "<REDACTED-ARC-API-KEY>".into(),
     };
@@ -420,8 +419,14 @@ async fn test_health_and_identity(env: &TestEnv, client: &Client) {
         &json!({"identityKey": true}),
     )
     .await;
-    let pubkey = resp["publicKey"].as_str().expect("publicKey should be string");
-    assert_eq!(pubkey.len(), 66, "compressed pubkey = 33 bytes = 66 hex chars");
+    let pubkey = resp["publicKey"]
+        .as_str()
+        .expect("publicKey should be string");
+    assert_eq!(
+        pubkey.len(),
+        66,
+        "compressed pubkey = 33 bytes = 66 hex chars"
+    );
     assert!(
         pubkey.starts_with("02") || pubkey.starts_with("03"),
         "compressed pubkey must start with 02 or 03"
@@ -513,8 +518,16 @@ async fn test_signature_roundtrip(env: &TestEnv, client: &Client) {
     }
 
     let signature = resp["signature"].as_str().expect("signature hex");
-    assert!(signature.len() >= 128, "DER signature too short: {}", signature.len());
-    eprintln!("  Signature: {}... ({:.0}ms)", &signature[..40], elapsed.as_millis());
+    assert!(
+        signature.len() >= 128,
+        "DER signature too short: {}",
+        signature.len()
+    );
+    eprintln!(
+        "  Signature: {}... ({:.0}ms)",
+        &signature[..40],
+        elapsed.as_millis()
+    );
 
     // verifySignature with correct data → valid: true
     let resp = post_json(
@@ -576,7 +589,11 @@ async fn test_encrypt_decrypt(env: &TestEnv, client: &Client) {
     .await;
     assert!(resp.get("error").is_none(), "encrypt failed: {resp}");
     let ciphertext = resp["ciphertext"].as_str().expect("ciphertext");
-    eprintln!("  Encrypted (anyone): {}... ({} bytes)", &ciphertext[..30], ciphertext.len());
+    eprintln!(
+        "  Encrypted (anyone): {}... ({} bytes)",
+        &ciphertext[..30],
+        ciphertext.len()
+    );
 
     // Decrypt
     let resp = post_json(
@@ -592,7 +609,10 @@ async fn test_encrypt_decrypt(env: &TestEnv, client: &Client) {
     .await;
     assert!(resp.get("error").is_none(), "decrypt failed: {resp}");
     let decrypted = resp["plaintext"].as_str().expect("plaintext");
-    assert_eq!(decrypted, plaintext, "decrypt must return original plaintext");
+    assert_eq!(
+        decrypted, plaintext,
+        "decrypt must return original plaintext"
+    );
 
     // Encrypt with counterparty="self" (exercises partial ECDH via KSS)
     let resp = post_json(
@@ -820,10 +840,7 @@ async fn test_mainnet_transaction(env: &TestEnv, client: &Client) {
     // Build P2PKH locking script for the MPC address
     let mpc_pubkey = bsv::PublicKey::from_hex(&env.joint_key_hex).expect("parse joint key");
     let mpc_pubkey_hash = mpc_pubkey.hash160();
-    let locking_script = format!(
-        "76a914{}88ac",
-        hex::encode(mpc_pubkey_hash)
-    );
+    let locking_script = format!("76a914{}88ac", hex::encode(mpc_pubkey_hash));
 
     // Wallet at :3321 requires Origin: http://admin.com and outputDescription
     let fund_resp = match client
@@ -861,7 +878,10 @@ async fn test_mainnet_transaction(env: &TestEnv, client: &Client) {
         eprintln!("  SKIP: No rawTx or tx in response: {fund_resp}");
         return;
     };
-    eprintln!("  Funded: txid={fund_txid} ({} bytes)", fund_raw_tx.len() / 2);
+    eprintln!(
+        "  Funded: txid={fund_txid} ({} bytes)",
+        fund_raw_tx.len() / 2
+    );
 
     // Step 2: Internalize the funding transaction.
     // Use auto-scan mode (no "outputs" array) — the handler will scan all outputs
@@ -935,7 +955,10 @@ async fn test_mainnet_transaction(env: &TestEnv, client: &Client) {
     );
 
     let txid = resp["txid"].as_str().expect("txid must be in response");
-    eprintln!("  Transaction broadcast! txid={txid} ({:.0}ms)", elapsed.as_millis());
+    eprintln!(
+        "  Transaction broadcast! txid={txid} ({:.0}ms)",
+        elapsed.as_millis()
+    );
     eprintln!("  View: https://whatsonchain.com/tx/{txid}");
 
     // Step 5: Verify UTXO tracker updated (change output should exist)
@@ -948,7 +971,10 @@ async fn test_mainnet_transaction(env: &TestEnv, client: &Client) {
     let total = resp["totalOutputs"].as_u64().unwrap_or(0);
     eprintln!("  listOutputs after spend: {resp}");
     // Should have 1 change output (the 5000 - 3000 - fee remaining)
-    assert!(total >= 1, "should have at least 1 change output after spend");
+    assert!(
+        total >= 1,
+        "should have at least 1 change output after spend"
+    );
 
     // Step 6: Verify transaction on WhatsOnChain (may take a few seconds to index)
     eprintln!("  Verifying on WhatsOnChain...");
@@ -962,7 +988,9 @@ async fn test_mainnet_transaction(env: &TestEnv, client: &Client) {
                 if woc.get("txid").is_some() {
                     eprintln!(
                         "  Verified on WoC (attempt {attempt}): confirmations={}",
-                        woc.get("confirmations").and_then(|v| v.as_i64()).unwrap_or(-1)
+                        woc.get("confirmations")
+                            .and_then(|v| v.as_i64())
+                            .unwrap_or(-1)
                     );
                     verified = true;
                     break;
@@ -1006,7 +1034,8 @@ async fn test_all_endpoints_no_panic(env: &TestEnv, client: &Client) {
             status.as_u16() != 500,
             "Endpoint {url} returned 500 (panic/internal error): {text}"
         );
-        serde_json::from_str(&text).unwrap_or_else(|_| json!({"_raw": text, "_status": status.as_u16()}))
+        serde_json::from_str(&text)
+            .unwrap_or_else(|_| json!({"_raw": text, "_status": status.as_u16()}))
     }
 
     // ── Identity & auth (simple, no body needed) ──────────────────────
@@ -1025,92 +1054,144 @@ async fn test_all_endpoints_no_panic(env: &TestEnv, client: &Client) {
 
     // ── Core signing (MPC) ────────────────────────────────────────────
 
-    let r = post_no_panic(client, &format!("{base_url}/getPublicKey"), &json!({"identityKey": true})).await;
+    let r = post_no_panic(
+        client,
+        &format!("{base_url}/getPublicKey"),
+        &json!({"identityKey": true}),
+    )
+    .await;
     assert!(r["publicKey"].is_string());
     eprintln!("  /getPublicKey: ok");
 
     // createSignature — provide valid params; may error on protocol but must not panic
     let test_data = hex::encode(b"test-no-panic");
-    let r = post_no_panic(client, &format!("{base_url}/createSignature"), &json!({
-        "data": test_data,
-        "protocolID": [2, "no-panic-test"],
-        "keyID": "k1",
-        "counterparty": "anyone"
-    })).await;
-    eprintln!("  /createSignature: ok (error={})", r.get("error").is_some());
+    let r = post_no_panic(
+        client,
+        &format!("{base_url}/createSignature"),
+        &json!({
+            "data": test_data,
+            "protocolID": [2, "no-panic-test"],
+            "keyID": "k1",
+            "counterparty": "anyone"
+        }),
+    )
+    .await;
+    eprintln!(
+        "  /createSignature: ok (error={})",
+        r.get("error").is_some()
+    );
 
     // verifySignature — with invalid sig, should return valid:false, not panic
-    let _r = post_no_panic(client, &format!("{base_url}/verifySignature"), &json!({
-        "data": hex::encode(b"test"),
-        "signature": "00".repeat(64),
-        "protocolID": [2, "no-panic-test"],
-        "keyID": "k1",
-        "counterparty": "anyone",
-        "forSelf": true
-    })).await;
+    let _r = post_no_panic(
+        client,
+        &format!("{base_url}/verifySignature"),
+        &json!({
+            "data": hex::encode(b"test"),
+            "signature": "00".repeat(64),
+            "protocolID": [2, "no-panic-test"],
+            "keyID": "k1",
+            "counterparty": "anyone",
+            "forSelf": true
+        }),
+    )
+    .await;
     eprintln!("  /verifySignature: ok");
 
     // createAction — will fail (no UTXOs) but must not panic
-    let r = post_no_panic(client, &format!("{base_url}/createAction"), &json!({
-        "description": "no-panic test",
-        "outputs": [{"satoshis": 100, "lockingScript": "006a"}]
-    })).await;
+    let r = post_no_panic(
+        client,
+        &format!("{base_url}/createAction"),
+        &json!({
+            "description": "no-panic test",
+            "outputs": [{"satoshis": 100, "lockingScript": "006a"}]
+        }),
+    )
+    .await;
     eprintln!("  /createAction: ok (error={})", r.get("error").is_some());
 
     // internalizeAction — invalid tx, will error but must not panic
-    let r = post_no_panic(client, &format!("{base_url}/internalizeAction"), &json!({
-        "tx": "deadbeef"
-    })).await;
-    eprintln!("  /internalizeAction: ok (error={})", r.get("error").is_some());
+    let r = post_no_panic(
+        client,
+        &format!("{base_url}/internalizeAction"),
+        &json!({
+            "tx": "deadbeef"
+        }),
+    )
+    .await;
+    eprintln!(
+        "  /internalizeAction: ok (error={})",
+        r.get("error").is_some()
+    );
 
     // ── Encryption (local) ────────────────────────────────────────────
 
-    let plaintext = base64::Engine::encode(
-        &base64::engine::general_purpose::STANDARD,
-        b"no-panic test",
-    );
-    let r = post_no_panic(client, &format!("{base_url}/encrypt"), &json!({
-        "plaintext": plaintext,
-        "protocolID": [2, "no-panic-test"],
-        "keyID": "enc-np",
-        "counterparty": "anyone"
-    })).await;
+    let plaintext =
+        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"no-panic test");
+    let r = post_no_panic(
+        client,
+        &format!("{base_url}/encrypt"),
+        &json!({
+            "plaintext": plaintext,
+            "protocolID": [2, "no-panic-test"],
+            "keyID": "enc-np",
+            "counterparty": "anyone"
+        }),
+    )
+    .await;
     assert!(r.get("error").is_none(), "encrypt should succeed: {r}");
     eprintln!("  /encrypt: ok");
 
-    let r = post_no_panic(client, &format!("{base_url}/decrypt"), &json!({
-        "ciphertext": "AAAA",
-        "protocolID": [2, "no-panic-test"],
-        "keyID": "dec-np",
-        "counterparty": "anyone"
-    })).await;
+    let r = post_no_panic(
+        client,
+        &format!("{base_url}/decrypt"),
+        &json!({
+            "ciphertext": "AAAA",
+            "protocolID": [2, "no-panic-test"],
+            "keyID": "dec-np",
+            "counterparty": "anyone"
+        }),
+    )
+    .await;
     eprintln!("  /decrypt: ok (error={})", r.get("error").is_some());
 
-    let hmac_data = base64::Engine::encode(
-        &base64::engine::general_purpose::STANDARD,
-        b"hmac no-panic",
-    );
-    let r = post_no_panic(client, &format!("{base_url}/createHmac"), &json!({
-        "data": hmac_data,
-        "protocolID": [2, "no-panic-test"],
-        "keyID": "hmac-np",
-        "counterparty": "anyone"
-    })).await;
+    let hmac_data =
+        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"hmac no-panic");
+    let r = post_no_panic(
+        client,
+        &format!("{base_url}/createHmac"),
+        &json!({
+            "data": hmac_data,
+            "protocolID": [2, "no-panic-test"],
+            "keyID": "hmac-np",
+            "counterparty": "anyone"
+        }),
+    )
+    .await;
     assert!(r.get("error").is_none(), "createHmac should succeed: {r}");
     eprintln!("  /createHmac: ok");
 
-    let _r = post_no_panic(client, &format!("{base_url}/verifyHmac"), &json!({
-        "data": hmac_data,
-        "hmac": "0000000000000000000000000000000000000000000000000000000000000000",
-        "protocolID": [2, "no-panic-test"],
-        "keyID": "hmac-np",
-        "counterparty": "anyone"
-    })).await;
+    let _r = post_no_panic(
+        client,
+        &format!("{base_url}/verifyHmac"),
+        &json!({
+            "data": hmac_data,
+            "hmac": "0000000000000000000000000000000000000000000000000000000000000000",
+            "protocolID": [2, "no-panic-test"],
+            "keyID": "hmac-np",
+            "counterparty": "anyone"
+        }),
+    )
+    .await;
     eprintln!("  /verifyHmac: ok");
 
     // ── UTXO management ───────────────────────────────────────────────
 
-    let r = post_no_panic(client, &format!("{base_url}/listOutputs"), &json!({"basket": "default"})).await;
+    let r = post_no_panic(
+        client,
+        &format!("{base_url}/listOutputs"),
+        &json!({"basket": "default"}),
+    )
+    .await;
     assert!(r["totalOutputs"].is_number());
     eprintln!("  /listOutputs: ok");
 
@@ -1119,7 +1200,12 @@ async fn test_all_endpoints_no_panic(env: &TestEnv, client: &Client) {
     assert!(r["actions"].is_array());
     eprintln!("  /listActions: ok");
 
-    let r = post_no_panic(client, &format!("{base_url}/relinquishOutput"), &json!({"basket": "default", "output": "deadbeef.0"})).await;
+    let r = post_no_panic(
+        client,
+        &format!("{base_url}/relinquishOutput"),
+        &json!({"basket": "default", "output": "deadbeef.0"}),
+    )
+    .await;
     assert_eq!(r["success"], true);
     eprintln!("  /relinquishOutput: ok");
 
@@ -1134,33 +1220,63 @@ async fn test_all_endpoints_no_panic(env: &TestEnv, client: &Client) {
     assert!(r["error"].is_string());
     eprintln!("  /proveCertificate: ok (expected error)");
 
-    let r = post_no_panic(client, &format!("{base_url}/acquireCertificate"), &json!({})).await;
+    let r = post_no_panic(
+        client,
+        &format!("{base_url}/acquireCertificate"),
+        &json!({}),
+    )
+    .await;
     assert!(r["error"].is_string());
     eprintln!("  /acquireCertificate: ok (expected error)");
 
-    let r = post_no_panic(client, &format!("{base_url}/relinquishCertificate"), &json!({})).await;
+    let r = post_no_panic(
+        client,
+        &format!("{base_url}/relinquishCertificate"),
+        &json!({}),
+    )
+    .await;
     assert_eq!(r["success"], true);
     eprintln!("  /relinquishCertificate: ok");
 
     // ── Discovery ─────────────────────────────────────────────────────
 
-    let r = post_no_panic(client, &format!("{base_url}/discoverByIdentityKey"), &json!({"identityKey": "02deadbeef"})).await;
+    let r = post_no_panic(
+        client,
+        &format!("{base_url}/discoverByIdentityKey"),
+        &json!({"identityKey": "02deadbeef"}),
+    )
+    .await;
     assert_eq!(r["totalResults"], 0);
     assert!(r["results"].is_array());
     eprintln!("  /discoverByIdentityKey: ok");
 
-    let r = post_no_panic(client, &format!("{base_url}/discoverByAttributes"), &json!({"attributes": {}})).await;
+    let r = post_no_panic(
+        client,
+        &format!("{base_url}/discoverByAttributes"),
+        &json!({"attributes": {}}),
+    )
+    .await;
     assert_eq!(r["totalResults"], 0);
     assert!(r["results"].is_array());
     eprintln!("  /discoverByAttributes: ok");
 
     // ── Key linkage ───────────────────────────────────────────────────
 
-    let r = post_no_panic(client, &format!("{base_url}/revealCounterpartyKeyLinkage"), &json!({})).await;
+    let r = post_no_panic(
+        client,
+        &format!("{base_url}/revealCounterpartyKeyLinkage"),
+        &json!({}),
+    )
+    .await;
     assert!(r["error"].is_string());
     eprintln!("  /revealCounterpartyKeyLinkage: ok (expected error)");
 
-    let r = post_no_panic(client, &format!("{base_url}/revealSpecificKeyLinkage"), &json!({})).await;
+    let r = post_no_panic(
+        client,
+        &format!("{base_url}/revealSpecificKeyLinkage"),
+        &json!({}),
+    )
+    .await;
     assert!(r["error"].is_string());
     eprintln!("  /revealSpecificKeyLinkage: ok (expected error)");
 
@@ -1170,7 +1286,12 @@ async fn test_all_endpoints_no_panic(env: &TestEnv, client: &Client) {
     assert!(r["height"].is_number());
     eprintln!("  /getHeight: ok");
 
-    let r = post_no_panic(client, &format!("{base_url}/waitForAuthentication"), &json!({})).await;
+    let r = post_no_panic(
+        client,
+        &format!("{base_url}/waitForAuthentication"),
+        &json!({}),
+    )
+    .await;
     assert_eq!(r["authenticated"], true);
     eprintln!("  /waitForAuthentication: ok");
 

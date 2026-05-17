@@ -69,20 +69,13 @@ pub fn derive_child_pubkey(
     let hmac = sha256_hmac(&shared_secret.to_compressed(), invoice_number.as_bytes());
 
     // G * hmac — compute the offset point
-    let offset_pub = PublicKey::from_scalar_mul_generator(&hmac).map_err(|e| {
-        MpcError::Protocol(format!(
-            "BRC-42: failed to compute G * hmac: {}",
-            e
-        ))
-    })?;
+    let offset_pub = PublicKey::from_scalar_mul_generator(&hmac)
+        .map_err(|e| MpcError::Protocol(format!("BRC-42: failed to compute G * hmac: {}", e)))?;
 
     // child_pub = root_pub + offset_pub (point addition)
-    let child_pub = root_pub.add(&offset_pub).map_err(|e| {
-        MpcError::Protocol(format!(
-            "BRC-42: point addition failed: {}",
-            e
-        ))
-    })?;
+    let child_pub = root_pub
+        .add(&offset_pub)
+        .map_err(|e| MpcError::Protocol(format!("BRC-42: point addition failed: {}", e)))?;
 
     Ok(child_pub)
 }
@@ -157,9 +150,8 @@ pub fn derive_anyone_joint_key(
     key_id: &str,
     security_level: u8,
 ) -> Result<JointPublicKey> {
-    let root_pub = PublicKey::from_bytes(&joint_key.compressed).map_err(|e| {
-        MpcError::InvalidShare(format!("invalid joint public key: {}", e))
-    })?;
+    let root_pub = PublicKey::from_bytes(&joint_key.compressed)
+        .map_err(|e| MpcError::InvalidShare(format!("invalid joint public key: {}", e)))?;
 
     let child_pub = derive_anyone_pubkey(&root_pub, protocol_name, key_id, security_level)?;
     pubkey_to_joint_key(&child_pub)
@@ -176,9 +168,8 @@ pub fn derive_joint_key_with_secret(
     key_id: &str,
     security_level: u8,
 ) -> Result<JointPublicKey> {
-    let root_pub = PublicKey::from_bytes(&joint_key.compressed).map_err(|e| {
-        MpcError::InvalidShare(format!("invalid joint public key: {}", e))
-    })?;
+    let root_pub = PublicKey::from_bytes(&joint_key.compressed)
+        .map_err(|e| MpcError::InvalidShare(format!("invalid joint public key: {}", e)))?;
 
     let invoice = compute_invoice(security_level, protocol_name, key_id);
     let child_pub = derive_child_pubkey(&root_pub, shared_secret, &invoice)?;
@@ -191,7 +182,10 @@ fn pubkey_to_joint_key(pubkey: &PublicKey) -> Result<JointPublicKey> {
     let address = Address::new_from_public_key(pubkey, true)
         .map_err(|e| MpcError::InvalidShare(format!("failed to derive BSV address: {}", e)))?
         .to_string();
-    Ok(JointPublicKey { compressed, address })
+    Ok(JointPublicKey {
+        compressed,
+        address,
+    })
 }
 
 #[cfg(test)]
@@ -202,10 +196,9 @@ mod tests {
     /// Known test key (same as POC 3 for consistency).
     fn test_root_key() -> (PrivateKey, PublicKey) {
         let privkey = PrivateKey::from_bytes(&[
-            0x0b, 0x1e, 0x2c, 0x3d, 0x4e, 0x5f, 0x6a, 0x7b,
-            0x8c, 0x9d, 0xae, 0xbf, 0xc0, 0xd1, 0xe2, 0xf3,
-            0x14, 0x25, 0x36, 0x47, 0x58, 0x69, 0x7a, 0x8b,
-            0x9c, 0xad, 0xbe, 0xcf, 0xd0, 0xe1, 0xf2, 0x03,
+            0x0b, 0x1e, 0x2c, 0x3d, 0x4e, 0x5f, 0x6a, 0x7b, 0x8c, 0x9d, 0xae, 0xbf, 0xc0, 0xd1,
+            0xe2, 0xf3, 0x14, 0x25, 0x36, 0x47, 0x58, 0x69, 0x7a, 0x8b, 0x9c, 0xad, 0xbe, 0xcf,
+            0xd0, 0xe1, 0xf2, 0x03,
         ])
         .expect("valid test private key");
         let pubkey = privkey.public_key();
@@ -274,7 +267,10 @@ mod tests {
         let other_pub = other_priv.public_key();
         let h1 = compute_brc42_hmac(&pubkey, "2-test-key1");
         let h2 = compute_brc42_hmac(&other_pub, "2-test-key1");
-        assert_ne!(h1, h2, "different shared secrets must produce different HMACs");
+        assert_ne!(
+            h1, h2,
+            "different shared secrets must produce different HMACs"
+        );
     }
 
     // -------------------------------------------------------------------
@@ -410,10 +406,9 @@ mod tests {
 
         let (root_priv, root_pub) = test_root_key();
         let server_priv = PrivateKey::from_bytes(&[
-            0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x11, 0x22,
-            0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0x00,
-            0xab, 0xcd, 0xef, 0x12, 0x34, 0x56, 0x78, 0x9a,
-            0xbc, 0xde, 0xf0, 0x13, 0x57, 0x9b, 0xdf, 0x02,
+            0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+            0x99, 0x00, 0xab, 0xcd, 0xef, 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0, 0x13,
+            0x57, 0x9b, 0xdf, 0x02,
         ])
         .expect("valid server key");
         let server_pub = server_priv.public_key();
@@ -423,7 +418,12 @@ mod tests {
         let protocol = Protocol::new(SecurityLevel::Counterparty, "3241645161d8");
         let key_id = "test-prefix test-suffix";
         let wallet_derived = deriver
-            .derive_public_key(&protocol, key_id, &Counterparty::Other(server_pub.clone()), true)
+            .derive_public_key(
+                &protocol,
+                key_id,
+                &Counterparty::Other(server_pub.clone()),
+                true,
+            )
             .expect("wallet derivation");
 
         // Compute shared secret (in production, this comes from MPC partial ECDH)
@@ -474,10 +474,9 @@ mod tests {
 
         let (root_priv, root_pub) = test_root_key();
         let server_priv = PrivateKey::from_bytes(&[
-            0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x11, 0x22,
-            0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0x00,
-            0xab, 0xcd, 0xef, 0x12, 0x34, 0x56, 0x78, 0x9a,
-            0xbc, 0xde, 0xf0, 0x13, 0x57, 0x9b, 0xdf, 0x02,
+            0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+            0x99, 0x00, 0xab, 0xcd, 0xef, 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0, 0x13,
+            0x57, 0x9b, 0xdf, 0x02,
         ])
         .expect("valid server key");
         let server_pub = server_priv.public_key();
@@ -486,7 +485,12 @@ mod tests {
         let protocol = Protocol::new(SecurityLevel::Counterparty, "auth message signature");
         let key_id = "request-nonce-abc123";
         let wallet_derived = deriver
-            .derive_public_key(&protocol, key_id, &Counterparty::Other(server_pub.clone()), true)
+            .derive_public_key(
+                &protocol,
+                key_id,
+                &Counterparty::Other(server_pub.clone()),
+                true,
+            )
             .expect("wallet derivation");
 
         let shared_secret = root_priv.derive_shared_secret(&server_pub).expect("ECDH");

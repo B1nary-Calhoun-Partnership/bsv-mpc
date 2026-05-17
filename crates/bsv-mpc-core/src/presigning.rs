@@ -414,9 +414,7 @@ impl PresigningManager {
                     outbound_tx,
                 );
             })
-            .map_err(|e| {
-                MpcError::Protocol(format!("failed to spawn presigning thread: {e}"))
-            })?;
+            .map_err(|e| MpcError::Protocol(format!("failed to spawn presigning thread: {e}")))?;
 
         self.sm_tx = Some(inbound_tx);
         self.sm_rx = Some(outbound_rx);
@@ -886,8 +884,7 @@ mod tests {
         config: ThresholdConfig,
         session_id: &SessionId,
     ) -> EncryptedShare {
-        let key_share_json =
-            serde_json::to_vec(key_share).expect("key share should serialize");
+        let key_share_json = serde_json::to_vec(key_share).expect("key share should serialize");
         EncryptedShare {
             nonce: vec![0u8; 12],
             ciphertext: key_share_json,
@@ -1007,12 +1004,10 @@ mod tests {
 
         let result = mgr.init_generate();
         assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("already in progress")
-        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("already in progress"));
     }
 
     #[test]
@@ -1031,12 +1026,10 @@ mod tests {
 
         let result = mgr.process_generate_round(vec![]);
         assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("no generation in progress")
-        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("no generation in progress"));
     }
 
     // ---- Integration test: two managers exchange messages to generate a presignature ----
@@ -1061,8 +1054,14 @@ mod tests {
         let msgs_0 = mgr_0.init_generate().unwrap();
         let msgs_1 = mgr_1.init_generate().unwrap();
 
-        assert!(!msgs_0.is_empty(), "manager 0 should produce initial messages");
-        assert!(!msgs_1.is_empty(), "manager 1 should produce initial messages");
+        assert!(
+            !msgs_0.is_empty(),
+            "manager 0 should produce initial messages"
+        );
+        assert!(
+            !msgs_1.is_empty(),
+            "manager 1 should produce initial messages"
+        );
         assert!(mgr_0.is_generating());
         assert!(mgr_1.is_generating());
 
@@ -1097,16 +1096,8 @@ mod tests {
         }
 
         // Both managers should have a presignature in their pool
-        assert_eq!(
-            mgr_0.pool_size(),
-            1,
-            "manager 0 should have 1 presignature"
-        );
-        assert_eq!(
-            mgr_1.pool_size(),
-            1,
-            "manager 1 should have 1 presignature"
-        );
+        assert_eq!(mgr_0.pool_size(), 1, "manager 0 should have 1 presignature");
+        assert_eq!(mgr_1.pool_size(), 1, "manager 1 should have 1 presignature");
         assert!(!mgr_0.is_generating());
         assert!(!mgr_1.is_generating());
 

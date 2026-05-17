@@ -36,7 +36,7 @@ use crate::hd::{compute_brc42_hmac, compute_invoice, derive_child_pubkey};
 
 use bsv::primitives::ec::PublicKey;
 use cggmp24::supported_curves::Secp256k1;
-use generic_ec::{SecretScalar, Scalar};
+use generic_ec::{Scalar, SecretScalar};
 
 // ── Share parsing ────────────────────────────────────────────────────────────
 
@@ -52,9 +52,8 @@ fn parse_incomplete_key_share(
     // Extract the core's JSON and re-deserialize as IncompleteKeyShare.
     if let Ok(full) = serde_json::from_slice::<serde_json::Value>(raw_share_json) {
         if let Some(core_val) = full.get("core") {
-            let core_bytes = serde_json::to_vec(core_val).map_err(|e| {
-                MpcError::InvalidShare(format!("failed to re-serialize core: {e}"))
-            })?;
+            let core_bytes = serde_json::to_vec(core_val)
+                .map_err(|e| MpcError::InvalidShare(format!("failed to re-serialize core: {e}")))?;
             if let Ok(share) =
                 serde_json::from_slice::<cggmp24::IncompleteKeyShare<Secp256k1>>(&core_bytes)
             {
@@ -64,9 +63,8 @@ fn parse_incomplete_key_share(
     }
 
     // Fall back to raw IncompleteKeyShare (legacy/POC format)
-    serde_json::from_slice(raw_share_json).map_err(|e| {
-        MpcError::InvalidShare(format!("failed to deserialize key share: {e}"))
-    })
+    serde_json::from_slice(raw_share_json)
+        .map_err(|e| MpcError::InvalidShare(format!("failed to deserialize key share: {e}")))
 }
 
 /// Extract the secret scalar bytes from a serialized cggmp24 key share.
@@ -157,12 +155,11 @@ fn lagrange_coefficient(j: usize, evaluation_points: &[[u8; 32]]) -> Result<[u8;
         if m == j {
             continue;
         }
-        let i_m =
-            Scalar::<Secp256k1>::from_be_bytes(*ep_m).map_err(|_| {
-                MpcError::Protocol(format!(
-                    "invalid evaluation point at index {m}: not a valid scalar"
-                ))
-            })?;
+        let i_m = Scalar::<Secp256k1>::from_be_bytes(*ep_m).map_err(|_| {
+            MpcError::Protocol(format!(
+                "invalid evaluation point at index {m}: not a valid scalar"
+            ))
+        })?;
 
         // numerator: -I_m
         let neg_i_m = -i_m;
@@ -248,18 +245,17 @@ pub fn derive_symmetric_key_anyone(
 
     // child_anyone_priv = 1 + hmac (scalar addition mod curve order)
     let one = Scalar::<Secp256k1>::one();
-    let hmac_scalar = Scalar::<Secp256k1>::from_be_bytes(hmac_bytes).map_err(|_| {
-        MpcError::Protocol("HMAC bytes not a valid secp256k1 scalar".into())
-    })?;
+    let hmac_scalar = Scalar::<Secp256k1>::from_be_bytes(hmac_bytes)
+        .map_err(|_| MpcError::Protocol("HMAC bytes not a valid secp256k1 scalar".into()))?;
     let child_anyone_priv = one + hmac_scalar;
     let encoded = child_anyone_priv.to_be_bytes();
     let mut scalar_bytes = [0u8; 32];
     scalar_bytes.copy_from_slice(encoded.as_bytes());
 
     // sym_point = child_our_pub * child_anyone_priv
-    let sym_point = child_our_pub.mul_scalar(&scalar_bytes).map_err(|e| {
-        MpcError::Protocol(format!("anyone symmetric key scalar mult failed: {e}"))
-    })?;
+    let sym_point = child_our_pub
+        .mul_scalar(&scalar_bytes)
+        .map_err(|e| MpcError::Protocol(format!("anyone symmetric key scalar mult failed: {e}")))?;
 
     // sym_key = x-coordinate of sym_point
     Ok(sym_point.x())
@@ -296,9 +292,9 @@ pub fn derive_symmetric_key_from_partials(
     let child_counter_pub = derive_child_pubkey(counterparty_pub, shared_secret, invoice)?;
 
     // hmac * child_counter_pub (local scalar multiplication)
-    let hmac_times_child = child_counter_pub.mul_scalar(&hmac_bytes).map_err(|e| {
-        MpcError::Protocol(format!("symmetric key hmac*child mult failed: {e}"))
-    })?;
+    let hmac_times_child = child_counter_pub
+        .mul_scalar(&hmac_bytes)
+        .map_err(|e| MpcError::Protocol(format!("symmetric key hmac*child mult failed: {e}")))?;
 
     // sym_point = root_times_child + hmac_times_child
     let sym_point = point_add(root_times_child, &hmac_times_child)?;
@@ -319,24 +315,20 @@ mod tests {
 
     /// Same test key as POC 3 / POC 9 / hd.rs tests.
     const TEST_KEY_BYTES: [u8; 32] = [
-        0x0b, 0x1e, 0x2c, 0x3d, 0x4e, 0x5f, 0x6a, 0x7b, 0x8c, 0x9d, 0xae, 0xbf, 0xc0, 0xd1,
-        0xe2, 0xf3, 0x14, 0x25, 0x36, 0x47, 0x58, 0x69, 0x7a, 0x8b, 0x9c, 0xad, 0xbe, 0xcf,
-        0xd0, 0xe1, 0xf2, 0x03,
+        0x0b, 0x1e, 0x2c, 0x3d, 0x4e, 0x5f, 0x6a, 0x7b, 0x8c, 0x9d, 0xae, 0xbf, 0xc0, 0xd1, 0xe2,
+        0xf3, 0x14, 0x25, 0x36, 0x47, 0x58, 0x69, 0x7a, 0x8b, 0x9c, 0xad, 0xbe, 0xcf, 0xd0, 0xe1,
+        0xf2, 0x03,
     ];
 
-    fn bsv_privkey_to_scalar(
-        privkey: &PrivateKey,
-    ) -> NonZero<SecretScalar<Secp256k1>> {
+    fn bsv_privkey_to_scalar(privkey: &PrivateKey) -> NonZero<SecretScalar<Secp256k1>> {
         let bytes = privkey.to_bytes();
-        let mut scalar = Scalar::<Secp256k1>::from_be_bytes(bytes)
-            .expect("valid scalar from private key bytes");
+        let mut scalar =
+            Scalar::<Secp256k1>::from_be_bytes(bytes).expect("valid scalar from private key bytes");
         let secret = SecretScalar::new(&mut scalar);
         NonZero::from_secret_scalar(secret).expect("non-zero scalar")
     }
 
-    fn generate_2of2_shares(
-        root_key: &PrivateKey,
-    ) -> Vec<cggmp24::IncompleteKeyShare<Secp256k1>> {
+    fn generate_2of2_shares(root_key: &PrivateKey) -> Vec<cggmp24::IncompleteKeyShare<Secp256k1>> {
         let sk = bsv_privkey_to_scalar(root_key);
         cggmp24::trusted_dealer::builder::<Secp256k1, SecurityLevel128>(2)
             .set_threshold(Some(2))
@@ -389,9 +381,7 @@ mod tests {
         let shares = generate_2of2_shares(&root_key);
 
         // Normal ECDH: root_pub * root_priv (self counterparty)
-        let full_ecdh = root_key
-            .derive_shared_secret(&root_pub)
-            .expect("ECDH self");
+        let full_ecdh = root_key.derive_shared_secret(&root_pub).expect("ECDH self");
 
         // MPC partial ECDH: compute partials and combine with Lagrange
         let share0_json = serde_json::to_vec(&shares[0]).unwrap();
@@ -404,10 +394,7 @@ mod tests {
         let partial0 = compute_partial_ecdh_point(&root_pub, &scalar0).unwrap();
         let partial1 = compute_partial_ecdh_point(&root_pub, &scalar1).unwrap();
 
-        let partials = vec![
-            (partial0, vss_points[0]),
-            (partial1, vss_points[1]),
-        ];
+        let partials = vec![(partial0, vss_points[0]), (partial1, vss_points[1])];
         let mpc_ecdh = combine_partials_lagrange(&partials).unwrap();
 
         assert_eq!(
@@ -446,11 +433,9 @@ mod tests {
         let partial0 = compute_partial_ecdh_point(&server_pub, &scalar0).unwrap();
         let partial1 = compute_partial_ecdh_point(&server_pub, &scalar1).unwrap();
 
-        let mpc_ecdh = combine_partials_lagrange(&[
-            (partial0, vss_points[0]),
-            (partial1, vss_points[1]),
-        ])
-        .unwrap();
+        let mpc_ecdh =
+            combine_partials_lagrange(&[(partial0, vss_points[0]), (partial1, vss_points[1])])
+                .unwrap();
 
         assert_eq!(
             full_ecdh.to_compressed(),
@@ -509,11 +494,8 @@ mod tests {
         // For "self": counterparty_pub = root_pub
         let p0_r1 = compute_partial_ecdh_point(&root_pub, &scalar0).unwrap();
         let p1_r1 = compute_partial_ecdh_point(&root_pub, &scalar1).unwrap();
-        let shared_secret = combine_partials_lagrange(&[
-            (p0_r1, vss_points[0]),
-            (p1_r1, vss_points[1]),
-        ])
-        .unwrap();
+        let shared_secret =
+            combine_partials_lagrange(&[(p0_r1, vss_points[0]), (p1_r1, vss_points[1])]).unwrap();
 
         // Compute invoice and child_counter_pub
         let invoice = compute_invoice(2, "worm memory", key_id);
@@ -522,11 +504,8 @@ mod tests {
         // Round 2: root_priv * child_counter_pub
         let p0_r2 = compute_partial_ecdh_point(&child_counter_pub, &scalar0).unwrap();
         let p1_r2 = compute_partial_ecdh_point(&child_counter_pub, &scalar1).unwrap();
-        let root_times_child = combine_partials_lagrange(&[
-            (p0_r2, vss_points[0]),
-            (p1_r2, vss_points[1]),
-        ])
-        .unwrap();
+        let root_times_child =
+            combine_partials_lagrange(&[(p0_r2, vss_points[0]), (p1_r2, vss_points[1])]).unwrap();
 
         // Final: derive_symmetric_key_from_partials
         let mpc_sym = derive_symmetric_key_from_partials(

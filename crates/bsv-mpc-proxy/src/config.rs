@@ -101,8 +101,7 @@ impl ProxyConfig {
             kss_url: std::env::var("MPC_KSS_URL")
                 .unwrap_or_else(|_| "https://kss.lobsterfarm.com".into()),
 
-            share_path: std::env::var("MPC_SHARE_PATH")
-                .unwrap_or_else(|_| "share.enc".into()),
+            share_path: std::env::var("MPC_SHARE_PATH").unwrap_or_else(|_| "share.enc".into()),
 
             fee_per_signing: std::env::var("MPC_FEE_SATS")
                 .unwrap_or_else(|_| "1000".into())
@@ -154,9 +153,6 @@ mod tests {
         assert!(config.fee_threshold.is_none());
         assert_eq!(config.max_presignatures, 20);
         assert!(config.encryption_key.is_none());
-        assert_eq!(
-            config.arc_api_key,
-            "<REDACTED-ARC-API-KEY>"
-        );
+        assert_eq!(config.arc_api_key, "<REDACTED-ARC-API-KEY>");
     }
 }

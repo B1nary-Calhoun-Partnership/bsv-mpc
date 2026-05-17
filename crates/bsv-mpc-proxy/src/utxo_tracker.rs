@@ -116,11 +116,8 @@ impl UtxoTracker {
     /// Returns the selected outputs (cloned) and the total selected amount.
     /// Returns an empty vec if insufficient funds.
     pub fn select_utxos(&self, target_sats: u64) -> (Vec<TrackedOutput>, u64) {
-        let mut unspent: Vec<&TrackedOutput> = self
-            .outputs
-            .iter()
-            .filter(|o| o.is_unspent())
-            .collect();
+        let mut unspent: Vec<&TrackedOutput> =
+            self.outputs.iter().filter(|o| o.is_unspent()).collect();
 
         // Sort by satoshis descending (largest first)
         unspent.sort_by_key(|o| std::cmp::Reverse(o.satoshis));
@@ -327,22 +324,14 @@ mod tests {
             vec!["state", "memory"],
         ));
 
-        let state_outputs = tracker.list_unspent(
-            None,
-            Some(&[String::from("state")]),
-        );
+        let state_outputs = tracker.list_unspent(None, Some(&[String::from("state")]));
         assert_eq!(state_outputs.len(), 2); // aa and cc
 
-        let memory_outputs = tracker.list_unspent(
-            None,
-            Some(&[String::from("memory")]),
-        );
+        let memory_outputs = tracker.list_unspent(None, Some(&[String::from("memory")]));
         assert_eq!(memory_outputs.len(), 2); // bb and cc
 
-        let any_outputs = tracker.list_unspent(
-            None,
-            Some(&[String::from("state"), String::from("memory")]),
-        );
+        let any_outputs =
+            tracker.list_unspent(None, Some(&[String::from("state"), String::from("memory")]));
         assert_eq!(any_outputs.len(), 3); // all match at least one tag
     }
 

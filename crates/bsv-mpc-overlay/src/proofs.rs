@@ -28,9 +28,9 @@
 //! Fee distribution is proportional: a node with 60% of the proofs in an epoch
 //! receives 60% of the collected fees for that epoch.
 
-use bsv_mpc_core::types::ParticipationProof;
 use crate::error::OverlayError;
 use crate::types::{FeeSettlement, NodeFeeShare, OverlayProof};
+use bsv_mpc_core::types::ParticipationProof;
 
 /// Current proof serialization version.
 /// Used when proof publication is implemented (Beta milestone).

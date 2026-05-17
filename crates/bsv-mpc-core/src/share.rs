@@ -86,7 +86,7 @@ pub fn encrypt_share(share_bytes: &[u8], encryption_key: &[u8; 32]) -> Result<En
         nonce: nonce_bytes.to_vec(),
         ciphertext,
         session_id: SessionId(String::new()), // caller fills in
-        share_index: ShareIndex(0),            // caller fills in
+        share_index: ShareIndex(0),           // caller fills in
         config: ThresholdConfig {
             threshold: 0,
             parties: 0,
@@ -374,10 +374,7 @@ mod tests {
         share.nonce[0] ^= 0x01;
 
         let result = decrypt_share(&share, &key);
-        assert!(
-            result.is_err(),
-            "tampered nonce should fail GCM auth check"
-        );
+        assert!(result.is_err(), "tampered nonce should fail GCM auth check");
     }
 
     // ----------------------------------------------------------------

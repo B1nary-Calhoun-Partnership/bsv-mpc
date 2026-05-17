@@ -106,10 +106,9 @@ impl axum::response::IntoResponse for ProxyError {
 
         let (status, message) = match &self {
             ProxyError::InvalidRequest(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
-            ProxyError::PresignatureExhausted => (
-                StatusCode::SERVICE_UNAVAILABLE,
-                self.to_string(),
-            ),
+            ProxyError::PresignatureExhausted => {
+                (StatusCode::SERVICE_UNAVAILABLE, self.to_string())
+            }
             ProxyError::KssError(msg) => (StatusCode::BAD_GATEWAY, msg.clone()),
             ProxyError::Utxo(msg) => (StatusCode::UNPROCESSABLE_ENTITY, msg.clone()),
             _ => (StatusCode::INTERNAL_SERVER_ERROR, self.to_string()),

@@ -300,7 +300,11 @@ pub fn verify_participation_proof(proof: &ParticipationProof) -> bool {
 
     // 7. No duplicate entries in participating_nodes.
     // Collect into a HashSet of byte slices and check the count matches.
-    let unique: HashSet<&[u8]> = proof.participating_nodes.iter().map(|v| v.as_slice()).collect();
+    let unique: HashSet<&[u8]> = proof
+        .participating_nodes
+        .iter()
+        .map(|v| v.as_slice())
+        .collect();
     if unique.len() != proof.participating_nodes.len() {
         return false;
     }
@@ -383,8 +387,14 @@ mod tests {
         let session = SessionId("test-session".to_string());
         let agent = fake_pubkey(0xAA);
         let nodes = vec![fake_pubkey(0xAA), fake_pubkey(0xBB)];
-        create_participation_proof(&session, &agent, &nodes, &fake_hash(0x11), Some(fake_txid()))
-            .expect("valid_proof helper should not fail")
+        create_participation_proof(
+            &session,
+            &agent,
+            &nodes,
+            &fake_hash(0x11),
+            Some(fake_txid()),
+        )
+        .expect("valid_proof helper should not fail")
     }
 
     // ----------------------------------------------------------------
@@ -398,14 +408,9 @@ mod tests {
         let nodes = vec![fake_pubkey(0x01), fake_pubkey(0x02)];
         let signing_hash = fake_hash(0xFF);
 
-        let proof = create_participation_proof(
-            &session,
-            &agent,
-            &nodes,
-            &signing_hash,
-            Some(fake_txid()),
-        )
-        .expect("should succeed with valid inputs");
+        let proof =
+            create_participation_proof(&session, &agent, &nodes, &signing_hash, Some(fake_txid()))
+                .expect("should succeed with valid inputs");
 
         assert_eq!(proof.session_hash.len(), 32);
         assert_eq!(proof.agent_identity, agent);
@@ -560,9 +565,8 @@ mod tests {
         let session = SessionId("session-03".to_string());
         let agent = fake_pubkey_03(0xCC);
         let nodes = vec![fake_pubkey_03(0xCC), fake_pubkey(0xDD)];
-        let proof =
-            create_participation_proof(&session, &agent, &nodes, &fake_hash(0x22), None)
-                .expect("should succeed with 0x03 prefix");
+        let proof = create_participation_proof(&session, &agent, &nodes, &fake_hash(0x22), None)
+            .expect("should succeed with 0x03 prefix");
         assert!(verify_participation_proof(&proof));
     }
 
@@ -617,9 +621,8 @@ mod tests {
         let session = SessionId("no-fee".to_string());
         let agent = fake_pubkey(0x01);
         let nodes = vec![fake_pubkey(0x01)];
-        let proof =
-            create_participation_proof(&session, &agent, &nodes, &fake_hash(0x00), None)
-                .expect("should succeed");
+        let proof = create_participation_proof(&session, &agent, &nodes, &fake_hash(0x00), None)
+            .expect("should succeed");
         let script = proof_to_op_return(&proof);
 
         // The script should still be well-formed with an OP_0 for the fee_txid.
@@ -767,14 +770,9 @@ mod tests {
         let nodes = vec![fake_pubkey_03(0x10), fake_pubkey(0x20)];
         let signing_hash = fake_hash(0x99);
 
-        let proof = create_participation_proof(
-            &session,
-            &agent,
-            &nodes,
-            &signing_hash,
-            Some(fake_txid()),
-        )
-        .expect("should succeed");
+        let proof =
+            create_participation_proof(&session, &agent, &nodes, &signing_hash, Some(fake_txid()))
+                .expect("should succeed");
 
         // Verify the proof passes structural validation.
         assert!(verify_participation_proof(&proof));
@@ -800,9 +798,8 @@ mod tests {
             nodes.push(fake_pubkey(i));
         }
 
-        let proof =
-            create_participation_proof(&session, &agent, &nodes, &fake_hash(0xDD), None)
-                .expect("should succeed with many nodes");
+        let proof = create_participation_proof(&session, &agent, &nodes, &fake_hash(0xDD), None)
+            .expect("should succeed with many nodes");
 
         assert!(verify_participation_proof(&proof));
         let script = proof_to_op_return(&proof);

@@ -7,8 +7,8 @@
 
 use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
 use bsv_mpc_overlay::chip;
-use bsv_mpc_overlay::types::{DiscoveryQuery, MpcNodeInfo, MPC_TOPIC};
 use bsv_mpc_overlay::discovery;
+use bsv_mpc_overlay::types::{DiscoveryQuery, MpcNodeInfo, MPC_TOPIC};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -131,10 +131,7 @@ async fn handle_deregister(
     }
 
     let status = if removed { "removed" } else { "not_found" };
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({"status": status})),
-    )
+    (StatusCode::OK, Json(serde_json::json!({"status": status})))
 }
 
 /// Build the local registry Axum router.
@@ -242,7 +239,11 @@ async fn test_local_registry_register_discover_deregister() {
     let result: LookupResponse = resp.json().await.unwrap();
     assert_eq!(result.nodes.len(), 2);
 
-    let remaining: Vec<&str> = result.nodes.iter().map(|n| n.identity_key.as_str()).collect();
+    let remaining: Vec<&str> = result
+        .nodes
+        .iter()
+        .map(|n| n.identity_key.as_str())
+        .collect();
     assert!(!remaining.contains(&"02bbb2"));
     assert!(remaining.contains(&"02aaa1"));
     assert!(remaining.contains(&"02ccc3"));
@@ -279,7 +280,12 @@ fn test_chip_token_create_and_filter_pipeline() {
     let configs = vec![
         ("https://us1.com", 100u64, vec!["2-of-2"], vec!["secp256k1"]),
         ("https://eu1.com", 500, vec!["2-of-3"], vec!["secp256k1"]),
-        ("https://ap1.com", 200, vec!["2-of-2", "2-of-3"], vec!["secp256k1"]),
+        (
+            "https://ap1.com",
+            200,
+            vec!["2-of-2", "2-of-3"],
+            vec!["secp256k1"],
+        ),
         ("https://us2.com", 300, vec!["3-of-5"], vec!["secp256k1"]),
         ("https://eu2.com", 150, vec!["2-of-2"], vec!["ed25519"]),
     ];
@@ -362,26 +368,22 @@ async fn test_live_slap_tracker_reachability() {
         }
     }
 
-    assert!(
-        reachable > 0,
-        "At least one SLAP tracker must be reachable"
-    );
+    assert!(reachable > 0, "At least one SLAP tracker must be reachable");
 }
 
 #[tokio::test]
 #[ignore = "requires network: queries live mainnet overlay for tm_mpc_signing"]
 async fn test_live_lookup_resolver_tm_mpc_signing() {
-    use bsv::overlay::{LookupAnswer, LookupQuestion, LookupResolver, LookupResolverConfig, NetworkPreset};
+    use bsv::overlay::{
+        LookupAnswer, LookupQuestion, LookupResolver, LookupResolverConfig, NetworkPreset,
+    };
 
     let resolver = LookupResolver::new(LookupResolverConfig {
         network_preset: NetworkPreset::Mainnet,
         ..Default::default()
     });
 
-    let question = LookupQuestion::new(
-        "ls_ship",
-        serde_json::json!({"topics": [MPC_TOPIC]}),
-    );
+    let question = LookupQuestion::new("ls_ship", serde_json::json!({"topics": [MPC_TOPIC]}));
 
     // This should succeed (possibly with 0 outputs if nobody registered yet)
     match resolver.query(&question, Some(10_000)).await {
@@ -428,5 +430,9 @@ async fn test_live_health_check() {
     // The overlay tracker may or may not have a /health endpoint,
     // but verify_node_health should not panic or error
     let result = discovery::verify_node_health(&node).await;
-    assert!(result.is_ok(), "Health check should not error: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "Health check should not error: {:?}",
+        result
+    );
 }

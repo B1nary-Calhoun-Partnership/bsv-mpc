@@ -99,10 +99,7 @@ pub async fn discover_nodes(
         }
     } else {
         let mut additional = HashMap::new();
-        additional.insert(
-            "ls_ship".to_string(),
-            vec![overlay_url.to_string()],
-        );
+        additional.insert("ls_ship".to_string(), vec![overlay_url.to_string()]);
         LookupResolverConfig {
             network_preset: NetworkPreset::Mainnet,
             additional_hosts: Some(additional),
@@ -114,10 +111,7 @@ pub async fn discover_nodes(
 
     // Query for SHIP tokens advertising tm_mpc_signing
     // This is the pattern from POC 14 test 6
-    let question = LookupQuestion::new(
-        "ls_ship",
-        serde_json::json!({"topics": [MPC_TOPIC]}),
-    );
+    let question = LookupQuestion::new("ls_ship", serde_json::json!({"topics": [MPC_TOPIC]}));
 
     let answer = resolver.query(&question, Some(10_000)).await.map_err(|e| {
         OverlayError::LookupFailed(format!("SHIP lookup for {} failed: {}", MPC_TOPIC, e))
@@ -128,11 +122,7 @@ pub async fn discover_nodes(
 
     match answer {
         LookupAnswer::OutputList { outputs } => {
-            tracing::debug!(
-                "Got {} output(s) for {} lookup",
-                outputs.len(),
-                MPC_TOPIC
-            );
+            tracing::debug!("Got {} output(s) for {} lookup", outputs.len(), MPC_TOPIC);
 
             for output in outputs {
                 // Parse BEEF to get the transaction
@@ -227,7 +217,9 @@ pub async fn discover_nodes(
     // Deduplicate by identity_key (keep the most recently published)
     let mut deduped: HashMap<String, MpcNodeInfo> = HashMap::new();
     for node in filtered {
-        let entry = deduped.entry(node.identity_key.clone()).or_insert_with(|| node.clone());
+        let entry = deduped
+            .entry(node.identity_key.clone())
+            .or_insert_with(|| node.clone());
         if node.published_at > entry.published_at {
             *entry = node;
         }
@@ -261,10 +253,7 @@ pub async fn discover_nodes(
 /// # Returns
 ///
 /// The number of participation proofs published by this node.
-pub async fn node_reputation(
-    overlay_url: &str,
-    identity_key: &str,
-) -> Result<u64, OverlayError> {
+pub async fn node_reputation(overlay_url: &str, identity_key: &str) -> Result<u64, OverlayError> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()?;
@@ -336,11 +325,7 @@ pub async fn verify_node_health(node: &MpcNodeInfo) -> Result<bool, OverlayError
             if healthy {
                 tracing::debug!("Node {} is healthy", node.domain);
             } else {
-                tracing::debug!(
-                    "Node {} returned HTTP {}",
-                    node.domain,
-                    resp.status()
-                );
+                tracing::debug!("Node {} returned HTTP {}", node.domain, resp.status());
             }
             Ok(healthy)
         }
@@ -419,10 +404,7 @@ pub async fn discover_healthy_nodes(
 /// # Returns
 ///
 /// Filtered, deduplicated, and sorted nodes.
-pub fn filter_and_rank_nodes(
-    nodes: Vec<MpcNodeInfo>,
-    query: &DiscoveryQuery,
-) -> Vec<MpcNodeInfo> {
+pub fn filter_and_rank_nodes(nodes: Vec<MpcNodeInfo>, query: &DiscoveryQuery) -> Vec<MpcNodeInfo> {
     let limit = query.limit.unwrap_or(20);
     let default_curve = "secp256k1".to_string();
     let curve = query.curve.as_ref().unwrap_or(&default_curve);
@@ -470,7 +452,13 @@ pub fn filter_and_rank_nodes(
 mod tests {
     use super::*;
 
-    fn make_node(key: &str, domain: &str, fee: u64, curves: Vec<&str>, thresholds: Vec<&str>) -> MpcNodeInfo {
+    fn make_node(
+        key: &str,
+        domain: &str,
+        fee: u64,
+        curves: Vec<&str>,
+        thresholds: Vec<&str>,
+    ) -> MpcNodeInfo {
         MpcNodeInfo {
             identity_key: key.to_string(),
             domain: domain.to_string(),
@@ -489,7 +477,13 @@ mod tests {
         let nodes = vec![
             make_node("key1", "a.com", 100, vec!["secp256k1"], vec!["2-of-2"]),
             make_node("key2", "b.com", 200, vec!["ed25519"], vec!["2-of-2"]),
-            make_node("key3", "c.com", 150, vec!["secp256k1", "ed25519"], vec!["2-of-2"]),
+            make_node(
+                "key3",
+                "c.com",
+                150,
+                vec!["secp256k1", "ed25519"],
+                vec!["2-of-2"],
+            ),
         ];
 
         let query = DiscoveryQuery {
@@ -499,7 +493,9 @@ mod tests {
 
         let result = filter_and_rank_nodes(nodes, &query);
         assert_eq!(result.len(), 2);
-        assert!(result.iter().all(|n| n.curves.contains(&"secp256k1".to_string())));
+        assert!(result
+            .iter()
+            .all(|n| n.curves.contains(&"secp256k1".to_string())));
     }
 
     #[test]
@@ -507,7 +503,13 @@ mod tests {
         let nodes = vec![
             make_node("key1", "a.com", 100, vec!["secp256k1"], vec!["2-of-2"]),
             make_node("key2", "b.com", 200, vec!["secp256k1"], vec!["2-of-3"]),
-            make_node("key3", "c.com", 150, vec!["secp256k1"], vec!["2-of-2", "2-of-3"]),
+            make_node(
+                "key3",
+                "c.com",
+                150,
+                vec!["secp256k1"],
+                vec!["2-of-2", "2-of-3"],
+            ),
         ];
 
         let query = DiscoveryQuery {
@@ -629,7 +631,13 @@ mod tests {
         let nodes = vec![
             make_node("key1", "a.com", 100, vec!["secp256k1"], vec!["2-of-2"]),
             make_node("key2", "b.com", 500, vec!["secp256k1"], vec!["2-of-3"]),
-            make_node("key3", "c.com", 200, vec!["secp256k1"], vec!["2-of-2", "2-of-3"]),
+            make_node(
+                "key3",
+                "c.com",
+                200,
+                vec!["secp256k1"],
+                vec!["2-of-2", "2-of-3"],
+            ),
             make_node("key4", "d.com", 300, vec!["ed25519"], vec!["2-of-3"]),
         ];
 

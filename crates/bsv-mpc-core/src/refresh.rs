@@ -320,10 +320,7 @@ mod tests {
 
     // ---- Helper: run DKG keygen only (no aux info) ----
 
-    async fn run_keygen(
-        n: u16,
-        t: u16,
-    ) -> Vec<cggmp24::key_share::IncompleteKeyShare<Secp256k1>> {
+    async fn run_keygen(n: u16, t: u16) -> Vec<cggmp24::key_share::IncompleteKeyShare<Secp256k1>> {
         let mut rng = rand::rngs::OsRng;
         let eid_bytes: [u8; 32] = rng.gen();
         let eid = ExecutionId::new(&eid_bytes);
@@ -537,7 +534,12 @@ mod tests {
 
         // Step 4: Verify joint public key is unchanged via Lagrange reconstruction
         assert!(
-            verify_reshare(&joint_pubkey, &new_public_shares, &all_eval_points, t as usize),
+            verify_reshare(
+                &joint_pubkey,
+                &new_public_shares,
+                &all_eval_points,
+                t as usize
+            ),
             "joint public key must be unchanged after resharing"
         );
     }
@@ -683,7 +685,10 @@ mod tests {
         for subset in &[[0u16, 1], [0, 2], [1, 2]] {
             let sig = sign_with_parties(&new_key_shares, subset, &data).await;
             sig.verify(&joint_pubkey, &data).unwrap_or_else(|_| {
-                panic!("subset [{}, {}] must produce valid signature", subset[0], subset[1])
+                panic!(
+                    "subset [{}, {}] must produce valid signature",
+                    subset[0], subset[1]
+                )
             });
         }
     }
@@ -703,10 +708,7 @@ mod tests {
 
         // Generate 5 new evaluation points (simple: Scalar::from(1), ..., Scalar::from(5))
         let new_eval_points: Vec<NonZero<Scalar<Secp256k1>>> = (1..=new_n)
-            .map(|i| {
-                NonZero::from_scalar(Scalar::from(i as u64))
-                    .expect("small nonzero scalar")
-            })
+            .map(|i| NonZero::from_scalar(Scalar::from(i as u64)).expect("small nonzero scalar"))
             .collect();
 
         let mut rng = rand::rngs::OsRng;

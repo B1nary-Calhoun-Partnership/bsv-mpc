@@ -161,10 +161,10 @@ impl ProxyBuilder {
             )
         });
 
-        let presign_manager = Arc::new(RwLock::new(
-            self.presign_manager
-                .unwrap_or_else(|| PresignManager::new(self.config.max_presignatures)),
-        ));
+        let presign_manager =
+            Arc::new(RwLock::new(self.presign_manager.unwrap_or_else(|| {
+                PresignManager::new(self.config.max_presignatures)
+            })));
 
         let storage: Arc<dyn StorageBackend> = self
             .storage
@@ -209,9 +209,7 @@ pub async fn run(config: ProxyConfig) -> anyhow::Result<()> {
         config.fee_threshold.clone(),
     );
 
-    let presign_manager = Arc::new(RwLock::new(PresignManager::new(
-        config.max_presignatures,
-    )));
+    let presign_manager = Arc::new(RwLock::new(PresignManager::new(config.max_presignatures)));
 
     let storage: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new());
 
@@ -274,10 +272,7 @@ pub async fn run(config: ProxyConfig) -> anyhow::Result<()> {
         // locally; signing uses the MPC bridge.
         .route("/listCertificates", post(wallet_api::list_certificates))
         .route("/proveCertificate", post(wallet_api::prove_certificate))
-        .route(
-            "/acquireCertificate",
-            post(wallet_api::acquire_certificate),
-        )
+        .route("/acquireCertificate", post(wallet_api::acquire_certificate))
         .route(
             "/relinquishCertificate",
             post(wallet_api::relinquish_certificate),

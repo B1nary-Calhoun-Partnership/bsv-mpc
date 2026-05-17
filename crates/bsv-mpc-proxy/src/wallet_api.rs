@@ -147,7 +147,10 @@ async fn compute_signing_hmac_offset(
         }
     };
 
-    Ok(bsv_mpc_core::hd::compute_brc42_hmac(&shared_secret, &invoice))
+    Ok(bsv_mpc_core::hd::compute_brc42_hmac(
+        &shared_secret,
+        &invoice,
+    ))
 }
 
 /// Derive the expected BRC-42 child public key for signature verification.
@@ -294,7 +297,7 @@ fn read_varint_from(data: &[u8], offset: &mut usize) -> Result<u64, String> {
 struct SighashParams<'a> {
     version: u32,
     inputs: &'a [([u8; 32], u32, u32)], // (txid_internal, vout, sequence)
-    outputs: &'a [(u64, &'a [u8])],      // (satoshis, locking_script)
+    outputs: &'a [(u64, &'a [u8])],     // (satoshis, locking_script)
     locktime: u32,
     input_index: usize,
     subscript: &'a [u8], // locking script of the UTXO being spent
@@ -369,7 +372,7 @@ fn compute_bip143_sighash(params: &SighashParams<'_>) -> [u8; 32] {
 fn serialize_signed_tx(
     version: u32,
     inputs: &[([u8; 32], u32, Vec<u8>, u32)], // (txid, vout, unlocking_script, sequence)
-    outputs: &[(u64, Vec<u8>)],                 // (satoshis, locking_script)
+    outputs: &[(u64, Vec<u8>)],               // (satoshis, locking_script)
     locktime: u32,
 ) -> Vec<u8> {
     let mut buf = Vec::new();
@@ -487,14 +490,8 @@ fn parse_input_txids(raw_tx: &[u8]) -> Result<Vec<String>, String> {
 }
 
 /// Fetch raw transaction hex from WhatsOnChain and return decoded bytes.
-async fn get_raw_tx_from_woc(
-    client: &reqwest::Client,
-    txid: &str,
-) -> Result<Vec<u8>, String> {
-    let url = format!(
-        "https://api.whatsonchain.com/v1/bsv/main/tx/{}/hex",
-        txid
-    );
+async fn get_raw_tx_from_woc(client: &reqwest::Client, txid: &str) -> Result<Vec<u8>, String> {
+    let url = format!("https://api.whatsonchain.com/v1/bsv/main/tx/{}/hex", txid);
     let resp = client
         .get(&url)
         .send()
@@ -509,9 +506,11 @@ async fn get_raw_tx_from_woc(
         ));
     }
 
-    let hex_str = resp.text().await.map_err(|e| format!("WoC read body: {}", e))?;
-    hex::decode(hex_str.trim().trim_matches('"'))
-        .map_err(|e| format!("bad hex from WoC: {}", e))
+    let hex_str = resp
+        .text()
+        .await
+        .map_err(|e| format!("WoC read body: {}", e))?;
+    hex::decode(hex_str.trim().trim_matches('"')).map_err(|e| format!("bad hex from WoC: {}", e))
 }
 
 /// Convert a TSC proof (from WoC) into a BRC-74 MerklePath.
@@ -554,8 +553,7 @@ fn tsc_to_merkle_path(
         current_offset /= 2;
     }
 
-    MerklePath::new_unchecked(block_height, path)
-        .map_err(|e| format!("invalid merkle path: {}", e))
+    MerklePath::new_unchecked(block_height, path).map_err(|e| format!("invalid merkle path: {}", e))
 }
 
 /// Fetch a TSC merkle proof from WoC and convert to BRC-74 MerklePath.
@@ -563,10 +561,7 @@ fn tsc_to_merkle_path(
 /// Returns `None` if the transaction is unconfirmed (no proof available).
 /// Uses the `/tx/{txid}/proof/tsc` endpoint which returns TSC format,
 /// and the `/tx/hash/{txid}` endpoint for block height.
-async fn get_merkle_proof_from_woc(
-    client: &reqwest::Client,
-    txid: &str,
-) -> Option<MerklePath> {
+async fn get_merkle_proof_from_woc(client: &reqwest::Client, txid: &str) -> Option<MerklePath> {
     // Get TSC proof
     let tsc_url = format!(
         "https://api.whatsonchain.com/v1/bsv/main/tx/{}/proof/tsc",
@@ -598,10 +593,7 @@ async fn get_merkle_proof_from_woc(
         .collect();
 
     // Get block height from tx details
-    let tx_url = format!(
-        "https://api.whatsonchain.com/v1/bsv/main/tx/hash/{}",
-        txid
-    );
+    let tx_url = format!("https://api.whatsonchain.com/v1/bsv/main/tx/hash/{}", txid);
     let tx_resp = client.get(&tx_url).send().await.ok()?;
     if !tx_resp.status().is_success() {
         return None;
@@ -648,10 +640,16 @@ async fn construct_beef(
             // Parent is confirmed — add with its BUMP
             let bump_idx = beef.merge_bump(merkle_path);
             beef.merge_raw_tx(parent_raw, Some(bump_idx));
-            tracing::debug!(parent_txid, "Added confirmed parent with merkle proof to BEEF");
+            tracing::debug!(
+                parent_txid,
+                "Added confirmed parent with merkle proof to BEEF"
+            );
         } else {
             // Parent is unconfirmed — need to find a confirmed ancestor
-            tracing::debug!(parent_txid, "Parent unconfirmed, looking for confirmed ancestor");
+            tracing::debug!(
+                parent_txid,
+                "Parent unconfirmed, looking for confirmed ancestor"
+            );
 
             // Parse the parent's inputs to find grandparent txids
             let grandparent_txids = match parse_input_txids(&parent_raw) {
@@ -683,10 +681,7 @@ async fn construct_beef(
             }
 
             if !found_ancestor {
-                tracing::warn!(
-                    parent_txid,
-                    "No confirmed ancestor found within 2 levels"
-                );
+                tracing::warn!(parent_txid, "No confirmed ancestor found within 2 levels");
                 return None;
             }
 
@@ -775,13 +770,8 @@ async fn broadcast_tx(
                         || text.contains("MINED")
                     {
                         let response: serde_json::Value = serde_json::from_str(&text)
-                            .unwrap_or_else(|_| {
-                                json!({ "status": "success", "raw": text })
-                            });
-                        tracing::info!(
-                            endpoint,
-                            "ARC broadcast successful with BEEF"
-                        );
+                            .unwrap_or_else(|_| json!({ "status": "success", "raw": text }));
+                        tracing::info!(endpoint, "ARC broadcast successful with BEEF");
                         return Ok(response);
                     }
 
@@ -806,9 +796,8 @@ async fn broadcast_tx(
     // Step 3: Retry ARC with raw tx (for cases where parents are already known
     // to ARC, e.g. spending confirmed UTXOs where BEEF construction failed)
     {
-        let arc_endpoints: Vec<(&str, Option<&str>)> = vec![
-            ("https://arc.taal.com", Some(arc_api_key)),
-        ];
+        let arc_endpoints: Vec<(&str, Option<&str>)> =
+            vec![("https://arc.taal.com", Some(arc_api_key))];
 
         for (endpoint, api_key) in &arc_endpoints {
             let url = format!("{}/v1/tx", endpoint);
@@ -832,13 +821,8 @@ async fn broadcast_tx(
                         || text.contains("MINED")
                     {
                         let response: serde_json::Value = serde_json::from_str(&text)
-                            .unwrap_or_else(|_| {
-                                json!({ "status": "success", "raw": text })
-                            });
-                        tracing::info!(
-                            endpoint,
-                            "ARC broadcast successful with raw tx"
-                        );
+                            .unwrap_or_else(|_| json!({ "status": "success", "raw": text }));
+                        tracing::info!(endpoint, "ARC broadcast successful with raw tx");
                         return Ok(response);
                     }
 
@@ -1264,15 +1248,11 @@ pub async fn create_action_impl(state: &AppState, body: Value) -> Value {
     for (i, o) in outputs_json.iter().enumerate() {
         let sats = match o.get("satoshis").and_then(|v| v.as_u64()) {
             Some(s) => s,
-            None => {
-                return json!({"error": format!("output[{}]: missing satoshis", i)})
-            }
+            None => return json!({"error": format!("output[{}]: missing satoshis", i)}),
         };
         let script_hex = match o.get("lockingScript").and_then(|v| v.as_str()) {
             Some(s) => s,
-            None => {
-                return json!({"error": format!("output[{}]: missing lockingScript", i)})
-            }
+            None => return json!({"error": format!("output[{}]: missing lockingScript", i)}),
         };
         let script = match hex::decode(script_hex) {
             Ok(b) => b,
@@ -1370,9 +1350,7 @@ pub async fn create_action_impl(state: &AppState, body: Value) -> Value {
                     "MPC fee injected"
                 );
             }
-            Err(e) => {
-                return json!({"error": format!("fee injection failed: {}", e)})
-            }
+            Err(e) => return json!({"error": format!("fee injection failed: {}", e)}),
         }
     }
 
@@ -1381,9 +1359,7 @@ pub async fn create_action_impl(state: &AppState, body: Value) -> Value {
     for utxo in &selected_utxos {
         let decoded = match hex::decode(&utxo.txid) {
             Ok(b) if b.len() == 32 => b,
-            _ => {
-                return json!({"error": format!("invalid txid hex: {}", utxo.txid)})
-            }
+            _ => return json!({"error": format!("invalid txid hex: {}", utxo.txid)}),
         };
         let mut txid_bytes = [0u8; 32];
         txid_bytes.copy_from_slice(&decoded);
@@ -1430,9 +1406,7 @@ pub async fn create_action_impl(state: &AppState, body: Value) -> Value {
         // compute_signing_hmac_offset() and use the derived pubkey for subscript.
         let signing_result = match state.bridge.sign(&sighash, presig, None).await {
             Ok(result) => result,
-            Err(e) => {
-                return json!({"error": format!("signing input {} failed: {}", i, e)})
-            }
+            Err(e) => return json!({"error": format!("signing input {} failed: {}", i, e)}),
         };
 
         // Build checksig format: DER signature + sighash type byte (0x41)
@@ -1507,16 +1481,20 @@ pub async fn create_action_impl(state: &AppState, body: Value) -> Value {
         // Track change output (if non-dust)
         let change_sats = outputs[change_index].0;
         if change_sats > 0 {
-            if let Err(e) = state.storage.add_output(TrackedOutput {
-                txid: txid.clone(),
-                vout: change_index as u32,
-                satoshis: change_sats,
-                locking_script: change_script,
-                spending_txid: None,
-                basket: Some("default".into()),
-                tags: vec![],
-                created_at: chrono::Utc::now(),
-            }).await {
+            if let Err(e) = state
+                .storage
+                .add_output(TrackedOutput {
+                    txid: txid.clone(),
+                    vout: change_index as u32,
+                    satoshis: change_sats,
+                    locking_script: change_script,
+                    spending_txid: None,
+                    basket: Some("default".into()),
+                    tags: vec![],
+                    created_at: chrono::Utc::now(),
+                })
+                .await
+            {
                 tracing::warn!(error = %e, "Failed to track change output");
             }
         }
@@ -1639,16 +1617,20 @@ pub async fn internalize_action_impl(state: &AppState, body: Value) -> Value {
                 );
             }
 
-            if let Err(e) = state.storage.add_output(TrackedOutput {
-                txid: txid.clone(),
-                vout: output_index as u32,
-                satoshis,
-                locking_script: script.clone(),
-                spending_txid: None,
-                basket: Some(basket.to_string()),
-                tags: vec![],
-                created_at: chrono::Utc::now(),
-            }).await {
+            if let Err(e) = state
+                .storage
+                .add_output(TrackedOutput {
+                    txid: txid.clone(),
+                    vout: output_index as u32,
+                    satoshis,
+                    locking_script: script.clone(),
+                    spending_txid: None,
+                    basket: Some(basket.to_string()),
+                    tags: vec![],
+                    created_at: chrono::Utc::now(),
+                })
+                .await
+            {
                 tracing::warn!(output_index, error = %e, "Failed to track internalized output");
             }
             accepted_count += 1;
@@ -1657,16 +1639,20 @@ pub async fn internalize_action_impl(state: &AppState, body: Value) -> Value {
         // No specific outputs — scan all outputs for ones matching our root key
         for (vout, (satoshis, script)) in tx_outputs.iter().enumerate() {
             if *script == our_script {
-                if let Err(e) = state.storage.add_output(TrackedOutput {
-                    txid: txid.clone(),
-                    vout: vout as u32,
-                    satoshis: *satoshis,
-                    locking_script: script.clone(),
-                    spending_txid: None,
-                    basket: Some(basket.to_string()),
-                    tags: vec![],
-                    created_at: chrono::Utc::now(),
-                }).await {
+                if let Err(e) = state
+                    .storage
+                    .add_output(TrackedOutput {
+                        txid: txid.clone(),
+                        vout: vout as u32,
+                        satoshis: *satoshis,
+                        locking_script: script.clone(),
+                        spending_txid: None,
+                        basket: Some(basket.to_string()),
+                        tags: vec![],
+                        created_at: chrono::Utc::now(),
+                    })
+                    .await
+                {
                     tracing::warn!(vout, error = %e, "Failed to track scanned output");
                 }
                 accepted_count += 1;
@@ -1706,7 +1692,7 @@ fn is_beef_format(bytes: &[u8]) -> bool {
     let magic = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
     magic == 0x01010101  // ATOMIC_BEEF
         || magic == 0xEFBE0001  // BEEF_V1
-        || magic == 0xEFBE0002  // BEEF_V2
+        || magic == 0xEFBE0002 // BEEF_V2
 }
 
 /// `(outputs: Vec<(satoshis, locking_script_bytes)>, txid_hex)` extracted
@@ -1720,8 +1706,7 @@ type BeefExtractedTx = Result<(Vec<(u64, Vec<u8>)>, String), String>;
 fn extract_tx_from_beef(bytes: &[u8]) -> BeefExtractedTx {
     use bsv::transaction::Beef;
 
-    let beef = Beef::from_binary(bytes)
-        .map_err(|e| format!("Beef::from_binary failed: {}", e))?;
+    let beef = Beef::from_binary(bytes).map_err(|e| format!("Beef::from_binary failed: {}", e))?;
 
     // Determine the target transaction ID:
     // - AtomicBEEF has an explicit atomic_txid
@@ -1743,15 +1728,18 @@ fn extract_tx_from_beef(bytes: &[u8]) -> BeefExtractedTx {
     );
 
     // Find the target transaction in the BEEF
-    let beef_tx = beef.find_txid(&target_txid)
+    let beef_tx = beef
+        .find_txid(&target_txid)
         .ok_or_else(|| format!("target tx {} not found in BEEF", target_txid))?;
 
     // Extract outputs from the BeefTx.
     // Try the parsed Transaction first, then fall back to raw bytes.
     if let Some(tx) = beef_tx.tx() {
-        let outputs: Vec<(u64, Vec<u8>)> = tx.outputs.iter().map(|o| {
-            (o.get_satoshis(), o.locking_script.to_binary())
-        }).collect();
+        let outputs: Vec<(u64, Vec<u8>)> = tx
+            .outputs
+            .iter()
+            .map(|o| (o.get_satoshis(), o.locking_script.to_binary()))
+            .collect();
         let txid = tx.id();
         Ok((outputs, txid))
     } else if let Some(raw_tx) = beef_tx.raw_tx() {
@@ -1761,7 +1749,10 @@ fn extract_tx_from_beef(bytes: &[u8]) -> BeefExtractedTx {
         let txid = compute_txid(raw_tx);
         Ok((outputs, txid))
     } else {
-        Err(format!("BEEF tx {} has no transaction data (txid-only entry)", target_txid))
+        Err(format!(
+            "BEEF tx {} has no transaction data (txid-only entry)",
+            target_txid
+        ))
     }
 }
 
@@ -1808,18 +1799,13 @@ pub async fn encrypt_impl(state: &AppState, body: Value) -> Value {
     };
 
     // Derive 32-byte symmetric key via BRC-42
-    let sym_key = match derive_symmetric_key(
-        &state.bridge,
-        level,
-        &protocol_name,
-        &key_id,
-        &counterparty,
-    )
-    .await
-    {
-        Ok(key) => key,
-        Err(e) => return json!({ "error": e }),
-    };
+    let sym_key =
+        match derive_symmetric_key(&state.bridge, level, &protocol_name, &key_id, &counterparty)
+            .await
+        {
+            Ok(key) => key,
+            Err(e) => return json!({ "error": e }),
+        };
 
     // AES-256-GCM encrypt with random 12-byte nonce
     let mut nonce_bytes = [0u8; 12];
@@ -1842,10 +1828,7 @@ pub async fn encrypt_impl(state: &AppState, body: Value) -> Value {
 }
 
 /// Axum handler for `POST /encrypt`. Delegates to [`encrypt_impl`].
-pub async fn encrypt(
-    State(state): State<Arc<AppState>>,
-    Json(body): Json<Value>,
-) -> Json<Value> {
+pub async fn encrypt(State(state): State<Arc<AppState>>, Json(body): Json<Value>) -> Json<Value> {
     Json(encrypt_impl(&state, body).await)
 }
 
@@ -1894,18 +1877,13 @@ pub async fn decrypt_impl(state: &AppState, body: Value) -> Value {
     let ciphertext = &data[12..];
 
     // Derive same symmetric key
-    let sym_key = match derive_symmetric_key(
-        &state.bridge,
-        level,
-        &protocol_name,
-        &key_id,
-        &counterparty,
-    )
-    .await
-    {
-        Ok(key) => key,
-        Err(e) => return json!({ "error": e }),
-    };
+    let sym_key =
+        match derive_symmetric_key(&state.bridge, level, &protocol_name, &key_id, &counterparty)
+            .await
+        {
+            Ok(key) => key,
+            Err(e) => return json!({ "error": e }),
+        };
 
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&sym_key));
 
@@ -1918,10 +1896,7 @@ pub async fn decrypt_impl(state: &AppState, body: Value) -> Value {
 }
 
 /// Axum handler for `POST /decrypt`. Delegates to [`decrypt_impl`].
-pub async fn decrypt(
-    State(state): State<Arc<AppState>>,
-    Json(body): Json<Value>,
-) -> Json<Value> {
+pub async fn decrypt(State(state): State<Arc<AppState>>, Json(body): Json<Value>) -> Json<Value> {
     Json(decrypt_impl(&state, body).await)
 }
 
@@ -1961,22 +1936,17 @@ pub async fn create_hmac_impl(state: &AppState, body: Value) -> Value {
     };
 
     // Derive HMAC key via BRC-42 (same derivation path as encrypt/decrypt)
-    let hmac_key = match derive_symmetric_key(
-        &state.bridge,
-        level,
-        &protocol_name,
-        &key_id,
-        &counterparty,
-    )
-    .await
-    {
-        Ok(key) => key,
-        Err(e) => return json!({ "error": e }),
-    };
+    let hmac_key =
+        match derive_symmetric_key(&state.bridge, level, &protocol_name, &key_id, &counterparty)
+            .await
+        {
+            Ok(key) => key,
+            Err(e) => return json!({ "error": e }),
+        };
 
     // HMAC-SHA256
-    let mut mac =
-        <Hmac<Sha256> as Mac>::new_from_slice(&hmac_key).expect("HMAC-SHA256 accepts any key length");
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&hmac_key)
+        .expect("HMAC-SHA256 accepts any key length");
     mac.update(&data);
     let result = mac.finalize();
 
@@ -2038,22 +2008,17 @@ pub async fn verify_hmac_impl(state: &AppState, body: Value) -> Value {
     };
 
     // Derive HMAC key
-    let hmac_key = match derive_symmetric_key(
-        &state.bridge,
-        level,
-        &protocol_name,
-        &key_id,
-        &counterparty,
-    )
-    .await
-    {
-        Ok(key) => key,
-        Err(e) => return json!({ "error": e }),
-    };
+    let hmac_key =
+        match derive_symmetric_key(&state.bridge, level, &protocol_name, &key_id, &counterparty)
+            .await
+        {
+            Ok(key) => key,
+            Err(e) => return json!({ "error": e }),
+        };
 
     // Compute HMAC and verify with constant-time comparison
-    let mut mac =
-        <Hmac<Sha256> as Mac>::new_from_slice(&hmac_key).expect("HMAC-SHA256 accepts any key length");
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&hmac_key)
+        .expect("HMAC-SHA256 accepts any key length");
     mac.update(&data);
 
     // verify_slice uses constant-time comparison (from subtle crate)
@@ -2075,16 +2040,20 @@ pub async fn verify_hmac(
 /// Library-callable version of `list_outputs`. Accepts parsed state and request body directly.
 pub async fn list_outputs_impl(state: &AppState, body: Value) -> Value {
     let basket = body["basket"].as_str();
-    let tags: Option<Vec<String>> = body["tags"]
-        .as_array()
-        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect());
+    let tags: Option<Vec<String>> = body["tags"].as_array().map(|arr| {
+        arr.iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect()
+    });
     let include_locking_scripts = body["include"].as_str() == Some("locking scripts");
     let limit = body["limit"].as_u64().unwrap_or(100) as usize;
     let offset = body["offset"].as_u64().unwrap_or(0) as usize;
 
     let unspent = match state.storage.list_unspent(basket, tags.as_deref()).await {
         Ok(u) => u,
-        Err(e) => return json!({"error": format!("storage error: {e}"), "totalOutputs": 0, "outputs": []}),
+        Err(e) => {
+            return json!({"error": format!("storage error: {e}"), "totalOutputs": 0, "outputs": []})
+        }
     };
 
     let total = unspent.len();
@@ -2380,9 +2349,9 @@ mod tests {
 
     /// Same test key as POC 3 / POC 9 / hd.rs tests.
     const TEST_KEY_BYTES: [u8; 32] = [
-        0x0b, 0x1e, 0x2c, 0x3d, 0x4e, 0x5f, 0x6a, 0x7b, 0x8c, 0x9d, 0xae, 0xbf, 0xc0, 0xd1,
-        0xe2, 0xf3, 0x14, 0x25, 0x36, 0x47, 0x58, 0x69, 0x7a, 0x8b, 0x9c, 0xad, 0xbe, 0xcf,
-        0xd0, 0xe1, 0xf2, 0x03,
+        0x0b, 0x1e, 0x2c, 0x3d, 0x4e, 0x5f, 0x6a, 0x7b, 0x8c, 0x9d, 0xae, 0xbf, 0xc0, 0xd1, 0xe2,
+        0xf3, 0x14, 0x25, 0x36, 0x47, 0x58, 0x69, 0x7a, 0x8b, 0x9c, 0xad, 0xbe, 0xcf, 0xd0, 0xe1,
+        0xf2, 0x03,
     ];
 
     fn test_joint_key() -> JointPublicKey {
@@ -2512,7 +2481,11 @@ mod tests {
             "counterparty": "anyone"
         });
         let Json(enc_resp) = encrypt(State(state.clone()), Json(encrypt_body)).await;
-        assert!(enc_resp.get("error").is_none(), "encrypt should succeed: {:?}", enc_resp);
+        assert!(
+            enc_resp.get("error").is_none(),
+            "encrypt should succeed: {:?}",
+            enc_resp
+        );
         let ciphertext_b64 = enc_resp["ciphertext"].as_str().unwrap();
 
         // Verify ciphertext is different from plaintext
@@ -2526,7 +2499,11 @@ mod tests {
             "counterparty": "anyone"
         });
         let Json(dec_resp) = decrypt(State(state.clone()), Json(decrypt_body)).await;
-        assert!(dec_resp.get("error").is_none(), "decrypt should succeed: {:?}", dec_resp);
+        assert!(
+            dec_resp.get("error").is_none(),
+            "decrypt should succeed: {:?}",
+            dec_resp
+        );
         let result_b64 = dec_resp["plaintext"].as_str().unwrap();
         let result = BASE64.decode(result_b64).unwrap();
         assert_eq!(result, plaintext.as_bytes());
@@ -2554,7 +2531,9 @@ mod tests {
         });
         let Json(dec_resp) = decrypt(State(state.clone()), Json(decrypt_body)).await;
         assert!(dec_resp.get("error").is_none());
-        let result = BASE64.decode(dec_resp["plaintext"].as_str().unwrap()).unwrap();
+        let result = BASE64
+            .decode(dec_resp["plaintext"].as_str().unwrap())
+            .unwrap();
         assert!(result.is_empty());
     }
 
@@ -2600,7 +2579,10 @@ mod tests {
             "counterparty": "anyone"
         });
         let Json(dec_resp) = decrypt(State(state.clone()), Json(dec_body)).await;
-        assert!(dec_resp.get("error").is_some(), "wrong key should fail decryption");
+        assert!(
+            dec_resp.get("error").is_some(),
+            "wrong key should fail decryption"
+        );
     }
 
     #[tokio::test]
@@ -2646,9 +2628,17 @@ mod tests {
             "counterparty": "anyone"
         });
         let Json(resp) = create_hmac(State(state), Json(body)).await;
-        assert!(resp.get("error").is_none(), "create_hmac should succeed: {:?}", resp);
+        assert!(
+            resp.get("error").is_none(),
+            "create_hmac should succeed: {:?}",
+            resp
+        );
         let hmac_hex = resp["hmac"].as_str().unwrap();
-        assert_eq!(hmac_hex.len(), 64, "HMAC-SHA256 should be 32 bytes = 64 hex chars");
+        assert_eq!(
+            hmac_hex.len(),
+            64,
+            "HMAC-SHA256 should be 32 bytes = 64 hex chars"
+        );
     }
 
     #[tokio::test]
@@ -2766,7 +2756,11 @@ mod tests {
             "forSelf": true
         });
         let Json(resp) = verify_signature(State(state), Json(body)).await;
-        assert!(resp.get("error").is_none(), "verify should succeed: {:?}", resp);
+        assert!(
+            resp.get("error").is_none(),
+            "verify should succeed: {:?}",
+            resp
+        );
         assert_eq!(resp["valid"], true);
     }
 
@@ -2849,7 +2843,9 @@ mod tests {
         });
         let Json(dec_resp) = decrypt(State(state), Json(dec_body)).await;
         assert!(dec_resp.get("error").is_none());
-        let result = BASE64.decode(dec_resp["plaintext"].as_str().unwrap()).unwrap();
+        let result = BASE64
+            .decode(dec_resp["plaintext"].as_str().unwrap())
+            .unwrap();
         assert_eq!(result, large_data);
     }
 
@@ -2947,11 +2943,18 @@ mod tests {
             "counterparty": "anyone",
         });
         let Json(derived_resp) = get_public_key(State(state), Json(derived_body)).await;
-        assert!(derived_resp.get("error").is_none(), "should succeed: {:?}", derived_resp);
+        assert!(
+            derived_resp.get("error").is_none(),
+            "should succeed: {:?}",
+            derived_resp
+        );
 
         let derived_hex = derived_resp["publicKey"].as_str().unwrap();
         assert_eq!(derived_hex.len(), 66);
-        assert_ne!(derived_hex, identity_hex, "derived key should differ from identity");
+        assert_ne!(
+            derived_hex, identity_hex,
+            "derived key should differ from identity"
+        );
     }
 
     #[tokio::test]
@@ -3011,15 +3014,21 @@ mod tests {
             version: 1,
             inputs: &[(txid, 0, 0xFFFFFFFF)],
             outputs: &[(1000, &subscript)],
-            locktime: 0, input_index: 0, subscript: &subscript,
-            input_satoshis: 5000, sighash_type: 0x41,
+            locktime: 0,
+            input_index: 0,
+            subscript: &subscript,
+            input_satoshis: 5000,
+            sighash_type: 0x41,
         });
         let h2 = compute_bip143_sighash(&SighashParams {
             version: 1,
             inputs: &[(txid, 0, 0xFFFFFFFF)],
             outputs: &[(1000, &subscript)],
-            locktime: 0, input_index: 0, subscript: &subscript,
-            input_satoshis: 5000, sighash_type: 0x41,
+            locktime: 0,
+            input_index: 0,
+            subscript: &subscript,
+            input_satoshis: 5000,
+            sighash_type: 0x41,
         });
         assert_eq!(h1, h2, "same inputs must produce same sighash");
         assert_ne!(h1, [0u8; 32], "sighash should not be zero");
@@ -3034,15 +3043,21 @@ mod tests {
             version: 1,
             inputs: &[(txid, 0, 0xFFFFFFFF)],
             outputs: &[(1000, &subscript)],
-            locktime: 0, input_index: 0, subscript: &subscript,
-            input_satoshis: 5000, sighash_type: 0x41,
+            locktime: 0,
+            input_index: 0,
+            subscript: &subscript,
+            input_satoshis: 5000,
+            sighash_type: 0x41,
         });
         let h2 = compute_bip143_sighash(&SighashParams {
             version: 1,
             inputs: &[(txid, 0, 0xFFFFFFFF)],
             outputs: &[(2000, &subscript)], // different output amount
-            locktime: 0, input_index: 0, subscript: &subscript,
-            input_satoshis: 5000, sighash_type: 0x41,
+            locktime: 0,
+            input_index: 0,
+            subscript: &subscript,
+            input_satoshis: 5000,
+            sighash_type: 0x41,
         });
         assert_ne!(h1, h2, "different outputs must produce different sighash");
     }
@@ -3052,12 +3067,8 @@ mod tests {
         let script = p2pkh_locking_script_from_hash(&[0xcc; 20]);
         let outputs = vec![(5000u64, script.clone()), (3000u64, script)];
 
-        let raw_tx = serialize_signed_tx(
-            1,
-            &[([0xaa; 32], 0, vec![0x00], 0xFFFFFFFF)],
-            &outputs,
-            0,
-        );
+        let raw_tx =
+            serialize_signed_tx(1, &[([0xaa; 32], 0, vec![0x00], 0xFFFFFFFF)], &outputs, 0);
 
         let parsed = parse_tx_outputs(&raw_tx).unwrap();
         assert_eq!(parsed.len(), 2);
@@ -3086,7 +3097,10 @@ mod tests {
 
         // 1 input + 1 output = ~193 bytes. At 110 sats/KB: ceil(193 * 110 / 1000) = 22 sats
         assert!(fee_1_1 >= 1, "minimum 1 sat");
-        assert!(fee_1_1 < 50, "fee should be ~22 sats for small tx at 110 sats/KB, got {fee_1_1}");
+        assert!(
+            fee_1_1 < 50,
+            "fee should be ~22 sats for small tx at 110 sats/KB, got {fee_1_1}"
+        );
         assert!(fee_1_2 > fee_1_1, "more outputs = higher fee");
         assert!(fee_2_3 > fee_1_2, "more inputs = higher fee");
     }
@@ -3308,12 +3322,11 @@ mod tests {
         let mut raw_tx = Vec::new();
         raw_tx.extend_from_slice(&1u32.to_le_bytes()); // version
         raw_tx.push(1); // 1 input
-        // input: txid (32 bytes) + vout (4 bytes)
+                        // input: txid (32 bytes) + vout (4 bytes)
         let parent_txid_internal: [u8; 32] = [
-            0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0x11,
-            0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99,
-            0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0x11,
-            0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99,
+            0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+            0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55,
+            0x66, 0x77, 0x88, 0x99,
         ];
         raw_tx.extend_from_slice(&parent_txid_internal);
         raw_tx.extend_from_slice(&0u32.to_le_bytes()); // vout
@@ -3363,7 +3376,7 @@ mod tests {
         let mut raw_tx = Vec::new();
         raw_tx.extend_from_slice(&1u32.to_le_bytes()); // version
         raw_tx.push(2); // 2 inputs
-        // Input 0 from parent_a
+                        // Input 0 from parent_a
         raw_tx.extend_from_slice(&parent_a);
         raw_tx.extend_from_slice(&0u32.to_le_bytes());
         raw_tx.push(0);
@@ -3445,9 +3458,8 @@ mod tests {
     #[test]
     fn test_tsc_to_merkle_path_odd_index() {
         let txid = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let nodes = vec![
-            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
-        ];
+        let nodes =
+            vec!["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string()];
 
         // Index 5 (odd) — sibling at offset 4
         let mp = tsc_to_merkle_path(200, 5, txid, &nodes).unwrap();
@@ -3526,15 +3538,10 @@ mod tests {
         let root_pub = privkey.public_key();
 
         // Our offset computation (what createSignature uses)
-        let offset = compute_signing_hmac_offset(
-            &state.bridge,
-            2,
-            "test protocol",
-            "key-42",
-            "anyone",
-        )
-        .await
-        .unwrap();
+        let offset =
+            compute_signing_hmac_offset(&state.bridge, 2, "test protocol", "key-42", "anyone")
+                .await
+                .unwrap();
 
         // BRC-42: child_priv = root_priv + HMAC(shared_secret, invoice)
         // For "anyone": shared_secret = root_pub
@@ -3542,7 +3549,10 @@ mod tests {
         let invoice = bsv_mpc_core::hd::compute_invoice(2, "test protocol", "key-42");
         let expected = bsv_mpc_core::hd::compute_brc42_hmac(&root_pub, &invoice);
 
-        assert_eq!(offset, expected, "HMAC offset must match direct computation");
+        assert_eq!(
+            offset, expected,
+            "HMAC offset must match direct computation"
+        );
     }
 
     /// Test: derived key signing produces signature verifiable against derived pubkey.
@@ -3560,15 +3570,10 @@ mod tests {
         let privkey = PrivateKey::from_bytes(&TEST_KEY_BYTES).unwrap();
 
         // Compute the HMAC offset (what createSignature computes internally)
-        let _offset = compute_signing_hmac_offset(
-            &state.bridge,
-            2,
-            "test sig",
-            "roundtrip-key",
-            "anyone",
-        )
-        .await
-        .unwrap();
+        let _offset =
+            compute_signing_hmac_offset(&state.bridge, 2, "test sig", "roundtrip-key", "anyone")
+                .await
+                .unwrap();
 
         // Derive the child private key using BSV SDK (simulates MPC signing with offset)
         let deriver = KeyDeriver::new(Some(privkey));
@@ -3613,8 +3618,15 @@ mod tests {
             "forSelf": true
         });
         let Json(resp) = verify_signature(State(state.clone()), Json(body)).await;
-        assert!(resp.get("error").is_none(), "verify should succeed: {:?}", resp);
-        assert_eq!(resp["valid"], true, "verifySignature must confirm derived key signature");
+        assert!(
+            resp.get("error").is_none(),
+            "verify should succeed: {:?}",
+            resp
+        );
+        assert_eq!(
+            resp["valid"], true,
+            "verifySignature must confirm derived key signature"
+        );
 
         // Verify with DIFFERENT protocol params -> must be invalid
         let wrong_body = json!({
@@ -3638,25 +3650,34 @@ mod tests {
     async fn test_different_params_produce_different_offsets() {
         let state = test_state();
 
-        let offset1 = compute_signing_hmac_offset(
-            &state.bridge, 2, "proto-a", "key1", "anyone",
-        ).await.unwrap();
+        let offset1 = compute_signing_hmac_offset(&state.bridge, 2, "proto-a", "key1", "anyone")
+            .await
+            .unwrap();
 
-        let offset2 = compute_signing_hmac_offset(
-            &state.bridge, 2, "proto-a", "key2", "anyone",
-        ).await.unwrap();
+        let offset2 = compute_signing_hmac_offset(&state.bridge, 2, "proto-a", "key2", "anyone")
+            .await
+            .unwrap();
 
-        let offset3 = compute_signing_hmac_offset(
-            &state.bridge, 2, "proto-b", "key1", "anyone",
-        ).await.unwrap();
+        let offset3 = compute_signing_hmac_offset(&state.bridge, 2, "proto-b", "key1", "anyone")
+            .await
+            .unwrap();
 
-        let offset4 = compute_signing_hmac_offset(
-            &state.bridge, 1, "proto-a", "key1", "anyone",
-        ).await.unwrap();
+        let offset4 = compute_signing_hmac_offset(&state.bridge, 1, "proto-a", "key1", "anyone")
+            .await
+            .unwrap();
 
-        assert_ne!(offset1, offset2, "different keyID must produce different offset");
-        assert_ne!(offset1, offset3, "different protocol must produce different offset");
-        assert_ne!(offset1, offset4, "different security level must produce different offset");
+        assert_ne!(
+            offset1, offset2,
+            "different keyID must produce different offset"
+        );
+        assert_ne!(
+            offset1, offset3,
+            "different protocol must produce different offset"
+        );
+        assert_ne!(
+            offset1, offset4,
+            "different security level must produce different offset"
+        );
     }
 
     /// Test: HMAC offset is deterministic.
@@ -3664,13 +3685,13 @@ mod tests {
     async fn test_hmac_offset_deterministic() {
         let state = test_state();
 
-        let offset1 = compute_signing_hmac_offset(
-            &state.bridge, 2, "test", "key", "anyone",
-        ).await.unwrap();
+        let offset1 = compute_signing_hmac_offset(&state.bridge, 2, "test", "key", "anyone")
+            .await
+            .unwrap();
 
-        let offset2 = compute_signing_hmac_offset(
-            &state.bridge, 2, "test", "key", "anyone",
-        ).await.unwrap();
+        let offset2 = compute_signing_hmac_offset(&state.bridge, 2, "test", "key", "anyone")
+            .await
+            .unwrap();
 
         assert_eq!(offset1, offset2, "same params must produce same offset");
     }
@@ -3679,9 +3700,7 @@ mod tests {
     #[tokio::test]
     async fn test_hmac_offset_self_errors_without_kss() {
         let state = test_state();
-        let result = compute_signing_hmac_offset(
-            &state.bridge, 2, "test", "key", "self",
-        ).await;
+        let result = compute_signing_hmac_offset(&state.bridge, 2, "test", "key", "self").await;
         assert!(result.is_err());
     }
 
@@ -3698,11 +3717,14 @@ mod tests {
             "counterparty": "anyone",
         });
         let Json(pk_resp) = get_public_key(State(state.clone()), Json(body)).await;
-        assert!(pk_resp.get("error").is_none(), "getPublicKey error: {:?}", pk_resp);
+        assert!(
+            pk_resp.get("error").is_none(),
+            "getPublicKey error: {:?}",
+            pk_resp
+        );
         let derived_pubkey_hex = pk_resp["publicKey"].as_str().unwrap();
-        let derived_pubkey = PublicKey::from_bytes(
-            &hex::decode(derived_pubkey_hex).unwrap()
-        ).unwrap();
+        let derived_pubkey =
+            PublicKey::from_bytes(&hex::decode(derived_pubkey_hex).unwrap()).unwrap();
 
         // Sign with BSV SDK's derived private key
         let deriver = KeyDeriver::new(Some(privkey));
@@ -3731,8 +3753,10 @@ mod tests {
             "forSelf": true
         });
         let Json(verify_resp) = verify_signature(State(state), Json(verify_body)).await;
-        assert_eq!(verify_resp["valid"], true,
-            "verifySignature must agree with getPublicKey derivation");
+        assert_eq!(
+            verify_resp["valid"], true,
+            "verifySignature must agree with getPublicKey derivation"
+        );
     }
 
     // ── Library API smoke tests ──────────────────────────────────────────
@@ -3741,8 +3765,8 @@ mod tests {
     fn test_library_exports_compile() {
         // Verify that all public library types are accessible from the crate root.
         use crate::{
-            AppState, FeeInjectionInfo, FeeInjector, MpcBridge, PresignManager,
-            ProxyBuilder, ProxyConfig, ProxyError, ProxyResult, TrackedOutput, UtxoTracker,
+            AppState, FeeInjectionInfo, FeeInjector, MpcBridge, PresignManager, ProxyBuilder,
+            ProxyConfig, ProxyError, ProxyResult, TrackedOutput, UtxoTracker,
         };
 
         // Suppress unused import warnings by referencing the types.
@@ -3769,7 +3793,10 @@ mod tests {
         assert_eq!(result["network"], "mainnet");
 
         let result = get_version_impl(&state, json!({})).await;
-        assert!(result["version"].as_str().unwrap().starts_with("bsv-mpc-proxy"));
+        assert!(result["version"]
+            .as_str()
+            .unwrap()
+            .starts_with("bsv-mpc-proxy"));
 
         let result = is_authenticated_impl(&state, json!({})).await;
         assert_eq!(result["authenticated"], true);

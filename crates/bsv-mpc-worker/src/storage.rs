@@ -27,9 +27,8 @@ use serde::{Deserialize, Serialize};
 /// In production, this will be replaced by Durable Object SQLite.
 /// Using a global static allows the storage to persist across
 /// HTTP requests within the same Worker invocation.
-static STORAGE: LazyLock<Mutex<InnerStorage>> = LazyLock::new(|| {
-    Mutex::new(InnerStorage::default())
-});
+static STORAGE: LazyLock<Mutex<InnerStorage>> =
+    LazyLock::new(|| Mutex::new(InnerStorage::default()));
 
 /// Internal storage state behind the mutex.
 #[derive(Default)]
@@ -178,9 +177,7 @@ impl ShareStorage {
     /// HTTP round-trip requests during multi-round protocols.
     pub fn store_protocol_state(&self, session_id: &str, state: Vec<u8>) -> Result<(), String> {
         let mut storage = STORAGE.lock().map_err(|e| format!("lock poisoned: {e}"))?;
-        storage
-            .protocol_state
-            .insert(session_id.to_string(), state);
+        storage.protocol_state.insert(session_id.to_string(), state);
         Ok(())
     }
 
@@ -247,11 +244,7 @@ impl ShareStorage {
     /// Count total presignatures across all agents.
     pub fn total_presignature_count(&self) -> Result<u64, String> {
         let storage = STORAGE.lock().map_err(|e| format!("lock poisoned: {e}"))?;
-        Ok(storage
-            .presignatures
-            .values()
-            .map(|q| q.len() as u64)
-            .sum())
+        Ok(storage.presignatures.values().map(|q| q.len() as u64).sum())
     }
 
     /// Reset all storage (for tests).
@@ -278,7 +271,10 @@ mod tests {
             ciphertext: vec![1, 2, 3, 4],
             session_id: SessionId(format!("session-{agent_id}")),
             share_index: ShareIndex(0),
-            config: ThresholdConfig { threshold: 2, parties: 2 },
+            config: ThresholdConfig {
+                threshold: 2,
+                parties: 2,
+            },
         }
     }
 
@@ -343,7 +339,9 @@ mod tests {
         assert!(storage.list_agents().unwrap().is_empty());
 
         storage.store_share("bob", &make_test_share("bob")).unwrap();
-        storage.store_share("alice", &make_test_share("alice")).unwrap();
+        storage
+            .store_share("alice", &make_test_share("alice"))
+            .unwrap();
 
         assert_eq!(storage.share_count().unwrap(), 2);
         let agents = storage.list_agents().unwrap();

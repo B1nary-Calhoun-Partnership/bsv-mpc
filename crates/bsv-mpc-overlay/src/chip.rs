@@ -90,12 +90,8 @@ pub fn create_chip_token(
         ));
     }
 
-    let script = create_signed_overlay_admin_token(
-        identity_priv,
-        Protocol::Ship,
-        domain,
-        MPC_TOPIC,
-    );
+    let script =
+        create_signed_overlay_admin_token(identity_priv, Protocol::Ship, domain, MPC_TOPIC);
 
     Ok(script.to_binary())
 }
@@ -182,7 +178,9 @@ pub fn parse_chip_token(script_bytes: &[u8]) -> Result<ChipTokenInfo, OverlayErr
         fields,
         "SHIP",
     )
-    .map_err(|e| OverlayError::InvalidChipToken(format!("signature linkage check failed: {}", e)))?;
+    .map_err(|e| {
+        OverlayError::InvalidChipToken(format!("signature linkage check failed: {}", e))
+    })?;
 
     if !linkage_ok {
         return Err(OverlayError::InvalidChipToken(
@@ -231,8 +229,15 @@ mod tests {
             "CHIP token MUST have exactly 5 fields to be admitted by canonical validators"
         );
         assert_eq!(&pushdrop.fields[0], b"SHIP");
-        assert_eq!(pushdrop.fields[1].len(), 33, "identity_key must be 33-byte compressed pubkey");
-        assert_eq!(&pushdrop.fields[1][..], &key.public_key().to_compressed()[..]);
+        assert_eq!(
+            pushdrop.fields[1].len(),
+            33,
+            "identity_key must be 33-byte compressed pubkey"
+        );
+        assert_eq!(
+            &pushdrop.fields[1][..],
+            &key.public_key().to_compressed()[..]
+        );
         assert_eq!(&pushdrop.fields[2], b"https://mpc.example.com");
         assert_eq!(&pushdrop.fields[3], MPC_TOPIC.as_bytes());
         assert!(
@@ -251,13 +256,8 @@ mod tests {
         let domain = "https://mpc-eu-1.example.com";
 
         let ours = create_chip_token(&key, domain).unwrap();
-        let theirs = create_signed_overlay_admin_token(
-            &key,
-            Protocol::Ship,
-            domain,
-            MPC_TOPIC,
-        )
-        .to_binary();
+        let theirs =
+            create_signed_overlay_admin_token(&key, Protocol::Ship, domain, MPC_TOPIC).to_binary();
 
         assert_eq!(ours, theirs, "create_chip_token must be byte-identical to bsv-rs::create_signed_overlay_admin_token for the same inputs");
     }
@@ -354,7 +354,11 @@ mod tests {
         );
 
         let err = parse_chip_token(&script.to_binary()).unwrap_err();
-        assert!(err.to_string().contains("expected protocol SHIP"), "got: {}", err);
+        assert!(
+            err.to_string().contains("expected protocol SHIP"),
+            "got: {}",
+            err
+        );
     }
 
     #[test]
@@ -368,7 +372,11 @@ mod tests {
         );
 
         let err = parse_chip_token(&script.to_binary()).unwrap_err();
-        assert!(err.to_string().contains("expected topic tm_mpc_signing"), "got: {}", err);
+        assert!(
+            err.to_string().contains("expected topic tm_mpc_signing"),
+            "got: {}",
+            err
+        );
     }
 
     #[test]
@@ -391,7 +399,11 @@ mod tests {
             .position(|w| w == &sig[..])
             .expect("signature bytes must appear in serialized script");
         bytes[pos + sig.len() - 1] ^= 0x01;
-        assert_ne!(bytes[pos + sig.len() - 1], sig_bit, "tamper must change a byte");
+        assert_ne!(
+            bytes[pos + sig.len() - 1],
+            sig_bit,
+            "tamper must change a byte"
+        );
 
         let err = parse_chip_token(&bytes).unwrap_err();
         assert!(
@@ -431,7 +443,8 @@ mod tests {
 
         let err = parse_chip_token(&script.to_binary()).unwrap_err();
         assert!(
-            err.to_string().contains("signature does not link") || err.to_string().contains("signature"),
+            err.to_string().contains("signature does not link")
+                || err.to_string().contains("signature"),
             "expected linkage rejection (locking-key mismatch), got: {}",
             err
         );
@@ -454,6 +467,10 @@ mod tests {
         let script = pushdrop.lock();
 
         let err = parse_chip_token(&script.to_binary()).unwrap_err();
-        assert!(err.to_string().contains("identity key must be 33 bytes"), "got: {}", err);
+        assert!(
+            err.to_string().contains("identity key must be 33 bytes"),
+            "got: {}",
+            err
+        );
     }
 }

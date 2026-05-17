@@ -241,10 +241,7 @@ fn get_session(server_nonce: &str) -> Option<AuthSession> {
 
 /// Get the number of active sessions (for health/debugging).
 pub fn session_count() -> usize {
-    AUTH_SESSIONS
-        .lock()
-        .expect("session lock poisoned")
-        .len()
+    AUTH_SESSIONS.lock().expect("session lock poisoned").len()
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────
@@ -581,10 +578,7 @@ pub fn sign_response_headers(
         (headers::IDENTITY_KEY.to_string(), server_identity),
         (headers::MESSAGE_TYPE.to_string(), "general".to_string()),
         (headers::NONCE.to_string(), response_nonce),
-        (
-            headers::YOUR_NONCE.to_string(),
-            request_nonce.to_string(),
-        ),
+        (headers::YOUR_NONCE.to_string(), request_nonce.to_string()),
         (headers::SIGNATURE.to_string(), sig_hex),
     ])
 }
@@ -871,10 +865,7 @@ mod tests {
     #[test]
     fn test_auth_error_status_codes() {
         assert_eq!(AuthError::NotAuthenticated.status_code(), 401);
-        assert_eq!(
-            AuthError::InvalidSignature("bad".into()).status_code(),
-            401
-        );
+        assert_eq!(AuthError::InvalidSignature("bad".into()).status_code(), 401);
         assert_eq!(AuthError::SessionNotFound.status_code(), 401);
         assert_eq!(
             AuthError::SessionExpired {
@@ -892,10 +883,7 @@ mod tests {
             .status_code(),
             403
         );
-        assert_eq!(
-            AuthError::VerificationError("x".into()).status_code(),
-            500
-        );
+        assert_eq!(AuthError::VerificationError("x".into()).status_code(), 500);
     }
 
     // ── Agent Authorization ─────────────────────────────────────────────

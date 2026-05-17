@@ -57,8 +57,7 @@ use tracing;
 
 use crate::error::{MpcError, Result};
 use crate::types::{
-    DkgResult, EncryptedShare, JointPublicKey, RoundMessage, SessionId, ShareIndex,
-    ThresholdConfig,
+    DkgResult, EncryptedShare, JointPublicKey, RoundMessage, SessionId, ShareIndex, ThresholdConfig,
 };
 
 // ---------------------------------------------------------------------------
@@ -88,8 +87,9 @@ pub(crate) fn outgoing_to_wire<M: Serialize>(
     Ok(WireMessage {
         sender,
         is_broadcast: out.recipient.is_broadcast(),
-        msg: serde_json::to_value(&out.msg)
-            .map_err(|e| MpcError::Serialization(format!("failed to serialize outgoing message: {e}")))?,
+        msg: serde_json::to_value(&out.msg).map_err(|e| {
+            MpcError::Serialization(format!("failed to serialize outgoing message: {e}"))
+        })?,
     })
 }
 
@@ -106,8 +106,9 @@ pub(crate) fn wire_to_incoming<M: serde::de::DeserializeOwned>(
         } else {
             round_based::MessageType::P2P
         },
-        msg: serde_json::from_value(wire.msg)
-            .map_err(|e| MpcError::Serialization(format!("failed to deserialize incoming message: {e}")))?,
+        msg: serde_json::from_value(wire.msg).map_err(|e| {
+            MpcError::Serialization(format!("failed to deserialize incoming message: {e}"))
+        })?,
     })
 }
 
@@ -223,7 +224,6 @@ pub struct DkgCoordinator {
 
     // Channel handles for communicating with the SM thread.
     // These are None before init() and after completion.
-
     /// Send incoming messages to the SM thread.
     sm_tx: Option<mpsc::Sender<SmInbound>>,
     /// Receive outgoing messages and status from the SM thread.
@@ -310,7 +310,9 @@ impl DkgCoordinator {
     /// Returns [`MpcError::Dkg`] if the keygen state machine fails to start.
     pub fn init(&mut self) -> Result<Vec<RoundMessage>> {
         if self.phase != DkgPhase::NotStarted {
-            return Err(MpcError::Dkg("init() called but DKG already started".into()));
+            return Err(MpcError::Dkg(
+                "init() called but DKG already started".into(),
+            ));
         }
 
         // Validate party index is in range
@@ -345,9 +347,7 @@ impl DkgCoordinator {
     pub fn process_round(&mut self, messages: Vec<RoundMessage>) -> Result<DkgRoundResult> {
         match self.phase {
             DkgPhase::NotStarted => {
-                return Err(MpcError::Dkg(
-                    "process_round() called before init()".into(),
-                ));
+                return Err(MpcError::Dkg("process_round() called before init()".into()));
             }
             DkgPhase::Complete => {
                 return Err(MpcError::Dkg(
@@ -358,9 +358,10 @@ impl DkgCoordinator {
         }
 
         // Feed all incoming messages to the SM thread
-        let tx = self.sm_tx.as_ref().ok_or_else(|| {
-            MpcError::Dkg("SM channel not available (internal error)".into())
-        })?;
+        let tx = self
+            .sm_tx
+            .as_ref()
+            .ok_or_else(|| MpcError::Dkg("SM channel not available (internal error)".into()))?;
 
         for msg in &messages {
             let wire_bytes = &msg.payload;
@@ -468,9 +469,10 @@ impl DkgCoordinator {
 
     /// Collect the initial batch of outgoing messages after starting a phase.
     fn collect_outgoing_messages(&mut self) -> Result<Vec<RoundMessage>> {
-        let rx = self.sm_rx.as_ref().ok_or_else(|| {
-            MpcError::Dkg("SM channel not available (internal error)".into())
-        })?;
+        let rx = self
+            .sm_rx
+            .as_ref()
+            .ok_or_else(|| MpcError::Dkg("SM channel not available (internal error)".into()))?;
 
         let mut outgoing = Vec::new();
 
@@ -512,9 +514,10 @@ impl DkgCoordinator {
     /// Collect messages after feeding incoming messages for a round.
     /// Handles phase transitions (keygen -> aux_info -> complete).
     fn collect_round_result(&mut self) -> Result<DkgRoundResult> {
-        let rx = self.sm_rx.as_ref().ok_or_else(|| {
-            MpcError::Dkg("SM channel not available (internal error)".into())
-        })?;
+        let rx = self
+            .sm_rx
+            .as_ref()
+            .ok_or_else(|| MpcError::Dkg("SM channel not available (internal error)".into()))?;
 
         let mut outgoing = Vec::new();
 
@@ -612,8 +615,9 @@ impl DkgCoordinator {
 
         // Deserialize the IncompleteKeyShare
         let incomplete: cggmp24::IncompleteKeyShare<Secp256k1> =
-            serde_json::from_slice(incomplete_json)
-                .map_err(|e| MpcError::Dkg(format!("failed to deserialize incomplete share: {e}")))?;
+            serde_json::from_slice(incomplete_json).map_err(|e| {
+                MpcError::Dkg(format!("failed to deserialize incomplete share: {e}"))
+            })?;
 
         // Deserialize the AuxInfo
         let aux_info: cggmp24::key_share::AuxInfo<SecurityLevel128> =
@@ -628,10 +632,9 @@ impl DkgCoordinator {
         let address = derive_p2pkh_address(&compressed_bytes);
 
         // Combine into a complete KeyShare
-        let key_share = cggmp24::KeyShare::<Secp256k1, SecurityLevel128>::from_parts(
-            (incomplete, aux_info),
-        )
-        .map_err(|e| MpcError::Dkg(format!("failed to combine key share: {e}")))?;
+        let key_share =
+            cggmp24::KeyShare::<Secp256k1, SecurityLevel128>::from_parts((incomplete, aux_info))
+                .map_err(|e| MpcError::Dkg(format!("failed to combine key share: {e}")))?;
 
         // Serialize the complete KeyShare for storage
         let key_share_json = serde_json::to_vec(&key_share)
@@ -731,7 +734,8 @@ fn run_keygen_sm(
     });
 
     let mut msg_id: u64 = 0;
-    let mut wire_buffer: std::collections::VecDeque<WireMessage> = std::collections::VecDeque::new();
+    let mut wire_buffer: std::collections::VecDeque<WireMessage> =
+        std::collections::VecDeque::new();
 
     loop {
         match sm.proceed() {
@@ -739,22 +743,25 @@ fn run_keygen_sm(
                 let wire = match outgoing_to_wire(my_index, outgoing) {
                     Ok(w) => w,
                     Err(e) => {
-                        let _ = outbound_tx.send(SmOutbound::Error(
-                            format!("keygen: failed to create wire message: {e}"),
-                        ));
+                        let _ = outbound_tx.send(SmOutbound::Error(format!(
+                            "keygen: failed to create wire message: {e}"
+                        )));
                         return;
                     }
                 };
                 let wire_bytes = match serde_json::to_vec(&wire) {
                     Ok(b) => b,
                     Err(e) => {
-                        let _ = outbound_tx.send(SmOutbound::Error(
-                            format!("keygen: failed to serialize outgoing: {e}"),
-                        ));
+                        let _ = outbound_tx.send(SmOutbound::Error(format!(
+                            "keygen: failed to serialize outgoing: {e}"
+                        )));
                         return;
                     }
                 };
-                if outbound_tx.send(SmOutbound::OutgoingMessage(wire_bytes)).is_err() {
+                if outbound_tx
+                    .send(SmOutbound::OutgoingMessage(wire_bytes))
+                    .is_err()
+                {
                     return; // Coordinator dropped its receiver
                 }
             }
@@ -775,17 +782,35 @@ fn run_keygen_sm(
                                 if wire_bytes.first() == Some(&b'[') {
                                     match serde_json::from_slice::<Vec<WireMessage>>(&wire_bytes) {
                                         Ok(v) => v.into(),
-                                        Err(e) => { let _ = outbound_tx.send(SmOutbound::Error(format!("keygen: failed to deserialize bundled incoming: {e}"))); return; }
+                                        Err(e) => {
+                                            let _ = outbound_tx.send(SmOutbound::Error(format!(
+                                            "keygen: failed to deserialize bundled incoming: {e}"
+                                        )));
+                                            return;
+                                        }
                                     }
                                 } else {
                                     match serde_json::from_slice::<WireMessage>(&wire_bytes) {
-                                        Ok(w) => { let mut d = std::collections::VecDeque::new(); d.push_back(w); d }
-                                        Err(e) => { let _ = outbound_tx.send(SmOutbound::Error(format!("keygen: failed to deserialize incoming: {e}"))); return; }
+                                        Ok(w) => {
+                                            let mut d = std::collections::VecDeque::new();
+                                            d.push_back(w);
+                                            d
+                                        }
+                                        Err(e) => {
+                                            let _ = outbound_tx.send(SmOutbound::Error(format!(
+                                                "keygen: failed to deserialize incoming: {e}"
+                                            )));
+                                            return;
+                                        }
                                     }
                                 };
                             let first = match wires.pop_front() {
                                 Some(w) => w,
-                                None => { let _ = outbound_tx.send(SmOutbound::Error("keygen: empty bundle".into())); return; }
+                                None => {
+                                    let _ = outbound_tx
+                                        .send(SmOutbound::Error("keygen: empty bundle".into()));
+                                    return;
+                                }
                             };
                             wire_buffer.extend(wires);
                             first
@@ -795,10 +820,17 @@ fn run_keygen_sm(
                 msg_id += 1;
                 let incoming = match wire_to_incoming(wire, msg_id) {
                     Ok(inc) => inc,
-                    Err(e) => { let _ = outbound_tx.send(SmOutbound::Error(format!("keygen: failed to parse incoming message: {e}"))); return; }
+                    Err(e) => {
+                        let _ = outbound_tx.send(SmOutbound::Error(format!(
+                            "keygen: failed to parse incoming message: {e}"
+                        )));
+                        return;
+                    }
                 };
                 if sm.received_msg(incoming).is_err() {
-                    let _ = outbound_tx.send(SmOutbound::Error("keygen: SM rejected incoming message".into()));
+                    let _ = outbound_tx.send(SmOutbound::Error(
+                        "keygen: SM rejected incoming message".into(),
+                    ));
                     return;
                 }
             }
@@ -809,26 +841,25 @@ fn run_keygen_sm(
                         let share_json = match serde_json::to_vec(&incomplete_share) {
                             Ok(j) => j,
                             Err(e) => {
-                                let _ = outbound_tx.send(SmOutbound::Error(
-                                    format!("keygen: failed to serialize share: {e}"),
-                                ));
+                                let _ = outbound_tx.send(SmOutbound::Error(format!(
+                                    "keygen: failed to serialize share: {e}"
+                                )));
                                 return;
                             }
                         };
                         let _ = outbound_tx.send(SmOutbound::KeygenComplete(share_json));
                     }
                     Err(e) => {
-                        let _ = outbound_tx.send(SmOutbound::Error(
-                            format!("keygen protocol error: {e:?}"),
-                        ));
+                        let _ = outbound_tx
+                            .send(SmOutbound::Error(format!("keygen protocol error: {e:?}")));
                     }
                 }
                 return;
             }
             ProceedResult::Error(e) => {
-                let _ = outbound_tx.send(SmOutbound::Error(
-                    format!("keygen state machine error: {e}"),
-                ));
+                let _ = outbound_tx.send(SmOutbound::Error(format!(
+                    "keygen state machine error: {e}"
+                )));
                 return;
             }
         }
@@ -861,9 +892,8 @@ fn run_aux_info_sm(
                 party = my_index,
                 "generating Paillier safe primes (this may take 30-60s)..."
             );
-            let primes = cggmp24::PregeneratedPrimes::<SecurityLevel128>::generate(
-                &mut rand::rngs::OsRng,
-            );
+            let primes =
+                cggmp24::PregeneratedPrimes::<SecurityLevel128>::generate(&mut rand::rngs::OsRng);
             tracing::info!(party = my_index, "Paillier prime generation complete");
             primes
         }
@@ -877,7 +907,8 @@ fn run_aux_info_sm(
     });
 
     let mut msg_id: u64 = 0;
-    let mut wire_buffer: std::collections::VecDeque<WireMessage> = std::collections::VecDeque::new();
+    let mut wire_buffer: std::collections::VecDeque<WireMessage> =
+        std::collections::VecDeque::new();
 
     loop {
         match sm.proceed() {
@@ -885,22 +916,25 @@ fn run_aux_info_sm(
                 let wire = match outgoing_to_wire(my_index, outgoing) {
                     Ok(w) => w,
                     Err(e) => {
-                        let _ = outbound_tx.send(SmOutbound::Error(
-                            format!("auxinfo: failed to create wire message: {e}"),
-                        ));
+                        let _ = outbound_tx.send(SmOutbound::Error(format!(
+                            "auxinfo: failed to create wire message: {e}"
+                        )));
                         return;
                     }
                 };
                 let wire_bytes = match serde_json::to_vec(&wire) {
                     Ok(b) => b,
                     Err(e) => {
-                        let _ = outbound_tx.send(SmOutbound::Error(
-                            format!("auxinfo: failed to serialize outgoing: {e}"),
-                        ));
+                        let _ = outbound_tx.send(SmOutbound::Error(format!(
+                            "auxinfo: failed to serialize outgoing: {e}"
+                        )));
                         return;
                     }
                 };
-                if outbound_tx.send(SmOutbound::OutgoingMessage(wire_bytes)).is_err() {
+                if outbound_tx
+                    .send(SmOutbound::OutgoingMessage(wire_bytes))
+                    .is_err()
+                {
                     return;
                 }
             }
@@ -921,17 +955,35 @@ fn run_aux_info_sm(
                                 if wire_bytes.first() == Some(&b'[') {
                                     match serde_json::from_slice::<Vec<WireMessage>>(&wire_bytes) {
                                         Ok(v) => v.into(),
-                                        Err(e) => { let _ = outbound_tx.send(SmOutbound::Error(format!("auxinfo: failed to deserialize bundled incoming: {e}"))); return; }
+                                        Err(e) => {
+                                            let _ = outbound_tx.send(SmOutbound::Error(format!(
+                                            "auxinfo: failed to deserialize bundled incoming: {e}"
+                                        )));
+                                            return;
+                                        }
                                     }
                                 } else {
                                     match serde_json::from_slice::<WireMessage>(&wire_bytes) {
-                                        Ok(w) => { let mut d = std::collections::VecDeque::new(); d.push_back(w); d }
-                                        Err(e) => { let _ = outbound_tx.send(SmOutbound::Error(format!("auxinfo: failed to deserialize incoming: {e}"))); return; }
+                                        Ok(w) => {
+                                            let mut d = std::collections::VecDeque::new();
+                                            d.push_back(w);
+                                            d
+                                        }
+                                        Err(e) => {
+                                            let _ = outbound_tx.send(SmOutbound::Error(format!(
+                                                "auxinfo: failed to deserialize incoming: {e}"
+                                            )));
+                                            return;
+                                        }
                                     }
                                 };
                             let first = match wires.pop_front() {
                                 Some(w) => w,
-                                None => { let _ = outbound_tx.send(SmOutbound::Error("auxinfo: empty bundle".into())); return; }
+                                None => {
+                                    let _ = outbound_tx
+                                        .send(SmOutbound::Error("auxinfo: empty bundle".into()));
+                                    return;
+                                }
                             };
                             wire_buffer.extend(wires);
                             first
@@ -941,10 +993,17 @@ fn run_aux_info_sm(
                 msg_id += 1;
                 let incoming = match wire_to_incoming(wire, msg_id) {
                     Ok(inc) => inc,
-                    Err(e) => { let _ = outbound_tx.send(SmOutbound::Error(format!("auxinfo: failed to parse incoming message: {e}"))); return; }
+                    Err(e) => {
+                        let _ = outbound_tx.send(SmOutbound::Error(format!(
+                            "auxinfo: failed to parse incoming message: {e}"
+                        )));
+                        return;
+                    }
                 };
                 if sm.received_msg(incoming).is_err() {
-                    let _ = outbound_tx.send(SmOutbound::Error("auxinfo: SM rejected incoming message".into()));
+                    let _ = outbound_tx.send(SmOutbound::Error(
+                        "auxinfo: SM rejected incoming message".into(),
+                    ));
                     return;
                 }
             }
@@ -955,26 +1014,25 @@ fn run_aux_info_sm(
                         let aux_json = match serde_json::to_vec(&aux_info) {
                             Ok(j) => j,
                             Err(e) => {
-                                let _ = outbound_tx.send(SmOutbound::Error(
-                                    format!("auxinfo: failed to serialize aux info: {e}"),
-                                ));
+                                let _ = outbound_tx.send(SmOutbound::Error(format!(
+                                    "auxinfo: failed to serialize aux info: {e}"
+                                )));
                                 return;
                             }
                         };
                         let _ = outbound_tx.send(SmOutbound::AuxInfoComplete(aux_json));
                     }
                     Err(e) => {
-                        let _ = outbound_tx.send(SmOutbound::Error(
-                            format!("aux info protocol error: {e:?}"),
-                        ));
+                        let _ = outbound_tx
+                            .send(SmOutbound::Error(format!("aux info protocol error: {e:?}")));
                     }
                 }
                 return;
             }
             ProceedResult::Error(e) => {
-                let _ = outbound_tx.send(SmOutbound::Error(
-                    format!("aux info state machine error: {e}"),
-                ));
+                let _ = outbound_tx.send(SmOutbound::Error(format!(
+                    "aux info state machine error: {e}"
+                )));
                 return;
             }
         }
@@ -1031,10 +1089,7 @@ pub use self::WireMessage as DkgWireMessage;
 /// for testing. Production code should use `PregeneratedPrimes::generate()`
 /// which generates safe primes.
 #[cfg(test)]
-fn generate_blum_prime(
-    rng: &mut impl rand::RngCore,
-    bits_size: u32,
-) -> cggmp24::backend::Integer {
+fn generate_blum_prime(rng: &mut impl rand::RngCore, bits_size: u32) -> cggmp24::backend::Integer {
     use cggmp24::backend::Integer;
     loop {
         let n = Integer::generate_prime(rng, bits_size);
@@ -1057,8 +1112,7 @@ fn generate_test_primes(
         generate_blum_prime(rng, bitsize),
         generate_blum_prime(rng, bitsize),
     ];
-    cggmp24::key_refresh::PregeneratedPrimes::try_from(primes)
-        .expect("primes have wrong bit size")
+    cggmp24::key_refresh::PregeneratedPrimes::try_from(primes).expect("primes have wrong bit size")
 }
 
 // ---------------------------------------------------------------------------
@@ -1218,16 +1272,8 @@ mod tests {
     fn different_sessions_produce_different_eids() {
         let config = ThresholdConfig::new(2, 2).unwrap();
 
-        let coord1 = DkgCoordinator::new(
-            SessionId("session-a".to_string()),
-            config,
-            ShareIndex(0),
-        );
-        let coord2 = DkgCoordinator::new(
-            SessionId("session-b".to_string()),
-            config,
-            ShareIndex(0),
-        );
+        let coord1 = DkgCoordinator::new(SessionId("session-a".to_string()), config, ShareIndex(0));
+        let coord2 = DkgCoordinator::new(SessionId("session-b".to_string()), config, ShareIndex(0));
 
         assert_ne!(coord1.eid_bytes, coord2.eid_bytes);
     }
@@ -1299,8 +1345,7 @@ mod tests {
 
         assert_eq!(incomplete_shares.len(), 2);
         assert_eq!(
-            incomplete_shares[0].shared_public_key,
-            incomplete_shares[1].shared_public_key,
+            incomplete_shares[0].shared_public_key, incomplete_shares[1].shared_public_key,
             "both parties must agree on joint public key"
         );
 
@@ -1360,8 +1405,7 @@ mod tests {
         let deserialized: cggmp24::KeyShare<Secp256k1, SecurityLevel128> =
             serde_json::from_slice(&share_json).unwrap();
         assert_eq!(
-            deserialized.core.shared_public_key,
-            key_shares[0].core.shared_public_key,
+            deserialized.core.shared_public_key, key_shares[0].core.shared_public_key,
             "serialized key share must round-trip"
         );
 
@@ -1524,8 +1568,7 @@ mod tests {
                     // Verify the key is a valid secp256k1 point
                     assert_eq!(r0.joint_key.compressed.len(), 33);
                     assert!(
-                        r0.joint_key.compressed[0] == 0x02
-                            || r0.joint_key.compressed[0] == 0x03
+                        r0.joint_key.compressed[0] == 0x02 || r0.joint_key.compressed[0] == 0x03
                     );
                     assert!(r0.joint_key.address.starts_with('1'));
 

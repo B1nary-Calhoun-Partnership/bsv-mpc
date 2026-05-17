@@ -72,9 +72,7 @@ pub trait StorageBackend: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<(Vec<TrackedOutput>, u64), ProxyError>> + Send + '_>>;
 
     /// Total balance of all unspent outputs in satoshis.
-    fn total_balance(
-        &self,
-    ) -> Pin<Box<dyn Future<Output = Result<u64, ProxyError>> + Send + '_>>;
+    fn total_balance(&self) -> Pin<Box<dyn Future<Output = Result<u64, ProxyError>> + Send + '_>>;
 }
 
 // ─── InMemoryBackend ────────────────────────────────────────────────────────
@@ -164,9 +162,7 @@ impl StorageBackend for InMemoryBackend {
         })
     }
 
-    fn total_balance(
-        &self,
-    ) -> Pin<Box<dyn Future<Output = Result<u64, ProxyError>> + Send + '_>> {
+    fn total_balance(&self) -> Pin<Box<dyn Future<Output = Result<u64, ProxyError>> + Send + '_>> {
         Box::pin(async move {
             let tracker = self.tracker.read().await;
             Ok(tracker.total_balance())
@@ -272,9 +268,7 @@ impl StorageBackend for WalletInfraBackend {
         })
     }
 
-    fn total_balance(
-        &self,
-    ) -> Pin<Box<dyn Future<Output = Result<u64, ProxyError>> + Send + '_>> {
+    fn total_balance(&self) -> Pin<Box<dyn Future<Output = Result<u64, ProxyError>> + Send + '_>> {
         // TODO: Delegate to StorageClient::get_balance() or sum unspent outputs
         // If StorageClient exposes a balance endpoint, use it. Otherwise,
         // call list_unspent(None, None) and sum satoshis.
@@ -336,8 +330,14 @@ mod tests {
     #[tokio::test]
     async fn in_memory_add_and_list() {
         let backend = InMemoryBackend::new();
-        backend.add_output(make_output("aabb", 0, 1000)).await.unwrap();
-        backend.add_output(make_output("ccdd", 1, 2000)).await.unwrap();
+        backend
+            .add_output(make_output("aabb", 0, 1000))
+            .await
+            .unwrap();
+        backend
+            .add_output(make_output("ccdd", 1, 2000))
+            .await
+            .unwrap();
 
         assert_eq!(backend.total_balance().await.unwrap(), 3000);
         let unspent = backend.list_unspent(None, None).await.unwrap();
@@ -347,8 +347,14 @@ mod tests {
     #[tokio::test]
     async fn in_memory_mark_spent() {
         let backend = InMemoryBackend::new();
-        backend.add_output(make_output("aabb", 0, 1000)).await.unwrap();
-        backend.add_output(make_output("ccdd", 1, 2000)).await.unwrap();
+        backend
+            .add_output(make_output("aabb", 0, 1000))
+            .await
+            .unwrap();
+        backend
+            .add_output(make_output("ccdd", 1, 2000))
+            .await
+            .unwrap();
 
         assert!(backend.mark_spent("aabb", 0, "eeff").await.unwrap());
         assert_eq!(backend.total_balance().await.unwrap(), 2000);
@@ -361,7 +367,10 @@ mod tests {
     #[tokio::test]
     async fn in_memory_mark_spent_not_found() {
         let backend = InMemoryBackend::new();
-        backend.add_output(make_output("aabb", 0, 1000)).await.unwrap();
+        backend
+            .add_output(make_output("aabb", 0, 1000))
+            .await
+            .unwrap();
         assert!(!backend.mark_spent("nonexistent", 0, "eeff").await.unwrap());
     }
 
@@ -390,11 +399,23 @@ mod tests {
     async fn in_memory_tag_filter() {
         let backend = InMemoryBackend::new();
         backend
-            .add_output(make_output_with_basket("aa", 0, 1000, "default", vec!["state"]))
+            .add_output(make_output_with_basket(
+                "aa",
+                0,
+                1000,
+                "default",
+                vec!["state"],
+            ))
             .await
             .unwrap();
         backend
-            .add_output(make_output_with_basket("bb", 0, 2000, "default", vec!["memory"]))
+            .add_output(make_output_with_basket(
+                "bb",
+                0,
+                2000,
+                "default",
+                vec!["memory"],
+            ))
             .await
             .unwrap();
         backend
@@ -415,10 +436,7 @@ mod tests {
         assert_eq!(state_outputs.len(), 2);
 
         let any = backend
-            .list_unspent(
-                None,
-                Some(&[String::from("state"), String::from("memory")]),
-            )
+            .list_unspent(None, Some(&[String::from("state"), String::from("memory")]))
             .await
             .unwrap();
         assert_eq!(any.len(), 3);
@@ -428,8 +446,14 @@ mod tests {
     async fn in_memory_select_utxos() {
         let backend = InMemoryBackend::new();
         backend.add_output(make_output("aa", 0, 500)).await.unwrap();
-        backend.add_output(make_output("bb", 0, 3000)).await.unwrap();
-        backend.add_output(make_output("cc", 0, 1000)).await.unwrap();
+        backend
+            .add_output(make_output("bb", 0, 3000))
+            .await
+            .unwrap();
+        backend
+            .add_output(make_output("cc", 0, 1000))
+            .await
+            .unwrap();
 
         let (selected, total) = backend.select_utxos(3500).await.unwrap();
         assert_eq!(selected.len(), 2);
@@ -449,10 +473,7 @@ mod tests {
 
     #[tokio::test]
     async fn wallet_infra_stubs_return_error() {
-        let backend = WalletInfraBackend::new(
-            "https://example.com".into(),
-            reqwest::Client::new(),
-        );
+        let backend = WalletInfraBackend::new("https://example.com".into(), reqwest::Client::new());
         assert!(backend.add_output(make_output("aa", 0, 100)).await.is_err());
         assert!(backend.mark_spent("aa", 0, "bb").await.is_err());
         assert!(backend.list_unspent(None, None).await.is_err());
@@ -465,7 +486,10 @@ mod tests {
         // Verify the trait can be used as Arc<dyn StorageBackend>
         let backend: std::sync::Arc<dyn StorageBackend> =
             std::sync::Arc::new(InMemoryBackend::new());
-        backend.add_output(make_output("aa", 0, 1000)).await.unwrap();
+        backend
+            .add_output(make_output("aa", 0, 1000))
+            .await
+            .unwrap();
         assert_eq!(backend.total_balance().await.unwrap(), 1000);
     }
 }

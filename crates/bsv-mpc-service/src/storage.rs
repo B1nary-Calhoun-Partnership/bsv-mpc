@@ -324,10 +324,7 @@ impl SqliteShareStorage {
         presig_id: &str,
         data: &[u8],
     ) -> anyhow::Result<()> {
-        let queue = self
-            .presignatures
-            .entry(agent_id.to_string())
-            .or_default();
+        let queue = self.presignatures.entry(agent_id.to_string()).or_default();
         queue.push_back(StoredPresignature {
             id: presig_id.to_string(),
             session_id: session_id.to_string(),

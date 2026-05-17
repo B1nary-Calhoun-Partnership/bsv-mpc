@@ -295,9 +295,10 @@ impl SigningCoordinator {
         }
 
         // Feed all incoming messages to the SM thread
-        let tx = self.sm_tx.as_ref().ok_or_else(|| {
-            MpcError::Signing("SM channel not available (internal error)".into())
-        })?;
+        let tx = self
+            .sm_tx
+            .as_ref()
+            .ok_or_else(|| MpcError::Signing("SM channel not available (internal error)".into()))?;
 
         for msg in &messages {
             let wire_bytes = &msg.payload;
@@ -374,9 +375,10 @@ impl SigningCoordinator {
 
     /// Collect the initial batch of outgoing messages after starting the SM.
     fn collect_outgoing_messages(&mut self) -> Result<Vec<RoundMessage>> {
-        let rx = self.sm_rx.as_ref().ok_or_else(|| {
-            MpcError::Signing("SM channel not available (internal error)".into())
-        })?;
+        let rx = self
+            .sm_rx
+            .as_ref()
+            .ok_or_else(|| MpcError::Signing("SM channel not available (internal error)".into()))?;
 
         let mut outgoing = Vec::new();
 
@@ -410,9 +412,10 @@ impl SigningCoordinator {
     /// Collect messages after feeding incoming messages for a round.
     /// Handles completion when the SM produces the final signature.
     fn collect_round_result(&mut self) -> Result<SigningRoundResult> {
-        let rx = self.sm_rx.as_ref().ok_or_else(|| {
-            MpcError::Signing("SM channel not available (internal error)".into())
-        })?;
+        let rx = self
+            .sm_rx
+            .as_ref()
+            .ok_or_else(|| MpcError::Signing("SM channel not available (internal error)".into()))?;
 
         let mut outgoing = Vec::new();
 
@@ -579,7 +582,8 @@ fn run_signing_sm(
     // WireMessages in a single payload, we consume the first and buffer the
     // rest. Subsequent NeedsOneMoreMessage calls drain the buffer before
     // requesting more from the coordinator.
-    let mut wire_buffer: std::collections::VecDeque<WireMessage> = std::collections::VecDeque::new();
+    let mut wire_buffer: std::collections::VecDeque<WireMessage> =
+        std::collections::VecDeque::new();
 
     loop {
         match sm.proceed() {
@@ -632,14 +636,18 @@ fn run_signing_sm(
                                         Ok(v) => v.into(),
                                         Err(e) => {
                                             let _ = outbound_tx.send(SmOutbound::Error(format!(
-                                                "signing: failed to deserialize bundled incoming: {e}"
-                                            )));
+                                            "signing: failed to deserialize bundled incoming: {e}"
+                                        )));
                                             return;
                                         }
                                     }
                                 } else {
                                     match serde_json::from_slice::<WireMessage>(&wire_bytes) {
-                                        Ok(w) => { let mut d = std::collections::VecDeque::new(); d.push_back(w); d }
+                                        Ok(w) => {
+                                            let mut d = std::collections::VecDeque::new();
+                                            d.push_back(w);
+                                            d
+                                        }
                                         Err(e) => {
                                             let _ = outbound_tx.send(SmOutbound::Error(format!(
                                                 "signing: failed to deserialize incoming: {e}"
@@ -686,13 +694,11 @@ fn run_signing_sm(
                     Ok(sig) => {
                         let mut sig_bytes = [0u8; 64];
                         sig.write_to_slice(&mut sig_bytes);
-                        let _ =
-                            outbound_tx.send(SmOutbound::SigningComplete(sig_bytes.to_vec()));
+                        let _ = outbound_tx.send(SmOutbound::SigningComplete(sig_bytes.to_vec()));
                     }
                     Err(e) => {
-                        let _ = outbound_tx.send(SmOutbound::Error(format!(
-                            "signing protocol error: {e:?}"
-                        )));
+                        let _ = outbound_tx
+                            .send(SmOutbound::Error(format!("signing protocol error: {e:?}")));
                     }
                 }
                 return;
@@ -913,10 +919,7 @@ mod tests {
 
     // ---- Helper: DKG via sim to produce key shares ----
 
-    fn dkg_key_shares(
-        n: u16,
-        t: u16,
-    ) -> Vec<cggmp24::KeyShare<Secp256k1, SecurityLevel128>> {
+    fn dkg_key_shares(n: u16, t: u16) -> Vec<cggmp24::KeyShare<Secp256k1, SecurityLevel128>> {
         let mut rng = rand::rngs::OsRng;
 
         // Step 1: Keygen
@@ -999,12 +1002,8 @@ mod tests {
             config,
         };
 
-        let coord = SigningCoordinator::new(
-            SessionId("test".to_string()),
-            share,
-            config,
-            vec![0, 1],
-        );
+        let coord =
+            SigningCoordinator::new(SessionId("test".to_string()), share, config, vec![0, 1]);
 
         assert_eq!(coord.current_round(), 0);
         assert_eq!(coord.config().threshold, 2);
@@ -1022,12 +1021,8 @@ mod tests {
             config,
         };
 
-        let mut coord = SigningCoordinator::new(
-            SessionId("test".to_string()),
-            share,
-            config,
-            vec![0, 1],
-        );
+        let mut coord =
+            SigningCoordinator::new(SessionId("test".to_string()), share, config, vec![0, 1]);
 
         let result = coord.init_round(&[0u8; 32], None);
         assert!(result.is_err());
@@ -1049,12 +1044,8 @@ mod tests {
             config,
         };
 
-        let mut coord = SigningCoordinator::new(
-            SessionId("test".to_string()),
-            share,
-            config,
-            vec![0, 1],
-        );
+        let mut coord =
+            SigningCoordinator::new(SessionId("test".to_string()), share, config, vec![0, 1]);
 
         let result = coord.process_round(vec![]);
         assert!(result.is_err());
@@ -1123,14 +1114,14 @@ mod tests {
     fn der_encode_known_values() {
         // Known r, s values -- verify DER encoding
         let r = vec![
-            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c,
-            0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19,
-            0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+            0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b,
+            0x1c, 0x1d, 0x1e, 0x1f,
         ];
         let s = vec![
-            0x80, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c,
-            0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19,
-            0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
+            0x80, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+            0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b,
+            0x1c, 0x1d, 0x1e, 0x1f,
         ];
 
         let der = der_encode_signature(&r, &s);
@@ -1208,9 +1199,7 @@ mod tests {
         let participants: Vec<u16> = vec![0, 1];
 
         let sig = round_based::sim::run_with_setup(
-            participants
-                .iter()
-                .map(|i| &key_shares[usize::from(*i)]),
+            participants.iter().map(|i| &key_shares[usize::from(*i)]),
             |i, party, share| {
                 let party = buffer_outgoing(party);
                 let mut party_rng = rand::rngs::OsRng;
@@ -1268,14 +1257,9 @@ mod tests {
         let share0 = key_share_to_encrypted(&key_shares[0], 0, config);
         let share1 = key_share_to_encrypted(&key_shares[1], 1, config);
 
-        let mut coord0 = SigningCoordinator::new(
-            session.clone(),
-            share0,
-            config,
-            participants.clone(),
-        );
-        let mut coord1 =
-            SigningCoordinator::new(session, share1, config, participants);
+        let mut coord0 =
+            SigningCoordinator::new(session.clone(), share0, config, participants.clone());
+        let mut coord1 = SigningCoordinator::new(session, share1, config, participants);
 
         // Message hash to sign
         let message_hash: [u8; 32] = {
@@ -1314,24 +1298,17 @@ mod tests {
                     outgoing0 = new0;
                     outgoing1 = new1;
                 }
-                (
-                    Ok(SigningRoundResult::Complete(r0)),
-                    Ok(SigningRoundResult::Complete(r1)),
-                ) => {
+                (Ok(SigningRoundResult::Complete(r0)), Ok(SigningRoundResult::Complete(r1))) => {
                     // Both completed! Verify signatures match.
                     assert_eq!(r0.r, r1.r, "both coordinators must produce the same r");
                     assert_eq!(r0.s, r1.s, "both coordinators must produce the same s");
-                    assert_eq!(
-                        r0.signature, r1.signature,
-                        "DER signatures must match"
-                    );
+                    assert_eq!(r0.signature, r1.signature, "DER signatures must match");
 
                     // Verify DER signature structure
                     assert_eq!(r0.signature[0], 0x30, "DER SEQUENCE tag");
 
                     // Verify with BSV SDK
-                    let pubkey_bytes =
-                        key_shares[0].core.shared_public_key.to_bytes(true);
+                    let pubkey_bytes = key_shares[0].core.shared_public_key.to_bytes(true);
                     let bsv_pubkey = bsv::PublicKey::from_bytes(&pubkey_bytes)
                         .expect("BSV SDK should accept the public key");
 
@@ -1347,14 +1324,8 @@ mod tests {
 
                     return; // Test passed!
                 }
-                (
-                    Ok(SigningRoundResult::Complete(_)),
-                    Ok(SigningRoundResult::NextRound(_)),
-                )
-                | (
-                    Ok(SigningRoundResult::NextRound(_)),
-                    Ok(SigningRoundResult::Complete(_)),
-                ) => {
+                (Ok(SigningRoundResult::Complete(_)), Ok(SigningRoundResult::NextRound(_)))
+                | (Ok(SigningRoundResult::NextRound(_)), Ok(SigningRoundResult::Complete(_))) => {
                     panic!(
                         "coordinators desynchronized at round {round}: \
                          one completed but the other didn't"
@@ -1392,14 +1363,9 @@ mod tests {
         let share1 = key_share_to_encrypted(&key_shares[1], 1, config);
 
         // Use sign() for coord0 and init_round() for coord1
-        let mut coord0 = SigningCoordinator::new(
-            session.clone(),
-            share0,
-            config,
-            participants.clone(),
-        );
-        let mut coord1 =
-            SigningCoordinator::new(session, share1, config, participants);
+        let mut coord0 =
+            SigningCoordinator::new(session.clone(), share0, config, participants.clone());
+        let mut coord1 = SigningCoordinator::new(session, share1, config, participants);
 
         let message_hash: [u8; 32] = {
             let mut hasher = sha2::Sha256::new();
@@ -1437,16 +1403,12 @@ mod tests {
                     outgoing0 = new0;
                     outgoing1 = new1;
                 }
-                (
-                    Ok(SigningRoundResult::Complete(r0)),
-                    Ok(SigningRoundResult::Complete(r1)),
-                ) => {
+                (Ok(SigningRoundResult::Complete(r0)), Ok(SigningRoundResult::Complete(r1))) => {
                     assert_eq!(r0.r, r1.r);
                     assert_eq!(r0.s, r1.s);
 
                     // BSV SDK verify
-                    let pubkey_bytes =
-                        key_shares[0].core.shared_public_key.to_bytes(true);
+                    let pubkey_bytes = key_shares[0].core.shared_public_key.to_bytes(true);
                     let bsv_pubkey = bsv::PublicKey::from_bytes(&pubkey_bytes).unwrap();
                     let mut sig_compact = [0u8; 64];
                     sig_compact[..32].copy_from_slice(&r0.r);
@@ -1456,14 +1418,8 @@ mod tests {
 
                     return;
                 }
-                (
-                    Ok(SigningRoundResult::Complete(_)),
-                    Ok(SigningRoundResult::NextRound(_)),
-                )
-                | (
-                    Ok(SigningRoundResult::NextRound(_)),
-                    Ok(SigningRoundResult::Complete(_)),
-                ) => {
+                (Ok(SigningRoundResult::Complete(_)), Ok(SigningRoundResult::NextRound(_)))
+                | (Ok(SigningRoundResult::NextRound(_)), Ok(SigningRoundResult::Complete(_))) => {
                     panic!("desync at round {round}");
                 }
                 (Err(e), _) => panic!("coord0 error at round {round}: {e}"),
@@ -1500,9 +1456,7 @@ mod tests {
         let participants: Vec<u16> = vec![0, 1];
 
         let presigs = round_based::sim::run_with_setup(
-            participants
-                .iter()
-                .map(|i| &key_shares[usize::from(*i)]),
+            participants.iter().map(|i| &key_shares[usize::from(*i)]),
             |i, party, share| {
                 let party = buffer_outgoing(party);
                 let mut party_rng = rand::rngs::OsRng;

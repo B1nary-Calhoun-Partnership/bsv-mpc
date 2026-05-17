@@ -178,8 +178,7 @@ pub async fn background_replenish(state: Arc<AppState>) {
         let sleep_secs = if consecutive_failures == 0 {
             BASE_INTERVAL_SECS
         } else {
-            (BASE_INTERVAL_SECS * 2u64.saturating_pow(consecutive_failures))
-                .min(MAX_BACKOFF_SECS)
+            (BASE_INTERVAL_SECS * 2u64.saturating_pow(consecutive_failures)).min(MAX_BACKOFF_SECS)
         };
 
         tokio::time::sleep(tokio::time::Duration::from_secs(sleep_secs)).await;

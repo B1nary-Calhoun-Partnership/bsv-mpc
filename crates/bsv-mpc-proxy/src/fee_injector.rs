@@ -78,11 +78,7 @@ impl FeeInjector {
     /// - `fee_sats` — Total fee per signing in satoshis.
     /// - `fee_addresses` — Addresses of MPC node operators.
     /// - `fee_threshold` — Optional multisig threshold (e.g., `"2-of-3"`).
-    pub fn new(
-        fee_sats: u64,
-        fee_addresses: Vec<String>,
-        fee_threshold: Option<String>,
-    ) -> Self {
+    pub fn new(fee_sats: u64, fee_addresses: Vec<String>, fee_threshold: Option<String>) -> Self {
         Self {
             fee_sats,
             fee_addresses,
@@ -340,10 +336,7 @@ fn build_p2ms_script(threshold: u16, pubkeys: &[PublicKey]) -> Vec<u8> {
 /// any remainder from integer division.
 ///
 /// Ported from poc7-fee-injection/src/lib.rs: `split_fee_outputs()`.
-fn split_fee_outputs(
-    fee_sats: u64,
-    scripts: &[Vec<u8>],
-) -> anyhow::Result<Vec<(u64, Vec<u8>)>> {
+fn split_fee_outputs(fee_sats: u64, scripts: &[Vec<u8>]) -> anyhow::Result<Vec<(u64, Vec<u8>)>> {
     anyhow::ensure!(!scripts.is_empty(), "No fee addresses provided");
 
     let n = scripts.len() as u64;
@@ -621,21 +614,13 @@ mod tests {
 
     #[test]
     fn parse_threshold_t_exceeds_n() {
-        let injector = FeeInjector::new(
-            1000,
-            vec!["a".into(), "b".into()],
-            Some("3-of-2".into()),
-        );
+        let injector = FeeInjector::new(1000, vec!["a".into(), "b".into()], Some("3-of-2".into()));
         assert!(injector.parse_threshold().is_err());
     }
 
     #[test]
     fn parse_threshold_n_mismatch() {
-        let injector = FeeInjector::new(
-            1000,
-            vec!["a".into(), "b".into()],
-            Some("2-of-3".into()),
-        );
+        let injector = FeeInjector::new(1000, vec!["a".into(), "b".into()], Some("2-of-3".into()));
         assert!(injector.parse_threshold().is_err());
     }
 

@@ -447,12 +447,14 @@ fn bundle_messages(messages: &[RoundMessage]) -> std::result::Result<RoundMessag
     let values: Vec<serde_json::Value> = messages
         .iter()
         .map(|m| {
-            serde_json::from_slice(&m.payload)
-                .map_err(|e| MpcError::Serialization(format!("failed to parse wire message for bundling: {e}")))
+            serde_json::from_slice(&m.payload).map_err(|e| {
+                MpcError::Serialization(format!("failed to parse wire message for bundling: {e}"))
+            })
         })
         .collect::<std::result::Result<Vec<_>, _>>()?;
-    let bundled_payload = serde_json::to_vec(&values)
-        .map_err(|e| MpcError::Serialization(format!("failed to serialize bundled messages: {e}")))?;
+    let bundled_payload = serde_json::to_vec(&values).map_err(|e| {
+        MpcError::Serialization(format!("failed to serialize bundled messages: {e}"))
+    })?;
     let first = &messages[0];
     Ok(RoundMessage {
         session_id: first.session_id.clone(),
@@ -529,10 +531,7 @@ impl MpcBridge {
     pub async fn new(config: &ProxyConfig) -> anyhow::Result<Self> {
         // 1. Read share file
         let file_bytes = tokio::fs::read(&config.share_path).await.map_err(|e| {
-            anyhow::anyhow!(
-                "failed to read share file '{}': {e}",
-                config.share_path
-            )
+            anyhow::anyhow!("failed to read share file '{}': {e}", config.share_path)
         })?;
 
         // 2. Parse DkgResult (optionally decrypt first)
@@ -593,11 +592,9 @@ impl MpcBridge {
         // The ciphertext field holds raw cggmp24 key share JSON.
         // If parsing fails (e.g., stub shares), partial_ecdh will fail at call time.
         let (share_scalar, vss_points) =
-            match ecdh::parse_share_scalar(&dkg_result.share.ciphertext)
-                .and_then(|scalar| {
-                    ecdh::parse_share_vss_points(&dkg_result.share.ciphertext)
-                        .map(|pts| (scalar, pts))
-                }) {
+            match ecdh::parse_share_scalar(&dkg_result.share.ciphertext).and_then(|scalar| {
+                ecdh::parse_share_vss_points(&dkg_result.share.ciphertext).map(|pts| (scalar, pts))
+            }) {
                 Ok((scalar, pts)) => (scalar, pts),
                 Err(e) => {
                     tracing::warn!(
@@ -718,12 +715,8 @@ impl MpcBridge {
 
         tokio::task::spawn_blocking(move || {
             // Create coordinator for this signing operation
-            let mut coord = SigningCoordinator::new(
-                session_id.clone(),
-                share,
-                threshold_config,
-                participants,
-            );
+            let mut coord =
+                SigningCoordinator::new(session_id.clone(), share, threshold_config, participants);
 
             // Initialize signing → get proxy's Round 1 messages
             let proxy_msgs = coord.sign(&hash, presignature, hmac_offset)?;
@@ -1028,7 +1021,9 @@ impl MpcBridge {
         key_id: &str,
     ) -> bsv_mpc_core::error::Result<[u8; 32]> {
         match counterparty {
-            "anyone" => ecdh::derive_symmetric_key_anyone(&self.root_pub, level, protocol_name, key_id),
+            "anyone" => {
+                ecdh::derive_symmetric_key_anyone(&self.root_pub, level, protocol_name, key_id)
+            }
             _ => {
                 // For "self" and "other(hex_pubkey)": 2-round partial ECDH
                 let counterparty_pub = if counterparty == "self" {
@@ -1152,8 +1147,8 @@ impl MpcBridge {
     #[cfg(test)]
     pub fn new_for_test(joint_key: JointPublicKey) -> Self {
         let agent_id = hex_encode(&joint_key.compressed);
-        let root_pub = PublicKey::from_bytes(&joint_key.compressed)
-            .expect("test joint key must be valid");
+        let root_pub =
+            PublicKey::from_bytes(&joint_key.compressed).expect("test joint key must be valid");
         Self {
             kss_url: "http://localhost:9999".into(),
             share: EncryptedShare {
@@ -1208,7 +1203,10 @@ mod tests {
         assert_eq!(hex_decode("").unwrap(), Vec::<u8>::new());
         assert_eq!(hex_decode("00").unwrap(), vec![0x00]);
         assert_eq!(hex_decode("ff").unwrap(), vec![0xff]);
-        assert_eq!(hex_decode("deadbeef").unwrap(), vec![0xde, 0xad, 0xbe, 0xef]);
+        assert_eq!(
+            hex_decode("deadbeef").unwrap(),
+            vec![0xde, 0xad, 0xbe, 0xef]
+        );
         assert_eq!(hex_decode("FF").unwrap(), vec![0xff]);
     }
 
