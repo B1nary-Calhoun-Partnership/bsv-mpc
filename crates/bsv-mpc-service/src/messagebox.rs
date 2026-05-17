@@ -1,0 +1,338 @@
+//! MessageBox-driven inbox listener for the KSS — Phase C of the
+//! MPC-Spec §06.14 normative "MUST add MessageBox transport client to
+//! participate in cross-impl ceremonies" requirement.
+//!
+//! ## What this module is
+//!
+//! A thin orchestration layer that:
+//!
+//! 1. Subscribes to one MessageBox mailbox via
+//!    [`MessageBoxClient::subscribe_round_messages`] (typed
+//!    `RoundMessage` stream from Phase B).
+//! 2. On each inbound message, feeds it to a caller-supplied async
+//!    closure (the "handler") that decides what response messages, if
+//!    any, to ship.
+//! 3. Wraps each handler-returned outgoing message in a canonical
+//!    envelope (via [`MessageBoxClient::send_round_message`]) and
+//!    sends it back to the recipient.
+//!
+//! ## What this module is NOT
+//!
+//! Not the cggmp24 coordinator integration — Phase C is explicitly the
+//! *dispatcher primitive* without ceremony plumbing. Phase D wires the
+//! real [`bsv_mpc_core::dkg::DkgCoordinator`] /
+//! [`bsv_mpc_core::signing::SigningCoordinator`] /
+//! [`bsv_mpc_core::presigning::PresigningManager`] in as handlers.
+//!
+//! ## Handler shape
+//!
+//! Closure-based instead of trait-object (`async_trait` avoided): the
+//! handler is `Fn(DecodedRoundMessage) -> Future<Output =
+//! Result<Vec<OutgoingRoundMessage>>>`. The closure captures whatever
+//! state it needs (coordinator handles, locks, channels) and returns
+//! zero or more outbound messages to ship in response. Returning an
+//! empty `Vec` is fine — the ceremony may be complete, or this is a
+//! "broadcast received, nothing to say back" branch.
+//!
+//! ## Lifecycle
+//!
+//! - [`MessageBoxListener::start`] does the inbox subscription inline
+//!   so `Ok(_)` means we're really listening.
+//! - The background pump runs until [`shutdown`](MessageBoxListener::shutdown)
+//!   or until the listener handle is dropped.
+//! - On shutdown, the inner `RoundMessageSubscription::shutdown` runs
+//!   the §06.4 graceful `leaveRoom` path before closing the WS.
+
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+
+use bsv_mpc_core::envelope::WrapParams;
+use bsv_mpc_core::types::RoundMessage;
+use bsv_mpc_messagebox::{DecodedRoundMessage, MessageBoxClient};
+use tokio::sync::oneshot;
+use tokio::task::JoinHandle;
+use tracing::{debug, warn};
+
+/// One outbound RoundMessage the handler wants to ship in response to
+/// an inbound message. The listener wraps it as a canonical envelope
+/// (BRC-78 encrypt to `recipient_pub_hex`, BRC-31 sign with our
+/// identity) and ships via [`MessageBoxClient::send_round_message`].
+#[derive(Debug, Clone)]
+pub struct OutgoingRoundMessage {
+    /// Recipient's BRC-31 identity-key hex (compressed pub).
+    pub recipient_pub_hex: String,
+    /// MessageBox mailbox to land on. Typically the same box the
+    /// inbound message arrived on — the listener does NOT auto-route
+    /// to the inbound box because some handlers may want to fan out to
+    /// other boxes (e.g., the `presig_return_{session_id}` mailbox per
+    /// §06.17.2).
+    pub message_box: String,
+    /// The cggmp24-level message to ship.
+    pub round_msg: RoundMessage,
+    /// Envelope metadata (to_party, joint_pubkey, phase,
+    /// execution_id_prefix, correlation_id, traceparent).
+    pub params: WrapParams,
+}
+
+/// Boxed async-returning closure type that the listener feeds inbound
+/// messages to. Returns the list of outbound messages to ship in
+/// response. Type alias keeps signatures readable.
+pub type HandlerFuture =
+    Pin<Box<dyn Future<Output = anyhow::Result<Vec<OutgoingRoundMessage>>> + Send>>;
+
+/// Listener handle. Hold to keep the background pump alive; drop or
+/// `shutdown().await` to stop.
+pub struct MessageBoxListener {
+    handle: Option<JoinHandle<()>>,
+    shutdown_tx: Option<oneshot::Sender<()>>,
+}
+
+impl MessageBoxListener {
+    /// Subscribe to `message_box`, run `handler` on each inbound
+    /// `DecodedRoundMessage`, ship handler responses via `client`.
+    ///
+    /// The subscription handshake happens inline (per Phase B), so
+    /// `Ok` guarantees the listener is live on the relay. Subsequent
+    /// reconnects after a drop are handled by the underlying
+    /// `RoundMessageSubscription` per §06.12.
+    ///
+    /// `handler` must be `Send + Sync + 'static` so it can run in the
+    /// background pump task; it gets cheaply cloned (via the boxed
+    /// `Arc` indirection) on each dispatch.
+    pub async fn start<F>(
+        client: MessageBoxClient,
+        message_box: &str,
+        handler: F,
+    ) -> anyhow::Result<Self>
+    where
+        F: Fn(DecodedRoundMessage) -> HandlerFuture + Send + Sync + 'static,
+    {
+        let sub = client
+            .subscribe_round_messages(message_box)
+            .await
+            .map_err(|e| anyhow::anyhow!("subscribe_round_messages({message_box}): {e}"))?;
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let handler: Arc<F> = Arc::new(handler);
+        let client_for_task = client.clone();
+        let handle = tokio::spawn(async move {
+            run_loop(client_for_task, sub, handler, shutdown_rx).await;
+        });
+
+        Ok(Self {
+            handle: Some(handle),
+            shutdown_tx: Some(shutdown_tx),
+        })
+    }
+
+    /// Gracefully shut down — signals the pump, the pump runs
+    /// `RoundMessageSubscription::shutdown` (which cascades to the
+    /// underlying §06.4 `leaveRoom` path), then awaits the task exit.
+    pub async fn shutdown(mut self) {
+        if let Some(tx) = self.shutdown_tx.take() {
+            let _ = tx.send(());
+        }
+        if let Some(h) = self.handle.take() {
+            let _ = h.await;
+        }
+    }
+}
+
+impl Drop for MessageBoxListener {
+    fn drop(&mut self) {
+        if let Some(tx) = self.shutdown_tx.take() {
+            let _ = tx.send(());
+        }
+        if let Some(h) = self.handle.take() {
+            h.abort();
+        }
+    }
+}
+
+async fn run_loop<F>(
+    client: MessageBoxClient,
+    mut sub: bsv_mpc_messagebox::RoundMessageSubscription,
+    handler: Arc<F>,
+    mut shutdown: oneshot::Receiver<()>,
+) where
+    F: Fn(DecodedRoundMessage) -> HandlerFuture + Send + Sync + 'static,
+{
+    loop {
+        tokio::select! {
+            biased;
+            _ = &mut shutdown => {
+                sub.shutdown().await;
+                return;
+            }
+            item = sub.next() => {
+                let Some(item) = item else {
+                    debug!("RoundMessageSubscription closed — listener exiting");
+                    return;
+                };
+                let inbound = match item {
+                    Ok(m) => m,
+                    Err(e) => {
+                        warn!("inbound subscription error (continuing): {e}");
+                        continue;
+                    }
+                };
+                let inbound_summary = format!(
+                    "session={} round={} from_party={} via={:?} message_box={}",
+                    hex::encode(inbound.round_msg.session_id.as_bytes()),
+                    inbound.round_msg.round,
+                    inbound.round_msg.from.0,
+                    inbound.via,
+                    inbound.message_box,
+                );
+                debug!("dispatching inbound: {inbound_summary}");
+                let fut = (handler)(inbound);
+                let outgoing = match fut.await {
+                    Ok(o) => o,
+                    Err(e) => {
+                        warn!("handler returned error ({inbound_summary}): {e:#}");
+                        continue;
+                    }
+                };
+                if outgoing.is_empty() {
+                    debug!("handler returned no outbound messages ({inbound_summary})");
+                    continue;
+                }
+                for out in outgoing {
+                    let send_summary = format!(
+                        "to={}... box={} round={} to_party={}",
+                        &out.recipient_pub_hex[..out.recipient_pub_hex.len().min(8)],
+                        out.message_box,
+                        out.round_msg.round,
+                        out.params.to_party,
+                    );
+                    if let Err(e) = client
+                        .send_round_message(
+                            &out.recipient_pub_hex,
+                            &out.message_box,
+                            &out.round_msg,
+                            out.params,
+                        )
+                        .await
+                    {
+                        warn!("send_round_message failed ({send_summary}): {e}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bsv::primitives::ec::PrivateKey;
+    use bsv_mpc_core::types::{SessionId, ShareIndex};
+    use bsv_mpc_messagebox::InboundVia;
+    use rand::RngCore;
+
+    fn fresh_priv() -> PrivateKey {
+        let mut b = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut b);
+        b[0] |= 0x01;
+        PrivateKey::from_bytes(&b).unwrap()
+    }
+
+    #[test]
+    fn outgoing_round_message_constructs() {
+        let sender = fresh_priv();
+        let out = OutgoingRoundMessage {
+            recipient_pub_hex: sender.public_key().to_hex(),
+            message_box: "mpc-dkg".into(),
+            round_msg: RoundMessage {
+                session_id: SessionId([0xaa; 32]),
+                round: 0,
+                from: ShareIndex(0),
+                to: Some(ShareIndex(1)),
+                payload: vec![1, 2, 3],
+            },
+            params: WrapParams {
+                to_party: 1,
+                joint_pubkey: [0u8; 33],
+                phase: "dkg".into(),
+                execution_id_prefix: [0u8; 8],
+                correlation_id: None,
+                traceparent: None,
+            },
+        };
+        assert_eq!(out.message_box, "mpc-dkg");
+        assert_eq!(out.round_msg.from.0, 0);
+        assert_eq!(out.params.phase, "dkg");
+    }
+
+    /// Sanity test that the handler closure signature + dispatch path
+    /// compiles + that `MessageBoxListener::start` is the right shape
+    /// without requiring a live relay.
+    #[test]
+    fn handler_closure_type_compiles() {
+        let _: Box<dyn Fn(DecodedRoundMessage) -> HandlerFuture + Send + Sync + 'static> =
+            Box::new(|_inbound: DecodedRoundMessage| -> HandlerFuture {
+                Box::pin(async move { Ok(Vec::<OutgoingRoundMessage>::new()) })
+            });
+    }
+
+    #[test]
+    fn handler_can_capture_state_and_emit_response() {
+        // Demonstrates the typical pattern: a closure captures an Arc
+        // around shared state (here a counter), inspects the inbound,
+        // and returns an outbound. Exercised end-to-end against the
+        // live relay in tests/messagebox_listener_e2e.rs.
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let counter = Arc::new(AtomicU32::new(0));
+        let recipient_hex = fresh_priv().public_key().to_hex();
+
+        let counter_for_handler = counter.clone();
+        let recipient_for_handler = recipient_hex.clone();
+        let handler = move |inbound: DecodedRoundMessage| -> HandlerFuture {
+            let counter = counter_for_handler.clone();
+            let recipient = recipient_for_handler.clone();
+            Box::pin(async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Ok(vec![OutgoingRoundMessage {
+                    recipient_pub_hex: recipient,
+                    message_box: inbound.message_box.clone(),
+                    round_msg: inbound.round_msg.clone(),
+                    params: WrapParams {
+                        to_party: inbound.round_msg.from.0,
+                        joint_pubkey: [0u8; 33],
+                        phase: "dkg".into(),
+                        execution_id_prefix: [0u8; 8],
+                        correlation_id: None,
+                        traceparent: None,
+                    },
+                }])
+            })
+        };
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let sender_pub = PrivateKey::from_bytes(&[0x11; 32]).unwrap().public_key();
+        let synthetic = DecodedRoundMessage {
+            message_id: "fixture".into(),
+            message_box: "mpc-dkg".into(),
+            sender_pub,
+            round_msg: RoundMessage {
+                session_id: SessionId([0xbb; 32]),
+                round: 0,
+                from: ShareIndex(1),
+                to: Some(ShareIndex(0)),
+                payload: b"hello".to_vec(),
+            },
+            via: InboundVia::WsPush,
+        };
+        let outgoing = runtime
+            .block_on(async move { handler(synthetic).await })
+            .unwrap();
+        assert_eq!(outgoing.len(), 1);
+        assert_eq!(outgoing[0].round_msg.payload, b"hello");
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
+}

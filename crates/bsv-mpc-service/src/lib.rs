@@ -4,7 +4,10 @@
 //! so they can be used from integration tests and embedded deployments.
 
 pub mod handlers;
+pub mod messagebox;
 pub mod storage;
+
+pub use messagebox::{HandlerFuture, MessageBoxListener, OutgoingRoundMessage};
 
 use std::sync::Arc;
 
