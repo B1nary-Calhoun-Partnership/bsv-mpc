@@ -44,12 +44,21 @@ pub struct MessagePayload {
     pub body: serde_json::Value,
 }
 
-/// `POST /sendMessage` response. Returns one entry per recipient on success.
+/// `POST /sendMessage` response. The relay's success body is
+/// `{ status: "success", message: "...", results: [{recipient, messageId}, ...] }`
+/// per `bsv-messagebox-cloudflare-public/src/routes/send_message.rs::
+/// outcome_to_http`. We expose the per-recipient acknowledgements under
+/// the more conventional name `messages` via serde alias.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SendMessageResponse {
     pub status: String,
+    /// Server-side human-readable summary. Optional — kept for parity.
     #[serde(default)]
+    pub message: Option<String>,
+    /// Per-recipient delivery results. Aliased so callers can use
+    /// `.messages` while the wire field name stays `results`.
+    #[serde(alias = "results", default)]
     pub messages: Vec<SendResultEntry>,
 }
 
@@ -79,16 +88,29 @@ pub struct ListMessagesResponse {
 }
 
 /// One inbound message as returned by `/listMessages` or pushed over WS.
+/// Matches the server's `MessageRow` schema byte-for-byte (per
+/// `bsv-messagebox-cloudflare-public/src/lib.rs:list_messages` + OpenAPI).
+///
+/// Notably:
+/// - `messageBox` is NOT included — the caller already knows which box
+///   they queried.
+/// - `body` is a **JSON STRING**, not a JSON object. The server stores
+///   the original sender's `MessagePayload.body` inside a wrapper:
+///   `{"message": <body>}` (per `routes/send_message.rs:202`). Use
+///   [`crate::wire::unwrap_inbound_body`] to peel the wrap and decode the
+///   canonical CBOR envelope in one call.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InboundMessage {
     pub message_id: String,
-    /// Sender's BRC-31 identity-key hex (verified by the server before
-    /// storing — the recipient can trust this field).
+    /// Sender's BRC-31 identity-key hex (verified by the server).
     pub sender: String,
-    pub message_box: String,
-    pub body: serde_json::Value,
+    /// JSON-stringified server-wrap. Pass to
+    /// [`crate::wire::unwrap_inbound_body`].
+    pub body: String,
     pub created_at: String,
+    #[serde(default)]
+    pub updated_at: String,
 }
 
 // ---------------------------------------------------------------------------

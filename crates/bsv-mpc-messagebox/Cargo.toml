@@ -9,8 +9,12 @@ repository.workspace = true
 [dependencies]
 bsv-mpc-core = { path = "../bsv-mpc-core" }
 
-# BSV SDK (PrivateKey / PublicKey / ECDSA for BRC-31)
-bsv.workspace = true
+# BSV SDK. We need:
+# - `auth` for `Peer`, `PeerOptions`, `SimplifiedFetchTransport`,
+#   `HttpRequest`, `HttpResponse` (BRC-104 SimplifiedFetchTransport).
+# - `http` so SimplifiedFetchTransport's reqwest backend is compiled in.
+# `auth` transitively pulls `wallet` (`ProtoWallet`) and `messages`.
+bsv = { workspace = true, features = ["auth", "http"] }
 
 # Async runtime + HTTP
 tokio.workspace = true

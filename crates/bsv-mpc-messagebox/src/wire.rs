@@ -36,9 +36,37 @@ pub fn wrap_envelope_to_body(env: &MessageEnvelope) -> Value {
     Value::String(hex::encode(bytes))
 }
 
+/// Decode the server's `InboundMessage.body` (a JSON-stringified wrap of
+/// the form `{"message": "<lowercase hex>"}`) back into a canonical
+/// MessageEnvelope.
+///
+/// The server-imposed `{"message": ...}` wrap is per
+/// `bsv-messagebox-cloudflare-public/src/routes/send_message.rs::process_send`
+/// stored-body shape; it is NOT part of our wire spec — peel it here so
+/// callers see only the canonical envelope.
+///
+/// Errors:
+/// - `Json` if the outer string is not valid JSON.
+/// - `Protocol` if the JSON doesn't have a string `message` field.
+/// - `Envelope(EnvelopeReencodeMismatch)` for any §05.9.1 violation.
+pub fn unwrap_inbound_body(server_body_str: &str) -> Result<MessageEnvelope> {
+    let outer: Value = serde_json::from_str(server_body_str)?;
+    let inner = outer.get("message").ok_or_else(|| {
+        MessageBoxError::Protocol(format!(
+            "InboundMessage.body must be JSON-stringified {{\"message\": <body>}} \
+             per the server wrap; got: {server_body_str}"
+        ))
+    })?;
+    unwrap_body_to_envelope(inner)
+}
+
 /// Decode a `MessagePayload.body` JSON value back into a canonical
 /// MessageEnvelope. Enforces the strict-decode contract per §05.9.1 (the
 /// byte-equivalent re-encode check runs inside `decode_strict`).
+///
+/// Use [`unwrap_inbound_body`] when peeling a server-side
+/// `InboundMessage.body` — that variant handles the
+/// `{"message": <body>}` wrap the relay adds at storage time.
 ///
 /// Errors:
 /// - `Protocol` if `body` is not a JSON string or hex is malformed.
