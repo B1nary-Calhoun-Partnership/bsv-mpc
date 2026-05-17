@@ -1045,10 +1045,8 @@ mod tests {
         let share_0 = wrap_key_share(&key_shares[0], 0, config, &session_id);
         let share_1 = wrap_key_share(&key_shares[1], 1, config, &session_id);
 
-        let mut mgr_0 =
-            PresigningManager::new(session_id, share_0, participants.clone(), 5);
-        let mut mgr_1 =
-            PresigningManager::new(session_id, share_1, participants.clone(), 5);
+        let mut mgr_0 = PresigningManager::new(session_id, share_0, participants.clone(), 5);
+        let mut mgr_1 = PresigningManager::new(session_id, share_1, participants.clone(), 5);
 
         // Both managers start presigning
         let msgs_0 = mgr_0.init_generate().unwrap();
@@ -1136,10 +1134,8 @@ mod tests {
         let share_0 = wrap_key_share(&key_shares[0], 0, config, &session_id);
         let share_1 = wrap_key_share(&key_shares[1], 1, config, &session_id);
 
-        let mut mgr_0 =
-            PresigningManager::new(session_id, share_0, participants.clone(), 5);
-        let mut mgr_1 =
-            PresigningManager::new(session_id, share_1, participants.clone(), 5);
+        let mut mgr_0 = PresigningManager::new(session_id, share_0, participants.clone(), 5);
+        let mut mgr_1 = PresigningManager::new(session_id, share_1, participants.clone(), 5);
 
         // Generate 2 presignatures
         for gen_idx in 0..2 {

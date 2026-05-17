@@ -265,6 +265,19 @@ mod tests {
     use super::*;
     use bsv_mpc_core::types::{SessionId, ShareIndex, ThresholdConfig};
 
+    /// Serializes storage tests so they don't race the global `STORAGE`
+    /// static via `reset()`. Each test acquires this lock for its full
+    /// body. Std-only so we don't pull `serial_test` into the dep tree.
+    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Acquire the test lock — poisoning is recovered (a failing test
+    /// poisons the mutex; subsequent tests still need to run).
+    fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+        TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
     fn make_test_share(agent_id: &str) -> EncryptedShare {
         EncryptedShare {
             nonce: vec![0u8; 12],
@@ -280,6 +293,7 @@ mod tests {
 
     #[test]
     fn store_and_get_share() {
+        let _guard = test_lock();
         let storage = ShareStorage::new();
         storage.reset();
 
@@ -298,6 +312,7 @@ mod tests {
 
     #[test]
     fn get_nonexistent_share() {
+        let _guard = test_lock();
         let storage = ShareStorage::new();
         storage.reset();
 
@@ -307,6 +322,7 @@ mod tests {
 
     #[test]
     fn delete_share_cascading() {
+        let _guard = test_lock();
         let storage = ShareStorage::new();
         storage.reset();
 
@@ -326,6 +342,7 @@ mod tests {
 
     #[test]
     fn delete_nonexistent_share() {
+        let _guard = test_lock();
         let storage = ShareStorage::new();
         storage.reset();
 
@@ -335,6 +352,7 @@ mod tests {
 
     #[test]
     fn list_agents_and_count() {
+        let _guard = test_lock();
         let storage = ShareStorage::new();
         storage.reset();
 
@@ -353,6 +371,7 @@ mod tests {
 
     #[test]
     fn share_metadata() {
+        let _guard = test_lock();
         let storage = ShareStorage::new();
         storage.reset();
 
@@ -382,6 +401,7 @@ mod tests {
 
     #[test]
     fn protocol_state_round_trip() {
+        let _guard = test_lock();
         let storage = ShareStorage::new();
         storage.reset();
 
@@ -405,6 +425,7 @@ mod tests {
 
     #[test]
     fn presignature_fifo_consumption() {
+        let _guard = test_lock();
         let storage = ShareStorage::new();
         storage.reset();
 
@@ -446,6 +467,7 @@ mod tests {
 
     #[test]
     fn total_presignature_count() {
+        let _guard = test_lock();
         let storage = ShareStorage::new();
         storage.reset();
 
@@ -464,6 +486,7 @@ mod tests {
 
     #[test]
     fn store_share_upsert() {
+        let _guard = test_lock();
         let storage = ShareStorage::new();
         storage.reset();
 
