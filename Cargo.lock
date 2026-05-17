@@ -446,6 +446,7 @@ checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 [[package]]
 name = "cggmp24"
 version = "0.7.0-alpha.4"
+source = "git+https://github.com/Calhooon/cggmp21?rev=6c6421ee38687db0d2535f06b225f3073e5aa399#6c6421ee38687db0d2535f06b225f3073e5aa399"
 dependencies = [
  "cggmp24-keygen",
  "digest",
@@ -469,6 +470,7 @@ dependencies = [
 [[package]]
 name = "cggmp24-keygen"
 version = "0.7.0-alpha.4"
+source = "git+https://github.com/Calhooon/cggmp21?rev=6c6421ee38687db0d2535f06b225f3073e5aa399#6c6421ee38687db0d2535f06b225f3073e5aa399"
 dependencies = [
  "digest",
  "displaydoc",
@@ -1512,6 +1514,7 @@ dependencies = [
 [[package]]
 name = "key-share"
 version = "0.7.0"
+source = "git+https://github.com/Calhooon/cggmp21?rev=6c6421ee38687db0d2535f06b225f3073e5aa399#6c6421ee38687db0d2535f06b225f3073e5aa399"
 dependencies = [
  "displaydoc",
  "generic-ec",
@@ -1751,6 +1754,7 @@ dependencies = [
 [[package]]
 name = "paillier-zk"
 version = "0.7.0-alpha.4"
+source = "git+https://github.com/Calhooon/cggmp21?rev=6c6421ee38687db0d2535f06b225f3073e5aa399#6c6421ee38687db0d2535f06b225f3073e5aa399"
 dependencies = [
  "digest",
  "fast-paillier",
