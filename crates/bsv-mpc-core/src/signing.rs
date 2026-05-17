@@ -1257,8 +1257,7 @@ mod tests {
         let share0 = key_share_to_encrypted(&key_shares[0], 0, config);
         let share1 = key_share_to_encrypted(&key_shares[1], 1, config);
 
-        let mut coord0 =
-            SigningCoordinator::new(session, share0, config, participants.clone());
+        let mut coord0 = SigningCoordinator::new(session, share0, config, participants.clone());
         let mut coord1 = SigningCoordinator::new(session, share1, config, participants);
 
         // Message hash to sign
@@ -1363,8 +1362,7 @@ mod tests {
         let share1 = key_share_to_encrypted(&key_shares[1], 1, config);
 
         // Use sign() for coord0 and init_round() for coord1
-        let mut coord0 =
-            SigningCoordinator::new(session, share0, config, participants.clone());
+        let mut coord0 = SigningCoordinator::new(session, share0, config, participants.clone());
         let mut coord1 = SigningCoordinator::new(session, share1, config, participants);
 
         let message_hash: [u8; 32] = {
