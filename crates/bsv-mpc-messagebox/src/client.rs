@@ -31,8 +31,11 @@
 
 use std::sync::Arc;
 
-use bsv::primitives::ec::PrivateKey;
-use bsv_mpc_core::envelope::MessageEnvelope;
+use bsv::primitives::ec::{PrivateKey, PublicKey};
+use bsv_mpc_core::envelope::{
+    unwrap_envelope_to_round_message, wrap_round_message, MessageEnvelope, WrapParams,
+};
+use bsv_mpc_core::types::RoundMessage;
 use rand::RngCore;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -70,6 +73,12 @@ pub struct DecodedEnvelope {
 #[derive(Clone)]
 pub struct MessageBoxClient {
     auth: Arc<MessageBoxAuth>,
+    /// Stable BRC-31 identity priv held for outbound envelope signing
+    /// (`brc31_sign_envelope`) + inbound envelope decryption
+    /// (`brc78_decrypt`). Same key as the one inside the wallet — kept
+    /// in clone-able form so we don't need to dig it out of the
+    /// `ProtoWallet` on each call.
+    identity_priv: PrivateKey,
 }
 
 impl MessageBoxClient {
@@ -77,10 +86,11 @@ impl MessageBoxClient {
     /// stable BRC-31 identity. Starts the underlying `bsv-rs::Peer`
     /// transport callback (required before any HTTP round-trip).
     pub fn new(relay_url: impl Into<String>, our_priv: PrivateKey) -> Result<Self> {
-        let auth = MessageBoxAuth::new(relay_url, our_priv)?;
+        let auth = MessageBoxAuth::new(relay_url, our_priv.clone())?;
         auth.start();
         Ok(Self {
             auth: Arc::new(auth),
+            identity_priv: our_priv,
         })
     }
 
@@ -188,6 +198,184 @@ impl MessageBoxClient {
     pub fn auth(&self) -> &Arc<MessageBoxAuth> {
         &self.auth
     }
+
+    // ---------------------------------------------------------------------
+    // Typed RoundMessage send/subscribe (Phase B of the bsv-mpc-service
+    // MessageBox transport — composes wrap_round_message +
+    // unwrap_envelope_to_round_message with the existing envelope-level
+    // send/subscribe). The dispatcher in `bsv-mpc-service` consumes these.
+    // ---------------------------------------------------------------------
+
+    /// Wrap `round_msg` as a canonical `MessageEnvelope` and send it to
+    /// `recipient_pub_hex` on `message_box`. Auto-generates a fresh
+    /// message_id. Returns the relay-echoed message_id (for
+    /// [`acknowledge`]).
+    ///
+    /// `params` provides the envelope metadata the `RoundMessage`
+    /// itself doesn't carry: `to_party`, `joint_pubkey`, `phase`,
+    /// `execution_id_prefix`, and optional `correlation_id` /
+    /// `traceparent` — see [`bsv_mpc_core::envelope::WrapParams`].
+    ///
+    /// For broadcast `RoundMessage`s (per §05.4.7), the caller is
+    /// responsible for the N-unicast expansion: call `send_round_message`
+    /// once per recipient with the right `to_party` in `params`.
+    pub async fn send_round_message(
+        &self,
+        recipient_pub_hex: &str,
+        message_box: &str,
+        round_msg: &RoundMessage,
+        params: WrapParams,
+    ) -> Result<String> {
+        let recipient_pub = PublicKey::from_hex(recipient_pub_hex)
+            .map_err(|e| MessageBoxError::Protocol(format!("recipient pub hex: {e:?}")))?;
+        let envelope = wrap_round_message(round_msg, params, &recipient_pub, &self.identity_priv)
+            .map_err(MessageBoxError::Envelope)?;
+        self.send(recipient_pub_hex, message_box, &envelope).await
+    }
+
+    /// Subscribe to one mailbox and yield typed [`DecodedRoundMessage`]s —
+    /// each envelope's BRC-78 inner has been decrypted with our identity
+    /// priv, the BRC-31 sender signature verified against the
+    /// relay-asserted sender pub (defense in depth), and the round-number
+    /// translated back to coordinator-form 0-indexed.
+    ///
+    /// On shutdown, sends `leaveRoom` like
+    /// [`MessageBoxClient::subscribe`].
+    pub async fn subscribe_round_messages(
+        &self,
+        message_box: &str,
+    ) -> Result<RoundMessageSubscription> {
+        let env_sub = self.subscribe(message_box).await?;
+        Ok(RoundMessageSubscription::new(
+            env_sub,
+            self.identity_priv.clone(),
+            message_box.to_string(),
+        ))
+    }
+}
+
+/// One typed inbound `RoundMessage` event surfaced by
+/// [`MessageBoxClient::subscribe_round_messages`]. Carries the
+/// relay-assigned `message_id` (for `acknowledge`), the verified sender
+/// pub (BRC-31 already checked), the path (`WsPush`/`Backfill`), and
+/// the message_box the envelope arrived on (for dispatchers that
+/// listen on multiple boxes).
+#[derive(Debug, Clone)]
+pub struct DecodedRoundMessage {
+    pub message_id: String,
+    pub message_box: String,
+    pub sender_pub: PublicKey,
+    pub round_msg: RoundMessage,
+    pub via: InboundVia,
+}
+
+/// Typed subscription handle. Holds the underlying envelope
+/// subscription + an adapter task that decodes each `DecodedEnvelope`
+/// into a `DecodedRoundMessage`.
+pub struct RoundMessageSubscription {
+    inbound: mpsc::Receiver<Result<DecodedRoundMessage>>,
+    env_sub: Option<EnvelopeSubscription>,
+    adapter: Option<JoinHandle<()>>,
+    adapter_shutdown: Option<oneshot::Sender<()>>,
+}
+
+impl RoundMessageSubscription {
+    fn new(mut env_sub: EnvelopeSubscription, our_priv: PrivateKey, message_box: String) -> Self {
+        let (tx, rx) = mpsc::channel::<Result<DecodedRoundMessage>>(64);
+        let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
+
+        // Move the inner mpsc out so the adapter task owns it. Replace
+        // with a closed-by-default placeholder so the wrapper Drop is
+        // still safe.
+        let (placeholder_tx, placeholder_rx) = mpsc::channel::<Result<DecodedEnvelope>>(1);
+        drop(placeholder_tx);
+        let mut real_inbound = std::mem::replace(&mut env_sub.inbound, placeholder_rx);
+
+        let adapter = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = &mut shutdown_rx => return,
+                    item = real_inbound.recv() => {
+                        let Some(item) = item else { return; };
+                        let forwarded = match item {
+                            Ok(decoded) => decode_round_message(decoded, &our_priv, &message_box),
+                            Err(e) => Err(e),
+                        };
+                        if tx.send(forwarded).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+
+        Self {
+            inbound: rx,
+            env_sub: Some(env_sub),
+            adapter: Some(adapter),
+            adapter_shutdown: Some(shutdown_tx),
+        }
+    }
+
+    /// Pull the next typed inbound RoundMessage (or error). Returns
+    /// `None` on graceful shutdown / consumer drop.
+    pub async fn next(&mut self) -> Option<Result<DecodedRoundMessage>> {
+        self.inbound.recv().await
+    }
+
+    /// Gracefully shut down — propagates through to the underlying
+    /// `EnvelopeSubscription::shutdown` (which sends `leaveRoom` per
+    /// room before closing).
+    pub async fn shutdown(mut self) {
+        if let Some(env_sub) = self.env_sub.take() {
+            env_sub.shutdown().await;
+        }
+        if let Some(tx) = self.adapter_shutdown.take() {
+            let _ = tx.send(());
+        }
+        if let Some(h) = self.adapter.take() {
+            let _ = h.await;
+        }
+    }
+}
+
+impl Drop for RoundMessageSubscription {
+    fn drop(&mut self) {
+        if let Some(tx) = self.adapter_shutdown.take() {
+            let _ = tx.send(());
+        }
+        if let Some(h) = self.adapter.take() {
+            h.abort();
+        }
+    }
+}
+
+/// Convert one decoded envelope into a typed RoundMessage event.
+/// Parses the relay-asserted `sender` hex as a `PublicKey`, runs BRC-31
+/// verify + BRC-78 decrypt via `unwrap_envelope_to_round_message`,
+/// surfaces the result.
+fn decode_round_message(
+    decoded: DecodedEnvelope,
+    our_priv: &PrivateKey,
+    message_box: &str,
+) -> Result<DecodedRoundMessage> {
+    let sender_pub = PublicKey::from_hex(&decoded.sender).map_err(|e| {
+        MessageBoxError::Protocol(format!(
+            "relay-asserted sender hex isn't a valid pubkey ({}): {e:?}",
+            decoded.sender
+        ))
+    })?;
+    let round_msg =
+        unwrap_envelope_to_round_message(&decoded.envelope, our_priv, Some(&sender_pub))
+            .map_err(MessageBoxError::Envelope)?;
+    Ok(DecodedRoundMessage {
+        message_id: decoded.message_id,
+        message_box: message_box.to_string(),
+        sender_pub,
+        round_msg,
+        via: decoded.via,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -422,6 +610,118 @@ mod tests {
             "must be lowercase hex"
         );
         assert_ne!(a, b, "must be unique per call");
+    }
+
+    #[test]
+    fn decode_round_message_round_trips_full_envelope_path() {
+        // Vector test for the typed RoundMessage adapter: build a
+        // canonical envelope from a known RoundMessage via
+        // wrap_round_message_deterministic, then run it through the
+        // adapter `decode_round_message` (which composes BRC-31 verify +
+        // BRC-78 decrypt + round-translation). Byte-exact recovery is
+        // the gate.
+        use bsv_mpc_core::envelope::wrap_round_message_deterministic;
+        use bsv_mpc_core::types::{SessionId, ShareIndex};
+
+        let sender_priv = PrivateKey::from_bytes(&[0x11; 32]).unwrap();
+        let sender_pub = sender_priv.public_key();
+        let recipient_priv = PrivateKey::from_bytes(&[0x22; 32]).unwrap();
+        let recipient_pub = recipient_priv.public_key();
+        let eph_priv = PrivateKey::from_bytes(&[0x33; 32]).unwrap();
+        let iv = [0x44u8; 12];
+
+        let rm = RoundMessage {
+            session_id: SessionId([0x55; 32]),
+            round: 1,
+            from: ShareIndex(0),
+            to: Some(ShareIndex(1)),
+            payload: b"round-msg-adapter-vector".to_vec(),
+        };
+        let params = WrapParams {
+            to_party: 1,
+            joint_pubkey: {
+                let mut p = [0u8; 33];
+                p[0] = 0x02;
+                p
+            },
+            phase: "dkg".into(),
+            execution_id_prefix: [0u8; 8],
+            correlation_id: None,
+            traceparent: None,
+        };
+        let envelope = wrap_round_message_deterministic(
+            &rm,
+            params,
+            &recipient_pub,
+            &sender_priv,
+            &eph_priv,
+            &iv,
+        )
+        .unwrap();
+
+        // Construct the DecodedEnvelope that subscribe() would surface
+        // (sender = relay-verified hex of sender pub).
+        let decoded_env = DecodedEnvelope {
+            message_id: "adapter-fixture-1".into(),
+            sender: sender_pub.to_hex(),
+            envelope,
+            via: InboundVia::WsPush,
+        };
+
+        let decoded = decode_round_message(decoded_env, &recipient_priv, "mpc-dkg").unwrap();
+        assert_eq!(decoded.message_id, "adapter-fixture-1");
+        assert_eq!(decoded.sender_pub.to_hex(), sender_pub.to_hex());
+        assert_eq!(decoded.message_box, "mpc-dkg");
+        assert_eq!(decoded.via, InboundVia::WsPush);
+        assert_eq!(decoded.round_msg.session_id, rm.session_id);
+        assert_eq!(decoded.round_msg.round, rm.round);
+        assert_eq!(decoded.round_msg.from, rm.from);
+        assert_eq!(decoded.round_msg.to, rm.to);
+        assert_eq!(decoded.round_msg.payload, rm.payload);
+    }
+
+    #[test]
+    fn decode_round_message_propagates_decode_error_on_wrong_recipient() {
+        // The adapter MUST propagate BRC-78 decryption failures (wrong
+        // recipient priv) as an Err — not silently drop the message.
+        use bsv_mpc_core::envelope::wrap_round_message_deterministic;
+        use bsv_mpc_core::types::{SessionId, ShareIndex};
+
+        let sender_priv = PrivateKey::from_bytes(&[0x11; 32]).unwrap();
+        let intended_recipient_priv = PrivateKey::from_bytes(&[0x22; 32]).unwrap();
+        let envelope = wrap_round_message_deterministic(
+            &RoundMessage {
+                session_id: SessionId([0x99; 32]),
+                round: 0,
+                from: ShareIndex(0),
+                to: Some(ShareIndex(1)),
+                payload: vec![0x01, 0x02, 0x03],
+            },
+            WrapParams {
+                to_party: 1,
+                joint_pubkey: [0u8; 33],
+                phase: "sign".into(),
+                execution_id_prefix: [0u8; 8],
+                correlation_id: None,
+                traceparent: None,
+            },
+            &intended_recipient_priv.public_key(),
+            &sender_priv,
+            &PrivateKey::from_bytes(&[0x33; 32]).unwrap(),
+            &[0x44u8; 12],
+        )
+        .unwrap();
+
+        let decoded_env = DecodedEnvelope {
+            message_id: "err-fixture".into(),
+            sender: sender_priv.public_key().to_hex(),
+            envelope,
+            via: InboundVia::WsPush,
+        };
+        let attacker_priv = PrivateKey::from_bytes(&[0xee; 32]).unwrap();
+        let err = decode_round_message(decoded_env, &attacker_priv, "mpc-sign").unwrap_err();
+        // Wrapped via MessageBoxError::Envelope(MpcError::Encryption(...))
+        assert!(matches!(err, MessageBoxError::Envelope(_)));
     }
 
     #[test]

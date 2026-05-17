@@ -37,8 +37,8 @@ use bsv_mpc_messagebox::http;
 use bsv_mpc_messagebox::types::{MessagePayload, SendMessageRequest, BOX_SIGN};
 use bsv_mpc_messagebox::wire;
 use bsv_mpc_messagebox::{
-    subscribe, DecodedEnvelope, EnvelopeSubscription, InboundEnvelopeEvent, InboundVia,
-    MessageBoxClient, WsSubscription,
+    subscribe, DecodedEnvelope, DecodedRoundMessage, EnvelopeSubscription, InboundEnvelopeEvent,
+    InboundVia, MessageBoxClient, RoundMessageSubscription, WsSubscription,
 };
 use rand::RngCore;
 
@@ -525,6 +525,141 @@ async fn wait_for_decoded(
         }
         eprintln!(
             "(skipping unrelated DecodedEnvelope: message_id={} via={:?})",
+            decoded.message_id, decoded.via
+        );
+    }
+}
+
+/// Fourth live-relay scenario for the M1 sprint: typed `RoundMessage`
+/// send/subscribe (Phase B of the bsv-mpc-service MessageBox transport)
+/// end-to-end against the deployed Calhoun relay. Covers:
+///
+/// 1. Alice + Bob each construct a `MessageBoxClient`.
+/// 2. Alice opens a `RoundMessageSubscription` via
+///    `MessageBoxClient::subscribe_round_messages` — yields typed
+///    `DecodedRoundMessage`s, each already decrypted with Alice's priv
+///    and BRC-31-verified against the sender's relay-asserted pub.
+/// 3. Bob calls `MessageBoxClient::send_round_message(alice_pub,
+///    "mpc-dkg", &round_msg, params)` — accepts a typed `RoundMessage`
+///    + `WrapParams` directly. Auto-generates a fresh message_id.
+/// 4. Alice's `sub.next()` yields a `DecodedRoundMessage` whose
+///    `.round_msg` matches Bob's send byte-for-byte (session_id, round,
+///    from, to, payload). `via == WsPush`. `.sender_pub` matches Bob's
+///    identity pub. `.message_box == "mpc-dkg"`.
+/// 5. Alice ACKs + gracefully shuts down.
+///
+/// This is the merge gate for Phase B — the typed RoundMessage layer
+/// that bsv-mpc-service will consume in Phase C. Drift in the wrap
+/// helpers, the round-translation, the BRC-31/BRC-78 composition, or
+/// the message_box plumbing fails here.
+#[tokio::test]
+async fn live_relay_typed_round_message_round_trips_via_subscription() {
+    use bsv_mpc_core::envelope::WrapParams;
+    use bsv_mpc_core::types::{RoundMessage, ShareIndex};
+    use bsv_mpc_messagebox::types::BOX_DKG;
+
+    let Some(relay_url) = relay_url() else {
+        eprintln!("MESSAGEBOX_RELAY_URL not set — skipping typed-RoundMessage proof.");
+        return;
+    };
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let alice = MessageBoxClient::new(&relay_url, fresh_priv()).expect("alice client");
+    let bob = MessageBoxClient::new(&relay_url, fresh_priv()).expect("bob client");
+    let alice_pub = alice.identity_hex().await.expect("alice identity_hex");
+    let bob_pub = bob.identity_hex().await.expect("bob identity_hex");
+    eprintln!("✔ alice = {alice_pub}");
+    eprintln!("✔ bob   = {bob_pub}");
+
+    let mut sub: RoundMessageSubscription = alice
+        .subscribe_round_messages(BOX_DKG)
+        .await
+        .expect("alice subscribe_round_messages MUST succeed");
+    eprintln!("✔ alice subscribed to {BOX_DKG} (typed RoundMessage stream)");
+
+    let round_msg = RoundMessage {
+        session_id: SessionId([0xb0; 32]),
+        round: 0,
+        from: ShareIndex(0),
+        to: Some(ShareIndex(1)),
+        payload: b"typed-round-message-live-proof".to_vec(),
+    };
+    let params = WrapParams {
+        to_party: 1,
+        joint_pubkey: [0u8; 33], // DKG keygen phase — joint key doesn't exist yet
+        phase: "dkg".into(),
+        execution_id_prefix: [0xde, 0xad, 0xbe, 0xef, 0xfe, 0xed, 0xfa, 0xce],
+        correlation_id: Some("typed-round-msg-corr".into()),
+        traceparent: None,
+    };
+
+    let message_id = bob
+        .send_round_message(&alice_pub, BOX_DKG, &round_msg, params)
+        .await
+        .expect("bob send_round_message MUST succeed");
+    eprintln!("✔ bob sent typed RoundMessage: message_id={message_id}");
+
+    let decoded = wait_for_decoded_round_message(&mut sub, &message_id, Duration::from_secs(10))
+        .await
+        .expect("typed RoundMessage MUST arrive on subscription within 10s");
+    assert_eq!(decoded.via, InboundVia::WsPush);
+    assert_eq!(decoded.sender_pub.to_hex(), bob_pub);
+    assert_eq!(decoded.message_box, BOX_DKG);
+    assert_eq!(
+        decoded.round_msg.session_id, round_msg.session_id,
+        "session_id MUST round-trip byte-exact"
+    );
+    assert_eq!(
+        decoded.round_msg.round, round_msg.round,
+        "round MUST round-trip 0-indexed (envelope is 1-based; wrap/unwrap translates)"
+    );
+    assert_eq!(decoded.round_msg.from, round_msg.from);
+    assert_eq!(decoded.round_msg.to, round_msg.to);
+    assert_eq!(
+        decoded.round_msg.payload, round_msg.payload,
+        "BRC-78-decrypted payload MUST match Bob's send byte-exact"
+    );
+    eprintln!(
+        "✔ alice received typed RoundMessage (via={:?}, {} payload bytes byte-exact, sender BRC-31 verified)",
+        decoded.via,
+        decoded.round_msg.payload.len()
+    );
+
+    alice
+        .acknowledge(std::slice::from_ref(&decoded.message_id))
+        .await
+        .expect("ack MUST succeed");
+    tokio::time::timeout(Duration::from_secs(5), sub.shutdown())
+        .await
+        .expect("shutdown MUST complete within 5s");
+    eprintln!("✔ alice gracefully shut down");
+}
+
+async fn wait_for_decoded_round_message(
+    sub: &mut RoundMessageSubscription,
+    want_message_id: &str,
+    timeout: Duration,
+) -> Result<DecodedRoundMessage, String> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(format!(
+                "timed out after {timeout:?} waiting for message_id={want_message_id}"
+            ));
+        }
+        let item = tokio::time::timeout(remaining, sub.next())
+            .await
+            .map_err(|_| format!("timeout waiting for {want_message_id}"))?
+            .ok_or_else(|| {
+                format!("subscription stream closed before {want_message_id} arrived")
+            })?;
+        let decoded = item.map_err(|e| format!("subscription error: {e}"))?;
+        if decoded.message_id == want_message_id {
+            return Ok(decoded);
+        }
+        eprintln!(
+            "(skipping unrelated DecodedRoundMessage: message_id={} via={:?})",
             decoded.message_id, decoded.via
         );
     }

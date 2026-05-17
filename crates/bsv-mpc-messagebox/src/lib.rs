@@ -49,6 +49,9 @@ pub mod types;
 pub mod wire;
 pub mod ws;
 
-pub use client::{DecodedEnvelope, EnvelopeSubscription, MessageBoxClient};
+pub use client::{
+    DecodedEnvelope, DecodedRoundMessage, EnvelopeSubscription, MessageBoxClient,
+    RoundMessageSubscription,
+};
 pub use error::{MessageBoxError, Result};
 pub use ws::{subscribe, InboundEnvelopeEvent, InboundVia, WsSubscription};
