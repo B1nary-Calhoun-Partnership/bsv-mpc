@@ -118,11 +118,10 @@ Mirror the types in `bsv-mpc-worker::api`. Could be extracted to a shared crate 
 - `generate_session_id(prefix)` (handlers.rs:211) — 32 bytes from `getrandom`, SHA-256 hashed, formatted as `"{prefix}-{hex(first_16_bytes)}"`. Used for all session IDs (dkg, sign, presign).
 - `err_response(status, msg)` (handlers.rs:219) — Returns `(StatusCode, Json({"error": "..."}))` tuple for error responses.
 - `bundle_outgoing_messages(messages)` (handlers.rs:227) — Combines multiple `RoundMessage`s into one by JSON-array-encoding their payloads. Preserves `session_id`, `round`, `from` from the first message, sets `to: None`.
-- `unbundle_incoming_message(msg)` (handlers.rs:254) — Splits a transport `RoundMessage` back into individual messages. Detects bundled payloads by checking if the first byte is `[` (JSON array). If not an array, returns the message as-is in a single-element vec. **Currently unused** — handlers pass bundled messages directly to coordinators as a single-element vec (coordinators handle unbundling internally via their SM thread).
 
 ### Message Flow
 
-Outgoing messages from coordinators are **bundled** via `bundle_outgoing_messages()` before being returned to the proxy. Incoming messages from the proxy are passed to coordinators as-is in a single-element vec (the coordinator's internal SM thread handles unbundling). The `unbundle_incoming_message()` helper exists for future use but is not called by any handler.
+Outgoing messages from coordinators are **bundled** via `bundle_outgoing_messages()` before being returned to the proxy. Incoming messages from the proxy are passed to coordinators as-is in a single-element vec (the coordinator's internal SM thread handles unbundling). If the service ever needs to unbundle on the receive side, mirror the pattern in `bsv-mpc-worker/src/api.rs::unbundle_incoming_message` (used + tested in the worker).
 
 ## Configuration
 

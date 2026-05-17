@@ -250,30 +250,6 @@ fn bundle_outgoing_messages(messages: &[RoundMessage]) -> Result<RoundMessage, S
     })
 }
 
-/// Unbundle an incoming transport RoundMessage into individual RoundMessages.
-fn unbundle_incoming_message(msg: &RoundMessage) -> Result<Vec<RoundMessage>, String> {
-    if msg.payload.first() == Some(&b'[') {
-        if let Ok(values) = serde_json::from_slice::<Vec<serde_json::Value>>(&msg.payload) {
-            return values
-                .into_iter()
-                .map(|v| {
-                    let payload = serde_json::to_vec(&v)
-                        .map_err(|e| format!("failed to re-serialize wire message: {e}"))?;
-                    Ok(RoundMessage {
-                        session_id: msg.session_id.clone(),
-                        round: msg.round,
-                        from: msg.from,
-                        to: msg.to,
-                        payload,
-                    })
-                })
-                .collect();
-        }
-    }
-
-    Ok(vec![msg.clone()])
-}
-
 // ── Handlers ──────────────────────────────────────────────────────────────
 
 /// `POST /dkg/init` — Start a Distributed Key Generation ceremony.
