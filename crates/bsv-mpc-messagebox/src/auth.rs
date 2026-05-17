@@ -52,9 +52,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use bsv::auth::{Peer, PeerOptions, SimplifiedFetchTransport};
 use bsv::primitives::ec::PrivateKey;
-use bsv::wallet::{
-    Counterparty, CreateSignatureArgs, Protocol, ProtoWallet, SecurityLevel,
-};
+use bsv::wallet::{Counterparty, CreateSignatureArgs, ProtoWallet, Protocol, SecurityLevel};
 use rand::RngCore;
 use serde_json::{json, Value};
 use tokio::sync::RwLock;
@@ -167,11 +165,7 @@ impl MessageBoxAuth {
     /// the WS URL exactly as it will appear on the request line. Pass
     /// `""` for `query` when the URL has no query string; otherwise the
     /// signable string MUST be the raw `?…` form.
-    pub async fn sign_ws_upgrade(
-        &self,
-        path: &str,
-        query: &str,
-    ) -> Result<SignedWsHeaders> {
+    pub async fn sign_ws_upgrade(&self, path: &str, query: &str) -> Result<SignedWsHeaders> {
         let session = self.ensure_session().await?;
         brc104::sign_ws_get(
             &self.wallet,
@@ -339,9 +333,7 @@ mod brc104 {
         let server_identity_key = data
             .get("identityKey")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                MessageBoxError::Auth("initialResponse missing identityKey".into())
-            })?
+            .ok_or_else(|| MessageBoxError::Auth("initialResponse missing identityKey".into()))?
             .to_string();
 
         // Server's nonce field is `initialNonce` or `nonce` depending on
@@ -383,7 +375,11 @@ mod brc104 {
         path: &str,
         query: &str,
     ) -> Result<SignedWsHeaders> {
-        let path_opt = if path.is_empty() { Some("/") } else { Some(path) };
+        let path_opt = if path.is_empty() {
+            Some("/")
+        } else {
+            Some(path)
+        };
         let query_opt = if query.is_empty() { None } else { Some(query) };
 
         let mut msg_nonce = [0u8; 32];
@@ -394,20 +390,11 @@ mod brc104 {
         rand::thread_rng().fill_bytes(&mut request_id);
         let request_id_b64 = BASE64.encode(request_id);
 
-        let serialized = serialize_request(
-            &request_id,
-            "GET",
-            path_opt,
-            query_opt,
-            &[],
-            None,
-        );
+        let serialized = serialize_request(&request_id, "GET", path_opt, query_opt, &[], None);
 
         let key_id = format!("{msg_nonce_b64} {server_nonce_b64}");
         let counterparty = Counterparty::from_hex(server_identity_key).map_err(|e| {
-            MessageBoxError::Auth(format!(
-                "parse server identity_key as Counterparty: {e:?}"
-            ))
+            MessageBoxError::Auth(format!("parse server identity_key as Counterparty: {e:?}"))
         })?;
 
         let result = wallet
@@ -534,14 +521,9 @@ mod tests {
         let server_nonce_b64 = BASE64.encode(server_nonce_bytes);
 
         let wallet = ProtoWallet::new(Some(priv_));
-        let headers = brc104::sign_ws_get(
-            &wallet,
-            &server_identity_hex,
-            &server_nonce_b64,
-            "/ws",
-            "",
-        )
-        .expect("sign_ws_get must succeed against a well-formed Session");
+        let headers =
+            brc104::sign_ws_get(&wallet, &server_identity_hex, &server_nonce_b64, "/ws", "")
+                .expect("sign_ws_get must succeed against a well-formed Session");
 
         // The 7 BRC-31 auth headers must all be present and in the
         // canonical order build_auth_headers produces.

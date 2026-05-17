@@ -55,9 +55,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{interval, MissedTickBehavior};
 use tokio_tungstenite::{
     connect_async,
-    tungstenite::{
-        handshake::client::generate_key, http::Request, protocol::Message,
-    },
+    tungstenite::{handshake::client::generate_key, http::Request, protocol::Message},
     MaybeTlsStream, WebSocketStream,
 };
 use tracing::{debug, warn};
@@ -153,10 +151,7 @@ impl Drop for WsSubscription {
 /// sees the error directly. The background task takes over for
 /// subsequent disconnects, applying §06.12 exponential backoff +
 /// backfill-on-reconnect (Option A from the #13 plan).
-pub async fn subscribe(
-    auth: Arc<MessageBoxAuth>,
-    boxes: Vec<String>,
-) -> Result<WsSubscription> {
+pub async fn subscribe(auth: Arc<MessageBoxAuth>, boxes: Vec<String>) -> Result<WsSubscription> {
     if boxes.is_empty() {
         return Err(MessageBoxError::Protocol(
             "subscribe requires at least one message_box".into(),
@@ -263,7 +258,7 @@ async fn run_loop(
             }
         };
 
-        match pump_frames_owned(ws, &identity_hex, &inbound, &mut shutdown).await {
+        match pump_frames_owned(ws, &identity_hex, &boxes, &inbound, &mut shutdown).await {
             PumpExit::Shutdown | PumpExit::ConsumerGone => return,
             PumpExit::Disconnected(reason) => {
                 warn!(reconnect_in = ?backoff, "ws disconnected: {reason}");
@@ -290,7 +285,7 @@ async fn run_loop_with_socket(
     inbound: mpsc::Sender<Result<InboundEnvelopeEvent>>,
     mut shutdown: oneshot::Receiver<()>,
 ) {
-    match pump_frames_owned(initial_ws, &identity_hex, &inbound, &mut shutdown).await {
+    match pump_frames_owned(initial_ws, &identity_hex, &boxes, &inbound, &mut shutdown).await {
         PumpExit::Shutdown | PumpExit::ConsumerGone => return,
         PumpExit::Disconnected(reason) => {
             warn!("ws disconnected (initial session): {reason}");
@@ -472,6 +467,56 @@ async fn send_join_room(ws: &mut WsStream, room_id: &str) -> Result<()> {
         .map_err(|e| MessageBoxError::WebSocket(format!("send joinRoom: {e}")))
 }
 
+/// Max time to wait for a `leftRoom` ack per room during graceful
+/// shutdown. Best-effort — if the relay is slow or unresponsive, we
+/// proceed to close anyway so app shutdown isn't blocked.
+const LEAVE_ACK_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Send `leaveRoom` for each subscribed room and await the matching
+/// `leftRoom` ack with a short timeout, then close the socket.
+/// Best-effort throughout — any per-room failure logs and continues so
+/// the caller's `shutdown().await` always completes.
+///
+/// Why bother: the relay's per-identity DO routes pushes by iterating
+/// every accepted socket and matching against the socket's
+/// `joined_rooms` attachment. Sending leaveRoom first lets the relay
+/// drop the room from its view before the socket goes away — clean
+/// hygiene that costs at most one round-trip.
+async fn graceful_leave_then_close(ws: &mut WsStream, identity_hex: &str, boxes: &[String]) {
+    for message_box in boxes {
+        let room_id = format!("{identity_hex}-{message_box}");
+        let frame = json!({ "event": "leaveRoom", "data": { "roomId": room_id } }).to_string();
+        if let Err(e) = ws.send(Message::Text(frame)).await {
+            debug!("leaveRoom send failed for {room_id} — proceeding to close: {e}");
+            continue;
+        }
+        // Best-effort ack — burn through frames until we see the
+        // matching leftRoom, the timeout fires, or the socket closes.
+        let _ = tokio::time::timeout(LEAVE_ACK_TIMEOUT, async {
+            while let Some(msg) = ws.next().await {
+                let Ok(msg) = msg else {
+                    return;
+                };
+                let text = match msg {
+                    Message::Text(t) => t.to_string(),
+                    Message::Close(_) => return,
+                    _ => continue,
+                };
+                if text == "pong" {
+                    continue;
+                }
+                if let Ok(ServerEvent::LeftRoom { room_id: acked }) = parse_server_event(&text) {
+                    if acked == room_id {
+                        return;
+                    }
+                }
+            }
+        })
+        .await;
+    }
+    let _ = ws.close(None).await;
+}
+
 async fn await_joined_room(ws: &mut WsStream, expected_room: &str) -> Result<()> {
     let deadline = tokio::time::Instant::now() + JOIN_ACK_TIMEOUT;
     loop {
@@ -534,6 +579,7 @@ async fn await_joined_room(ws: &mut WsStream, expected_room: &str) -> Result<()>
 async fn pump_frames_owned(
     mut ws: WsStream,
     identity_hex: &str,
+    boxes: &[String],
     inbound: &mpsc::Sender<Result<InboundEnvelopeEvent>>,
     shutdown: &mut oneshot::Receiver<()>,
 ) -> PumpExit {
@@ -549,7 +595,7 @@ async fn pump_frames_owned(
             biased;
 
             _ = &mut *shutdown => {
-                let _ = ws.close(None).await;
+                graceful_leave_then_close(ws, identity_hex, boxes).await;
                 return PumpExit::Shutdown;
             }
             _ = heartbeat.tick() => {
@@ -681,7 +727,7 @@ async fn dispatch_event(
         }
         ServerEvent::Connected { .. }
         | ServerEvent::JoinedRoom { .. }
-        | ServerEvent::LeftRoom
+        | ServerEvent::LeftRoom { .. }
         | ServerEvent::AuthenticationSuccess
         | ServerEvent::Unknown => FrameOutcome::Ok,
     }
@@ -719,7 +765,9 @@ fn parse_server_event(text: &str) -> Result<ServerEvent> {
         "joinedRoom" => ServerEvent::JoinedRoom {
             room_id: str_field(&raw.data, "roomId").unwrap_or_default(),
         },
-        "leftRoom" => ServerEvent::LeftRoom,
+        "leftRoom" => ServerEvent::LeftRoom {
+            room_id: str_field(&raw.data, "roomId").unwrap_or_default(),
+        },
         "joinFailed" => ServerEvent::JoinFailed {
             reason: str_field(&raw.data, "reason").unwrap_or_default(),
         },
@@ -756,13 +804,25 @@ struct RawFrame {
 
 #[derive(Debug)]
 enum ServerEvent {
-    Connected { identity_key: String },
+    Connected {
+        identity_key: String,
+    },
     AuthenticationSuccess,
-    JoinedRoom { room_id: String },
-    LeftRoom,
-    JoinFailed { reason: String },
-    LeaveFailed { reason: String },
-    MessageFailed { reason: String },
+    JoinedRoom {
+        room_id: String,
+    },
+    LeftRoom {
+        room_id: String,
+    },
+    JoinFailed {
+        reason: String,
+    },
+    LeaveFailed {
+        reason: String,
+    },
+    MessageFailed {
+        reason: String,
+    },
     SendMessage(SendMessageData),
     /// Any event name we don't act on (`sendMessageAck`, future events).
     /// Kept so the pump loop never errors on a new event type.
@@ -791,7 +851,10 @@ mod tests {
     fn build_ws_url_swaps_https_for_wss() {
         let u = build_ws_url("https://rust-message-box.dev-a3e.workers.dev").unwrap();
         assert_eq!(u.scheme(), "wss");
-        assert_eq!(u.host_str().unwrap(), "rust-message-box.dev-a3e.workers.dev");
+        assert_eq!(
+            u.host_str().unwrap(),
+            "rust-message-box.dev-a3e.workers.dev"
+        );
         assert_eq!(u.path(), "/ws");
     }
 

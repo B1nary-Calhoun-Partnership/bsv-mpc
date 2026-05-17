@@ -37,7 +37,8 @@ use bsv_mpc_messagebox::http;
 use bsv_mpc_messagebox::types::{MessagePayload, SendMessageRequest, BOX_SIGN};
 use bsv_mpc_messagebox::wire;
 use bsv_mpc_messagebox::{
-    subscribe, InboundEnvelopeEvent, InboundVia, WsSubscription,
+    subscribe, DecodedEnvelope, EnvelopeSubscription, InboundEnvelopeEvent, InboundVia,
+    MessageBoxClient, WsSubscription,
 };
 use rand::RngCore;
 
@@ -214,8 +215,7 @@ async fn live_relay_ws_subscribe_receives_push_then_backfill() {
     alice.start();
     let alice_pub = alice.identity_hex().await.expect("alice identity_hex");
 
-    let bob =
-        MessageBoxAuth::new(&relay_url, fresh_priv()).expect("MessageBoxAuth::new(bob)");
+    let bob = MessageBoxAuth::new(&relay_url, fresh_priv()).expect("MessageBoxAuth::new(bob)");
     bob.start();
     let bob_pub = bob.identity_hex().await.expect("bob identity_hex");
 
@@ -319,10 +319,9 @@ async fn live_relay_ws_subscribe_receives_push_then_backfill() {
     assert_eq!(send2.status, "success");
     eprintln!("✔ bob sent #2 while alice offline: message_id={msg_id_2}");
 
-    let mut sub2: WsSubscription =
-        subscribe(alice.clone(), vec![BOX_SIGN.to_string()])
-            .await
-            .expect("alice re-subscribe MUST succeed");
+    let mut sub2: WsSubscription = subscribe(alice.clone(), vec![BOX_SIGN.to_string()])
+        .await
+        .expect("alice re-subscribe MUST succeed");
     eprintln!("✔ alice re-subscribed; backfill drained before pump started");
 
     let event2 = wait_for(&mut sub2, &msg_id_2, Duration::from_secs(10))
@@ -389,6 +388,144 @@ async fn wait_for(
         eprintln!(
             "(skipping unrelated event: message_id={} via={:?})",
             event.message_id, event.via
+        );
+    }
+}
+
+/// Third live-relay scenario for the M1 sprint: typed `MessageBoxClient`
+/// public API (task #14) end-to-end against the deployed Calhoun relay.
+/// Covers:
+///
+/// 1. Alice + Bob each construct a `MessageBoxClient` (one BRC-31
+///    identity per client).
+/// 2. Alice opens an `EnvelopeSubscription` on `mpc-sign` via
+///    `MessageBoxClient::subscribe` — yields typed `DecodedEnvelope`s,
+///    not raw `InboundEnvelopeEvent`s.
+/// 3. Bob calls `MessageBoxClient::send(alice_pub, "mpc-sign",
+///    &envelope)` — accepts a typed `MessageEnvelope` directly (no
+///    SendMessageRequest plumbing visible to the caller).
+/// 4. Alice's `sub.next()` yields a `DecodedEnvelope` whose
+///    `.envelope` round-trips byte-exact with what Bob sent. Sender
+///    field matches Bob's identity. `via == WsPush`.
+/// 5. Alice ACKs via `MessageBoxClient::acknowledge`.
+/// 6. Alice calls `sub.shutdown().await` — the WS run-loop's graceful
+///    path sends `leaveRoom` for each joined room before closing. The
+///    relay tolerates timeouts here (best-effort per §06.13 / our
+///    `LEAVE_ACK_TIMEOUT`), so this call MUST complete cleanly.
+///
+/// This is the merge gate for #14 — drift in the typed API, the
+/// envelope decoder adapter, the `EnvelopeSubscription` lifecycle, or
+/// the `leaveRoom` shutdown path fails here.
+#[tokio::test]
+async fn live_relay_message_box_client_typed_round_trip_with_leave_on_shutdown() {
+    let Some(relay_url) = relay_url() else {
+        eprintln!("MESSAGEBOX_RELAY_URL not set — skipping MessageBoxClient proof.");
+        return;
+    };
+    let _ = tracing_subscriber::fmt::try_init();
+
+    // ----- Identities -----
+    let alice = MessageBoxClient::new(&relay_url, fresh_priv()).expect("alice client");
+    let bob = MessageBoxClient::new(&relay_url, fresh_priv()).expect("bob client");
+    let alice_pub = alice.identity_hex().await.expect("alice identity_hex");
+    let bob_pub = bob.identity_hex().await.expect("bob identity_hex");
+    eprintln!("✔ alice = {alice_pub}");
+    eprintln!("✔ bob   = {bob_pub}");
+
+    // ----- Subscribe (typed) + send (typed) -----
+    let mut sub: EnvelopeSubscription = alice
+        .subscribe(BOX_SIGN)
+        .await
+        .expect("alice MessageBoxClient::subscribe MUST succeed");
+    eprintln!("✔ alice subscribed to {BOX_SIGN} via MessageBoxClient (handshake inline)");
+
+    let envelope = {
+        let mut e = sample_envelope();
+        e.session_id = SessionId([0x77; 32]);
+        e.inner = b"client-api-proof-payload".to_vec();
+        e.correlation_id = Some("client-api-proof".into());
+        e
+    };
+    let envelope_bytes = envelope.encode_canonical();
+
+    let message_id = bob
+        .send(&alice_pub, BOX_SIGN, &envelope)
+        .await
+        .expect("bob MessageBoxClient::send MUST succeed");
+    eprintln!("✔ bob sent typed envelope via MessageBoxClient::send: message_id={message_id}");
+
+    // ----- Receive (typed) -----
+    let decoded = wait_for_decoded(&mut sub, &message_id, Duration::from_secs(10))
+        .await
+        .expect("typed envelope MUST arrive on subscription within 10s");
+    assert_eq!(
+        decoded.via,
+        InboundVia::WsPush,
+        "first envelope MUST arrive via live WS push"
+    );
+    assert_eq!(decoded.sender, bob_pub, "sender field MUST be bob");
+    assert_eq!(
+        decoded.envelope, envelope,
+        "typed envelope MUST round-trip byte-exact"
+    );
+    assert_eq!(
+        decoded.envelope.encode_canonical(),
+        envelope_bytes,
+        "byte-equivalent re-encode (§05.9.1) preserved through the typed API"
+    );
+    eprintln!(
+        "✔ alice received typed DecodedEnvelope (via={:?}, {} bytes byte-exact)",
+        decoded.via,
+        envelope_bytes.len()
+    );
+
+    // ----- ACK via the typed API -----
+    alice
+        .acknowledge(std::slice::from_ref(&decoded.message_id))
+        .await
+        .expect("MessageBoxClient::acknowledge MUST succeed");
+    eprintln!("✔ alice acknowledged via MessageBoxClient::acknowledge");
+
+    // ----- Graceful shutdown sends leaveRoom + closes -----
+    // The shutdown() future MUST complete (≤500ms × #rooms for the
+    // leave-ack timeout, plus the close handshake) regardless of relay
+    // health. If it hangs, this test deadlocks → CI failure.
+    tokio::time::timeout(Duration::from_secs(5), sub.shutdown())
+        .await
+        .expect(
+            "EnvelopeSubscription::shutdown MUST complete within 5s — \
+             graceful leaveRoom + close is best-effort, never blocking",
+        );
+    eprintln!("✔ alice EnvelopeSubscription gracefully shut down (leaveRoom + close)");
+}
+
+/// Variant of `wait_for` for the typed `EnvelopeSubscription` stream.
+async fn wait_for_decoded(
+    sub: &mut EnvelopeSubscription,
+    want_message_id: &str,
+    timeout: Duration,
+) -> Result<DecodedEnvelope, String> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(format!(
+                "timed out after {timeout:?} waiting for message_id={want_message_id}"
+            ));
+        }
+        let item = tokio::time::timeout(remaining, sub.next())
+            .await
+            .map_err(|_| format!("timeout waiting for {want_message_id}"))?
+            .ok_or_else(|| {
+                format!("subscription stream closed before {want_message_id} arrived")
+            })?;
+        let decoded = item.map_err(|e| format!("subscription error: {e}"))?;
+        if decoded.message_id == want_message_id {
+            return Ok(decoded);
+        }
+        eprintln!(
+            "(skipping unrelated DecodedEnvelope: message_id={} via={:?})",
+            decoded.message_id, decoded.via
         );
     }
 }

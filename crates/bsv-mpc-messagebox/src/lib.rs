@@ -49,10 +49,6 @@ pub mod types;
 pub mod wire;
 pub mod ws;
 
+pub use client::{DecodedEnvelope, EnvelopeSubscription, MessageBoxClient};
 pub use error::{MessageBoxError, Result};
 pub use ws::{subscribe, InboundEnvelopeEvent, InboundVia, WsSubscription};
-
-// `MessageBoxClient` re-export lands when `client::MessageBoxClient` is
-// populated by task #14. Until then, callers `use bsv_mpc_messagebox::wire`
-// directly for the wrap/unwrap helpers that ARE shipped here, and
-// `subscribe`/`WsSubscription` from this crate root for the WS surface.
