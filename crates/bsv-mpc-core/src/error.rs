@@ -67,6 +67,23 @@ pub enum MpcError {
     /// Generic MPC protocol error for cases not covered by specific variants.
     #[error("MPC protocol error: {0}")]
     Protocol(String),
+
+    /// A canonical wire-format input was malformed (e.g. duplicate participants,
+    /// zero nonce, mis-sized inputs). Per MPC-Spec §02 / §04 normative rules.
+    #[error("Invalid canonical-wire input: {0}")]
+    InvalidConfig(String),
+
+    /// A canonical CBOR envelope failed strict admission per MPC-Spec §05.9.1
+    /// (non-minimal int, indefinite length, duplicate key, trailing bytes,
+    /// float, unsorted keys, unknown tag, non-uint/tstr key). Always rejected
+    /// before any further processing.
+    #[error("Canonical envelope rejected ({rule}): {detail}")]
+    EnvelopeReencodeMismatch {
+        /// Which §05.9.1 sub-rule was violated.
+        rule: &'static str,
+        /// Human-readable detail of the violation.
+        detail: String,
+    },
 }
 
 /// A specialized `Result` type for MPC operations.

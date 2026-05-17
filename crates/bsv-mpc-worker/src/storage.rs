@@ -158,7 +158,7 @@ impl ShareStorage {
                 .unwrap_or(0);
             ShareMetadata {
                 agent_id: agent_id.to_string(),
-                session_id: stored.share.session_id.0.clone(),
+                session_id: stored.share.session_id.hex(),
                 share_index: stored.share.share_index.0,
                 threshold: stored.share.config.threshold,
                 parties: stored.share.config.parties,
@@ -269,7 +269,7 @@ mod tests {
         EncryptedShare {
             nonce: vec![0u8; 12],
             ciphertext: vec![1, 2, 3, 4],
-            session_id: SessionId(format!("session-{agent_id}")),
+            session_id: SessionId::from_str_hash(&format!("session-{agent_id}")),
             share_index: ShareIndex(0),
             config: ThresholdConfig {
                 threshold: 2,
@@ -289,7 +289,10 @@ mod tests {
         let retrieved = storage.get_share("agent-1").unwrap();
         assert!(retrieved.is_some());
         let retrieved = retrieved.unwrap();
-        assert_eq!(retrieved.session_id.0, "session-agent-1");
+        assert_eq!(
+            retrieved.session_id,
+            SessionId::from_str_hash("session-agent-1")
+        );
         assert_eq!(retrieved.share_index.0, 0);
     }
 
@@ -367,7 +370,10 @@ mod tests {
 
         let meta = storage.get_share_metadata("agent-m").unwrap().unwrap();
         assert_eq!(meta.agent_id, "agent-m");
-        assert_eq!(meta.session_id, "session-agent-m");
+        assert_eq!(
+            meta.session_id,
+            SessionId::from_str_hash("session-agent-m").hex()
+        );
         assert_eq!(meta.share_index, 0);
         assert_eq!(meta.threshold, 2);
         assert_eq!(meta.parties, 2);

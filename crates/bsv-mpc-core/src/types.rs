@@ -4,19 +4,93 @@
 //! and stored persistently. All types derive `Serialize`/`Deserialize` for
 //! transport over the wire and storage to disk.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-/// MPC session identifier, derived as the SHA-256 hash of the DKG transcript.
+/// MPC session identifier — the 32-byte SessionId per MPC-Spec §04.
 ///
-/// The session ID uniquely binds a group of share-holders to the key they
-/// generated together. It is used to look up shares, presignatures, and
-/// participation proofs.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct SessionId(pub String);
+/// Wire encoding (JSON): lowercase hex, no `0x` prefix, exactly 64 chars.
+/// In-memory: raw bytes for direct use in the canonical ExecutionId formula
+/// (§02), the SessionId formula (§04), and storage key paths.
+///
+/// Construct via [`SessionId::from_hex`] (boundary parse) or directly from
+/// raw bytes when computing per [`crate::canonical::canonical_session_id`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SessionId(pub [u8; 32]);
+
+impl SessionId {
+    /// Construct a SessionId from 32 raw bytes.
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    /// Parse a SessionId from its 64-char lowercase-hex wire form.
+    ///
+    /// Mixed case is rejected — wire format is normative lowercase per §04
+    /// canonical-encoding discipline. Length not equal to 64 hex chars is
+    /// rejected.
+    pub fn from_hex(s: &str) -> crate::Result<Self> {
+        if s.len() != 64 {
+            return Err(crate::MpcError::Serialization(format!(
+                "SessionId hex must be 64 chars, got {}",
+                s.len()
+            )));
+        }
+        if s.bytes().any(|b| !matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+            return Err(crate::MpcError::Serialization(
+                "SessionId hex must be lowercase 0-9a-f".into(),
+            ));
+        }
+        let mut out = [0u8; 32];
+        hex::decode_to_slice(s, &mut out)
+            .map_err(|e| crate::MpcError::Serialization(format!("SessionId hex decode: {e}")))?;
+        Ok(Self(out))
+    }
+
+    /// Render to lowercase hex (no prefix, 64 chars).
+    pub fn hex(&self) -> String {
+        hex::encode(self.0)
+    }
+
+    /// Raw 32-byte slice — feed directly to canonical formulas.
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    /// **Migration helper:** derive a SessionId by hashing an arbitrary
+    /// server-side token string. Used by HTTP-layer routing tokens that
+    /// pre-date the §04 canonical SessionId formula.
+    ///
+    /// NOT a substitute for [`crate::canonical::canonical_session_id`] —
+    /// real ceremony binding MUST use the canonical formula. This helper
+    /// exists only so legacy `SessionId(uuid_string)` sites keep working
+    /// during the wire-canonical migration (MPC-Spec #3, ADR-0004).
+    pub fn from_str_hash(token: &str) -> Self {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(b"bsv-mpc-legacy-session-token-v0");
+        h.update(token.as_bytes());
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&h.finalize());
+        Self(out)
+    }
+}
 
 impl std::fmt::Display for SessionId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
+        f.write_str(&self.hex())
+    }
+}
+
+impl Serialize for SessionId {
+    fn serialize<S: Serializer>(&self, ser: S) -> std::result::Result<S::Ok, S::Error> {
+        ser.serialize_str(&self.hex())
+    }
+}
+
+impl<'de> Deserialize<'de> for SessionId {
+    fn deserialize<D: Deserializer<'de>>(de: D) -> std::result::Result<Self, D::Error> {
+        let s = <String as Deserialize>::deserialize(de)?;
+        Self::from_hex(&s).map_err(serde::de::Error::custom)
     }
 }
 
@@ -191,4 +265,52 @@ pub struct SigningResult {
     pub recovery_id: u8,
     /// Participation proof recording which nodes contributed to this signature.
     pub proof: ParticipationProof,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_id_hex_roundtrip() {
+        let bytes = [
+            0xf2, 0x5e, 0x7c, 0x5e, 0x56, 0x0e, 0x01, 0x92, 0x6d, 0xfb, 0xfd, 0x70, 0xf3, 0x94,
+            0x03, 0x52, 0xc1, 0x34, 0x9e, 0x1e, 0x69, 0xa2, 0xf1, 0x7c, 0x16, 0x68, 0xbd, 0xa9,
+            0x88, 0x01, 0x4e, 0x0b,
+        ];
+        let sid = SessionId(bytes);
+        let h = sid.hex();
+        assert_eq!(
+            h,
+            "f25e7c5e560e01926dfbfd70f3940352c1349e1e69a2f17c1668bda988014e0b"
+        );
+        let parsed = SessionId::from_hex(&h).unwrap();
+        assert_eq!(sid, parsed);
+    }
+
+    #[test]
+    fn session_id_serde_as_hex() {
+        let sid = SessionId([0xab; 32]);
+        let j = serde_json::to_string(&sid).unwrap();
+        assert_eq!(j, format!("\"{}\"", "ab".repeat(32)));
+        let back: SessionId = serde_json::from_str(&j).unwrap();
+        assert_eq!(back, sid);
+    }
+
+    #[test]
+    fn session_id_rejects_short_hex() {
+        assert!(SessionId::from_hex("deadbeef").is_err());
+    }
+
+    #[test]
+    fn session_id_rejects_mixed_case() {
+        let s = "F25E7C5E560E01926DFBFD70F3940352C1349E1E69A2F17C1668BDA988014E0B";
+        assert!(SessionId::from_hex(s).is_err());
+    }
+
+    #[test]
+    fn session_id_rejects_non_hex() {
+        let s = "g25e7c5e560e01926dfbfd70f3940352c1349e1e69a2f17c1668bda988014e0b";
+        assert!(SessionId::from_hex(s).is_err());
+    }
 }

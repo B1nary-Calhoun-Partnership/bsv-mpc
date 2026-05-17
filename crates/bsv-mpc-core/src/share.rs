@@ -85,8 +85,8 @@ pub fn encrypt_share(share_bytes: &[u8], encryption_key: &[u8; 32]) -> Result<En
     Ok(EncryptedShare {
         nonce: nonce_bytes.to_vec(),
         ciphertext,
-        session_id: SessionId(String::new()), // caller fills in
-        share_index: ShareIndex(0),           // caller fills in
+        session_id: SessionId([0u8; 32]), // caller fills in (sentinel)
+        share_index: ShareIndex(0),       // caller fills in
         config: ThresholdConfig {
             threshold: 0,
             parties: 0,
@@ -165,7 +165,7 @@ pub fn derive_share_encryption_key(root_key: &[u8; 32], session_id: &SessionId) 
     let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(root_key)
         .expect("HMAC-SHA256 accepts any key length; 32 bytes is always valid");
     mac.update(SHARE_KEY_DOMAIN);
-    mac.update(session_id.0.as_bytes());
+    mac.update(session_id.as_bytes());
     let result = mac.finalize();
 
     // HMAC-SHA256 output is exactly 32 bytes, which is exactly what AES-256 needs.
@@ -220,7 +220,7 @@ mod tests {
         parties: u16,
     ) -> EncryptedShare {
         let mut share = encrypt_share(plaintext, key).expect("encryption should succeed");
-        share.session_id = SessionId(session_id.to_string());
+        share.session_id = SessionId::from_str_hash(session_id);
         share.share_index = ShareIndex(share_index);
         share.config = ThresholdConfig { threshold, parties };
         share
@@ -237,7 +237,7 @@ mod tests {
 
         let mut encrypted = encrypt_share(plaintext, &key).expect("encrypt should succeed");
         // Fill in valid metadata (encrypt_share returns placeholders).
-        encrypted.session_id = SessionId("test-session".to_string());
+        encrypted.session_id = SessionId::from_str_hash("test-session");
         encrypted.share_index = ShareIndex(0);
         encrypted.config = ThresholdConfig {
             threshold: 2,
@@ -384,7 +384,7 @@ mod tests {
     #[test]
     fn derived_keys_are_deterministic() {
         let root_key = [0x11u8; 32];
-        let session = SessionId("session-deterministic".to_string());
+        let session = SessionId::from_str_hash("session-deterministic");
 
         let key_1 = derive_share_encryption_key(&root_key, &session);
         let key_2 = derive_share_encryption_key(&root_key, &session);
@@ -395,8 +395,8 @@ mod tests {
     #[test]
     fn derived_keys_change_with_session_id() {
         let root_key = [0x22u8; 32];
-        let session_a = SessionId("session-alpha".to_string());
-        let session_b = SessionId("session-beta".to_string());
+        let session_a = SessionId::from_str_hash("session-alpha");
+        let session_b = SessionId::from_str_hash("session-beta");
 
         let key_a = derive_share_encryption_key(&root_key, &session_a);
         let key_b = derive_share_encryption_key(&root_key, &session_b);
@@ -411,7 +411,7 @@ mod tests {
     fn derived_keys_change_with_root_key() {
         let root_a = [0x33u8; 32];
         let root_b = [0x44u8; 32];
-        let session = SessionId("session-same".to_string());
+        let session = SessionId::from_str_hash("session-same");
 
         let key_a = derive_share_encryption_key(&root_a, &session);
         let key_b = derive_share_encryption_key(&root_b, &session);
@@ -425,7 +425,7 @@ mod tests {
     #[test]
     fn derived_key_is_32_bytes() {
         let root_key = [0x55u8; 32];
-        let session = SessionId("any-session".to_string());
+        let session = SessionId::from_str_hash("any-session");
 
         let key = derive_share_encryption_key(&root_key, &session);
         assert_eq!(key.len(), 32);
@@ -435,7 +435,7 @@ mod tests {
     fn derived_key_is_not_all_zeros() {
         // Sanity check: HMAC output should not be degenerate.
         let root_key = [0x00u8; 32];
-        let session = SessionId("zero-root".to_string());
+        let session = SessionId::from_str_hash("zero-root");
 
         let key = derive_share_encryption_key(&root_key, &session);
         assert_ne!(key, [0u8; 32], "derived key should not be all zeros");
@@ -448,7 +448,7 @@ mod tests {
     #[test]
     fn derive_encrypt_decrypt_full_flow() {
         let root_key = [0x66u8; 32];
-        let session = SessionId("flow-test-session".to_string());
+        let session = SessionId::from_str_hash("flow-test-session");
         let plaintext = b"complete flow: derive -> encrypt -> decrypt";
 
         let enc_key = derive_share_encryption_key(&root_key, &session);
@@ -474,7 +474,7 @@ mod tests {
         let share = EncryptedShare {
             nonce: vec![0u8; 8], // wrong: should be 12
             ciphertext: vec![1, 2, 3],
-            session_id: SessionId("s".to_string()),
+            session_id: SessionId::from_str_hash("s"),
             share_index: ShareIndex(0),
             config: ThresholdConfig {
                 threshold: 2,
@@ -489,7 +489,7 @@ mod tests {
         let share = EncryptedShare {
             nonce: vec![0u8; 12],
             ciphertext: vec![], // empty
-            session_id: SessionId("s".to_string()),
+            session_id: SessionId::from_str_hash("s"),
             share_index: ShareIndex(0),
             config: ThresholdConfig {
                 threshold: 2,
@@ -504,7 +504,7 @@ mod tests {
         let share = EncryptedShare {
             nonce: vec![0u8; 12],
             ciphertext: vec![1],
-            session_id: SessionId("s".to_string()),
+            session_id: SessionId::from_str_hash("s"),
             share_index: ShareIndex(3), // >= parties (3)
             config: ThresholdConfig {
                 threshold: 2,
@@ -519,7 +519,7 @@ mod tests {
         let share = EncryptedShare {
             nonce: vec![0u8; 12],
             ciphertext: vec![1],
-            session_id: SessionId("s".to_string()),
+            session_id: SessionId::from_str_hash("s"),
             share_index: ShareIndex(0),
             config: ThresholdConfig {
                 threshold: 1, // < 2
@@ -534,7 +534,7 @@ mod tests {
         let share = EncryptedShare {
             nonce: vec![0u8; 12],
             ciphertext: vec![1],
-            session_id: SessionId("s".to_string()),
+            session_id: SessionId::from_str_hash("s"),
             share_index: ShareIndex(0),
             config: ThresholdConfig {
                 threshold: 4,

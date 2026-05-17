@@ -457,7 +457,7 @@ fn bundle_messages(messages: &[RoundMessage]) -> std::result::Result<RoundMessag
     })?;
     let first = &messages[0];
     Ok(RoundMessage {
-        session_id: first.session_id.clone(),
+        session_id: first.session_id,
         round: first.round,
         from: first.from,
         to: None,
@@ -702,7 +702,7 @@ impl MpcBridge {
         hmac_offset: Option<[u8; 32]>,
     ) -> bsv_mpc_core::error::Result<SigningResult> {
         let share = self.share.clone();
-        let session_id = self.session_id.clone();
+        let session_id = self.session_id;
         let threshold_config = share.config;
         let participants = self.participants.clone();
         let kss_url = self.kss_url.clone();
@@ -716,7 +716,7 @@ impl MpcBridge {
         tokio::task::spawn_blocking(move || {
             // Create coordinator for this signing operation
             let mut coord =
-                SigningCoordinator::new(session_id.clone(), share, threshold_config, participants);
+                SigningCoordinator::new(session_id, share, threshold_config, participants);
 
             // Initialize signing → get proxy's Round 1 messages
             let proxy_msgs = coord.sign(&hash, presignature, hmac_offset)?;
@@ -736,7 +736,7 @@ impl MpcBridge {
                 &sign_init_url,
                 &SignInitRequest {
                     agent_id,
-                    session_id: session_id.0.clone(),
+                    session_id: session_id.hex(),
                     sighash: hex_encode(&hash),
                     use_presignature: false,
                     hmac_offset: hmac_offset.map(|o| hex_encode(&o)),
@@ -817,7 +817,7 @@ impl MpcBridge {
     /// Called by the background replenishment task during idle time.
     pub async fn presign(&self) -> bsv_mpc_core::error::Result<Presignature> {
         let share = self.share.clone();
-        let session_id = self.session_id.clone();
+        let session_id = self.session_id;
         let participants = self.participants.clone();
         let kss_url = self.kss_url.clone();
         let client = self.client.clone();
@@ -828,7 +828,7 @@ impl MpcBridge {
 
         tokio::task::spawn_blocking(move || {
             // Create a manager with pool_size=1 — we want exactly one presignature
-            let mut mgr = PresigningManager::new(session_id.clone(), share, participants, 1);
+            let mut mgr = PresigningManager::new(session_id, share, participants, 1);
 
             // Initialize presigning → get proxy's initial messages
             let proxy_msgs = mgr.init_generate()?;
@@ -846,7 +846,7 @@ impl MpcBridge {
                 &presign_init_url,
                 &PresignInitRequest {
                     agent_id,
-                    session_id: session_id.0.clone(),
+                    session_id: session_id.hex(),
                     count: 1,
                 },
                 &auth,
@@ -1154,7 +1154,7 @@ impl MpcBridge {
             share: EncryptedShare {
                 nonce: vec![0u8; 12],
                 ciphertext: vec![0u8; 1],
-                session_id: SessionId("test".into()),
+                session_id: SessionId::from_str_hash("test"),
                 share_index: ShareIndex(0),
                 config: ThresholdConfig {
                     threshold: 2,
@@ -1166,7 +1166,7 @@ impl MpcBridge {
             share_scalar: [0u8; 32],
             vss_points: vec![[0u8; 32]; 2],
             client: reqwest::Client::new(),
-            session_id: SessionId("test".into()),
+            session_id: SessionId::from_str_hash("test"),
             participants: vec![0, 1],
             agent_id,
             auth: Arc::new(Mutex::new(BridgeAuth::new().expect("test auth key"))),
@@ -1248,7 +1248,7 @@ mod tests {
         let json = serde_json::json!({
             "signing_session_id": "sign-1",
             "round_message": {
-                "session_id": "sess-1",
+                "session_id": "0000000000000000000000000000000000000000000000000000000000000001",
                 "round": 1,
                 "from": 0,
                 "to": null,
@@ -1279,7 +1279,7 @@ mod tests {
         let json = serde_json::json!({
             "presign_session_id": "ps-1",
             "round_messages": [{
-                "session_id": "sess-1",
+                "session_id": "0000000000000000000000000000000000000000000000000000000000000001",
                 "round": 1,
                 "from": 0,
                 "to": null,
@@ -1312,14 +1312,14 @@ mod tests {
             share: EncryptedShare {
                 nonce: vec![0u8; 12],
                 ciphertext: vec![1, 2, 3, 4, 5],
-                session_id: SessionId("test-session-123".into()),
+                session_id: SessionId::from_str_hash("test-session-123"),
                 share_index: ShareIndex(1),
                 config: ThresholdConfig {
                     threshold: 2,
                     parties: 2,
                 },
             },
-            session_id: SessionId("test-session-123".into()),
+            session_id: SessionId::from_str_hash("test-session-123"),
         };
 
         let dir = std::env::temp_dir();
@@ -1343,7 +1343,10 @@ mod tests {
 
         let bridge = MpcBridge::new(&config).await.unwrap();
         assert_eq!(bridge.joint_public_key().address, "1TestAddress");
-        assert_eq!(bridge.session_id().0, "test-session-123");
+        assert_eq!(
+            bridge.session_id(),
+            &SessionId::from_str_hash("test-session-123")
+        );
         assert_eq!(bridge.kss_url(), "http://localhost:9999");
         assert_eq!(bridge.participants, vec![0, 1]);
 
@@ -1386,14 +1389,14 @@ mod tests {
             share: EncryptedShare {
                 nonce: vec![0u8; 12],
                 ciphertext: vec![1, 2, 3],
-                session_id: SessionId("test".into()),
+                session_id: SessionId::from_str_hash("test"),
                 share_index: ShareIndex(2),
                 config: ThresholdConfig {
                     threshold: 2,
                     parties: 3,
                 },
             },
-            session_id: SessionId("test".into()),
+            session_id: SessionId::from_str_hash("test"),
         };
 
         let dir = std::env::temp_dir();

@@ -1,0 +1,94 @@
+{
+  "spec_section": "05.9.1 + ADR-0037",
+  "spec_title": "Canonical CBOR re-encode equivalence (parser-differential conformance)",
+  "description": "Byte-locks the parser-differential conformance test per ADR-0037 \u00a705.9.1.",
+  "notes": [
+    "The `cbor_hex` field is the raw envelope bytes (fields 1-8 only; sender_sig_brc31 omitted for byte-equivalence focus).",
+    "ACCEPTED vector round-trips byte-identically through canonical encoder.",
+    "REJECTED vectors fail re-encode equivalence OR fail strict-parser admission BEFORE re-encode.",
+    "Hand-authored REJECTED vectors marked TBD will be byte-locked in the second loop-3 sub-pass.",
+    "Recipient action on each vector MUST match `expected_recipient_action`.",
+    "Implementations MUST emit `EnvelopeReencodeMismatch` audit event on REJECTED outcomes per ADR-0037."
+  ],
+  "vectors_accepted": [
+    {
+      "name": "accepted-canonical-envelope",
+      "description": "A canonical-CBOR envelope; recipient MUST accept after byte-equivalent re-encode check.",
+      "cbor_hex": "a80101025820f25e7c5e560e01926dfbfd70f3940352c1349e1e69a2f17c1668bda988014e0b0358210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f8179804647369676e05010600070108480102030405060708",
+      "expected_recipient_action": "ACCEPT",
+      "re_encode_check": "PASS (cbor_hex round-trips to itself under canonical encoding)"
+    }
+  ],
+  "vectors_rejected": [
+    {
+      "name": "non-minimal-integer-version",
+      "description": "Version field encoded with explicit length byte (0x18 0x01) instead of minimal (0x01). Parses to same value; canonical re-encode produces different bytes.",
+      "cbor_hex": "a8011801025820f25e7c5e560e01926dfbfd70f3940352c1349e1e69a2f17c1668bda988014e0b0358210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f8179804647369676e05010600070108480102030405060708",
+      "expected_recipient_action": "REJECT",
+      "re_encode_check": "FAIL \u2014 re-encoded canonical bytes differ at offset 2",
+      "violated_rule": "\u00a705.9.1 #1 Non-minimal integer encoding"
+    },
+    {
+      "name": "indefinite-length-bstr-inner",
+      "description": "Field 8 (inner) encoded as indefinite-length byte string (0x5f...0xff). Forbidden by \u00a705.2.",
+      "cbor_hex": "a80101025820f25e7c5e560e01926dfbfd70f3940352c1349e1e69a2f17c1668bda988014e0b0358210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f8179804647369676e050106000701085f44010203044405060708ff",
+      "construction_note": "Replaced canonical def-length bstr 48|01020304050607080 with indef-length pair 5f|44|01020304|44|05060708|ff.",
+      "expected_recipient_action": "REJECT",
+      "re_encode_check": "REJECT before re-encode (CBOR strict-mode decoder MUST refuse indef-length per spec \u00a705.2)",
+      "violated_rule": "\u00a705.9.1 #2 Indefinite-length items"
+    },
+    {
+      "name": "duplicate-map-key",
+      "description": "Two entries with key 1 (version). Forbidden by canonical CBOR. Map header bumped to 9; second `01 02` inserted after first key-value pair.",
+      "cbor_hex": "a901010102025820f25e7c5e560e01926dfbfd70f3940352c1349e1e69a2f17c1668bda988014e0b0358210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f8179804647369676e05010600070108480102030405060708",
+      "construction_note": "Map-len byte changed a8\u2192a9; inserted extra (01, 02) pair at offset 3.",
+      "expected_recipient_action": "REJECT",
+      "re_encode_check": "REJECT during canonical re-encode (canonical CBOR enforces unique keys)",
+      "violated_rule": "\u00a705.9.1 #3 Duplicate map keys"
+    },
+    {
+      "name": "trailing-bytes",
+      "description": "Canonical envelope followed by trailing 0xFF byte. Forbidden by \u00a705.9.1 #4.",
+      "cbor_hex": "a80101025820f25e7c5e560e01926dfbfd70f3940352c1349e1e69a2f17c1668bda988014e0b0358210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f8179804647369676e05010600070108480102030405060708ff",
+      "expected_recipient_action": "REJECT",
+      "re_encode_check": "REJECT \u2014 input length exceeds parsed length",
+      "violated_rule": "\u00a705.9.1 #4 Trailing bytes after canonical termination"
+    },
+    {
+      "name": "float-in-round-field",
+      "description": "Field 5 (round) encoded as float16(1.0) instead of unsigned int 1. Forbidden by \u00a705.2.",
+      "cbor_hex": "a80101025820f25e7c5e560e01926dfbfd70f3940352c1349e1e69a2f17c1668bda988014e0b0358210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f8179804647369676e05f93c000600070108480102030405060708",
+      "construction_note": "Replaced canonical (05, 01) with (05, f9, 3c, 00) \u2014 float16 encoding of 1.0.",
+      "expected_recipient_action": "REJECT",
+      "re_encode_check": "REJECT \u2014 float forbidden per \u00a705.2",
+      "violated_rule": "\u00a705.9.1 #5 Floats"
+    },
+    {
+      "name": "unsorted-map-keys",
+      "description": "Map keys in order 2,1,3..8 instead of canonical 1,2,3..8. Canonical CBOR \u00a74.2 mandates ascending key order.",
+      "cbor_hex": "a8025820f25e7c5e560e01926dfbfd70f3940352c1349e1e69a2f17c1668bda988014e0b01010358210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f8179804647369676e05010600070108480102030405060708",
+      "construction_note": "Swapped first two key-value pairs (key=1 and key=2) in the canonical envelope.",
+      "expected_recipient_action": "REJECT",
+      "re_encode_check": "FAIL \u2014 re-encoded canonical-order bytes differ at offset 1",
+      "violated_rule": "\u00a705.9.1 #6 Unsorted map keys"
+    },
+    {
+      "name": "unknown-tag-on-session-id",
+      "description": "Field 2 (session_id bstr32) wrapped in CBOR tag 0xc0 (datetime). Tag not whitelisted in \u00a705.10.",
+      "cbor_hex": "a8010102c05820f25e7c5e560e01926dfbfd70f3940352c1349e1e69a2f17c1668bda988014e0b0358210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f8179804647369676e05010600070108480102030405060708",
+      "construction_note": "Inserted tag byte 0xc0 between key 0x02 and value-header 0x58.",
+      "expected_recipient_action": "REJECT",
+      "re_encode_check": "REJECT \u2014 tag not whitelisted in \u00a705.10 reserved fields",
+      "violated_rule": "\u00a705.9.1 #7 Tags not whitelisted"
+    },
+    {
+      "name": "bstr-map-key",
+      "description": "Map uses bstr key (0x41 0xff) instead of unsigned integer. \u00a705.3 requires keys be uint.",
+      "cbor_hex": "a841ff01025820f25e7c5e560e01926dfbfd70f3940352c1349e1e69a2f17c1668bda988014e0b0358210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f8179804647369676e05010600070108480102030405060708",
+      "construction_note": "Replaced first key 0x01 (uint 1) with 0x41 0xff (bstr 1-byte value 0xff).",
+      "expected_recipient_action": "REJECT",
+      "re_encode_check": "REJECT \u2014 key type not allowed per \u00a705.3 schema",
+      "violated_rule": "\u00a705.9.1 #8 Map keys not uint or tstr"
+    }
+  ]
+}

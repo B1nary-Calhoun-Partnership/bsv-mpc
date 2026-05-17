@@ -1,0 +1,75 @@
+{
+  "spec_section": "02",
+  "spec_title": "Canonical ExecutionId",
+  "formula": "ExecutionId = SHA-256(\"calhoun-binary-mpc\" (18B) || version_u8 || algorithm_tag_u8 || phase_tag_u8 || session_id_32B || joint_pubkey_33B)",
+  "preimage_length_bytes": 86,
+  "output_length_bytes": 32,
+  "vectors": [
+    {
+      "name": "execution-id-vector-A-sign-phase",
+      "description": "Sign phase (0x04), joint_pubkey = secp256k1 generator G compressed",
+      "inputs": {
+        "domain_separator_ascii": "calhoun-binary-mpc",
+        "domain_separator_hex": "63616c686f756e2d62696e6172792d6d7063",
+        "version": 1,
+        "algorithm_tag": 1,
+        "algorithm_name": "cggmp24",
+        "phase_tag": 4,
+        "phase_name": "sign",
+        "session_id_source": "SHA256(\"test-vector-A\")",
+        "session_id_hex": "f25e7c5e560e01926dfbfd70f3940352c1349e1e69a2f17c1668bda988014e0b",
+        "joint_pubkey_source": "secp256k1 generator G, SEC1 compressed",
+        "joint_pubkey_hex": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+      },
+      "preimage_hex": "63616c686f756e2d62696e6172792d6d7063010104f25e7c5e560e01926dfbfd70f3940352c1349e1e69a2f17c1668bda988014e0b0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+      "preimage_length_bytes": 86,
+      "expected": {
+        "execution_id_hex": "7286fe7b26a8ef9af0f42c517f53963d642602965b341cc0002084b1e801e883"
+      }
+    },
+    {
+      "name": "execution-id-vector-B-keygen",
+      "description": "DKG keygen phase (0x01), joint_pubkey = all-zero carve-out",
+      "inputs": {
+        "domain_separator_ascii": "calhoun-binary-mpc",
+        "domain_separator_hex": "63616c686f756e2d62696e6172792d6d7063",
+        "version": 1,
+        "algorithm_tag": 1,
+        "algorithm_name": "cggmp24",
+        "phase_tag": 1,
+        "phase_name": "dkg-keygen",
+        "session_id_source": "SHA256(\"test-vector-B\")",
+        "session_id_hex": "8bf9d11c1663da8567389511bdf497a9a3c815c38df2a940f5a396c71465b406",
+        "joint_pubkey_source": "33 zero bytes (keygen carve-out, §02.4)",
+        "joint_pubkey_hex": "000000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "preimage_hex": "63616c686f756e2d62696e6172792d6d70630101018bf9d11c1663da8567389511bdf497a9a3c815c38df2a940f5a396c71465b406000000000000000000000000000000000000000000000000000000000000000000",
+      "preimage_length_bytes": 86,
+      "expected": {
+        "execution_id_hex": "3bf98ecfaaabc27c71aabfd5d1a41533df7b8e5421f24ca2df5e200f82b0040a"
+      }
+    },
+    {
+      "name": "execution-id-vector-C-refresh",
+      "description": "Refresh phase (0x06), joint_pubkey = G compressed",
+      "inputs": {
+        "domain_separator_ascii": "calhoun-binary-mpc",
+        "domain_separator_hex": "63616c686f756e2d62696e6172792d6d7063",
+        "version": 1,
+        "algorithm_tag": 1,
+        "algorithm_name": "cggmp24",
+        "phase_tag": 6,
+        "phase_name": "refresh",
+        "session_id_source": "SHA256(\"test-vector-C\")",
+        "session_id_hex": "8997d07b34f5031f5fc8b00ddc4776120c5bd652923da947c6f2c04c43a05ccd",
+        "joint_pubkey_source": "secp256k1 generator G, SEC1 compressed",
+        "joint_pubkey_hex": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+      },
+      "preimage_hex": "63616c686f756e2d62696e6172792d6d70630101068997d07b34f5031f5fc8b00ddc4776120c5bd652923da947c6f2c04c43a05ccd0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+      "preimage_length_bytes": 86,
+      "expected": {
+        "execution_id_hex": "163ca28a96cee2da1c572c58be0bad3d501099a31f81cd4b3753f8bd02faa5c3"
+      }
+    }
+  ]
+}

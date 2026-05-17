@@ -216,7 +216,8 @@ fn key_share_to_dkg_result(
     let ciphertext = serde_json::to_vec(key_share).expect("key share serialization");
 
     // Deterministic session ID from joint key
-    let session_id = SessionId(format!("e2e-test-{}", &hex::encode(&compressed[..8])));
+    let session_id =
+        SessionId::from_str_hash(&format!("e2e-test-{}", &hex::encode(&compressed[..8])));
 
     DkgResult {
         joint_key: JointPublicKey {
@@ -226,7 +227,7 @@ fn key_share_to_dkg_result(
         share: EncryptedShare {
             nonce: vec![0u8; 12],
             ciphertext,
-            session_id: session_id.clone(),
+            session_id,
             share_index: ShareIndex(party_index),
             config: ThresholdConfig { threshold, parties },
         },

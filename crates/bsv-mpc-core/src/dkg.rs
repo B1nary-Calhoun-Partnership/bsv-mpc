@@ -191,7 +191,7 @@ pub enum DkgRoundResult {
 ///
 /// ```ignore
 /// let config = ThresholdConfig::new(2, 3)?; // 2-of-3
-/// let session = SessionId("unique-session-id".to_string());
+/// let session = SessionId::from_str_hash("unique-session-id");
 /// let mut coord = DkgCoordinator::new(session, config, ShareIndex(0));
 ///
 /// // Round 1: start keygen and get first outgoing messages
@@ -260,7 +260,7 @@ impl DkgCoordinator {
         let eid_bytes = {
             let mut hasher = sha2::Sha256::new();
             hasher.update(b"bsv-mpc-dkg-keygen-");
-            hasher.update(session_id.0.as_bytes());
+            hasher.update(session_id.as_bytes());
             let result = hasher.finalize();
             let mut bytes = [0u8; 32];
             bytes.copy_from_slice(&result);
@@ -437,7 +437,7 @@ impl DkgCoordinator {
         let aux_eid_bytes = {
             let mut hasher = sha2::Sha256::new();
             hasher.update(b"bsv-mpc-dkg-auxinfo-");
-            hasher.update(self.session_id.0.as_bytes());
+            hasher.update(self.session_id.as_bytes());
             let result = hasher.finalize();
             let mut bytes = [0u8; 32];
             bytes.copy_from_slice(&result);
@@ -588,7 +588,7 @@ impl DkgCoordinator {
             .map_err(|e| MpcError::Dkg(format!("failed to parse wire message: {e}")))?;
 
         Ok(RoundMessage {
-            session_id: self.session_id.clone(),
+            session_id: self.session_id,
             round: self.current_round,
             from: ShareIndex(wire.sender),
             to: if wire.is_broadcast {
@@ -656,7 +656,7 @@ impl DkgCoordinator {
                 nonce
             },
             ciphertext: key_share_json,
-            session_id: self.session_id.clone(),
+            session_id: self.session_id,
             share_index: self.my_index,
             config: self.config,
         };
@@ -668,18 +668,25 @@ impl DkgCoordinator {
 
         // Compute session ID as SHA-256 of the joint public key bytes
         // (in production this would include the full DKG transcript)
-        let session_hash = {
+        // Re-derive the DKG-output session_id by hashing the joint pubkey
+        // with the input session_id. This is a per-DKG "output identifier"
+        // distinct from the input session_id used for protocol binding.
+        // (Wire-canonical SessionId for the *next* ceremony is computed at
+        // its boundary via `crate::canonical::canonical_session_id`.)
+        let session_hash_bytes = {
             let mut hasher = sha2::Sha256::new();
             hasher.update(b"bsv-mpc-session-");
             hasher.update(&compressed_bytes);
-            hasher.update(self.session_id.0.as_bytes());
-            hex::encode(hasher.finalize())
+            hasher.update(self.session_id.as_bytes());
+            let mut out = [0u8; 32];
+            out.copy_from_slice(&hasher.finalize());
+            out
         };
 
         Ok(DkgRoundResult::Complete(DkgResult {
             joint_key,
             share,
-            session_id: SessionId(session_hash),
+            session_id: SessionId(session_hash_bytes),
         }))
     }
 
@@ -1205,7 +1212,7 @@ mod tests {
     #[test]
     fn coordinator_creation_with_valid_config() {
         let config = ThresholdConfig::new(2, 3).unwrap();
-        let session = SessionId("test-session".to_string());
+        let session = SessionId::from_str_hash("test-session");
         let coord = DkgCoordinator::new(session, config, ShareIndex(0));
 
         assert_eq!(coord.current_round(), 0);
@@ -1230,7 +1237,7 @@ mod tests {
     #[test]
     fn coordinator_rejects_process_round_before_init() {
         let config = ThresholdConfig::new(2, 2).unwrap();
-        let session = SessionId("test".to_string());
+        let session = SessionId::from_str_hash("test");
         let mut coord = DkgCoordinator::new(session, config, ShareIndex(0));
 
         let result = coord.process_round(vec![]);
@@ -1245,7 +1252,7 @@ mod tests {
     #[test]
     fn coordinator_rejects_init_with_bad_index() {
         let config = ThresholdConfig::new(2, 2).unwrap();
-        let session = SessionId("test".to_string());
+        let session = SessionId::from_str_hash("test");
         let mut coord = DkgCoordinator::new(session, config, ShareIndex(5)); // index 5 >= parties 2
 
         let result = coord.init();
@@ -1259,10 +1266,10 @@ mod tests {
 
     #[test]
     fn execution_id_is_deterministic() {
-        let session = SessionId("deterministic-test".to_string());
+        let session = SessionId::from_str_hash("deterministic-test");
         let config = ThresholdConfig::new(2, 2).unwrap();
 
-        let coord1 = DkgCoordinator::new(session.clone(), config, ShareIndex(0));
+        let coord1 = DkgCoordinator::new(session, config, ShareIndex(0));
         let coord2 = DkgCoordinator::new(session, config, ShareIndex(0));
 
         assert_eq!(coord1.eid_bytes, coord2.eid_bytes);
@@ -1272,8 +1279,10 @@ mod tests {
     fn different_sessions_produce_different_eids() {
         let config = ThresholdConfig::new(2, 2).unwrap();
 
-        let coord1 = DkgCoordinator::new(SessionId("session-a".to_string()), config, ShareIndex(0));
-        let coord2 = DkgCoordinator::new(SessionId("session-b".to_string()), config, ShareIndex(0));
+        let coord1 =
+            DkgCoordinator::new(SessionId::from_str_hash("session-a"), config, ShareIndex(0));
+        let coord2 =
+            DkgCoordinator::new(SessionId::from_str_hash("session-b"), config, ShareIndex(0));
 
         assert_ne!(coord1.eid_bytes, coord2.eid_bytes);
     }
@@ -1510,9 +1519,9 @@ mod tests {
         // We use two coordinators and relay messages between them.
 
         let config = ThresholdConfig::new(2, 2).unwrap();
-        let session = SessionId("coordinator-test".to_string());
+        let session = SessionId::from_str_hash("coordinator-test");
 
-        let mut coord0 = DkgCoordinator::new(session.clone(), config, ShareIndex(0));
+        let mut coord0 = DkgCoordinator::new(session, config, ShareIndex(0));
         let mut coord1 = DkgCoordinator::new(session, config, ShareIndex(1));
 
         // Pre-generate Blum primes for faster testing (vs safe primes which take 30-60s)

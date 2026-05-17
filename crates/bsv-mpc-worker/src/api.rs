@@ -287,7 +287,7 @@ fn bundle_outgoing_messages(
 
     let first = &messages[0];
     Ok(RoundMessage {
-        session_id: first.session_id.clone(),
+        session_id: first.session_id,
         round: first.round,
         from: first.from,
         to: None,
@@ -309,7 +309,7 @@ fn unbundle_incoming_message(msg: &RoundMessage) -> std::result::Result<Vec<Roun
                     let payload = serde_json::to_vec(&v)
                         .map_err(|e| format!("failed to re-serialize wire message: {e}"))?;
                     Ok(RoundMessage {
-                        session_id: msg.session_id.clone(),
+                        session_id: msg.session_id,
                         round: msg.round,
                         from: msg.from,
                         to: msg.to,
@@ -344,7 +344,7 @@ pub async fn handle_dkg_init(mut req: Request, _ctx: &RouteContext<()>) -> Resul
 
     // Generate a unique session ID
     let session_id_str = generate_session_id("dkg").map_err(Error::from)?;
-    let session_id = SessionId(session_id_str.clone());
+    let session_id = SessionId::from_str_hash(&session_id_str);
 
     // Create DKG coordinator for party 0 (KSS is always party 0)
     let mut coordinator = DkgCoordinator::new(session_id, config, ShareIndex(0));
@@ -418,7 +418,7 @@ pub async fn handle_dkg_round(mut req: Request, _ctx: &RouteContext<()>) -> Resu
             // TODO: Store agent_id during DKG init and retrieve it here.
             // For development, we extract it from the share's session_id.
             storage
-                .store_share(&dkg_result.session_id.0, &dkg_result.share)
+                .store_share(&dkg_result.session_id.hex(), &dkg_result.share)
                 .map_err(Error::from)?;
 
             // Clean up the live coordinator
@@ -428,7 +428,7 @@ pub async fn handle_dkg_round(mut req: Request, _ctx: &RouteContext<()>) -> Resu
                 .remove(&body.session_id);
 
             let response = DkgRoundResponse {
-                session_id: dkg_result.session_id.0.clone(),
+                session_id: dkg_result.session_id.hex(),
                 round_message: None,
                 complete: true,
                 joint_pubkey: Some(dkg_result.joint_key),
@@ -475,7 +475,7 @@ pub async fn handle_sign_init(mut req: Request, _ctx: &RouteContext<()>) -> Resu
 
     // Create signing coordinator for party 0
     // KSS is party 0, proxy is party 1 — standard 2-of-2 participants
-    let session_id = SessionId(body.session_id);
+    let session_id = SessionId::from_str_hash(&body.session_id);
     let config = share.config;
     let participants: Vec<u16> = (0..config.parties).collect();
 
@@ -593,7 +593,7 @@ pub async fn handle_presign_init(mut req: Request, _ctx: &RouteContext<()>) -> R
     let presign_session_id = generate_session_id("presign").map_err(Error::from)?;
 
     // Create presigning manager for party 0
-    let session_id = SessionId(body.session_id);
+    let session_id = SessionId::from_str_hash(&body.session_id);
     let participants: Vec<u16> = (0..share.config.parties).collect();
 
     let mut manager = PresigningManager::new(session_id, share, participants, body.count as usize);
@@ -783,7 +783,7 @@ mod tests {
     #[test]
     fn test_bundle_single_message() {
         let msg = RoundMessage {
-            session_id: SessionId("test".to_string()),
+            session_id: SessionId::from_str_hash("test"),
             round: 1,
             from: ShareIndex(0),
             to: None,
@@ -796,7 +796,7 @@ mod tests {
         };
 
         let bundled = bundle_outgoing_messages(&[msg]).unwrap();
-        assert_eq!(bundled.session_id.0, "test");
+        assert_eq!(bundled.session_id, SessionId::from_str_hash("test"));
         assert_eq!(bundled.round, 1);
         assert_eq!(bundled.from, ShareIndex(0));
 
@@ -808,7 +808,7 @@ mod tests {
     #[test]
     fn test_bundle_multiple_messages() {
         let make_msg = |sender: u16, is_broadcast: bool| RoundMessage {
-            session_id: SessionId("test".to_string()),
+            session_id: SessionId::from_str_hash("test"),
             round: 2,
             from: ShareIndex(sender),
             to: None,
@@ -834,7 +834,7 @@ mod tests {
         let bundled_payload = serde_json::to_vec(&vec![wire1, wire2]).unwrap();
 
         let msg = RoundMessage {
-            session_id: SessionId("test".to_string()),
+            session_id: SessionId::from_str_hash("test"),
             round: 1,
             from: ShareIndex(0),
             to: None,
@@ -843,7 +843,7 @@ mod tests {
 
         let unbundled = unbundle_incoming_message(&msg).unwrap();
         assert_eq!(unbundled.len(), 2);
-        assert_eq!(unbundled[0].session_id.0, "test");
+        assert_eq!(unbundled[0].session_id, SessionId::from_str_hash("test"));
         assert_eq!(unbundled[1].round, 1);
     }
 
@@ -853,7 +853,7 @@ mod tests {
         let payload = serde_json::to_vec(&wire).unwrap();
 
         let msg = RoundMessage {
-            session_id: SessionId("test".to_string()),
+            session_id: SessionId::from_str_hash("test"),
             round: 3,
             from: ShareIndex(1),
             to: None,
@@ -867,7 +867,7 @@ mod tests {
     #[test]
     fn test_bundle_unbundle_roundtrip() {
         let make_msg = |data: &str| RoundMessage {
-            session_id: SessionId("roundtrip".to_string()),
+            session_id: SessionId::from_str_hash("roundtrip"),
             round: 1,
             from: ShareIndex(0),
             to: None,

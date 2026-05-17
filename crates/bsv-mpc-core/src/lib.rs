@@ -45,6 +45,7 @@
 //! management. The transport layer (how round messages are delivered between
 //! parties) is handled by `bsv-mpc-worker` and `bsv-mpc-service`.
 
+pub mod canonical;
 pub mod dkg;
 pub mod ecdh;
 pub mod error;
