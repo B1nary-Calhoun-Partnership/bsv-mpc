@@ -160,8 +160,16 @@ impl ProxyConfig {
 mod tests {
     use super::*;
 
+    /// Serialize all tests in this module that mutate process-global
+    /// env vars — otherwise parallel cargo test runs race on
+    /// `MPC_*` vars and `defaults_are_sane` can observe a value set
+    /// by a peer test. Mirrors the same pattern in
+    /// `bsv-mpc-worker/src/storage.rs::TEST_LOCK` (a5d8f8f).
+    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn defaults_are_sane() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         // Clear any env vars that might interfere.
         std::env::remove_var("MPC_PROXY_PORT");
         std::env::remove_var("MPC_KSS_URL");
@@ -191,6 +199,7 @@ mod tests {
 
     #[test]
     fn threshold_configs_parses_comma_separated() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         std::env::set_var("MPC_THRESHOLD_CONFIGS", "2-of-3, 3-of-5,5-of-9 ");
         let config = ProxyConfig::from_env().unwrap();
         std::env::remove_var("MPC_THRESHOLD_CONFIGS");
@@ -199,6 +208,7 @@ mod tests {
 
     #[test]
     fn min_balance_sats_parses_when_set() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         std::env::set_var("MPC_MIN_BALANCE_SATS", "10000");
         let config = ProxyConfig::from_env().unwrap();
         std::env::remove_var("MPC_MIN_BALANCE_SATS");
