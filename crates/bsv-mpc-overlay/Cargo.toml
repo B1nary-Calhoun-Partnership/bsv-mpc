@@ -9,7 +9,7 @@ description = "BSV overlay network integration for MPC node discovery (SHIP/SLAP
 [dependencies]
 bsv-mpc-core = { path = "../bsv-mpc-core" }
 # Override workspace bsv to add overlay + http features needed for SHIP/SLAP
-bsv = { package = "bsv-rs", version = "0.3.0", features = ["transaction", "wallet", "overlay", "http"] }
+bsv = { package = "bsv-rs", version = "0.3.7", features = ["transaction", "wallet", "overlay", "http"] }
 serde.workspace = true
 serde_json.workspace = true
 reqwest.workspace = true

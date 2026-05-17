@@ -37,10 +37,10 @@ bsv-mpc-service = { path = "crates/bsv-mpc-service" }
 # MPC crypto (for DKG simulation in E2E tests)
 cggmp24 = { git = "https://github.com/LFDT-Lockness/cggmp21", features = ["curve-secp256k1", "backend-num-bigint"] }
 round-based = { version = "0.4.1", features = ["sim", "state-machine"] }
-generic-ec = { version = "0.4.1", features = ["curve-secp256k1", "serde"] }
+generic-ec = { version = "0.5", features = ["curve-secp256k1", "serde"] }
 
 # BSV SDK
-bsv = { package = "bsv-rs", version = "0.3.0", features = ["transaction", "wallet"] }
+bsv = { package = "bsv-rs", version = "0.3.7", features = ["transaction", "wallet"] }
 
 # HTTP + async
 axum = { version = "0.8" }
@@ -72,11 +72,11 @@ cggmp24-keygen = { git = "https://github.com/LFDT-Lockness/cggmp21", features = 
 
 # MPC protocol infrastructure (must match cggmp24's transitive deps)
 round-based = { version = "0.4.1", features = ["state-machine"] }
-generic-ec = { version = "0.4.1", features = ["curve-secp256k1", "serde"] }
-generic-ec-zkp = { version = "0.4", features = ["alloc"] }
+generic-ec = { version = "0.5", features = ["curve-secp256k1", "serde"] }
+generic-ec-zkp = { version = "0.5", features = ["alloc"] }
 
 # BSV
-bsv = { package = "bsv-rs", version = "0.3.0", features = ["transaction", "wallet"] }
+bsv = { package = "bsv-rs", version = "0.3.7", features = ["transaction", "wallet"] }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -117,6 +117,13 @@ tempfile = "3"
 
 # Pin glass_pumpkin to avoid rand_core 0.6/0.10 version conflict with fast-paillier.
 # See LESSONS.md for details. All POCs pin this individually; workspace must too.
+#
+# NOTE 2026-05-17: glass_pumpkin 1.9.0 requires core2 ^0.4 but core2 0.4.0 was
+# yanked from crates.io. The committed Cargo.lock pins the yanked version,
+# which cargo will still install (yanked = hidden from fresh resolve, not
+# deleted). Bumping to 1.10.0 breaks fast-paillier (rand_core::RngCore vs
+# rand_core::Rng trait mismatch); needs a coordinated fast-paillier bump
+# upstream first. Tracked as follow-up.
 glass_pumpkin = "=1.9.0"
 
 # For local bsv-rs development, add to ~/.cargo/config.toml or an untracked

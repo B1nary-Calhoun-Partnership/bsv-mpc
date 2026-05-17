@@ -5,7 +5,11 @@
 .DS_Store
 *.enc
 working/
-Cargo.lock
+# Cargo.lock is committed: this is a workspace with binary crates
+# (bsv-mpc-proxy, bsv-mpc-service) where reproducible builds matter.
+# Was gitignored historically; un-ignored 2026-05-17 alongside dep
+# unblock (bsv-rs 0.3.7 + generic-ec 0.5 + lockfile with yanked
+# core2 0.4.0 pin per glass_pumpkin =1.9.0).
 secrets.md
 ROUND-1-PROMPTS.md
 ROUND-2-PROMPTS.md
