@@ -157,12 +157,33 @@ pub async fn discover_nodes(
                     }
                 };
 
-                // Try to parse as CHIP token (5-field with capabilities)
+                // Parse as canonical 5-field signed SHIP token (Path A).
+                // Capabilities (curves, fee_sats, threshold_configs, version)
+                // are NOT in the token — they're served by each cosigner at
+                // GET https://{domain}/capabilities. Until task #16 wires
+                // the side-channel fetch, fill placeholder values; this
+                // keeps the type contract intact but `discover_nodes` will
+                // not return real capabilities yet (only identity + domain
+                // are trustworthy in the returned MpcNodeInfo). All filters
+                // that depend on capabilities (curve / threshold / fee)
+                // will pass-through the placeholder defaults — once #16
+                // lands, real values flow through.
                 let script_bytes = locking_script.to_binary();
                 match chip::parse_chip_token(&script_bytes) {
-                    Ok(node_info) => nodes.push(node_info),
+                    Ok(token_info) => nodes.push(MpcNodeInfo {
+                        identity_key: token_info.identity_key,
+                        domain: token_info.domain,
+                        // TODO(#16): fetch the next 5 fields from GET {domain}/capabilities.
+                        curves: vec!["secp256k1".to_string()],
+                        threshold_configs: vec!["2-of-2".to_string(), "2-of-3".to_string()],
+                        fee_sats: 0,
+                        version: "0.0.0".to_string(),
+                        published_at: chrono::Utc::now(),
+                        max_presignatures: None,
+                        min_balance_sats: None,
+                    }),
                     Err(e) => {
-                        tracing::trace!("Output is not a valid MPC CHIP token: {}", e);
+                        tracing::trace!("Output is not a valid signed MPC CHIP token: {}", e);
                     }
                 }
             }

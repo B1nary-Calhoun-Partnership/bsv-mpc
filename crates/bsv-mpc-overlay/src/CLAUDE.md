@@ -7,14 +7,15 @@ This crate handles the overlay-facing aspects of the MPC signing network: advert
 
 ## Implementation Status
 
-CHIP token creation/parsing and node discovery are **fully implemented** with comprehensive test coverage. Overlay publication (`publish_chip_token`) works but lacks BRC-31 auth headers. Proof functions are graceful stubs deferred to Beta (return errors or empty results, no panics). Fee settlement calculation is implemented.
+CHIP token creation/parsing uses the **canonical 5-field signed SHIP format** (Path A, 2026-05-17). Tokens are byte-identical to `bsv-rs::create_signed_overlay_admin_token` and admitted by canonical TS validators (`@bsv/overlay-discovery-services` `SHIPTopicManager.ts:30`). Pre-Path-A code emitted a 5-field-with-capabilities shape that mainnet validators silently rejected. Capabilities (curves, fees, threshold configs) moved off-chain to a `/capabilities` side-channel (TODO #16).
 
 | Area | Status |
 |------|--------|
-| CHIP token create/parse | **Implemented** — 5-field PushDrop with capabilities JSON, 14 tests |
+| CHIP token create/parse | **Implemented** — canonical 5-field signed SHIP, byte-parity vs bsv-rs, signature linkage validated via `bsv-overlay-discovery::validation::is_token_signature_correctly_linked`, 11 tests |
 | CHIP token publish | **Implemented** — HTTP POST to `/submit`, missing BRC-31 auth |
 | CHIP token revoke | **Stub** — returns error explaining what's needed |
-| SDK admin token wrappers | **Implemented** — `create_ship_admin_token`, `parse_ship_admin_token` |
+| Capabilities side-channel | **TODO #16** — `discovery.rs` uses placeholder values until cosigner `/capabilities` endpoint (#15) + fetch loop (#16) land |
+| SDK admin token wrappers | **Removed** — `create_ship_admin_token` / `parse_ship_admin_token` deleted with Path A refactor (they wrapped the deprecated 4-field bsv-rs function rejected by mainnet validators) |
 | Node discovery | **Implemented** — `LookupResolver` + SLAP, filter, dedup, sort. 9 tests |
 | Node health checking | **Implemented** — HTTP GET `/health` with 5s timeout |
 | Node reputation | **Implemented** — proof count lookup via overlay |

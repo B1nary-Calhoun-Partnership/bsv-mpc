@@ -10,6 +10,12 @@ description = "BSV overlay network integration for MPC node discovery (SHIP/SLAP
 bsv-mpc-core = { path = "../bsv-mpc-core" }
 # Override workspace bsv to add overlay + http features needed for SHIP/SLAP
 bsv = { package = "bsv-rs", version = "0.3.7", features = ["transaction", "wallet", "overlay", "http"] }
+
+# Canonical SHIP/SLAP signature validator — Rust port of the TS validator
+# logic in @bsv/overlay-discovery-services. Used by parse_chip_token to
+# enforce the 5-field signed format that mainnet validators require.
+# Pinned to a commit for reproducibility (crate not yet on crates.io).
+bsv-overlay-discovery = { git = "https://github.com/Calhooon/bsv-overlay-cloudflare", rev = "3c2cbc4" }
 serde.workspace = true
 serde_json.workspace = true
 reqwest.workspace = true
@@ -24,3 +30,9 @@ tokio.workspace = true
 [dev-dependencies]
 axum.workspace = true
 tokio = { workspace = true, features = ["full"] }
+# anyhow used by rustdoc examples in lib.rs + discovery.rs. Without this,
+# `cargo test --doc` fails. `cargo test --workspace --all-targets` does
+# NOT run doctests, which is why these examples have been silently
+# broken — the CI workflow adds a `cargo test --workspace --doc` step
+# to catch this kind of drift going forward.
+anyhow = "1"

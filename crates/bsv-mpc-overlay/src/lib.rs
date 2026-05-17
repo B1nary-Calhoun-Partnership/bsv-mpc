@@ -66,5 +66,6 @@ pub mod proofs;
 pub mod types;
 
 // Re-export key types for ergonomic imports.
+pub use chip::ChipTokenInfo;
 pub use error::OverlayError;
 pub use types::{DiscoveryQuery, MpcNodeInfo, OverlayProof, MPC_TOPIC};

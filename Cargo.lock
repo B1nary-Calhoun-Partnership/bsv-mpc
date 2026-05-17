@@ -255,8 +255,10 @@ dependencies = [
 name = "bsv-mpc-overlay"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "axum",
  "bsv-mpc-core",
+ "bsv-overlay-discovery",
  "bsv-rs",
  "chrono",
  "futures",
@@ -329,6 +331,37 @@ dependencies = [
  "sha2",
  "thiserror 2.0.18",
  "worker",
+]
+
+[[package]]
+name = "bsv-overlay-discovery"
+version = "0.1.0"
+source = "git+https://github.com/Calhooon/bsv-overlay-cloudflare?rev=3c2cbc4#3c2cbc4e6c90f865a86d3301044905359fa9ddbd"
+dependencies = [
+ "async-trait",
+ "bsv-overlay-engine",
+ "bsv-rs",
+ "hex",
+ "js-sys",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tracing",
+ "url",
+]
+
+[[package]]
+name = "bsv-overlay-engine"
+version = "0.1.0"
+source = "git+https://github.com/Calhooon/bsv-overlay-cloudflare?rev=3c2cbc4#3c2cbc4e6c90f865a86d3301044905359fa9ddbd"
+dependencies = [
+ "async-trait",
+ "bsv-rs",
+ "js-sys",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tracing",
 ]
 
 [[package]]

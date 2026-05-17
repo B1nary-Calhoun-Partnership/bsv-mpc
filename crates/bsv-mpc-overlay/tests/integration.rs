@@ -269,7 +269,13 @@ async fn test_local_registry_register_discover_deregister() {
 fn test_chip_token_create_and_filter_pipeline() {
     use bsv::primitives::PrivateKey;
 
-    // Create 5 different node tokens with various configs
+    // Post-Path-A flow: CHIP tokens carry only (identity_key, domain). The
+    // capabilities (curves, fee_sats, threshold_configs) live on each
+    // cosigner's /capabilities endpoint and are fetched after token
+    // validation by discovery.rs (TODO #16). This test mirrors the real
+    // flow: create + parse the canonical 5-field signed token, then merge
+    // with simulated capabilities to produce the MpcNodeInfo that
+    // filter_and_rank_nodes consumes.
     let configs = vec![
         ("https://us1.com", 100u64, vec!["2-of-2"], vec!["secp256k1"]),
         ("https://eu1.com", 500, vec!["2-of-3"], vec!["secp256k1"]),
@@ -281,11 +287,16 @@ fn test_chip_token_create_and_filter_pipeline() {
     let mut nodes: Vec<MpcNodeInfo> = Vec::new();
     for (domain, fee, thresholds, curves) in &configs {
         let key = PrivateKey::random();
-        let compressed = key.public_key().to_compressed();
 
-        let node_info = MpcNodeInfo {
-            identity_key: String::new(),
-            domain: domain.to_string(),
+        // Create + parse a real signed CHIP token. This is the part the
+        // overlay actually carries.
+        let bytes = chip::create_chip_token(&key, domain).unwrap();
+        let token = chip::parse_chip_token(&bytes).unwrap();
+
+        // Merge with simulated /capabilities response.
+        nodes.push(MpcNodeInfo {
+            identity_key: token.identity_key,
+            domain: token.domain,
             curves: curves.iter().map(|s| s.to_string()).collect(),
             threshold_configs: thresholds.iter().map(|s| s.to_string()).collect(),
             fee_sats: *fee,
@@ -293,12 +304,7 @@ fn test_chip_token_create_and_filter_pipeline() {
             published_at: chrono::Utc::now(),
             max_presignatures: None,
             min_balance_sats: None,
-        };
-
-        // Create CHIP token and parse it back
-        let bytes = chip::create_chip_token(&compressed, domain, &node_info).unwrap();
-        let parsed = chip::parse_chip_token(&bytes).unwrap();
-        nodes.push(parsed);
+        });
     }
 
     // Filter: secp256k1 + 2-of-2 + max 300 sats
