@@ -1,0 +1,52 @@
+[package]
+name = "bsv-mpc-messagebox"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+bsv-mpc-core = { path = "../bsv-mpc-core" }
+
+# BSV SDK (PrivateKey / PublicKey / ECDSA for BRC-31)
+bsv.workspace = true
+
+# Async runtime + HTTP
+tokio.workspace = true
+reqwest.workspace = true
+
+# WebSocket
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+
+# Async stream utilities
+futures.workspace = true
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+hex.workspace = true
+base64.workspace = true
+
+# Crypto (BRC-31 auth signature)
+sha2.workspace = true
+
+# RNG (BRC-31 nonces)
+rand.workspace = true
+
+# Time
+chrono.workspace = true
+
+# Error handling
+thiserror.workspace = true
+anyhow.workspace = true
+
+# Logging
+tracing.workspace = true
+
+# URL helpers
+url = "2"
+
+[dev-dependencies]
+tracing-subscriber.workspace = true
+tempfile.workspace = true

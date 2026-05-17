@@ -10,6 +10,7 @@ publish = false
 resolver = "2"
 members = [
     "crates/bsv-mpc-core",
+    "crates/bsv-mpc-messagebox",
     "crates/bsv-mpc-proxy",
     "crates/bsv-mpc-worker",
     "crates/bsv-mpc-service",
