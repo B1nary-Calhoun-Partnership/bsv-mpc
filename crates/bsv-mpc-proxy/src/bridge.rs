@@ -1160,6 +1160,7 @@ impl MpcBridge {
                     threshold: 2,
                     parties: 2,
                 },
+                joint_pubkey_compressed: Vec::new(),
             },
             joint_key,
             root_pub,
@@ -1318,6 +1319,7 @@ mod tests {
                     threshold: 2,
                     parties: 2,
                 },
+                joint_pubkey_compressed: Vec::new(),
             },
             session_id: SessionId::from_str_hash("test-session-123"),
         };
@@ -1395,6 +1397,7 @@ mod tests {
                     threshold: 2,
                     parties: 3,
                 },
+                joint_pubkey_compressed: Vec::new(),
             },
             session_id: SessionId::from_str_hash("test"),
         };

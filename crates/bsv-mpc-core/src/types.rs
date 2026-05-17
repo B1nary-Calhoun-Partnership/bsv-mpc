@@ -157,6 +157,11 @@ pub struct JointPublicKey {
 /// Shares are encrypted with AES-256-GCM using a key derived via BRC-42
 /// (HMAC-SHA256 of the root wallet key + session ID). The encrypted share
 /// can be safely stored on disk or synced to a backup service.
+///
+/// Carries the joint public key in cleartext (`joint_pubkey_compressed`) so
+/// coordinators built from a stored share can derive the canonical
+/// ExecutionId per MPC-Spec §02 without round-tripping to the DKG result.
+/// The joint pubkey is public information — no secret leakage.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EncryptedShare {
     /// AES-256-GCM nonce (12 bytes). Randomly generated per encryption.
@@ -169,6 +174,12 @@ pub struct EncryptedShare {
     pub share_index: ShareIndex,
     /// Threshold configuration for the group.
     pub config: ThresholdConfig,
+    /// Joint public key for this share (33-byte compressed secp256k1).
+    /// Empty (`Vec::new()`) only during DKG keygen before the joint key is
+    /// known; callers MUST fill in from `DkgResult.joint_key.compressed`
+    /// before persisting or using for sign/presign.
+    #[serde(default)]
+    pub joint_pubkey_compressed: Vec<u8>,
 }
 
 /// A completed presignature ready for one-round online signing.

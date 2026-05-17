@@ -53,6 +53,28 @@ use crate::types::{
     ThresholdConfig,
 };
 
+/// Extract the joint pubkey from a share or fall back to all-zero bytes.
+///
+/// Pre-canonical (legacy) shares may have an empty `joint_pubkey_compressed`.
+/// In that case the canonical formula is still well-defined with `[0;33]`,
+/// but cross-impl ceremonies will abort at round 1 — we emit a warning so
+/// the configuration error is visible in logs.
+pub(crate) fn share_joint_pubkey_or_zero(share: &EncryptedShare, ctx: &'static str) -> [u8; 33] {
+    if share.joint_pubkey_compressed.len() == 33 {
+        let mut out = [0u8; 33];
+        out.copy_from_slice(&share.joint_pubkey_compressed);
+        out
+    } else {
+        tracing::warn!(
+            phase = ctx,
+            len = share.joint_pubkey_compressed.len(),
+            "share missing canonical joint_pubkey_compressed — falling back to [0;33] \
+             (cross-impl ceremony will abort at round 1; fill the field from DkgResult)"
+        );
+        [0u8; 33]
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Channel message types between coordinator and SM thread
 // ---------------------------------------------------------------------------
@@ -172,15 +194,15 @@ impl SigningCoordinator {
         config: ThresholdConfig,
         participants: Vec<u16>,
     ) -> Self {
-        let eid_bytes = {
-            let mut hasher = sha2::Sha256::new();
-            hasher.update(b"bsv-mpc-signing-");
-            hasher.update(session_id.as_bytes());
-            let result = hasher.finalize();
-            let mut bytes = [0u8; 32];
-            bytes.copy_from_slice(&result);
-            bytes
-        };
+        // Canonical ExecutionId per MPC-Spec §02.2 with phase=Sign and the
+        // joint pubkey carried on the share.
+        let joint_pk_arr = share_joint_pubkey_or_zero(&share, "signing");
+        let eid_bytes =
+            crate::canonical::canonical_execution_id(&crate::canonical::ExecutionParams::new_v1(
+                crate::canonical::PhaseTag::Sign,
+                session_id,
+                joint_pk_arr,
+            ));
 
         Self {
             session_id,
@@ -984,6 +1006,7 @@ mod tests {
             session_id: SessionId::from_str_hash("test-signing-session"),
             share_index: ShareIndex(index),
             config,
+            joint_pubkey_compressed: key_share.core.shared_public_key.to_bytes(true).to_vec(),
         }
     }
 
@@ -1000,6 +1023,7 @@ mod tests {
             session_id: SessionId::from_str_hash("test"),
             share_index: ShareIndex(0),
             config,
+            joint_pubkey_compressed: Vec::new(),
         };
 
         let coord =
@@ -1019,6 +1043,7 @@ mod tests {
             session_id: SessionId::from_str_hash("test"),
             share_index: ShareIndex(5), // not in participants
             config,
+            joint_pubkey_compressed: Vec::new(),
         };
 
         let mut coord =
@@ -1042,6 +1067,7 @@ mod tests {
             session_id: SessionId::from_str_hash("test"),
             share_index: ShareIndex(0),
             config,
+            joint_pubkey_compressed: Vec::new(),
         };
 
         let mut coord =
@@ -1065,6 +1091,7 @@ mod tests {
             session_id: SessionId::from_str_hash("test"),
             share_index: ShareIndex(0),
             config,
+            joint_pubkey_compressed: Vec::new(),
         };
 
         let coord1 = SigningCoordinator::new(
@@ -1092,6 +1119,7 @@ mod tests {
             session_id: SessionId::from_str_hash("test"),
             share_index: ShareIndex(0),
             config,
+            joint_pubkey_compressed: Vec::new(),
         };
 
         let coord1 = SigningCoordinator::new(
