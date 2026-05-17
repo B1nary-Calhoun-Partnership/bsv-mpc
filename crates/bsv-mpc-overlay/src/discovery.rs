@@ -40,14 +40,90 @@
 //! # }
 //! ```
 
-use crate::chip;
+use crate::chip::{self, ChipTokenInfo};
 use crate::error::OverlayError;
 use crate::types::{DiscoveryQuery, MpcNodeInfo, MPC_TOPIC};
 use bsv::overlay::{
     LookupAnswer, LookupQuestion, LookupResolver, LookupResolverConfig, NetworkPreset,
 };
 use bsv::transaction::Transaction;
+use serde::Deserialize;
 use std::collections::HashMap;
+use std::time::Duration;
+
+/// Path A side-channel capabilities response served by each cosigner at
+/// `GET https://{domain}/capabilities`. Schema matches the JSON returned by
+/// `bsv-mpc-proxy::wallet_api::capabilities_impl`.
+///
+/// Discovery clients fetch this after validating the cosigner's SHIP token
+/// and merge it with the token's (identity_key, domain) to assemble a full
+/// [`MpcNodeInfo`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct CapabilitiesResponse {
+    pub curves: Vec<String>,
+    pub threshold_configs: Vec<String>,
+    pub fee_sats: u64,
+    pub version: String,
+    pub max_presignatures: Option<u32>,
+    pub min_balance_sats: Option<u64>,
+}
+
+/// Default per-request timeout for the `/capabilities` HTTP GET.
+const CAPABILITIES_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Fetch a single cosigner's capabilities JSON at `GET {domain}/capabilities`.
+///
+/// The cosigner's domain may or may not include a scheme; if missing, `https://`
+/// is assumed (per [`verify_node_health`] convention). Trailing slashes are
+/// stripped before joining the path.
+pub async fn fetch_capabilities(
+    client: &reqwest::Client,
+    domain: &str,
+) -> Result<CapabilitiesResponse, OverlayError> {
+    let base = if domain.starts_with("http://") || domain.starts_with("https://") {
+        domain.trim_end_matches('/').to_string()
+    } else {
+        format!("https://{}", domain.trim_end_matches('/'))
+    };
+    let url = format!("{base}/capabilities");
+
+    let resp = client
+        .get(&url)
+        .timeout(CAPABILITIES_FETCH_TIMEOUT)
+        .send()
+        .await
+        .map_err(|e| OverlayError::Unreachable(format!("{url}: {e}")))?;
+
+    if !resp.status().is_success() {
+        return Err(OverlayError::LookupFailed(format!(
+            "{url} returned HTTP {}",
+            resp.status()
+        )));
+    }
+
+    resp.json::<CapabilitiesResponse>()
+        .await
+        .map_err(|e| OverlayError::LookupFailed(format!("{url}: parse capabilities JSON: {e}")))
+}
+
+/// Assemble a full [`MpcNodeInfo`] from a validated SHIP token + fetched capabilities.
+///
+/// `published_at` is set to "now" since the canonical signed SHIP token does
+/// not carry a timestamp; the field is operational (used for dedup tiebreaking)
+/// rather than security-load-bearing.
+fn assemble_node_info(token: ChipTokenInfo, caps: CapabilitiesResponse) -> MpcNodeInfo {
+    MpcNodeInfo {
+        identity_key: token.identity_key,
+        domain: token.domain,
+        curves: caps.curves,
+        threshold_configs: caps.threshold_configs,
+        fee_sats: caps.fee_sats,
+        version: caps.version,
+        published_at: chrono::Utc::now(),
+        max_presignatures: caps.max_presignatures,
+        min_balance_sats: caps.min_balance_sats,
+    }
+}
 
 /// The SLAP lookup service name for MPC signing.
 ///
@@ -117,8 +193,9 @@ pub async fn discover_nodes(
         OverlayError::LookupFailed(format!("SHIP lookup for {} failed: {}", MPC_TOPIC, e))
     })?;
 
-    // Parse results
-    let mut nodes: Vec<MpcNodeInfo> = Vec::new();
+    // Stage 1: parse + validate signed SHIP tokens from overlay output.
+    // Capabilities come from the /capabilities side-channel below (Path A).
+    let mut validated_tokens: Vec<ChipTokenInfo> = Vec::new();
 
     match answer {
         LookupAnswer::OutputList { outputs } => {
@@ -148,30 +225,11 @@ pub async fn discover_nodes(
                 };
 
                 // Parse as canonical 5-field signed SHIP token (Path A).
-                // Capabilities (curves, fee_sats, threshold_configs, version)
-                // are NOT in the token — they're served by each cosigner at
-                // GET https://{domain}/capabilities. Until task #16 wires
-                // the side-channel fetch, fill placeholder values; this
-                // keeps the type contract intact but `discover_nodes` will
-                // not return real capabilities yet (only identity + domain
-                // are trustworthy in the returned MpcNodeInfo). All filters
-                // that depend on capabilities (curve / threshold / fee)
-                // will pass-through the placeholder defaults — once #16
-                // lands, real values flow through.
+                // Token carries only (identity_key, domain); capabilities
+                // come from the side-channel fetch below.
                 let script_bytes = locking_script.to_binary();
                 match chip::parse_chip_token(&script_bytes) {
-                    Ok(token_info) => nodes.push(MpcNodeInfo {
-                        identity_key: token_info.identity_key,
-                        domain: token_info.domain,
-                        // TODO(#16): fetch the next 5 fields from GET {domain}/capabilities.
-                        curves: vec!["secp256k1".to_string()],
-                        threshold_configs: vec!["2-of-2".to_string(), "2-of-3".to_string()],
-                        fee_sats: 0,
-                        version: "0.0.0".to_string(),
-                        published_at: chrono::Utc::now(),
-                        max_presignatures: None,
-                        min_balance_sats: None,
-                    }),
+                    Ok(token_info) => validated_tokens.push(token_info),
                     Err(e) => {
                         tracing::trace!("Output is not a valid signed MPC CHIP token: {}", e);
                     }
@@ -189,6 +247,40 @@ pub async fn discover_nodes(
             );
         }
     }
+
+    // Stage 2 (Path A): parallel fetch of /capabilities side-channel for each
+    // validated SHIP token. On per-cosigner fetch failure, the node is SKIPPED
+    // (logged at warn) rather than aborted-out — partial discovery beats no
+    // discovery when one cosigner is misbehaving. Per-request 5s timeout
+    // (CAPABILITIES_FETCH_TIMEOUT) bounds tail latency.
+    let cap_client = reqwest::Client::builder()
+        .timeout(CAPABILITIES_FETCH_TIMEOUT)
+        .build()
+        .map_err(|e| OverlayError::Unreachable(format!("build http client: {e}")))?;
+
+    let fetches = validated_tokens.into_iter().map(|token| {
+        let client = cap_client.clone();
+        async move {
+            let domain = token.domain.clone();
+            match fetch_capabilities(&client, &domain).await {
+                Ok(caps) => Some(assemble_node_info(token, caps)),
+                Err(e) => {
+                    tracing::warn!(
+                        "Skipping node {} ({}) — /capabilities fetch failed: {}",
+                        token.identity_key,
+                        domain,
+                        e
+                    );
+                    None
+                }
+            }
+        }
+    });
+    let nodes: Vec<MpcNodeInfo> = futures::future::join_all(fetches)
+        .await
+        .into_iter()
+        .flatten()
+        .collect();
 
     // Filter by query parameters
     let filtered: Vec<MpcNodeInfo> = nodes
@@ -451,6 +543,117 @@ pub fn filter_and_rank_nodes(nodes: Vec<MpcNodeInfo>, query: &DiscoveryQuery) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{routing::get, Json, Router};
+    use serde_json::json;
+    use std::net::SocketAddr;
+
+    // ── Path A side-channel: fetch_capabilities + assemble_node_info ──────
+
+    /// Spawn a one-shot Axum server that serves the given `/capabilities`
+    /// JSON body on a random port, returns the base URL.
+    async fn spawn_caps_server(body: serde_json::Value) -> String {
+        let app = Router::new().route(
+            "/capabilities",
+            get(move || {
+                let body = body.clone();
+                async move { Json(body) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn fetch_capabilities_returns_parsed_struct() {
+        let url = spawn_caps_server(json!({
+            "curves":            ["secp256k1"],
+            "threshold_configs": ["2-of-3"],
+            "fee_sats":          500,
+            "version":           "0.1.0",
+            "max_presignatures": 50,
+            "min_balance_sats":  10000
+        }))
+        .await;
+
+        let client = reqwest::Client::new();
+        let caps = fetch_capabilities(&client, &url).await.unwrap();
+
+        assert_eq!(caps.curves, vec!["secp256k1"]);
+        assert_eq!(caps.threshold_configs, vec!["2-of-3"]);
+        assert_eq!(caps.fee_sats, 500);
+        assert_eq!(caps.version, "0.1.0");
+        assert_eq!(caps.max_presignatures, Some(50));
+        assert_eq!(caps.min_balance_sats, Some(10_000));
+    }
+
+    #[tokio::test]
+    async fn fetch_capabilities_returns_unreachable_on_dead_host() {
+        // Random port nobody's listening on. Will fail at connect-time.
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(200))
+            .build()
+            .unwrap();
+        let err = fetch_capabilities(&client, "http://127.0.0.1:1")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, OverlayError::Unreachable(_)),
+            "expected Unreachable, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_capabilities_returns_lookup_failed_on_non_200() {
+        let app = Router::new().route(
+            "/capabilities",
+            get(|| async { axum::http::StatusCode::INTERNAL_SERVER_ERROR }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let url = format!("http://{addr}");
+
+        let client = reqwest::Client::new();
+        let err = fetch_capabilities(&client, &url).await.unwrap_err();
+        assert!(
+            matches!(err, OverlayError::LookupFailed(_)),
+            "expected LookupFailed for HTTP 500, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn assemble_node_info_merges_token_and_caps() {
+        let token = ChipTokenInfo {
+            identity_key: "02aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .into(),
+            domain: "https://node1.example.com".into(),
+        };
+        let caps = CapabilitiesResponse {
+            curves: vec!["secp256k1".into()],
+            threshold_configs: vec!["2-of-2".into(), "3-of-5".into()],
+            fee_sats: 750,
+            version: "0.2.1".into(),
+            max_presignatures: Some(25),
+            min_balance_sats: None,
+        };
+
+        let info = assemble_node_info(token.clone(), caps);
+        assert_eq!(info.identity_key, token.identity_key);
+        assert_eq!(info.domain, token.domain);
+        assert_eq!(info.fee_sats, 750);
+        assert_eq!(info.threshold_configs, vec!["2-of-2", "3-of-5"]);
+        assert_eq!(info.version, "0.2.1");
+        assert_eq!(info.max_presignatures, Some(25));
+        assert!(info.min_balance_sats.is_none());
+    }
+
+    // ── Existing filter/rank tests ────────────────────────────────────────
 
     fn make_node(
         key: &str,
