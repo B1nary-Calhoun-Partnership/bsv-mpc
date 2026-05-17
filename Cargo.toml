@@ -31,6 +31,7 @@ repository = "https://github.com/anthropics/bsv-mpc"
 bsv-mpc-core = { path = "crates/bsv-mpc-core" }
 bsv-mpc-proxy = { path = "crates/bsv-mpc-proxy" }
 bsv-mpc-service = { path = "crates/bsv-mpc-service" }
+bsv-mpc-overlay = { path = "crates/bsv-mpc-overlay" }
 
 # MPC crypto (for DKG simulation in E2E tests)
 cggmp24 = { git = "https://github.com/LFDT-Lockness/cggmp21", features = ["curve-secp256k1", "backend-num-bigint", "insecure-assume-preimage-known"] }

@@ -203,6 +203,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "bsv-mpc-core",
+ "bsv-mpc-overlay",
  "bsv-mpc-proxy",
  "bsv-mpc-service",
  "bsv-rs",
