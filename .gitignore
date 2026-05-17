@@ -22,3 +22,7 @@ ROUND3-PROMPT.md
 wrangler.toml
 .dev.vars
 build/
+
+# Graphify (Claude Code tool) writes AST/semantic caches alongside the repo
+# whenever an agent explores the codebase. They're regenerable and noisy.
+graphify-out/

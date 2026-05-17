@@ -48,6 +48,7 @@
 pub mod canonical;
 pub mod dkg;
 pub mod ecdh;
+pub mod envelope;
 pub mod error;
 pub mod hd;
 pub mod presigning;
