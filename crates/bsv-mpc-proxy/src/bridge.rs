@@ -359,7 +359,7 @@ impl BridgeAuth {
             .map_err(|e| MpcError::Protocol(format!("invalid server pubkey: {e}")))?;
 
         let key_id = format!("{} {}", request_nonce, server_session_nonce);
-        let invoice = compute_invoice(2, "auth message signature", &key_id);
+        let invoice = compute_invoice(2, "auth message signature", &key_id)?;
 
         // Derive signing key: auth_priv + HMAC(ECDH(server_pub, auth_priv), invoice)
         let signing_key = self
@@ -1035,7 +1035,7 @@ impl MpcBridge {
                     })?
                 };
 
-                let invoice = compute_invoice(level, protocol_name, key_id);
+                let invoice = compute_invoice(level, protocol_name, key_id)?;
 
                 // Round 1: base ECDH — counterparty_pub * root_priv
                 let shared_secret = self.partial_ecdh(&counterparty_pub).await?;
@@ -1073,7 +1073,7 @@ impl MpcBridge {
         key_id: &str,
         for_self: bool,
     ) -> bsv_mpc_core::error::Result<PublicKey> {
-        let invoice = compute_invoice(level, protocol_name, key_id);
+        let invoice = compute_invoice(level, protocol_name, key_id)?;
 
         match counterparty {
             "anyone" => {

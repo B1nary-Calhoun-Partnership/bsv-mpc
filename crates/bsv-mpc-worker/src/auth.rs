@@ -284,9 +284,13 @@ pub fn has_auth_headers(req: &Request) -> bool {
 
 /// Build the BRC-42 invoice string for auth message signing.
 ///
-/// Format: `"2-auth message signature-{key_id}"`
+/// Format: `"2-auth message signature-{key_id}"`. AUTH_PROTOCOL_NAME is a
+/// hardcoded constant known to pass canonical `validate_protocol_name`;
+/// any validation failure here is a programming bug (constant misedit), not
+/// a runtime condition. `.expect` is correct.
 fn auth_invoice(key_id: &str) -> String {
     compute_invoice(AUTH_SECURITY_LEVEL, AUTH_PROTOCOL_NAME, key_id)
+        .expect("AUTH_PROTOCOL_NAME constant must pass canonical BRC-42 validation")
 }
 
 /// Compute the message hash for signing/verification.

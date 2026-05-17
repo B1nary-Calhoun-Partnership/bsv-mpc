@@ -235,7 +235,7 @@ pub fn derive_symmetric_key_anyone(
     protocol_name: &str,
     key_id: &str,
 ) -> Result<[u8; 32]> {
-    let invoice = compute_invoice(level, protocol_name, key_id);
+    let invoice = compute_invoice(level, protocol_name, key_id)?;
 
     // For "anyone": shared_secret = root_pub
     let hmac_bytes = compute_brc42_hmac(root_pub, &invoice);
@@ -498,7 +498,7 @@ mod tests {
             combine_partials_lagrange(&[(p0_r1, vss_points[0]), (p1_r1, vss_points[1])]).unwrap();
 
         // Compute invoice and child_counter_pub
-        let invoice = compute_invoice(2, "worm memory", key_id);
+        let invoice = compute_invoice(2, "worm memory", key_id).unwrap();
         let child_counter_pub = derive_child_pubkey(&root_pub, &shared_secret, &invoice).unwrap();
 
         // Round 2: root_priv * child_counter_pub

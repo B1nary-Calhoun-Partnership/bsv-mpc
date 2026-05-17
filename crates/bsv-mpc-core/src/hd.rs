@@ -99,21 +99,59 @@ pub fn compute_brc42_hmac(shared_secret: &PublicKey, invoice_number: &str) -> [u
     sha256_hmac(&shared_secret.to_compressed(), invoice_number.as_bytes())
 }
 
-/// Build a BRC-42 invoice number string.
+/// Build a BRC-42 invoice number string in canonical form.
 ///
-/// Format: `"{security_level}-{protocol_name}-{key_id}"`
+/// Per BRC-42 §03.9 (and the cross-impl conformance gate at
+/// `MPC-Spec/conformance/test-vectors/03-brc42-invoice.json`), the invoice
+/// MUST be built from a CANONICALIZED protocol name and a VALIDATED key id —
+/// otherwise two implementations given inputs differing only in case or
+/// whitespace will derive DIFFERENT keys for what should be the same logical
+/// derivation. Pre-2026-05-17 this function was a raw `format!` that skipped
+/// validation entirely; every downstream caller was silently emitting
+/// non-canonical invoices.
+///
+/// This function delegates to `bsv::wallet::types::validate_protocol_name` and
+/// `bsv::wallet::types::validate_key_id` — the same canonical path that
+/// `bsv-rs::wallet::KeyDeriver::compute_invoice_number` and every conformant
+/// BSV SDK use. Output is byte-identical to those paths for any input they
+/// accept. This is the cross-impl wire-compat floor for BRC-42 derivation
+/// across the partnership.
+///
+/// Format: `"{security_level}-{canonical_protocol_name}-{key_id}"` where
+/// `canonical_protocol_name = protocol_name.trim().to_lowercase()` with
+/// format validation (5-400 chars, lowercase + digits + spaces only, no
+/// consecutive spaces, no trailing " protocol").
 ///
 /// Security levels (from BRC-42):
 /// - 0 = No security
 /// - 1 = App-level
 /// - 2 = Counterparty-level (most common — used by bsv-worm)
 ///
-/// Examples:
-/// - `compute_invoice(2, "worm memory", "block-42")` → `"2-worm memory-block-42"`
-/// - `compute_invoice(2, "3241645161d8", "test-prefix test-suffix")` → `"2-3241645161d8-test-prefix test-suffix"`
-/// - `compute_invoice(2, "auth message signature", "request-nonce-abc123")` → `"2-auth message signature-request-nonce-abc123"`
-pub fn compute_invoice(security_level: u8, protocol_name: &str, key_id: &str) -> String {
-    format!("{}-{}-{}", security_level, protocol_name, key_id)
+/// Examples (post-canonicalization):
+/// - `compute_invoice(2, "worm memory", "block-42")?` → `"2-worm memory-block-42"`
+/// - `compute_invoice(2, "  WORM Memory  ", "block-42")?` → `"2-worm memory-block-42"` (canonicalized)
+/// - `compute_invoice(2, "auth message signature", "request-nonce-abc123")?`
+///   → `"2-auth message signature-request-nonce-abc123"`
+///
+/// # Errors
+///
+/// `MpcError::Protocol` if `security_level > 2`, `protocol_name` fails
+/// `validate_protocol_name`, or `key_id` fails `validate_key_id`. The
+/// error message includes the underlying bsv-rs validation detail.
+///
+/// Resolves [`MPC-Spec` issue #1] / [ADR-0002] (canonical BRC-42 invoice).
+pub fn compute_invoice(security_level: u8, protocol_name: &str, key_id: &str) -> Result<String> {
+    if security_level > 2 {
+        return Err(MpcError::Protocol(format!(
+            "BRC-42: security_level must be 0, 1, or 2 (got {})",
+            security_level
+        )));
+    }
+    bsv::wallet::types::validate_key_id(key_id)
+        .map_err(|e| MpcError::Protocol(format!("BRC-42: invalid key_id: {}", e)))?;
+    let canonical_name = bsv::wallet::types::validate_protocol_name(protocol_name)
+        .map_err(|e| MpcError::Protocol(format!("BRC-42: invalid protocol_name: {}", e)))?;
+    Ok(format!("{}-{}-{}", security_level, canonical_name, key_id))
 }
 
 /// Derive a child public key for the "Anyone" counterparty (0 MPC round-trips).
@@ -137,7 +175,7 @@ pub fn derive_anyone_pubkey(
     security_level: u8,
 ) -> Result<PublicKey> {
     // For "anyone": shared_secret = root_pubkey
-    let invoice = compute_invoice(security_level, protocol_name, key_id);
+    let invoice = compute_invoice(security_level, protocol_name, key_id)?;
     derive_child_pubkey(root_pub, root_pub, &invoice)
 }
 
@@ -171,7 +209,7 @@ pub fn derive_joint_key_with_secret(
     let root_pub = PublicKey::from_bytes(&joint_key.compressed)
         .map_err(|e| MpcError::InvalidShare(format!("invalid joint public key: {}", e)))?;
 
-    let invoice = compute_invoice(security_level, protocol_name, key_id);
+    let invoice = compute_invoice(security_level, protocol_name, key_id)?;
     let child_pub = derive_child_pubkey(&root_pub, shared_secret, &invoice)?;
     pubkey_to_joint_key(&child_pub)
 }
@@ -217,24 +255,152 @@ mod tests {
     #[test]
     fn test_invoice_format() {
         assert_eq!(
-            compute_invoice(2, "worm memory", "block-42"),
+            compute_invoice(2, "worm memory", "block-42").unwrap(),
+            "2-worm memory-block-42"
+        );
+    }
+
+    // ── BRC-42 invoice canonicalization regression (M1 spec #1) ────────────
+    //
+    // Pre-fix `compute_invoice` was `format!("{}-{}-{}", ...)` with zero
+    // input validation — uppercase, leading/trailing whitespace, double
+    // spaces, and ` protocol` suffixes all passed through verbatim. The
+    // canonical BRC-42 path (`bsv::wallet::types::validate_protocol_name`,
+    // exercised by `bsv-rs::wallet::KeyDeriver::compute_invoice_number` and
+    // every conformant SDK) applies `.trim().to_lowercase()` + format
+    // validation BEFORE the format!. The pre-fix bug meant bsv-mpc derived
+    // DIFFERENT keys than every other conformant SDK for inputs differing
+    // only in case or whitespace — silent cross-impl drift, exactly the
+    // class the partnership conformance gate is supposed to catch.
+    //
+    // These tests are the gate. They FAIL on pre-fix code; they PASS after
+    // routing through `bsv::wallet::types::validate_protocol_name` and
+    // `validate_key_id`. Both invariants — canonicalization AND rejection —
+    // are asserted.
+
+    #[test]
+    fn compute_invoice_canonicalizes_uppercase_protocol_name() {
+        // Pre-fix: returns "2-WORM MEMORY-block-42"
+        // Post-fix: returns "2-worm memory-block-42" (matches bsv-rs canonical)
+        assert_eq!(
+            compute_invoice(2, "WORM MEMORY", "block-42").unwrap(),
+            "2-worm memory-block-42",
+            "BRC-42 §03.9: protocol_name MUST be lowercased before invoice format"
+        );
+    }
+
+    #[test]
+    fn compute_invoice_trims_protocol_name_whitespace() {
+        assert_eq!(
+            compute_invoice(2, "  worm memory  ", "block-42").unwrap(),
+            "2-worm memory-block-42",
+            "BRC-42 §03.9: protocol_name MUST be trimmed before invoice format"
+        );
+    }
+
+    #[test]
+    fn compute_invoice_canonicalizes_uppercase_and_whitespace_together() {
+        assert_eq!(
+            compute_invoice(2, "  WORM Memory  ", "block-42").unwrap(),
             "2-worm memory-block-42"
         );
     }
 
     #[test]
+    fn compute_invoice_rejects_protocol_name_with_double_space() {
+        // validate_protocol_name rejects this — bsv-rs canonical behavior.
+        let err = compute_invoice(2, "worm  memory", "block-42").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("consecutive spaces") || msg.contains("protocol_name"),
+            "expected double-space rejection, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn compute_invoice_rejects_protocol_name_too_short() {
+        // validate_protocol_name minimum: 5 chars.
+        let err = compute_invoice(2, "wm", "block-42").unwrap_err();
+        assert!(
+            err.to_string().contains("5 characters") || err.to_string().contains("protocol_name"),
+            "expected min-length rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn compute_invoice_rejects_protocol_name_with_hyphen() {
+        // validate_protocol_name: only lowercase + digits + spaces.
+        let err = compute_invoice(2, "worm-memory", "block-42").unwrap_err();
+        assert!(
+            err.to_string().contains("lowercase letters")
+                || err.to_string().contains("protocol_name"),
+            "expected invalid-char rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn compute_invoice_rejects_empty_key_id() {
+        // validate_key_id minimum: 1 char.
+        let err = compute_invoice(2, "worm memory", "").unwrap_err();
+        assert!(
+            err.to_string().contains("at least 1 character") || err.to_string().contains("key_id"),
+            "expected empty-key_id rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn compute_invoice_rejects_security_level_above_2() {
+        let err = compute_invoice(3, "worm memory", "block-42").unwrap_err();
+        assert!(
+            err.to_string().contains("security_level"),
+            "expected security-level rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn compute_invoice_matches_bsv_rs_canonical_path() {
+        // The canonical invoice format is what bsv-rs's KeyDeriver computes
+        // internally. Our compute_invoice MUST produce byte-identical output
+        // for any input that bsv-rs's path accepts. This locks cross-impl
+        // wire-compat for BRC-42 derivation across the partnership.
+        use bsv::wallet::types::{validate_key_id, validate_protocol_name};
+
+        let cases = [
+            (2u8, "worm memory", "block-42"),
+            (2, "auth message signature", "request-nonce-abc123"),
+            (2, "3241645161d8", "test-prefix test-suffix"),
+            (0, "proto", "key"),
+            (1, "proto", "key"),
+        ];
+
+        for (level, proto, key) in cases {
+            // bsv-rs canonical path (what KeyDeriver::compute_invoice_number does)
+            let canonical_proto = validate_protocol_name(proto).unwrap();
+            validate_key_id(key).unwrap();
+            let canonical_invoice = format!("{}-{}-{}", level, canonical_proto, key);
+
+            let ours = compute_invoice(level, proto, key).unwrap();
+            assert_eq!(
+                ours, canonical_invoice,
+                "bsv-mpc::compute_invoice MUST be byte-identical to the bsv-rs canonical \
+                 path for input ({level}, {proto:?}, {key:?})"
+            );
+        }
+    }
+
+    #[test]
     fn test_invoice_auth_protocol() {
         assert_eq!(
-            compute_invoice(2, "auth message signature", "request-nonce-abc123"),
+            compute_invoice(2, "auth message signature", "request-nonce-abc123").unwrap(),
             "2-auth message signature-request-nonce-abc123"
         );
     }
 
     #[test]
     fn test_invoice_different_security_levels() {
-        let inv0 = compute_invoice(0, "proto", "key");
-        let inv1 = compute_invoice(1, "proto", "key");
-        let inv2 = compute_invoice(2, "proto", "key");
+        let inv0 = compute_invoice(0, "proto", "key").unwrap();
+        let inv1 = compute_invoice(1, "proto", "key").unwrap();
+        let inv2 = compute_invoice(2, "proto", "key").unwrap();
         assert_ne!(inv0, inv1);
         assert_ne!(inv1, inv2);
         assert_eq!(inv0, "0-proto-key");
@@ -389,7 +555,7 @@ mod tests {
             .expect("ECDH self");
 
         // Our BRC-42 derivation with the pre-computed shared secret
-        let invoice = compute_invoice(2, "3241645161d8", key_id);
+        let invoice = compute_invoice(2, "3241645161d8", key_id).unwrap();
         let mpc_derived = derive_child_pubkey(&root_pub, &shared_secret, &invoice).unwrap();
 
         assert_eq!(
@@ -432,7 +598,7 @@ mod tests {
             .expect("ECDH other");
 
         // Our BRC-42 derivation
-        let invoice = compute_invoice(2, "3241645161d8", key_id);
+        let invoice = compute_invoice(2, "3241645161d8", key_id).unwrap();
         let mpc_derived = derive_child_pubkey(&root_pub, &shared_secret, &invoice).unwrap();
 
         assert_eq!(
@@ -457,7 +623,7 @@ mod tests {
             .expect("wallet derivation");
 
         let shared_secret = root_priv.derive_shared_secret(&root_pub).expect("ECDH");
-        let invoice = compute_invoice(2, "worm memory", key_id);
+        let invoice = compute_invoice(2, "worm memory", key_id).unwrap();
         let mpc_derived = derive_child_pubkey(&root_pub, &shared_secret, &invoice).unwrap();
 
         assert_eq!(
@@ -494,7 +660,7 @@ mod tests {
             .expect("wallet derivation");
 
         let shared_secret = root_priv.derive_shared_secret(&server_pub).expect("ECDH");
-        let invoice = compute_invoice(2, "auth message signature", key_id);
+        let invoice = compute_invoice(2, "auth message signature", key_id).unwrap();
         let mpc_derived = derive_child_pubkey(&root_pub, &shared_secret, &invoice).unwrap();
 
         assert_eq!(
@@ -551,7 +717,10 @@ mod tests {
         let root_pub = PublicKey::from_bytes(&jk.compressed).unwrap();
         let shared_secret = root_priv.derive_shared_secret(&root_pub).unwrap();
 
-        let child = derive_joint_key_with_secret(&jk, &shared_secret, "test", "key1", 2).unwrap();
+        // protocol_name was "test" (4 chars) — now rejected by canonical
+        // validate_protocol_name which requires ≥ 5 chars. Use a valid
+        // protocol_name that exercises the same path.
+        let child = derive_joint_key_with_secret(&jk, &shared_secret, "tests", "key1", 2).unwrap();
         assert!(!child.address.is_empty());
         assert_eq!(child.compressed.len(), 33);
         assert_ne!(jk.address, child.address);

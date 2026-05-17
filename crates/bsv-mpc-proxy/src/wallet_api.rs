@@ -119,7 +119,8 @@ async fn compute_signing_hmac_offset(
     key_id: &str,
     counterparty: &str,
 ) -> Result<[u8; 32], String> {
-    let invoice = bsv_mpc_core::hd::compute_invoice(level, protocol_name, key_id);
+    let invoice = bsv_mpc_core::hd::compute_invoice(level, protocol_name, key_id)
+        .map_err(|e| e.to_string())?;
 
     let shared_secret = match counterparty {
         "anyone" => {
@@ -2433,7 +2434,7 @@ mod tests {
     #[test]
     fn test_parse_protocol_params_defaults_counterparty_to_self() {
         let body = json!({
-            "protocolID": [2, "test"],
+            "protocolID": [2, "tests"],
             "keyID": "k"
         });
         let (_, _, _, cp) = parse_protocol_params(&body).unwrap();
@@ -2479,7 +2480,7 @@ mod tests {
     #[tokio::test]
     async fn test_derive_symmetric_key_anyone() {
         let state = test_state();
-        let key = derive_symmetric_key(&state.bridge, 2, "test-proto", "key1", "anyone")
+        let key = derive_symmetric_key(&state.bridge, 2, "test proto", "key1", "anyone")
             .await
             .unwrap();
         assert_eq!(key.len(), 32);
@@ -2489,10 +2490,10 @@ mod tests {
     #[tokio::test]
     async fn test_derive_symmetric_key_deterministic() {
         let state = test_state();
-        let k1 = derive_symmetric_key(&state.bridge, 2, "test-proto", "key1", "anyone")
+        let k1 = derive_symmetric_key(&state.bridge, 2, "test proto", "key1", "anyone")
             .await
             .unwrap();
-        let k2 = derive_symmetric_key(&state.bridge, 2, "test-proto", "key1", "anyone")
+        let k2 = derive_symmetric_key(&state.bridge, 2, "test proto", "key1", "anyone")
             .await
             .unwrap();
         assert_eq!(k1, k2, "same inputs must produce same key");
@@ -2501,10 +2502,10 @@ mod tests {
     #[tokio::test]
     async fn test_derive_symmetric_key_different_invoices() {
         let state = test_state();
-        let k1 = derive_symmetric_key(&state.bridge, 2, "test-proto", "key1", "anyone")
+        let k1 = derive_symmetric_key(&state.bridge, 2, "test proto", "key1", "anyone")
             .await
             .unwrap();
-        let k2 = derive_symmetric_key(&state.bridge, 2, "test-proto", "key2", "anyone")
+        let k2 = derive_symmetric_key(&state.bridge, 2, "test proto", "key2", "anyone")
             .await
             .unwrap();
         assert_ne!(k1, k2, "different key IDs must produce different keys");
@@ -2514,7 +2515,7 @@ mod tests {
     async fn test_derive_symmetric_key_self_errors_without_kss() {
         // With test bridge (no real KSS), "self" counterparty should error
         let state = test_state();
-        let result = derive_symmetric_key(&state.bridge, 2, "test-proto", "key1", "self").await;
+        let result = derive_symmetric_key(&state.bridge, 2, "test proto", "key1", "self").await;
         assert!(result.is_err());
     }
 
@@ -2525,7 +2526,7 @@ mod tests {
         let result = derive_symmetric_key(
             &state.bridge,
             2,
-            "test-proto",
+            "test proto",
             "key1",
             "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
         )
@@ -2544,7 +2545,7 @@ mod tests {
         // Encrypt
         let encrypt_body = json!({
             "plaintext": plaintext_b64,
-            "protocolID": [2, "test-proto"],
+            "protocolID": [2, "test proto"],
             "keyID": "test-key",
             "counterparty": "anyone"
         });
@@ -2562,7 +2563,7 @@ mod tests {
         // Decrypt
         let decrypt_body = json!({
             "ciphertext": ciphertext_b64,
-            "protocolID": [2, "test-proto"],
+            "protocolID": [2, "test proto"],
             "keyID": "test-key",
             "counterparty": "anyone"
         });
@@ -2584,7 +2585,7 @@ mod tests {
 
         let encrypt_body = json!({
             "plaintext": plaintext_b64,
-            "protocolID": [2, "test"],
+            "protocolID": [2, "tests"],
             "keyID": "empty",
             "counterparty": "anyone"
         });
@@ -2593,7 +2594,7 @@ mod tests {
 
         let decrypt_body = json!({
             "ciphertext": enc_resp["ciphertext"].as_str().unwrap(),
-            "protocolID": [2, "test"],
+            "protocolID": [2, "tests"],
             "keyID": "empty",
             "counterparty": "anyone"
         });
@@ -2612,7 +2613,7 @@ mod tests {
 
         let body = json!({
             "plaintext": plaintext_b64,
-            "protocolID": [2, "test"],
+            "protocolID": [2, "tests"],
             "keyID": "k",
             "counterparty": "anyone"
         });
@@ -2633,7 +2634,7 @@ mod tests {
         // Encrypt with key "k1"
         let enc_body = json!({
             "plaintext": plaintext_b64,
-            "protocolID": [2, "test"],
+            "protocolID": [2, "tests"],
             "keyID": "k1",
             "counterparty": "anyone"
         });
@@ -2642,7 +2643,7 @@ mod tests {
         // Decrypt with key "k2" — should fail (different derived key)
         let dec_body = json!({
             "ciphertext": enc_resp["ciphertext"].as_str().unwrap(),
-            "protocolID": [2, "test"],
+            "protocolID": [2, "tests"],
             "keyID": "k2",
             "counterparty": "anyone"
         });
@@ -2660,7 +2661,7 @@ mod tests {
         let short_ct = BASE64.encode([0u8; 20]);
         let body = json!({
             "ciphertext": short_ct,
-            "protocolID": [2, "test"],
+            "protocolID": [2, "tests"],
             "keyID": "k",
             "counterparty": "anyone"
         });
@@ -2691,7 +2692,7 @@ mod tests {
 
         let body = json!({
             "data": data_b64,
-            "protocolID": [2, "test-proto"],
+            "protocolID": [2, "test proto"],
             "keyID": "hmac-key",
             "counterparty": "anyone"
         });
@@ -2716,7 +2717,7 @@ mod tests {
 
         let body = json!({
             "data": data_b64,
-            "protocolID": [2, "test"],
+            "protocolID": [2, "tests"],
             "keyID": "k",
             "counterparty": "anyone"
         });
@@ -2733,7 +2734,7 @@ mod tests {
         // Create HMAC
         let create_body = json!({
             "data": data_b64,
-            "protocolID": [2, "test"],
+            "protocolID": [2, "tests"],
             "keyID": "verify-key",
             "counterparty": "anyone"
         });
@@ -2744,7 +2745,7 @@ mod tests {
         let verify_body = json!({
             "data": data_b64,
             "hmac": hmac_hex,
-            "protocolID": [2, "test"],
+            "protocolID": [2, "tests"],
             "keyID": "verify-key",
             "counterparty": "anyone"
         });
@@ -2761,7 +2762,7 @@ mod tests {
         let body = json!({
             "data": data_b64,
             "hmac": "0000000000000000000000000000000000000000000000000000000000000000",
-            "protocolID": [2, "test"],
+            "protocolID": [2, "tests"],
             "keyID": "k",
             "counterparty": "anyone"
         });
@@ -2777,7 +2778,7 @@ mod tests {
         // Create HMAC for "original"
         let create_body = json!({
             "data": BASE64.encode(b"original"),
-            "protocolID": [2, "test"],
+            "protocolID": [2, "tests"],
             "keyID": "k",
             "counterparty": "anyone"
         });
@@ -2788,7 +2789,7 @@ mod tests {
         let verify_body = json!({
             "data": BASE64.encode(b"tampered"),
             "hmac": hmac_hex,
-            "protocolID": [2, "test"],
+            "protocolID": [2, "tests"],
             "keyID": "k",
             "counterparty": "anyone"
         });
@@ -2860,7 +2861,7 @@ mod tests {
         let body = json!({
             "data": "00".repeat(32),
             "signature": "3044022000000000000000000000000000000000000000000000000000000000000000000220000000000000000000000000000000000000000000000000000000000000000000",
-            "protocolID": [2, "test"],
+            "protocolID": [2, "tests"],
             "keyID": "k",
             "counterparty": "self"
         });
@@ -2876,7 +2877,7 @@ mod tests {
         let body = json!({
             "data": "aabb",
             "signature": "3044022000",
-            "protocolID": [2, "test"],
+            "protocolID": [2, "tests"],
             "keyID": "k",
             "counterparty": "anyone",
             "hashToDirectlySign": true
@@ -2896,7 +2897,7 @@ mod tests {
 
         let enc_body = json!({
             "plaintext": plaintext_b64,
-            "protocolID": [2, "test"],
+            "protocolID": [2, "tests"],
             "keyID": "large",
             "counterparty": "anyone"
         });
@@ -2905,7 +2906,7 @@ mod tests {
 
         let dec_body = json!({
             "ciphertext": enc_resp["ciphertext"].as_str().unwrap(),
-            "protocolID": [2, "test"],
+            "protocolID": [2, "tests"],
             "keyID": "large",
             "counterparty": "anyone"
         });
@@ -2923,10 +2924,10 @@ mod tests {
     async fn test_hmac_and_encrypt_use_same_key_derivation() {
         // Both encrypt and createHmac should derive from the same BRC-42 path
         let state = test_state();
-        let k1 = derive_symmetric_key(&state.bridge, 2, "shared-proto", "shared-key", "anyone")
+        let k1 = derive_symmetric_key(&state.bridge, 2, "shared proto", "shared-key", "anyone")
             .await
             .unwrap();
-        let k2 = derive_symmetric_key(&state.bridge, 2, "shared-proto", "shared-key", "anyone")
+        let k2 = derive_symmetric_key(&state.bridge, 2, "shared proto", "shared-key", "anyone")
             .await
             .unwrap();
         assert_eq!(k1, k2, "encrypt and HMAC use the same key derivation");
@@ -3006,7 +3007,7 @@ mod tests {
         let identity_hex = identity_resp["publicKey"].as_str().unwrap();
 
         let derived_body = json!({
-            "protocolID": [2, "test protocol"],
+            "protocolID": [2, "test signing"],
             "keyID": "key-1",
             "counterparty": "anyone",
         });
@@ -3029,7 +3030,7 @@ mod tests {
     async fn test_get_public_key_self_errors_without_kss() {
         let state = test_state();
         let body = json!({
-            "protocolID": [2, "test"],
+            "protocolID": [2, "tests"],
             "keyID": "k",
             "counterparty": "self",
         });
@@ -3607,14 +3608,17 @@ mod tests {
 
         // Our offset computation (what createSignature uses)
         let offset =
-            compute_signing_hmac_offset(&state.bridge, 2, "test protocol", "key-42", "anyone")
+            compute_signing_hmac_offset(&state.bridge, 2, "test signing", "key-42", "anyone")
                 .await
                 .unwrap();
 
         // BRC-42: child_priv = root_priv + HMAC(shared_secret, invoice)
         // For "anyone": shared_secret = root_pub
         // So: expected_offset = HMAC(root_pub, invoice)
-        let invoice = bsv_mpc_core::hd::compute_invoice(2, "test protocol", "key-42");
+        // "test signing" was rejected by canonical validate_protocol_name
+        // (ends in " protocol" — see bsv-rs types.rs validate_protocol_name).
+        // Switch to "test signing" which exercises the same code path.
+        let invoice = bsv_mpc_core::hd::compute_invoice(2, "test signing", "key-42").unwrap();
         let expected = bsv_mpc_core::hd::compute_brc42_hmac(&root_pub, &invoice);
 
         assert_eq!(
@@ -3655,7 +3659,7 @@ mod tests {
         let derived_pub = bsv_mpc_core::hd::derive_child_pubkey(
             &root_pub,
             &root_pub, // shared_secret = root_pub for "anyone"
-            &bsv_mpc_core::hd::compute_invoice(2, "test sig", "roundtrip-key"),
+            &bsv_mpc_core::hd::compute_invoice(2, "test sig", "roundtrip-key").unwrap(),
         )
         .unwrap();
 
@@ -3718,19 +3722,19 @@ mod tests {
     async fn test_different_params_produce_different_offsets() {
         let state = test_state();
 
-        let offset1 = compute_signing_hmac_offset(&state.bridge, 2, "proto-a", "key1", "anyone")
+        let offset1 = compute_signing_hmac_offset(&state.bridge, 2, "proto a", "key1", "anyone")
             .await
             .unwrap();
 
-        let offset2 = compute_signing_hmac_offset(&state.bridge, 2, "proto-a", "key2", "anyone")
+        let offset2 = compute_signing_hmac_offset(&state.bridge, 2, "proto a", "key2", "anyone")
             .await
             .unwrap();
 
-        let offset3 = compute_signing_hmac_offset(&state.bridge, 2, "proto-b", "key1", "anyone")
+        let offset3 = compute_signing_hmac_offset(&state.bridge, 2, "proto b", "key1", "anyone")
             .await
             .unwrap();
 
-        let offset4 = compute_signing_hmac_offset(&state.bridge, 1, "proto-a", "key1", "anyone")
+        let offset4 = compute_signing_hmac_offset(&state.bridge, 1, "proto a", "key1", "anyone")
             .await
             .unwrap();
 
@@ -3753,11 +3757,11 @@ mod tests {
     async fn test_hmac_offset_deterministic() {
         let state = test_state();
 
-        let offset1 = compute_signing_hmac_offset(&state.bridge, 2, "test", "key", "anyone")
+        let offset1 = compute_signing_hmac_offset(&state.bridge, 2, "tests", "key", "anyone")
             .await
             .unwrap();
 
-        let offset2 = compute_signing_hmac_offset(&state.bridge, 2, "test", "key", "anyone")
+        let offset2 = compute_signing_hmac_offset(&state.bridge, 2, "tests", "key", "anyone")
             .await
             .unwrap();
 
@@ -3768,7 +3772,7 @@ mod tests {
     #[tokio::test]
     async fn test_hmac_offset_self_errors_without_kss() {
         let state = test_state();
-        let result = compute_signing_hmac_offset(&state.bridge, 2, "test", "key", "self").await;
+        let result = compute_signing_hmac_offset(&state.bridge, 2, "tests", "key", "self").await;
         assert!(result.is_err());
     }
 
