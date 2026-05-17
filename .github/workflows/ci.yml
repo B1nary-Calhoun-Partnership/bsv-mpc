@@ -12,6 +12,12 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
+  # Opt into Node.js 24 for all JavaScript actions ahead of GitHub forcing
+  # the switch on 2026-06-02 (Node 20 is removed entirely 2026-09-16). This
+  # way any compat issue surfaces in CI now while we can fix it, not on
+  # the day GH flips the default. Remove this env once it becomes the
+  # default and we've verified everything still works.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
   lint:
