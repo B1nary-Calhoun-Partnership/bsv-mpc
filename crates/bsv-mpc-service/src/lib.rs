@@ -3,10 +3,12 @@
 //! Exposes the service's handlers, storage, and router construction
 //! so they can be used from integration tests and embedded deployments.
 
+pub mod dkg_handler;
 pub mod handlers;
 pub mod messagebox;
 pub mod storage;
 
+pub use dkg_handler::DkgHandler;
 pub use messagebox::{HandlerFuture, MessageBoxListener, OutgoingRoundMessage};
 
 use std::sync::Arc;

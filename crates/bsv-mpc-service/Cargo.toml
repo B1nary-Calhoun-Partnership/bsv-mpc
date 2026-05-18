@@ -24,5 +24,11 @@ tracing-subscriber.workspace = true
 chrono.workspace = true
 futures.workspace = true
 
+# DKG handler needs PregeneratedPrimes + SecurityLevel128 types from the
+# pinned cggmp24 fork. Same source as bsv-mpc-core; default features
+# already locked in the workspace patch table at the root Cargo.toml.
+cggmp24.workspace = true
+
 [dev-dependencies]
 rand.workspace = true
+tempfile.workspace = true
