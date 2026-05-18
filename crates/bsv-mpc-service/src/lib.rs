@@ -6,10 +6,12 @@
 pub mod dkg_handler;
 pub mod handlers;
 pub mod messagebox;
+pub mod signing_handler;
 pub mod storage;
 
 pub use dkg_handler::DkgHandler;
 pub use messagebox::{HandlerFuture, MessageBoxListener, OutgoingRoundMessage};
+pub use signing_handler::SigningHandler;
 
 use std::sync::Arc;
 
