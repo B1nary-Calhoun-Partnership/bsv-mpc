@@ -11,10 +11,17 @@
 //! - `E2E_MAINNET=1` — opt-in to spending real sats (NEVER runs in CI)
 //!
 //! Requires:
-//! - `bsv-wallet-cli` running at `http://localhost:3321` with at least
-//!   ~3,000 sats spendable (funds the joint MPC address, then we drain
-//!   most back). Origin `http://localhost` is the auth header the
-//!   wallet expects per its BRC-100 dev-mode config.
+//! - A BRC-100 wallet (bsv-desktop or bsv-wallet-cli) running at
+//!   `http://localhost:3321` with ≥3,000 spendable sats in the
+//!   `default` basket. The default basket is admin-reserved per
+//!   `bsv-wallet-toolbox-rs/src/managers/permissions_manager.rs:843`,
+//!   so funding from it requires admin originator privileges. Per
+//!   `bsv-desktop/src/lib/config.ts:3` admin originator is
+//!   `"admin.com"`; per `bsv-desktop/src/onWalletReady.ts:50-55`
+//!   `parseOrigin` extracts the host via `new URL(rawOrigin).host` —
+//!   so the right header is `Origin: http://admin.com` (scheme is
+//!   parsed off; the host segment alone matches the admin string).
+//!   See `docs/WALLET-3321.md` for full breakdown.
 //! - Outbound network to `api.whatsonchain.com` (UTXO discovery) and
 //!   `arc.taal.com` / `arc.gorillapool.io` (broadcast fan-out).
 //!
@@ -296,7 +303,7 @@ To run (BURNS REAL SATS):
 
     let fund_resp = http
         .post("http://localhost:3321/createAction")
-        .header("Origin", "http://localhost")
+        .header("Origin", "http://admin.com")
         .header("Content-Type", "application/json")
         .json(&serde_json::json!({
             "description": "bsv-mpc Phase E within-stack MessageBox-signed mainnet test",
@@ -340,7 +347,7 @@ To run (BURNS REAL SATS):
 
     let wallet_pub_hex = http
         .post("http://localhost:3321/getPublicKey")
-        .header("Origin", "http://localhost")
+        .header("Origin", "http://admin.com")
         .header("Content-Type", "application/json")
         .json(&serde_json::json!({"identityKey": true}))
         .send()
