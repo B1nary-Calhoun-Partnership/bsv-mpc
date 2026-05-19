@@ -7,7 +7,7 @@
 
 ## CRITICAL: POCs are the source of truth — use BRC standards, not BIPs
 
-**Every implementation must be ported from proven POC code.** We validated 15 POCs on mainnet. The POC code in `poc/` is the authoritative source for how things work. If a stub description contradicts a POC, **the POC is correct** — fix the stub.
+**Every implementation must be ported from proven POC code.** We validated 16 POCs (15 on mainnet through M0, plus POC 16 inline-SM + Paillier pool in Phase G). The POC code in `poc/` is the authoritative source for how things work. If a stub description contradicts a POC, **the POC is correct** — fix the stub.
 
 **BSV uses BRC standards**, not Bitcoin BIPs. Key standards:
 - **Key derivation: BRC-42** (`~/bsv/BRCs/key-derivation/0042.md`) — ECDH + HMAC-SHA256 with invoice strings (protocolID, keyID, counterparty). NOT BIP-32/SLIP-10.
@@ -32,7 +32,7 @@ For BSV smart contracts (Level 3 fee covenant), use **Runar** (`https://github.c
 
 ## Architecture
 
-5 Rust crates in a Cargo workspace. The MPC Signing Proxy presents a BRC-100 wallet API on localhost:3322 — bsv-worm (or any BRC-100 client) calls it unchanged. Internally, every signing request becomes a 2-party CGGMP'24 threshold ECDSA ceremony with a remote Key Share Service (KSS).
+6 Rust crates in a Cargo workspace (`bsv-mpc-core`, `bsv-mpc-messagebox`, `bsv-mpc-proxy`, `bsv-mpc-worker`, `bsv-mpc-service`, `bsv-mpc-overlay`). The MPC Signing Proxy presents a BRC-100 wallet API on localhost:3322 — bsv-worm (or any BRC-100 client) calls it unchanged. Internally, every signing request becomes a 2-party CGGMP'24 threshold ECDSA ceremony with a remote Key Share Service (KSS). Ceremony round-messages flow over the canonical MessageBox transport (Phase A-F); a future Phase H crate will provide a wasm32-compatible CF Worker client.
 
 ```
 bsv-worm                          bsv-mpc
@@ -55,18 +55,33 @@ bsv-worm requires ZERO code changes. The MPC Signing Proxy is a drop-in replacem
 
 ### Crates
 
-#### bsv-mpc-core (~8K LOC, 12 files)
-Core MPC protocol layer wrapping cggmp24 for threshold ECDSA on secp256k1. **All protocol modules fully implemented — zero todo!() stubs.**
-- `dkg.rs` — DKG coordinator (4-round CGGMP'24). Thread-based SM bridge.
-- `signing.rs` — Threshold signing (1 round with presig, 4 without). BRC-42 additive offset support.
-- `presigning.rs` — Background presignature generation (3-round protocol). FIFO pool management.
+#### bsv-mpc-core (~7.5K LOC, 14 files)
+Core MPC protocol layer wrapping cggmp24 for threshold ECDSA on secp256k1. **All protocol modules fully implemented — zero todo!() stubs.** Coordinators are inline-driven (Phase G G-4b/c/d): no thread spawn, no tokio dep in this crate, wasm32-buildable + wasm32-runtime-verified via `tests/wasm32_dkg.rs`.
+- `dkg.rs` — DKG coordinator (4-round CGGMP'24). Inline `StateMachineImpl` ownership; `init()` + `process_round()` drive `proceed()` synchronously.
+- `signing.rs` — Threshold signing (1 round with presig, 4 without). BRC-42 additive offset support. Inline drive via shared `drive_inline` kernel.
+- `presigning.rs` — Background presignature generation (3-round protocol). Inline drive. FIFO pool management.
+- `paillier_pool.rs` — At-rest-encrypted Paillier safe-prime keypair pool per MPC-Spec §06.10.1 / ADR-0041. `PrimePoolStorage` trait + `InMemoryPoolStorage` + AES-256-GCM (BRC-42-derived key) + ≥2-keypair floor + `backfill_to_floor`. Consumed by `DkgCoordinator::with_pool()`.
 - `ecdh.rs` — Partial ECDH for threshold key derivation. Lagrange interpolation reconstruction.
 - `refresh.rs` — Key refresh via threshold resharing (ported from POC 13). Same joint key, 0 on-chain cost.
 - `share.rs` — AES-256-GCM share encryption + HMAC-SHA256 BRC-42 key derivation.
 - `hd.rs` — BRC-42 key derivation (NOT BIP-32). `derive_child_pubkey`, `derive_anyone_pubkey`, `compute_invoice`, `compute_brc42_hmac`.
 - `proof.rs` — BRC-18 participation proofs — create, OP_RETURN serialize, verify.
+- `canonical.rs` — Canonical encoders (CBOR / hash inputs) per MPC-Spec wire layer.
+- `envelope.rs` — Canonical signed envelope (Phase A) — encode_strict / decode_strict, BRC-31 outer-auth wrapper.
 - `types.rs` — All 10 core types: SessionId, ShareIndex, ThresholdConfig, JointPublicKey, EncryptedShare, Presignature, ParticipationProof, RoundMessage, DkgResult, SigningResult.
-- `error.rs` — MpcError enum with 9 variants + From impls.
+- `error.rs` — MpcError enum + From impls.
+- **`unsafe impl Send` shield** on `DkgCoordinator`/`SigningCoordinator`/`PresigningManager` (G-4e `a9a7e18`) — safe under documented serialization invariant; structural `SendShield<T>` wrapper deferred to Phase I deployment audit per `docs/PHASE-G-AUDIT.md` §2.5.
+
+#### bsv-mpc-messagebox (~2.9K LOC, 8 files)
+Native Rust MessageBox transport client (Phase A-F). Conforms to the canonical TS `@bsv/message-box-client` v2.0.7 spec at `~/bsv/message-box-client/src/MessageBoxClient.ts` — implementation conforms to the canonical TS, never the inverse (Path A, per [`feedback_canonical_ts_immutable`]). Uses native `tokio-tungstenite` for WebSocket subscribe; not yet wasm32-compatible (Phase H will produce a CF-Worker-compatible parallel client crate).
+- `client.rs` — Public `MessageBoxClient` API — entry point for `bsv-mpc-service` + downstream consumers.
+- `ws.rs` — `/ws` WebSocket subscribe per MPC-Spec §06.4 + §06.12 (reconnect with backoff, ping/pong, missed-message backfill).
+- `http.rs` — `POST /sendMessage` + the HTTP polling/inbox path.
+- `auth.rs` — BRC-31 mutual auth for the MessageBox transport (`bsv_rs::auth::Peer + SimplifiedFetchTransport`).
+- `wire.rs` — Wrap/unwrap between canonical CBOR `MessageEnvelope` and the MessageBox JSON envelope.
+- `types.rs` — Wire types matching the BSV `message-box-server` API.
+- `error.rs` — `MessageBoxError` + `From` impls.
+- `lib.rs` — Module exports + crate-level doc.
 
 #### bsv-mpc-proxy (~8K LOC, 12 files)
 BRC-100 compatible signing proxy. Drop-in replacement for bsv-wallet-cli at localhost:3322. Usable as library or binary.
@@ -119,19 +134,20 @@ bsv-mpc/
   INTEGRATION.md                     # bsv-worm integration, wallet-cli architecture
   STATUS.md                          # Implementation status and timeline
   EXECUTION-PLAN.md                  # Parallel sprint coordination
-  POCS.md                            # POC validation plan (all 15 completed)
+  POCS.md                            # POC validation plan (POCs 1-7 fleshed out; POCs 1-16 all PASSED — see LESSONS.md + STATUS.md)
   TESTING.md                         # Test strategy (unit / integration / E2E)
-  LESSONS.md                         # Technical findings from all 15 POCs
+  LESSONS.md                         # Technical findings from all 16 POCs
   HANDOFF.md                         # Quick-start for new sessions
   src/lib.rs                         # Root crate (exists solely to host integration tests)
   crates/
-    bsv-mpc-core/src/                # 12 files, ~8K LOC — all protocol modules implemented
+    bsv-mpc-core/src/                # 14 files, ~7.5K LOC — inline coordinators + paillier_pool
+    bsv-mpc-messagebox/src/          # 8 files, ~2.9K LOC — native MessageBox client (Phase A-F)
     bsv-mpc-proxy/src/               # 12 files, ~8K LOC — all 28 BRC-100 handlers implemented
     bsv-mpc-worker/src/              # 5 files, ~2.5K LOC — all handlers + BRC-31 auth implemented
     bsv-mpc-service/src/             # 5 files, ~1.2K LOC — all handlers implemented, in-memory storage
     bsv-mpc-overlay/src/             # 7 files, ~1.9K LOC — chip + discovery implemented, proof pub TODO
-  cggmp21-fork/                      # Git submodule: local cggmp24 fork with set_additive_shift()
-  poc/                               # 15 POCs, all VALIDATED (~12,300 LOC)
+  # cggmp24 fork is no longer a local submodule. Used to live at ./cggmp21-fork as a private partnership-org submodule; switched to the PUBLIC Calhooon-org fork pinned via root Cargo.toml [patch."https://github.com/LFDT-Lockness/cggmp21"] at commit 6c6421ee (Calhooon/cggmp21 branch brc42-additive-shift; tracks LFDT-Lockness/cggmp21 PR #200 which exposes set_additive_shift on SigningBuilder).
+  poc/                               # 16 POCs, all VALIDATED (~13K LOC). Latest: poc16-sm-inline (Phase G G-3).
   tests/
     e2e.rs                           # E2E test suite: proxy + KSS over HTTP (6 scenarios)
   docs/
@@ -148,7 +164,7 @@ Each crate also has its own `CLAUDE.md` with crate-specific architecture and imp
 
 ## POC Validation Results
 
-All 15 POCs PASSED. See `LESSONS.md` for comprehensive technical findings.
+All 16 POCs PASSED. POCs 1-15 ran in M0 (Mar 2026) and de-risked the cryptographic + wire path; POC 16 (`poc16-sm-inline`) ran in Phase G Step 3 (2026-05-19) and proved the inline-SM + Paillier-pool design before the production port. See `LESSONS.md` for comprehensive technical findings.
 
 | POC | Risk Validated | Result |
 |-----|---------------|--------|
@@ -167,6 +183,7 @@ All 15 POCs PASSED. See `LESSONS.md` for comprehensive technical findings.
 | POC 13: Key refresh | Shares refreshed without moving funds | **PASS** — same key, 0 on-chain cost |
 | POC 14: Overlay discovery | SHIP/SLAP node registration | **PASS** — 4/4 mainnet SLAP trackers alive |
 | POC 15: Capstone integration | bsv-worm works through MPC proxy | **PASS** — full x402 payment via MPC |
+| POC 16: Inline SM + Paillier pool | Inline state-machine drive, no thread spawn, prime pool round-trip | **PASS** — 5 hard gates green, drove Phase G inline rewrite |
 
 ### Key POC Lessons (see LESSONS.md for full details)
 
@@ -178,7 +195,7 @@ All 15 POCs PASSED. See `LESSONS.md` for comprehensive technical findings.
 - **Key refresh**: Built from cggmp24 primitives (~50 LOC). Same joint key, 0 on-chain cost. cggmp24 lacks this natively.
 - **CF Worker**: worker crate 0.7 required. DO storage for key shares (10KB JSON). 16ms HTTPS RTT.
 - **Fee injection**: Must inject BEFORE sighash. Graceful failure when change < fee.
-- **cggmp24 fork**: Git submodule at `./cggmp21-fork` exposes `set_additive_shift()` for BRC-42 derived key signing.
+- **cggmp24 fork**: Published Calhooon/cggmp21 fork at commit `6c6421ee` (tracks upstream LFDT-Lockness/cggmp21 PR #200) exposes `set_additive_shift()` for BRC-42 derived key signing. Pinned via `[patch."https://github.com/LFDT-Lockness/cggmp21"]` in root Cargo.toml. No submodule.
 
 ## Implementation Status
 
@@ -188,9 +205,10 @@ All 15 POCs PASSED. See `LESSONS.md` for comprehensive technical findings.
 |-------|--------|-------|
 | Types + errors (all crates) | **Complete** | All types defined, all error enums done |
 | Config + routing (proxy, service, worker) | **Complete** | Axum/CF Worker routers wired, env config working |
-| MPC protocol (DKG) | **Complete** | dkg.rs: 4-round CGGMP'24, thread-based SM |
-| MPC protocol (signing) | **Complete** | signing.rs: 1-round (presig) and 4-round (interactive) paths |
-| MPC protocol (presigning) | **Complete** | presigning.rs: 3-round offline generation, FIFO pool |
+| MPC protocol (DKG) | **Complete** | dkg.rs: 4-round CGGMP'24, inline SM (Phase G G-4b, no thread spawn, wasm32-verified) |
+| MPC protocol (signing) | **Complete** | signing.rs: 1-round (presig) and 4-round (interactive) paths, inline SM (Phase G G-4c) |
+| MPC protocol (presigning) | **Complete** | presigning.rs: 3-round offline generation, FIFO pool, inline SM (Phase G G-4d) |
+| Paillier safe-prime pool | **Complete** | paillier_pool.rs (Phase G G-4a): MPC-Spec §06.10.1 / ADR-0041 — at-rest-encrypted, floor=2 default, `backfill_to_floor` API |
 | Partial ECDH | **Complete** | ecdh.rs: Lagrange interpolation for threshold key derivation |
 | Key refresh | **Complete** | refresh.rs: threshold resharing, ported from POC 13 |
 | Share encryption (AES-256-GCM) | **Complete** | share.rs: encrypt/decrypt/derive_key |
@@ -214,8 +232,8 @@ All 15 POCs PASSED. See `LESSONS.md` for comprehensive technical findings.
 
 | Crate | Version | Purpose |
 |-------|---------|---------|
-| cggmp24 | **git submodule** (`./cggmp21-fork`) | CGGMP'24 threshold ECDSA + `set_additive_shift()` for BRC-42 |
-| cggmp24-keygen | **git submodule** (same) | DKG protocol |
+| cggmp24 | published Calhooon/cggmp21 fork `rev = 6c6421ee` (tracks PR #200) | CGGMP'24 threshold ECDSA + `set_additive_shift()` for BRC-42 |
+| cggmp24-keygen | published Calhooon/cggmp21 fork `rev = 6c6421ee` (same) | DKG protocol |
 | bsv | **crates.io `bsv-rs` 0.3.0** (patched to `../bsv-rs`) | BSV primitives (features = ["transaction", "wallet"]) |
 | axum | 0.8 | HTTP server (proxy + service), WebSocket support |
 | reqwest | 0.12 | HTTP client (proxy to KSS), rustls-tls |
@@ -291,7 +309,7 @@ bsv-mpc is a separate project that bsv-worm uses transparently. The proxy at `lo
 | Repo | Path | Purpose |
 |------|------|---------|
 | **bsv-rs** | `~/bsv/bsv-rs` | BSV SDK — Transaction, Script, PublicKey, BRC-42, sighash, BEEF |
-| **cggmp21-fork** | `./cggmp21-fork` (submodule) | Local fork with `set_additive_shift()` for BRC-42 derived key signing |
+| **cggmp21-fork** | published Calhooon/cggmp21 `rev = 6c6421ee` (no submodule) | Local fork with `set_additive_shift()` for BRC-42 derived key signing |
 | **bsv-wallet-cli** | `~/bsv/bsv-wallet-cli` | Reference BRC-100 wallet daemon. Use for funding MPC addresses. |
 | **rust-wallet-toolbox** | `~/bsv/rust-wallet-toolbox` | Wallet engine — ProtoWallet, StorageSqlx, WalletSigner |
 | **rust-middleware** | `~/bsv/rust-middleware` | `bsv-auth-cloudflare` — USE THIS for BRC-31 auth in bsv-mpc-worker |

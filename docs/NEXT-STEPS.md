@@ -71,17 +71,39 @@ ADR/PR against MPC-Spec — never silent consumer-side drift.
 
 All phases independently shippable + gated. Each commits to `main` only after its gate goes green. Each phase follows the 4-step workflow above.
 
-### Phase G — Coordinator SM-async rewrite in `bsv-mpc-core` (~3-4 wk total)
+### Phase G — Coordinator SM inline rewrite + Paillier safe-prime pool in `bsv-mpc-core` — **CLOSED 2026-05-19**
 
-**Step 1 (investigate)** — Survey: `round_based` crate source (does it have any async SM variant we missed?), `cggmp24-keygen` + LFDT-Lockness cggmp21 fork upstream activity toward async, POC 2 source for what it actually compiled + ran, `~/bsv/agents` (11 production CF Workers) for any single-threaded async-only Rust patterns. Risks to weigh: does `sm.proceed()` ever take >30s on WASM cold (worst case = `aux_info_gen` Paillier safe-prime gen)? Does the SM-internal future hold `!Send` state that complicates `LocalSet`?
+> **Status: merge-gate green.** All five steps landed on main; merge-gate
+> closed by `d9b1b27` (citing mainnet TXID
+> [`442bd391…`](https://whatsonchain.com/tx/442bd391cf8eda299f82dc1e4aeb1a9cb4f33610365d44c9c1c0e55d32f171b9)).
+> See `docs/PHASE-G-AUDIT.md` §7 for the full check-off.
+>
+> **Direction change vs. original plan**: the audit doc's Step 1
+> investigation surfaced that `round_based::StateMachine::proceed()` is
+> non-blocking by construction — the prior `std::thread` + `mpsc`
+> bridge was incidental complexity, and the originally-anticipated
+> `tokio::task::spawn_local` + `LocalSet` rewrite would also have been
+> incidental. The actual delivery holds the `StateMachineImpl` inline
+> on each coordinator and drives `proceed()` synchronously. No spawn
+> at all; no tokio dep added to `bsv-mpc-core`. ~800 LOC simpler than
+> the LocalSet path the original plan prescribed.
 
-**Step 2 (document)** — `docs/PHASE-G-AUDIT.md`: API surface diff (before vs after), `LocalSet` topology, yield-strategy for heavy `sm.proceed()` calls, exact patch shape per coordinator, test strategy.
+**Step 1 (investigate)** — Done. Three parallel Explore agents surveyed `round_based`, `cggmp24` async surface, and CF-Worker prior art in `~/bsv/`. Key finding: `proceed()` returns immediately when it needs input; existing thread-and-channel bridge added artificial blocking. Recorded in `docs/PHASE-G-AUDIT.md` §1.
 
-**Step 3 (POC)** — `poc/poc16-sm-async/`: a minimum standalone that drives ONE cggmp24 keygen state machine via `tokio::task::spawn_local` + `LocalSet` + async mpsc channels — no full DkgCoordinator yet. Gate: completes keygen against a sim peer in a single-threaded executor, produces a valid `IncompleteKeyShare`, no panics, no `std::thread::spawn` anywhere in the binary.
+**Step 2 (document)** — Done. `docs/PHASE-G-AUDIT.md` (`c443dd8`) — inline SM rewrite design + Paillier safe-prime pool per MPC-Spec §06.10.1 / ADR-0041. Audit §2 makes the case for inline over LocalSet; audit §3 specs the pool.
 
-**Step 4 (implement)** — Replace `std::thread::Builder::spawn` with `tokio::task::spawn_local` + `LocalSet` in dkg.rs/signing.rs/presigning.rs. Replace `std::sync::mpsc` with `tokio::sync::mpsc`. Convert SM driver loops to async with `tokio::task::yield_now().await` interleaved.
+**Step 3 (POC)** — Done. `poc/poc16-sm-inline/` (`8a85875`) — 5 hard gates green: inline 2-of-2 keygen with no `thread::spawn`, inline auxinfo with injected primes, pool round-trip preserves primes byte-for-byte, at-rest AES-256-GCM + BRC-42 encryption round-trip, wasm32 cargo-build clean.
 
-**Step 5 (gate)** — **Unit:** all existing coordinator unit tests still pass. **Vector:** byte-locked DKG/sign vectors still reproduce. **E2E:** Phase D + E mainnet TXID-shape unchanged (re-run the e2e + assert same byte-shape). **WASM:** new test compiles `bsv-mpc-core` to wasm32 + runs a 2-of-2 DKG sim in a single-threaded executor end-to-end.
+**Step 4 (implement)** — Done. Five focused commits:
+  - `f1b3947` G-4a: `crates/bsv-mpc-core/src/paillier_pool.rs` (6 unit tests).
+  - `bc9c1be` G-4b: dkg.rs inline rewrite (-316 LOC, 12 dkg tests).
+  - `cafb4c2` G-4c: signing.rs inline + shared `drive_inline` kernel (-261 LOC, 18 signing tests).
+  - `6ab583b` G-4d: presigning.rs inline (-229 LOC, 7 presigning tests).
+  - `a9a7e18` G-4e: `unsafe impl Send` shield on the three coordinator types — handles the `Rc<RefCell<_>>`-rooted `!Send` cascade through `bsv-mpc-service` / `bsv-mpc-proxy` / `bsv-mpc-worker` callers. Documented invariant in audit §2.5; structural `SendShield<T>` wrapper tracked as Phase G post-merge / Phase I deployment-audit follow-up.
+
+**Step 5 (gate)** — Done. **Unit:** all 404 native lib tests green across the workspace. **Vector:** byte-locked DKG/sign vectors reproduce via the conformance_02/04/05 integration tests in CI. **E2E:** Phase E mainnet TXID re-run with the inline coordinators produced fresh on-chain artifact
+[`442bd391…`](https://whatsonchain.com/tx/442bd391cf8eda299f82dc1e4aeb1a9cb4f33610365d44c9c1c0e55d32f171b9)
+(joint pubkey `02aa325a…`, DER 70 bytes byte-identical both parties, pre-flight ECDSA verify PASS, broadcast `SEEN_ON_NETWORK` via gorillapool ARC). **WASM:** `crates/bsv-mpc-core/tests/wasm32_dkg.rs` runs a 2-of-2 DKG end-to-end via `wasm-pack test --node` (150.66s); CI ci.yml `wasm` job green.
 
 ---
 
@@ -248,38 +270,24 @@ The phase issues land **after** each phase's investigation + audit doc lands —
 | DO hibernation + outbound WS interact badly (e.g., the WS dies during hibernation; reconnect storm on wake) | Medium | Phase H explicitly tests hibernation cycles. Reconnect uses §06.12 backoff (1s→cap 30s) so storms can't form. |
 | cggmp24 fork drifts upstream during G's rewrite | Low | The fork is pinned. Rewrite happens in bsv-mpc-core layer ABOVE the cggmp24 SM, not in cggmp24 itself. |
 
-## What I am EXPLICITLY NOT doing yet
+## Status snapshot (live)
 
-- [ ] No code edits to `bsv-mpc-core` coordinators (Phase G)
-- [ ] No new `bsv-mpc-messagebox-worker` crate (Phase H)
-- [ ] No changes to `bsv-mpc-worker` (Phase I)
-- [ ] No CHIP / capabilities / health.json wiring (Phase J)
-- [ ] No commits on this plan
-- [ ] No deletion of the within-stack `bsv-mpc-service` path (it stays as the reference oracle)
-- [ ] No phase issues (G/H/I/J/K) created yet — they land per-phase after each phase's audit doc lands
-- [ ] No org project auto-add workflow changes — the umbrella is added manually for now; auto-add can be configured later if useful
-- [ ] No `docs/PHASE-G-AUDIT.md` (or any subsequent phase audit) drafted — that's the FIRST step of Phase G itself
-- [ ] No `poc/poc16-sm-async/` (or any subsequent POC) created — POC is the THIRD step of each phase, lands after the audit doc is on main
+Each phase lands as its own issue when its audit doc lands. The umbrella tracker is bsv-mpc issue #2.
 
-What I AM doing in the immediate next-action under this plan (with your go):
-- [x] Commit `docs/NEXT-STEPS.md` to bsv-mpc main (this doc as the reference)
-- [x] Create milestone `v1.0 — CF-native cosigner (Calhoun-side)` on bsv-mpc
-- [x] Create umbrella placeholder issue on bsv-mpc, milestone-tagged
-- [x] Add the umbrella issue to the org Partnership Roadmap project, status Todo
-- [x] Comment on MPC-Spec #36 linking to the bsv-mpc umbrella (partnership visibility, no duplication)
+| Phase | State | Artifact |
+|---|---|---|
+| **G** — inline SM + Paillier pool | **CLOSED 2026-05-19** | TXID [`442bd391…`](https://whatsonchain.com/tx/442bd391cf8eda299f82dc1e4aeb1a9cb4f33610365d44c9c1c0e55d32f171b9) + merge-gate commit `d9b1b27` |
+| **H** — `bsv-mpc-messagebox` CF Worker client crate | next | audit doc + `poc/poc17-cf-outbound-ws/` pending |
+| **I** — wire G + H into `bsv-mpc-worker` | blocked on G + H | audit doc + `poc/poc18-cf-cosigner-stub/` pending |
+| **J** — CHIP + `/capabilities` + `health.json` | blocked on I | audit doc + `poc/poc19-chip-discovery/` pending |
+| **K** — Cross-stack joint mainnet TX (closes MPC-Spec #36) | blocked on J + Quaakee's rust-mpc | audit doc + joint conformance check pending |
 
-## What needs your input before I proceed
+## Reference: audit citations (from pre-Phase-G investigation)
 
-1. **Approve the (A) recommendation + the phase plan** (or push back if you see something off in the engineering shape).
-2. **Answer Q1-Q5** (defaults are fine if you don't want to micro-decide; just say "use defaults").
-3. **Confirm okay to start Phase G** as the first standalone unit (since it's independent of the deployment story and adds value on its own).
-
-## Reference: audit citations
-
-- **Audit 1 (rust-message-box):** `~/bsv/rust-message-box/Cargo.toml:6-7`, `src/message_hub.rs:236-256, 393-445`, `src/lib.rs:329-350`. SERVER only — no client lib exported.
-- **Audit 2 (cggmp24 WASM):** `bsv-mpc-core/src/dkg.rs:419` (`std::thread::Builder::new().spawn`), `signing.rs:371` (same), `presigning.rs:63` (same). POC 2 validated `simulation`-path compile only. `round_based 0.4.1` has no async SM variant.
-- **Audit 3 (outbound WS in CF):** `bsv-messagebox-cloudflare-public/Cargo.lock` pins `worker = "0.7.5"` (no public outbound WS). All `tests/load_gen` clients use native `tokio-tungstenite`. Zero precedent for DO-as-outbound-WS-client anywhere in `~/bsv/`.
+- **Audit 1 (rust-message-box):** `~/bsv/rust-message-box/Cargo.toml:6-7`, `src/message_hub.rs:236-256, 393-445`, `src/lib.rs:329-350`. SERVER only — no client lib exported. **The Phase H CLIENT crate must be built fresh; canonical TS reference is `@bsv/message-box-client` v2.0.7 at `~/bsv/message-box-client/src/MessageBoxClient.ts` (Path A: implementation conforms to the canonical TS, never the inverse — per [`feedback_canonical_ts_immutable`](memory)).**
+- **Audit 2 (cggmp24 WASM):** Originally pointed at `bsv-mpc-core/src/dkg.rs:419` (`std::thread::Builder::new().spawn`), `signing.rs:371` (same), `presigning.rs:63` (same). **All three `std::thread::Builder::spawn` sites were removed in Phase G** (`bc9c1be`, `cafb4c2`, `6ab583b` — inline rewrite, no spawn at all). Wasm32 build + runtime test green per `tests/wasm32_dkg.rs`.
+- **Audit 3 (outbound WS in CF):** `bsv-messagebox-cloudflare-public/Cargo.lock` pins `worker = "0.7.5"` (no public outbound WS). All `tests/load_gen` clients use native `tokio-tungstenite`. Zero precedent for DO-as-outbound-WS-client anywhere in `~/bsv/`. Still load-bearing for Phase H — the audit doc will need to pick a path: `web_sys::WebSocket` via wasm-bindgen vs. a sub-fetch hijack vs. wait for workers-rs upstream.
 
 ---
 
-**Last updated:** 2026-05-19 — reversed prior (B) recommendation in favor of (A) after deadline + UX/security constraint update.
+**Last updated:** 2026-05-19 — Phase G closed; doc adapted from launch-plan to live tracker.
