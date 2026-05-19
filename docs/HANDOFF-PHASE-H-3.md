@@ -1,5 +1,17 @@
 # Handoff — Phase H Step 3 (POC) pickup
 
+> **⚠ SUPERSEDED 2026-05-19** — this handoff covered the H-3 step
+> from-scratch pickup. H-3.1, H-3.2a, H-3.2b, and H-3.3a have all
+> landed empirically green on `main` (commits `cb923fc`, `bc8b0b4`,
+> `6ff1a53`, `0073e43`). The next session should read
+> **[HANDOFF-PHASE-H-3-3B.md](HANDOFF-PHASE-H-3-3B.md)** for the
+> H-3.3b (BRC-103 via Peer) pickup.
+>
+> This doc is preserved as a historical record of the H-3 plan as
+> originally framed (before the substrate was proven). The original
+> "5 gates" framing was correct; the empirical findings from H-3.2a/b
+> and H-3.3a are now captured in the new handoff.
+
 > For the next Claude session picking up Phase H at the POC step
 > (`poc/poc17-cf-outbound-ws/`). Read this + `docs/PHASE-H-AUDIT.md`
 > §2.5b + §11 first; then scaffold the POC per the plan below.
