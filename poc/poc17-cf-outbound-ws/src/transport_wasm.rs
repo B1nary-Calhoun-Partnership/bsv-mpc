@@ -188,6 +188,47 @@ mod ws_upgrade {
         _on_close: Closure<dyn FnMut(CloseEvent)>,
     }
 
+    /// Send-only half of a [`WsHandle`]. Returned by [`WsHandle::sender`]
+    /// when a caller needs outbound access independent of the inbound
+    /// `mpsc` receiver (e.g. `SocketIoTransport` whose background
+    /// dispatch task owns the receiver and whose `Transport::send` impl
+    /// runs from a different scope).
+    ///
+    /// Holds a `Clone` of the underlying `web_sys::WebSocket` JS handle.
+    /// Cloning a `web_sys::WebSocket` is a refcount bump on the JS side
+    /// — every clone references the same socket. The `WsSender` does
+    /// NOT participate in teardown: closing the socket and detaching the
+    /// JS callbacks remains the [`WsHandle`]'s responsibility via its
+    /// `Drop` impl. Sends through a `WsSender` clone after the
+    /// `WsHandle` has dropped will fail with a `ws send_with_str` JS
+    /// exception — callers spawning long-lived dispatch tasks should
+    /// keep the `WsHandle` alive for the dispatch lifetime (typically
+    /// by moving it into the same `spawn_local` future).
+    #[derive(Clone)]
+    pub struct WsSender {
+        ws: WebSocket,
+    }
+
+    impl WsSender {
+        /// Send a raw text frame. Equivalent to [`WsHandle::send_text`].
+        pub fn send_text(&self, s: &str) -> Result<(), String> {
+            self.ws
+                .send_with_str(s)
+                .map_err(|e| format!("ws send_with_str: {e:?}"))
+        }
+
+        /// Send an [`EngineIoPacket`]; the codec encodes the wire form.
+        pub fn send_engineio(&self, pkt: &EngineIoPacket) -> Result<(), String> {
+            self.send_text(&pkt.encode())
+        }
+
+        /// Send a [`SocketIoPacket`] wrapped in Engine.IO `Message(4)`.
+        pub fn send_socketio(&self, pkt: &SocketIoPacket) -> Result<(), String> {
+            let wrapped = EngineIoPacket::Message(pkt.encode());
+            self.send_engineio(&wrapped)
+        }
+    }
+
     impl WsHandle {
         /// Open a WebSocket against `<relay>/socket.io/?...&transport=
         /// websocket&sid=<sid>` and complete the Engine.IO 4 upgrade
@@ -329,6 +370,20 @@ mod ws_upgrade {
             self.send_engineio(&wrapped)
         }
 
+        /// Return a cheap, cloneable [`WsSender`] that can be handed to
+        /// callers (e.g. `SocketIoTransport`) which only need outbound
+        /// access. The underlying `web_sys::WebSocket` is a JS-handle and
+        /// `Clone` is a refcount bump on the JS side — sends from any
+        /// clone reach the same socket. The owning [`WsHandle`] retains
+        /// the closures + the inbound `mpsc` receiver and remains the
+        /// sole owner of teardown (its `Drop` impl detaches the JS
+        /// callbacks and closes the connection).
+        pub fn sender(&self) -> WsSender {
+            WsSender {
+                ws: self.ws.clone(),
+            }
+        }
+
         /// Receive the next inbound text frame. Returns `Ok(None)` if
         /// the channel has closed (WS dropped).
         pub async fn recv_text(&mut self) -> Option<Result<String, String>> {
@@ -390,7 +445,7 @@ mod ws_upgrade {
 }
 
 #[cfg(target_arch = "wasm32")]
-pub use ws_upgrade::{upgrade_to_websocket, UpgradeResult, WsHandle};
+pub use ws_upgrade::{upgrade_to_websocket, UpgradeResult, WsHandle, WsSender};
 
 // Native build target: stubs so the workspace `cargo build --all-targets`
 // doesn't fail. The actual H-3.2b/H-3.3 verification runs only in the
@@ -414,6 +469,10 @@ pub async fn upgrade_to_websocket(
 
 #[cfg(not(target_arch = "wasm32"))]
 pub struct WsHandle;
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone)]
+pub struct WsSender;
 
 #[cfg(not(target_arch = "wasm32"))]
 impl WsHandle {
@@ -457,6 +516,10 @@ impl WsHandle {
         Err("WsHandle::send_socketio is wasm32-only".into())
     }
 
+    pub fn sender(&self) -> WsSender {
+        WsSender
+    }
+
     pub async fn recv_text(&mut self) -> Option<std::result::Result<String, String>> {
         Some(Err("WsHandle::recv_text is wasm32-only".into()))
     }
@@ -471,5 +534,26 @@ impl WsHandle {
         &mut self,
     ) -> std::result::Result<crate::engineio_codec::SocketIoPacket, String> {
         Err("WsHandle::recv_socketio is wasm32-only".into())
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl WsSender {
+    pub fn send_text(&self, _s: &str) -> std::result::Result<(), String> {
+        Err("WsSender::send_text is wasm32-only".into())
+    }
+
+    pub fn send_engineio(
+        &self,
+        _pkt: &crate::engineio_codec::EngineIoPacket,
+    ) -> std::result::Result<(), String> {
+        Err("WsSender::send_engineio is wasm32-only".into())
+    }
+
+    pub fn send_socketio(
+        &self,
+        _pkt: &crate::engineio_codec::SocketIoPacket,
+    ) -> std::result::Result<(), String> {
+        Err("WsSender::send_socketio is wasm32-only".into())
     }
 }
