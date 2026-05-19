@@ -174,6 +174,16 @@ pub struct SigningCoordinator {
     message_hash: Option<[u8; 32]>,
 }
 
+// SAFETY: `SigningCoordinator` is structurally `!Send` because the
+// cggmp24 state machine it holds (`Box<dyn StateMachine<...>>`) carries
+// `Rc<RefCell<_>>` internal state. The `Rc` is `!Send` only because
+// reference counting is non-atomic; the coordinator is otherwise safe
+// to move between threads provided no two threads access it at once.
+// Callers in `bsv-mpc-{service,proxy,worker}` serialize access via a
+// `Mutex` (or by moving into a single `spawn_blocking` closure), so the
+// invariant is upheld. See the same comment on `dkg::DkgCoordinator`.
+unsafe impl Send for SigningCoordinator {}
+
 impl SigningCoordinator {
     /// Create a new signing coordinator.
     ///

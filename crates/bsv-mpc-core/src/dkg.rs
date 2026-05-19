@@ -265,6 +265,22 @@ pub struct DkgCoordinator {
     pregenerated_primes: Option<cggmp24::PregeneratedPrimes<SecurityLevel128>>,
 }
 
+// SAFETY: `DkgCoordinator` is structurally `!Send` because the cggmp24
+// state machines it holds (`Box<dyn StateMachine<...>>`) carry
+// `Rc<RefCell<_>>` internal state — see `round_based 0.4.1`
+// `state_machine::shared_state::SharedStateRef`. The `Rc` is `!Send`
+// only because reference counting is non-atomic. Provided the
+// coordinator is accessed from at most one thread at a time (the
+// canonical pattern: hold inside a `Mutex` or move into one
+// `spawn_blocking` closure), there is no data race on the refcount —
+// it just moves between threads while no other thread is touching it.
+//
+// All callers in `bsv-mpc-{service,proxy,worker}` follow this pattern,
+// so the `unsafe impl` is sound here. Callers that share a
+// `DkgCoordinator` across threads MUST serialize access via a `Mutex`
+// (or equivalent).
+unsafe impl Send for DkgCoordinator {}
+
 impl DkgCoordinator {
     /// Create a new DKG coordinator for the given threshold config and party index.
     ///

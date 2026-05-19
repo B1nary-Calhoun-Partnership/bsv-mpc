@@ -176,6 +176,16 @@ pub struct PresigningManager {
     next_msg_id: u64,
 }
 
+// SAFETY: `PresigningManager` is structurally `!Send` because the
+// cggmp24 state machine it holds (`Box<dyn StateMachine<...>>`) carries
+// `Rc<RefCell<_>>` internal state. The `Rc` is `!Send` only because
+// reference counting is non-atomic; the manager is otherwise safe to
+// move between threads provided no two threads access it at once.
+// Callers in `bsv-mpc-{service,proxy,worker}` serialize access via a
+// `Mutex` (or by moving into a single `spawn_blocking` closure), so the
+// invariant is upheld. See the same comment on `dkg::DkgCoordinator`.
+unsafe impl Send for PresigningManager {}
+
 impl PresigningManager {
     /// Create a new presigning manager with an empty pool.
     ///
