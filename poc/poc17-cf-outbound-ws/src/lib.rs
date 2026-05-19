@@ -19,6 +19,7 @@
 pub mod engineio_codec;
 pub mod socketio_client;
 pub mod transport;
+pub mod transport_socketio;
 pub mod transport_wasm;
 pub mod worker_do;
 
