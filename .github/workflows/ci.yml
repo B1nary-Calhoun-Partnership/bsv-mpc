@@ -55,7 +55,7 @@ jobs:
       - run: cargo test --workspace --doc
 
   wasm:
-    name: build (wasm32 — bsv-mpc-worker)
+    name: build + test (wasm32)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -67,4 +67,18 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: wasm
-      - run: cargo build -p bsv-mpc-worker --target wasm32-unknown-unknown
+      # Phase G Step 5a: bsv-mpc-core compiles cleanly to wasm32. This is
+      # the precondition for the future bsv-mpc-worker deployment using the
+      # inline coordinators (G-4b/c/d). Existing audit §7.4 checkbox.
+      - name: wasm32 build (bsv-mpc-core)
+        run: cargo build -p bsv-mpc-core --target wasm32-unknown-unknown
+      - name: wasm32 build (bsv-mpc-worker)
+        run: cargo build -p bsv-mpc-worker --target wasm32-unknown-unknown
+      # Phase G Step 5b: drive a 2-of-2 DKG end-to-end via the inline
+      # `DkgCoordinator` on wasm32-unknown-unknown. Proves the *runtime*
+      # (not just the build) of the inline rewrite — i.e. the SM driver
+      # loop in dkg.rs executes correctly on wasm32. Audit §5.3 + §7.4.
+      - name: install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+      - name: wasm32 DKG runtime test (bsv-mpc-core)
+        run: wasm-pack test --node -p bsv-mpc-core --test wasm32_dkg

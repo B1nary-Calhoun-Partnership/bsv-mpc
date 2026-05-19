@@ -26,9 +26,28 @@ chrono.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["test-util"] }
+# tokio is used ONLY for `#[tokio::test]` in the in-file unit tests (dkg.rs,
+# signing.rs, presigning.rs, refresh.rs). That macro needs only `rt` +
+# `macros`; the test bodies do not use tokio::time / tokio::sync / tokio::net
+# / tokio::fs. Specifying `default-features = false` here is deliberate: it
+# avoids inheriting the workspace's `full` features, which would pull `net`
+# → `mio` and break the wasm32-unknown-unknown test build (mio's UNIX FD
+# code does not compile on wasm32). Confirmed empirically 2026-05-19
+# (Phase G Step 5b).
+tokio = { version = "1", default-features = false, features = ["rt", "macros"] }
 tempfile.workspace = true
 futures.workspace = true
 pin-project.workspace = true
 round-based = { workspace = true, features = ["sim"] }
 cggmp24 = { git = "https://github.com/LFDT-Lockness/cggmp21", features = ["curve-secp256k1", "hd-wallet", "hd-slip10", "spof"] }
+
+# wasm32-only dev-deps for tests/wasm32_dkg.rs (Phase G Step 5b runtime gate).
+# - wasm-bindgen-test: the `#[wasm_bindgen_test]` harness, run via
+#   `wasm-pack test --node -p bsv-mpc-core`.
+# - getrandom/js: required to LINK the wasm32-unknown-unknown test binary.
+#   bsv-mpc-core's rlib build (G-5a) doesn't need it (rlib doesn't link),
+#   but a test binary does. Without `js`, wasm32 link fails with
+#   "the wasm*-unknown-unknown targets are not supported by default".
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = "0.3"
+getrandom = { version = "0.2", features = ["js"] }
