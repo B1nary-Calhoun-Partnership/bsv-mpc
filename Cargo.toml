@@ -16,6 +16,7 @@ members = [
     "crates/bsv-mpc-service",
     "crates/bsv-mpc-overlay",
     "poc/poc16-sm-inline",
+    "poc/poc17-cf-outbound-ws",
 ]
 exclude = []
 

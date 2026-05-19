@@ -1972,6 +1972,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "poc17-cf-outbound-ws"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bsv-rs",
+ "futures",
+ "getrandom 0.2.17",
+ "hex",
+ "js-sys",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tracing",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+ "worker",
+]
+
+[[package]]
 name = "polyval"
 version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

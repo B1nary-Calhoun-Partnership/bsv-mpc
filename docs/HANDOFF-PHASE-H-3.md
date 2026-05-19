@@ -162,7 +162,9 @@ poc/poc17-cf-outbound-ws/
                      # bsv-rs with [auth, wallet, transaction, wasm] features,
                      # serde, serde_json
   wrangler.toml      # gitignored! pulls from secrets.md for CF token
-  wrangler.toml.example  # tracked public template (account_id placeholder)
+  wrangler.example.toml  # tracked public template (account_id placeholder; renamed
+                         # from .toml.example so the secret-pattern pre-commit
+                         # hook doesn't match it — hook regex is `wrangler\.toml`)
   package.json       # MINIMAL — only wrangler as a devDep; no socket.io-client
                      # (we're pure-Rust per audit §11.2 revised)
   src/
@@ -188,7 +190,7 @@ poc/poc17-cf-outbound-ws/
 ```
 
 `wrangler.toml` follows the established pattern (gitignored, secrets
-in `secrets.md`, public `wrangler.toml.example` template). `package.json`
+in `secrets.md`, public `wrangler.example.toml` template). `package.json`
 is intentionally minimal — wrangler tooling only, no JS deps for the
 client (pure Rust+WASM).
 
