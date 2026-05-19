@@ -504,6 +504,7 @@ impl DkgCoordinator {
             self.current_round,
             outgoing,
             "keygen",
+            &MpcError::Dkg,
         );
 
         match result? {
@@ -535,6 +536,7 @@ impl DkgCoordinator {
             self.current_round,
             outgoing,
             "auxinfo",
+            &MpcError::Dkg,
         );
 
         match result? {
@@ -717,7 +719,10 @@ impl DkgCoordinator {
 /// Result of one drive step on an SM. Either it needs more input from the
 /// caller (the `wire_buffer` ran dry mid-protocol), or it completed and
 /// returned its protocol output.
-enum DriveStep<O> {
+///
+/// `pub(crate)` so signing/presigning coordinators can share this kernel
+/// without exposing it as a stable public API.
+pub(crate) enum DriveStep<O> {
     /// SM emitted `NeedsOneMoreMessage` with no buffered input. Caller
     /// returns `NextRound(outgoing)` to its caller.
     NeedsInput,
@@ -727,13 +732,16 @@ enum DriveStep<O> {
 }
 
 /// Drive a `StateMachine` until it either needs more input or finishes.
-/// Generic across the keygen and auxinfo SMs (different Msg + Output
-/// types). The caller passes mutable refs to all coordinator state the
-/// driver touches.
+/// Generic across the keygen, auxinfo, signing, and presigning SMs (each
+/// has its own Msg + Output types). The caller passes an `err_ctor`
+/// closure so the driver routes failures into the caller-appropriate
+/// `MpcError` variant (e.g. `MpcError::Dkg` / `MpcError::Signing` /
+/// `MpcError::Protocol`).
 ///
-/// `phase_tag` is used only for error messages ("keygen" / "auxinfo").
+/// `phase_tag` is included in every error message so logs distinguish
+/// the failing phase even when the variant alone isn't enough.
 #[allow(clippy::too_many_arguments)]
-fn drive_inline<O, E, M, SM>(
+pub(crate) fn drive_inline<O, E, M, SM, ErrFn>(
     sm: &mut SM,
     wire_buffer: &mut VecDeque<WireMessage>,
     next_msg_id: &mut u64,
@@ -742,18 +750,20 @@ fn drive_inline<O, E, M, SM>(
     current_round: u8,
     outgoing: &mut Vec<RoundMessage>,
     phase_tag: &str,
+    err_ctor: &ErrFn,
 ) -> Result<DriveStep<O>>
 where
     SM: StateMachine<Output = std::result::Result<O, E>, Msg = M> + ?Sized,
     M: Serialize + serde::de::DeserializeOwned,
     E: std::fmt::Display,
+    ErrFn: Fn(String) -> MpcError,
 {
     loop {
         match sm.proceed() {
             ProceedResult::SendMsg(out) => {
                 let wire = outgoing_to_wire(my_index, out)?;
                 let wire_bytes = serde_json::to_vec(&wire).map_err(|e| {
-                    MpcError::Dkg(format!("{phase_tag}: failed to serialize outgoing: {e}"))
+                    err_ctor(format!("{phase_tag}: failed to serialize outgoing: {e}"))
                 })?;
                 // Transport layer handles per-recipient routing via the
                 // wire-level recipient info; we don't pin a destination here.
@@ -770,24 +780,20 @@ where
                     return Ok(DriveStep::NeedsInput);
                 };
                 *next_msg_id += 1;
-                let incoming = wire_to_incoming(wire, *next_msg_id).map_err(|e| {
-                    MpcError::Dkg(format!("{phase_tag}: failed to parse incoming: {e}"))
-                })?;
-                sm.received_msg(incoming).map_err(|_| {
-                    MpcError::Dkg(format!("{phase_tag}: SM rejected incoming message"))
-                })?;
+                let incoming = wire_to_incoming(wire, *next_msg_id)
+                    .map_err(|e| err_ctor(format!("{phase_tag}: failed to parse incoming: {e}")))?;
+                sm.received_msg(incoming)
+                    .map_err(|_| err_ctor(format!("{phase_tag}: SM rejected incoming message")))?;
             }
             ProceedResult::Yielded => continue,
             ProceedResult::Output(result) => match result {
                 Ok(o) => return Ok(DriveStep::Complete(o)),
                 Err(e) => {
-                    return Err(MpcError::Dkg(format!("{phase_tag} protocol error: {e}")));
+                    return Err(err_ctor(format!("{phase_tag} protocol error: {e}")));
                 }
             },
             ProceedResult::Error(e) => {
-                return Err(MpcError::Dkg(format!(
-                    "{phase_tag} state machine error: {e}"
-                )));
+                return Err(err_ctor(format!("{phase_tag} state machine error: {e}")));
             }
         }
     }

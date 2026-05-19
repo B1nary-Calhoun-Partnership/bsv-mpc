@@ -17,12 +17,12 @@
 //!
 //! ### 2. Without Presignature (4 rounds) — implemented
 //!
-//! The full interactive protocol runs via a thread-based state machine bridge
-//! (same pattern as DKG in `dkg.rs`):
-//!
-//! 1. The cggmp24 signing SM runs in a dedicated `std::thread` (SM is `!Send`).
-//! 2. The coordinator communicates with it via `std::sync::mpsc` channels.
-//! 3. The caller drives the protocol by exchanging `RoundMessage`s.
+//! The full interactive protocol runs as an inline `round_based::StateMachine`
+//! held directly on the coordinator (Phase G architecture, mirroring
+//! `dkg.rs`). The `proceed()` API is non-blocking — it returns
+//! `NeedsOneMoreMessage` when it needs input — so no thread or mpsc channels
+//! are needed. The SM lives in `signing_sm: Option<SigningSm>` and is driven
+//! via the shared [`crate::dkg::drive_inline`] kernel.
 //!
 //! ## BSV Signature Format
 //!
@@ -35,18 +35,17 @@
 //! canonical form is produced, as required by BSV consensus rules.
 //! cggmp24 auto-normalizes to low-S.
 
-use std::sync::mpsc;
-use std::thread;
+use std::collections::VecDeque;
 
 use cggmp24::security_level::SecurityLevel128;
 use cggmp24::signing::PrehashedDataToSign;
 use cggmp24::supported_curves::Secp256k1;
 use cggmp24::ExecutionId;
 use generic_ec::Scalar;
-use round_based::state_machine::{ProceedResult, StateMachine};
-use sha2::Digest;
+use round_based::state_machine::StateMachine;
+use sha2::{Digest, Sha256};
 
-use crate::dkg::{outgoing_to_wire, wire_to_incoming, WireMessage};
+use crate::dkg::{drive_inline, DriveStep, WireMessage};
 use crate::error::{MpcError, Result};
 use crate::types::{
     EncryptedShare, Presignature, RoundMessage, SessionId, ShareIndex, SigningResult,
@@ -73,28 +72,6 @@ pub(crate) fn share_joint_pubkey_or_zero(share: &EncryptedShare, ctx: &'static s
         );
         [0u8; 33]
     }
-}
-
-// ---------------------------------------------------------------------------
-// Channel message types between coordinator and SM thread
-// ---------------------------------------------------------------------------
-
-/// Messages sent from the coordinator to the SM thread.
-enum SmInbound {
-    /// Feed an incoming wire message to the state machine.
-    IncomingMessage(Vec<u8>),
-}
-
-/// Messages sent from the SM thread back to the coordinator.
-enum SmOutbound {
-    /// The SM produced an outgoing wire message.
-    OutgoingMessage(Vec<u8>),
-    /// The SM needs one more incoming message before it can proceed.
-    NeedsMessage,
-    /// Signing completed. Contains the 64-byte r||s signature.
-    SigningComplete(Vec<u8>),
-    /// The SM encountered an error.
-    Error(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -126,6 +103,21 @@ enum SigningMode {
 }
 
 // ---------------------------------------------------------------------------
+// Inline-SM type alias (Phase G)
+// ---------------------------------------------------------------------------
+
+/// Boxed `StateMachine` for the signing sub-protocol. The Output is what
+/// the cggmp24 signing future returns (raw `Signature<Secp256k1>` on success);
+/// the Msg type is what cggmp24-signing emits over the wire. Boxed because
+/// `wrap_protocol`'s `impl StateMachine` has an opaque Future generic.
+type SigningSm = Box<
+    dyn StateMachine<
+        Output = std::result::Result<cggmp24::Signature<Secp256k1>, cggmp24::SigningError>,
+        Msg = cggmp24::signing::msg::Msg<Secp256k1, Sha256>,
+    >,
+>;
+
+// ---------------------------------------------------------------------------
 // SigningCoordinator
 // ---------------------------------------------------------------------------
 
@@ -140,7 +132,7 @@ enum SigningMode {
 /// ```ignore
 /// // Full protocol: interactive signing (4 rounds)
 /// let mut coord = SigningCoordinator::new(session_id, share, config, vec![0, 1]);
-/// let msgs = coord.init_round(&sighash)?;
+/// let msgs = coord.init_round(&sighash, None)?;
 /// transport.broadcast(msgs).await;
 /// loop {
 ///     let incoming = transport.receive_round().await;
@@ -166,15 +158,19 @@ pub struct SigningCoordinator {
     /// Current signing mode.
     mode: SigningMode,
 
-    // SM bridge (for full protocol mode)
-    /// Send incoming messages to the SM thread.
-    sm_tx: Option<mpsc::Sender<SmInbound>>,
-    /// Receive outgoing messages and status from the SM thread.
-    sm_rx: Option<mpsc::Receiver<SmOutbound>>,
-    /// Handle to the SM thread.
-    sm_thread: Option<thread::JoinHandle<()>>,
+    /// The active signing state machine, held directly on the coordinator
+    /// (Phase G inline architecture). `None` before `init_round()` and
+    /// after the SM completes / errors.
+    signing_sm: Option<SigningSm>,
+    /// Incoming wire messages buffered across `process_round()` calls.
+    /// Inputs are decoded once and queued; the SM consumes them one at a
+    /// time via `received_msg()`.
+    wire_buffer: VecDeque<WireMessage>,
+    /// Monotonic message id for `round_based::Incoming<M>::id`.
+    next_msg_id: u64,
 
-    /// The message hash being signed.
+    /// The message hash being signed (captured in `init_round`, used by
+    /// `assemble_signing_result` to build the SigningResult).
     message_hash: Option<[u8; 32]>,
 }
 
@@ -212,9 +208,9 @@ impl SigningCoordinator {
             participants,
             eid_bytes,
             mode: SigningMode::NotStarted,
-            sm_tx: None,
-            sm_rx: None,
-            sm_thread: None,
+            signing_sm: None,
+            wire_buffer: VecDeque::new(),
+            next_msg_id: 0,
             message_hash: None,
         }
     }
@@ -229,11 +225,7 @@ impl SigningCoordinator {
     ///
     /// * `message_hash` -- The 32-byte SHA-256d sighash of the BSV transaction input.
     /// * `_presignature` -- Reserved for future presigned path (currently ignored).
-    ///
-    /// # Returns
-    ///
-    /// Initial outgoing `RoundMessage`s. The final signature comes from
-    /// `process_round()` returning `SigningRoundResult::Complete`.
+    /// * `hmac_offset` -- Optional BRC-42 additive shift for HD-derived signing.
     pub fn sign(
         &mut self,
         message_hash: &[u8; 32],
@@ -247,16 +239,14 @@ impl SigningCoordinator {
 
     /// Start the signing protocol (Round 1).
     ///
-    /// Spawns the SM thread running cggmp24's signing state machine, collects
-    /// initial outgoing messages, and returns them for broadcast.
+    /// Constructs the cggmp24 signing `StateMachine` and drives it inline
+    /// until it needs incoming messages, then returns the collected outgoing
+    /// batch.
     ///
     /// # Arguments
     ///
     /// * `message_hash` -- The 32-byte SHA-256d sighash of the BSV transaction input.
-    ///
-    /// # Returns
-    ///
-    /// A vector of [`RoundMessage`]s to broadcast to all participating signers.
+    /// * `hmac_offset` -- Optional BRC-42 additive shift for HD-derived signing.
     pub fn init_round(
         &mut self,
         message_hash: &[u8; 32],
@@ -268,8 +258,10 @@ impl SigningCoordinator {
             ));
         }
 
-        // Validate our share index is in the participants list
-        let _my_signing_index = self
+        // Map this party's share index to its signing-time index within the
+        // participants list (cggmp24 wants the position, not the global share
+        // index).
+        let my_signing_index = self
             .participants
             .iter()
             .position(|&p| p == self.share.share_index.0)
@@ -284,23 +276,55 @@ impl SigningCoordinator {
         self.mode = SigningMode::FullProtocol;
         self.current_round = 1;
 
-        self.start_signing_sm(message_hash, hmac_offset)?;
-        self.collect_outgoing_messages()
+        // Decode the key share UP FRONT so caller-side errors (broken
+        // share JSON) surface as MpcError::Signing instead of a panic
+        // inside the SM future. KeyShare derives Clone (via the upstream
+        // DirtyKeyShare + Valid newtype), so we can move an owned copy
+        // into the closure to keep the SM 'static.
+        let key_share: cggmp24::KeyShare<Secp256k1, SecurityLevel128> =
+            serde_json::from_slice(&self.share.ciphertext)
+                .map_err(|e| MpcError::Signing(format!("failed to deserialize key share: {e}")))?;
+
+        // Construct the signing SM. The closure captures owned copies of
+        // every input (participants, key_share, message_hash, offset) so
+        // the returned `StateMachineImpl<...>` is 'static — storable in a
+        // Box<dyn ... + 'static> struct field.
+        let eid_bytes = self.eid_bytes;
+        let participants_owned = self.participants.clone();
+        let msg_hash = *message_hash;
+        let hmac_offset_owned = hmac_offset;
+
+        let sm: SigningSm = Box::new(round_based::state_machine::wrap_protocol(
+            move |party| async move {
+                let eid = ExecutionId::new(&eid_bytes);
+
+                let scalar = Scalar::<Secp256k1>::from_be_bytes_mod_order(msg_hash);
+                let data_to_sign = PrehashedDataToSign::from_scalar(scalar);
+
+                let mut builder =
+                    cggmp24::signing(eid, my_signing_index, &participants_owned, &key_share);
+                if let Some(offset_bytes) = hmac_offset_owned {
+                    let offset_scalar = Scalar::<Secp256k1>::from_be_bytes_mod_order(offset_bytes);
+                    builder = builder.set_additive_shift(offset_scalar);
+                }
+
+                builder
+                    .sign(&mut rand::rngs::OsRng, party, &data_to_sign)
+                    .await
+            },
+        ));
+        self.signing_sm = Some(sm);
+
+        let mut outgoing = Vec::new();
+        match self.drive_signing(&mut outgoing)? {
+            None => Ok(outgoing),
+            Some(_signature) => Err(MpcError::Signing(
+                "signing completed without any rounds (unexpected)".into(),
+            )),
+        }
     }
 
     /// Process incoming messages from the current signing round.
-    ///
-    /// Feeds messages to the SM thread and collects results. When the SM
-    /// produces the final signature, returns `SigningRoundResult::Complete`.
-    ///
-    /// # Arguments
-    ///
-    /// * `messages` -- All messages received for the current round from other signers.
-    ///
-    /// # Returns
-    ///
-    /// [`SigningRoundResult::NextRound`] with outgoing messages, or
-    /// [`SigningRoundResult::Complete`] with the final signature.
     pub fn process_round(&mut self, messages: Vec<RoundMessage>) -> Result<SigningRoundResult> {
         match self.mode {
             SigningMode::NotStarted => {
@@ -316,19 +340,21 @@ impl SigningCoordinator {
             SigningMode::FullProtocol => {}
         }
 
-        // Feed all incoming messages to the SM thread
-        let tx = self
-            .sm_tx
-            .as_ref()
-            .ok_or_else(|| MpcError::Signing("SM channel not available (internal error)".into()))?;
-
         for msg in &messages {
-            let wire_bytes = &msg.payload;
-            tx.send(SmInbound::IncomingMessage(wire_bytes.clone()))
-                .map_err(|e| MpcError::Signing(format!("failed to send to SM thread: {e}")))?;
+            self.buffer_incoming_payload(&msg.payload)?;
         }
 
-        self.collect_round_result()
+        let mut outgoing = Vec::new();
+        match self.drive_signing(&mut outgoing)? {
+            None => {
+                self.current_round += 1;
+                Ok(SigningRoundResult::NextRound(outgoing))
+            }
+            Some(signature) => {
+                self.mode = SigningMode::Complete;
+                self.assemble_signing_result(signature)
+            }
+        }
     }
 
     /// Get the current round number (0 = not started).
@@ -342,396 +368,103 @@ impl SigningCoordinator {
     }
 
     // -----------------------------------------------------------------------
-    // Internal: Start the signing state machine in a background thread
+    // Internal: inline drive helpers
     // -----------------------------------------------------------------------
 
-    fn start_signing_sm(
+    /// Drive the signing SM until it needs more input or completes.
+    fn drive_signing(
         &mut self,
-        message_hash: &[u8; 32],
-        hmac_offset: Option<[u8; 32]>,
-    ) -> Result<()> {
-        let (inbound_tx, inbound_rx) = mpsc::channel::<SmInbound>();
-        let (outbound_tx, outbound_rx) = mpsc::channel::<SmOutbound>();
+        outgoing: &mut Vec<RoundMessage>,
+    ) -> Result<Option<cggmp24::Signature<Secp256k1>>> {
+        // Compute the wire-time sender index up front so we don't hold
+        // an immutable borrow of `self` while drive_inline holds mutable
+        // borrows of `self.wire_buffer` / `self.next_msg_id`. The wire
+        // SENDER for outgoing messages is this party's signing-time index
+        // (its position within `participants`), matching the convention
+        // the previous threaded bridge in run_signing_sm used.
+        let signing_idx = self.signing_index()?;
+        let session_id = self.session_id;
+        let current_round = self.current_round;
 
-        let eid_bytes = self.eid_bytes;
-        let my_signing_index = self
-            .participants
+        let mut sm = self
+            .signing_sm
+            .take()
+            .ok_or_else(|| MpcError::Signing("drive_signing: SM not present".into()))?;
+
+        let result = drive_inline(
+            sm.as_mut(),
+            &mut self.wire_buffer,
+            &mut self.next_msg_id,
+            signing_idx,
+            session_id,
+            current_round,
+            outgoing,
+            "signing",
+            &MpcError::Signing,
+        );
+
+        match result? {
+            DriveStep::NeedsInput => {
+                self.signing_sm = Some(sm);
+                Ok(None)
+            }
+            DriveStep::Complete(signature) => Ok(Some(signature)),
+        }
+    }
+
+    /// Compute this party's signing-time index (position within
+    /// `participants`). Centralized so init_round and drive_signing agree.
+    fn signing_index(&self) -> Result<u16> {
+        self.participants
             .iter()
             .position(|&p| p == self.share.share_index.0)
+            .map(|p| p as u16)
             .ok_or_else(|| {
                 MpcError::Signing(format!(
                     "share index {} not found in participants {:?}",
                     self.share.share_index.0, self.participants
                 ))
-            })? as u16;
-        let participants = self.participants.clone();
-        let key_share_json = self.share.ciphertext.clone();
-        let msg_hash = *message_hash;
-
-        let thread_handle = thread::Builder::new()
-            .name(format!("signing-{}", self.share.share_index.0))
-            .spawn(move || {
-                run_signing_sm(
-                    eid_bytes,
-                    my_signing_index,
-                    participants,
-                    key_share_json,
-                    msg_hash,
-                    hmac_offset,
-                    inbound_rx,
-                    outbound_tx,
-                );
             })
-            .map_err(|e| MpcError::Signing(format!("failed to spawn signing thread: {e}")))?;
+    }
 
-        self.sm_tx = Some(inbound_tx);
-        self.sm_rx = Some(outbound_rx);
-        self.sm_thread = Some(thread_handle);
-
+    /// Decode one incoming `RoundMessage` payload and append onto the
+    /// internal wire buffer. The payload is either a single
+    /// `WireMessage` JSON or a bundled array.
+    fn buffer_incoming_payload(&mut self, wire_bytes: &[u8]) -> Result<()> {
+        if wire_bytes.first() == Some(&b'[') {
+            let bundle: Vec<WireMessage> = serde_json::from_slice(wire_bytes).map_err(|e| {
+                MpcError::Signing(format!("failed to deserialize bundled incoming: {e}"))
+            })?;
+            self.wire_buffer.extend(bundle);
+        } else {
+            let wire: WireMessage = serde_json::from_slice(wire_bytes)
+                .map_err(|e| MpcError::Signing(format!("failed to deserialize incoming: {e}")))?;
+            self.wire_buffer.push_back(wire);
+        }
         Ok(())
     }
 
-    // -----------------------------------------------------------------------
-    // Internal: Collect outgoing messages from the SM thread
-    // -----------------------------------------------------------------------
+    /// Convert the cggmp24 signature into a [`SigningResult`].
+    fn assemble_signing_result(
+        &self,
+        sig: cggmp24::Signature<Secp256k1>,
+    ) -> Result<SigningRoundResult> {
+        let message_hash = self
+            .message_hash
+            .ok_or_else(|| MpcError::Signing("message hash not set (internal error)".into()))?;
 
-    /// Collect the initial batch of outgoing messages after starting the SM.
-    fn collect_outgoing_messages(&mut self) -> Result<Vec<RoundMessage>> {
-        let rx = self
-            .sm_rx
-            .as_ref()
-            .ok_or_else(|| MpcError::Signing("SM channel not available (internal error)".into()))?;
+        let mut sig_bytes = [0u8; 64];
+        sig.write_to_slice(&mut sig_bytes);
 
-        let mut outgoing = Vec::new();
+        let result = sig_bytes_to_signing_result(
+            &sig_bytes,
+            &self.session_id,
+            self.share.share_index,
+            &message_hash,
+            &self.participants,
+        );
 
-        loop {
-            let msg = rx.recv().map_err(|e| {
-                MpcError::Signing(format!("SM thread channel closed unexpectedly: {e}"))
-            })?;
-
-            match msg {
-                SmOutbound::OutgoingMessage(wire_bytes) => {
-                    outgoing.push(self.wire_bytes_to_round_message(wire_bytes)?);
-                }
-                SmOutbound::NeedsMessage => {
-                    // SM is waiting for incoming messages — return what we have
-                    break;
-                }
-                SmOutbound::SigningComplete(_sig) => {
-                    return Err(MpcError::Signing(
-                        "signing completed without any rounds (unexpected)".into(),
-                    ));
-                }
-                SmOutbound::Error(e) => {
-                    return Err(MpcError::Signing(e));
-                }
-            }
-        }
-
-        Ok(outgoing)
-    }
-
-    /// Collect messages after feeding incoming messages for a round.
-    /// Handles completion when the SM produces the final signature.
-    fn collect_round_result(&mut self) -> Result<SigningRoundResult> {
-        let rx = self
-            .sm_rx
-            .as_ref()
-            .ok_or_else(|| MpcError::Signing("SM channel not available (internal error)".into()))?;
-
-        let mut outgoing = Vec::new();
-
-        loop {
-            let msg = rx.recv().map_err(|e| {
-                MpcError::Signing(format!("SM thread channel closed unexpectedly: {e}"))
-            })?;
-
-            match msg {
-                SmOutbound::OutgoingMessage(wire_bytes) => {
-                    outgoing.push(self.wire_bytes_to_round_message(wire_bytes)?);
-                }
-                SmOutbound::NeedsMessage => {
-                    // SM needs more input — return outgoing messages collected so far
-                    self.current_round += 1;
-                    return Ok(SigningRoundResult::NextRound(outgoing));
-                }
-                SmOutbound::SigningComplete(sig_bytes_vec) => {
-                    tracing::info!(
-                        party = self.share.share_index.0,
-                        "signing protocol complete"
-                    );
-
-                    self.cleanup_sm_thread();
-                    self.mode = SigningMode::Complete;
-
-                    let message_hash = self.message_hash.ok_or_else(|| {
-                        MpcError::Signing("message hash not set (internal error)".into())
-                    })?;
-
-                    if sig_bytes_vec.len() != 64 {
-                        return Err(MpcError::Signing(format!(
-                            "unexpected signature length: {} (expected 64)",
-                            sig_bytes_vec.len()
-                        )));
-                    }
-                    let mut sig_bytes = [0u8; 64];
-                    sig_bytes.copy_from_slice(&sig_bytes_vec);
-
-                    let result = sig_bytes_to_signing_result(
-                        &sig_bytes,
-                        &self.session_id,
-                        self.share.share_index,
-                        &message_hash,
-                        &self.participants,
-                    );
-
-                    return Ok(SigningRoundResult::Complete(result));
-                }
-                SmOutbound::Error(e) => {
-                    self.cleanup_sm_thread();
-                    return Err(MpcError::Signing(e));
-                }
-            }
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // Internal: Convert wire bytes to RoundMessage
-    // -----------------------------------------------------------------------
-
-    fn wire_bytes_to_round_message(&self, wire_bytes: Vec<u8>) -> Result<RoundMessage> {
-        let wire: WireMessage = serde_json::from_slice(&wire_bytes)
-            .map_err(|e| MpcError::Signing(format!("failed to parse wire message: {e}")))?;
-
-        Ok(RoundMessage {
-            session_id: self.session_id,
-            round: self.current_round,
-            from: ShareIndex(wire.sender),
-            // For both broadcast and p2p messages, we set `to` to None.
-            // The transport layer handles routing from the wire message itself.
-            to: None,
-            payload: wire_bytes,
-        })
-    }
-
-    // -----------------------------------------------------------------------
-    // Internal: Thread cleanup
-    // -----------------------------------------------------------------------
-
-    fn cleanup_sm_thread(&mut self) {
-        // Drop the sender to signal the thread to exit
-        self.sm_tx.take();
-        self.sm_rx.take();
-
-        // Join the thread if it's still running
-        if let Some(handle) = self.sm_thread.take() {
-            let _ = handle.join();
-        }
-    }
-}
-
-impl Drop for SigningCoordinator {
-    fn drop(&mut self) {
-        self.cleanup_sm_thread();
-    }
-}
-
-// ---------------------------------------------------------------------------
-// State machine thread function
-// ---------------------------------------------------------------------------
-
-/// Run the signing state machine in a dedicated thread.
-///
-/// This function blocks the thread, driving the SM via `proceed()` and
-/// communicating with the coordinator via channels. Same pattern as
-/// `run_keygen_sm` in `dkg.rs`.
-///
-/// The 8 args (one over the clippy default threshold of 7) are the
-/// natural SM-thread surface: cggmp24 protocol inputs (eid, party
-/// index, participants, key share, message hash, optional offset) plus
-/// the two channel ends for the bridge. Bundling them into a struct
-/// would add indirection without information.
-#[allow(clippy::too_many_arguments)]
-fn run_signing_sm(
-    eid_bytes: [u8; 32],
-    my_signing_index: u16,
-    participants: Vec<u16>,
-    key_share_json: Vec<u8>,
-    message_hash: [u8; 32],
-    hmac_offset: Option<[u8; 32]>,
-    inbound_rx: mpsc::Receiver<SmInbound>,
-    outbound_tx: mpsc::Sender<SmOutbound>,
-) {
-    // Deserialize key share
-    let key_share: cggmp24::KeyShare<Secp256k1, SecurityLevel128> =
-        match serde_json::from_slice(&key_share_json) {
-            Ok(ks) => ks,
-            Err(e) => {
-                let _ = outbound_tx.send(SmOutbound::Error(format!(
-                    "failed to deserialize key share: {e}"
-                )));
-                return;
-            }
-        };
-
-    // Create data to sign from the message hash.
-    // from_be_bytes_mod_order is infallible and reduces modulo the curve order,
-    // which is correct for sighashes (they are already hashed).
-    let scalar = Scalar::<Secp256k1>::from_be_bytes_mod_order(message_hash);
-    let data_to_sign = PrehashedDataToSign::from_scalar(scalar);
-
-    let eid = ExecutionId::new(&eid_bytes);
-
-    // Build the signing protocol, optionally with a BRC-42 additive shift.
-    // When hmac_offset is set, the signing produces a signature for the
-    // derived child key (root_pub + G * offset) rather than the root key.
-    let mut builder = cggmp24::signing(eid, my_signing_index, &participants, &key_share);
-    if let Some(offset_bytes) = hmac_offset {
-        let offset_scalar = Scalar::<Secp256k1>::from_be_bytes_mod_order(offset_bytes);
-        builder = builder.set_additive_shift(offset_scalar);
-    }
-
-    // Create the signing state machine via wrap_protocol.
-    // sign() accepts &dyn AnyDataToSign which PrehashedDataToSign implements.
-    let mut sm = round_based::state_machine::wrap_protocol(|party| async move {
-        builder
-            .sign(&mut rand::rngs::OsRng, party, &data_to_sign)
-            .await
-    });
-
-    let mut msg_id: u64 = 0;
-    // Local buffer for bundled messages. When the KSS sends a JSON array of
-    // WireMessages in a single payload, we consume the first and buffer the
-    // rest. Subsequent NeedsOneMoreMessage calls drain the buffer before
-    // requesting more from the coordinator.
-    let mut wire_buffer: std::collections::VecDeque<WireMessage> =
-        std::collections::VecDeque::new();
-
-    loop {
-        match sm.proceed() {
-            ProceedResult::SendMsg(outgoing) => {
-                let wire = match outgoing_to_wire(my_signing_index, outgoing) {
-                    Ok(w) => w,
-                    Err(e) => {
-                        let _ = outbound_tx.send(SmOutbound::Error(format!(
-                            "signing: failed to create wire message: {e}"
-                        )));
-                        return;
-                    }
-                };
-                let wire_bytes = match serde_json::to_vec(&wire) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        let _ = outbound_tx.send(SmOutbound::Error(format!(
-                            "signing: failed to serialize outgoing: {e}"
-                        )));
-                        return;
-                    }
-                };
-                if outbound_tx
-                    .send(SmOutbound::OutgoingMessage(wire_bytes))
-                    .is_err()
-                {
-                    return;
-                }
-            }
-            ProceedResult::NeedsOneMoreMessage => {
-                // Check local buffer first — if bundled messages remain, consume
-                // one without signaling the coordinator.
-                let wire = if let Some(w) = wire_buffer.pop_front() {
-                    w
-                } else {
-                    // Buffer empty — tell coordinator we need input and wait.
-                    if outbound_tx.send(SmOutbound::NeedsMessage).is_err() {
-                        return;
-                    }
-                    let inbound = match inbound_rx.recv() {
-                        Ok(msg) => msg,
-                        Err(_) => return,
-                    };
-                    match inbound {
-                        SmInbound::IncomingMessage(wire_bytes) => {
-                            // Parse: single WireMessage or bundled JSON array.
-                            let mut wires: std::collections::VecDeque<WireMessage> =
-                                if wire_bytes.first() == Some(&b'[') {
-                                    match serde_json::from_slice::<Vec<WireMessage>>(&wire_bytes) {
-                                        Ok(v) => v.into(),
-                                        Err(e) => {
-                                            let _ = outbound_tx.send(SmOutbound::Error(format!(
-                                            "signing: failed to deserialize bundled incoming: {e}"
-                                        )));
-                                            return;
-                                        }
-                                    }
-                                } else {
-                                    match serde_json::from_slice::<WireMessage>(&wire_bytes) {
-                                        Ok(w) => {
-                                            let mut d = std::collections::VecDeque::new();
-                                            d.push_back(w);
-                                            d
-                                        }
-                                        Err(e) => {
-                                            let _ = outbound_tx.send(SmOutbound::Error(format!(
-                                                "signing: failed to deserialize incoming: {e}"
-                                            )));
-                                            return;
-                                        }
-                                    }
-                                };
-                            let first = match wires.pop_front() {
-                                Some(w) => w,
-                                None => {
-                                    let _ = outbound_tx.send(SmOutbound::Error(
-                                        "signing: received empty bundled message".into(),
-                                    ));
-                                    return;
-                                }
-                            };
-                            wire_buffer.extend(wires);
-                            first
-                        }
-                    }
-                };
-
-                msg_id += 1;
-                let incoming = match wire_to_incoming(wire, msg_id) {
-                    Ok(inc) => inc,
-                    Err(e) => {
-                        let _ = outbound_tx.send(SmOutbound::Error(format!(
-                            "signing: failed to parse incoming message: {e}"
-                        )));
-                        return;
-                    }
-                };
-                if sm.received_msg(incoming).is_err() {
-                    let _ = outbound_tx.send(SmOutbound::Error(
-                        "signing: SM rejected incoming message".into(),
-                    ));
-                    return;
-                }
-            }
-            ProceedResult::Yielded => {}
-            ProceedResult::Output(result) => {
-                match result {
-                    Ok(sig) => {
-                        let mut sig_bytes = [0u8; 64];
-                        sig.write_to_slice(&mut sig_bytes);
-                        let _ = outbound_tx.send(SmOutbound::SigningComplete(sig_bytes.to_vec()));
-                    }
-                    Err(e) => {
-                        let _ = outbound_tx
-                            .send(SmOutbound::Error(format!("signing protocol error: {e:?}")));
-                    }
-                }
-                return;
-            }
-            ProceedResult::Error(e) => {
-                let _ = outbound_tx.send(SmOutbound::Error(format!(
-                    "signing state machine error: {e}"
-                )));
-                return;
-            }
-        }
+        Ok(SigningRoundResult::Complete(result))
     }
 }
 
@@ -763,7 +496,7 @@ fn sig_bytes_to_signing_result(
     // Here we use a minimal proof since we don't have real identity keys.
     let proof = crate::types::ParticipationProof {
         session_hash: {
-            let mut hasher = sha2::Sha256::new();
+            let mut hasher = Sha256::new();
             hasher.update(b"bsv-mpc-signing-proof-");
             hasher.update(session_id.as_bytes());
             hasher.finalize().to_vec()
