@@ -400,9 +400,9 @@ dependencies = [
 
 [[package]]
 name = "bsv-rs"
-version = "0.3.7"
+version = "0.3.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3bb3530038b54cbeb9b85f1fd3c31f1b24de5e037878da9944eeb339df3c720e"
+checksum = "3ddf2dd7429c2016cf01de1fa81d5436638902085f7bba80810e2b5a002c830d"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -411,6 +411,7 @@ dependencies = [
  "bs58",
  "cbc",
  "futures",
+ "futures-timer",
  "getrandom 0.2.17",
  "hex",
  "hmac",
@@ -985,6 +986,12 @@ name = "futures-task"
 version = "0.3.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "037711b3d59c33004d3856fbdc83b99d4ff37a24768fa1be9ce3538a1cde4393"
+
+[[package]]
+name = "futures-timer"
+version = "3.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f288b0a4f20f9a56b5d1da57e2227c661b7b16168e2f72365f57b63326e29b24"
 
 [[package]]
 name = "futures-util"

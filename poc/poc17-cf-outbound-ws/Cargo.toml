@@ -22,7 +22,7 @@ worker = "0.7"
 # scoped to this POC — other workspace members (e.g. `bsv-mpc-core`) don't
 # need them and resolver-2 keeps the feature set local to this build target.
 # Per audit §11.2 revised: SocketIoTransport wraps `bsv_rs::auth::Peer`.
-bsv = { package = "bsv-rs", version = "0.3.7", default-features = false, features = ["auth", "wallet", "transaction", "wasm"] }
+bsv = { package = "bsv-rs", version = "0.3.8", default-features = false, features = ["auth", "wallet", "transaction", "wasm"] }
 
 # Serialization (runtime-agnostic; inherits workspace versions)
 serde = { workspace = true }
