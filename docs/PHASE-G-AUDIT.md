@@ -613,7 +613,7 @@ commit lands on `main` BEFORE the full implementation begins.**
 |---|---|---|
 | G-3.1 | Inline 2-of-2 DKG keygen with no `std::thread::spawn` | Two `DkgCoordinator`-like minimal harnesses message-relay to each other in a single thread; produce valid `IncompleteKeyShare`s; joint pubkey matches; zero use of `thread::spawn` or `tokio::spawn` (grep-checkable) |
 | G-3.2 | Inline auxinfo with INJECTED primes | `aux_info_gen` runs with `PregeneratedPrimes` constructed via `TryFrom<[Integer; 4]>` from out-of-band Blum primes; produces valid `AuxInfo` |
-| G-3.3 | Byte-identical AuxInfo across in-line and injected-from-pool paths | Same RNG seed → same `AuxInfo` bytes whether `PregeneratedPrimes::generate(rng)` (inline) or `pool.take()` (where the pool was populated with the same primes) was used |
+| G-3.3 | Pool round-trip preserves `PregeneratedPrimes` byte-for-byte + auxinfo runs end-to-end on the round-tripped primes | Empirical: `cggmp24::aux_info_gen` is non-deterministic on internal RNG state (ZK proof nonces), so the testable invariant is "primes go in, the same primes come out" + "round-tripped primes still drive `aux_info_gen` to a valid AuxInfo." Original phrasing ("byte-identical AuxInfo") corrected by POC empirical run, see this gate's `tests/poc.rs` doc-comment. |
 | G-3.4 | At-rest encryption round-trip | A minimal `InMemoryPoolStorage` + AES-256-GCM + BRC-42 key derivation: put → take → use → produces same `AuxInfo` as direct injection. Ciphertext blob is non-trivial (not the plaintext) |
 | G-3.5 | `cargo build --target wasm32-unknown-unknown` succeeds on poc16 itself | Compiles to WASM. (Empirical run not required — the production build covers that in G-5.) |
 
@@ -643,8 +643,10 @@ true. No asterisks — if any single item is open, the phase stays open.
 ### 7.2 Vector reproducibility
 - [ ] Byte-locked DKG vector reproduces (existing).
 - [ ] Byte-locked signing vector reproduces (existing).
-- [ ] New byte-locked aux_info-with-injected-primes vector
-      reproduces (proves pool path matches inline path).
+- [ ] New byte-locked **PregeneratedPrimes-round-trip-through-pool**
+      vector reproduces (proves pool path preserves primes; AuxInfo is
+      not byte-locked because `aux_info_gen` consumes internal RNG
+      state — see G-3.3).
 
 ### 7.3 E2E (within-stack, real sats)
 - [ ] `cargo test --test sign_mainnet_via_messagebox_e2e -- --ignored`
@@ -746,7 +748,10 @@ review can resolve them before the POC step.
 
 5. **Merge gate is real.** Phase E's mainnet TXID byte-shape preserved
    on a fresh run + new wasm32 2-of-2 DKG sim + byte-identical
-   AuxInfo across pool-injected vs inline-generated paths. No
+   `PregeneratedPrimes` round-trip through pool. (The original audit
+   draft claimed byte-identical AuxInfo; POC empirically showed
+   `cggmp24::aux_info_gen` is non-deterministic on internal RNG state,
+   so we test the stronger pool-specific invariant instead.) No
    asterisks; on-chain artifact in the merge commit.
 
 ---

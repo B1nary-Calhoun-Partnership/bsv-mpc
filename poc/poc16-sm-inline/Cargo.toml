@@ -1,0 +1,47 @@
+[package]
+name = "poc16-sm-inline"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Phase G POC: inline state-machine drive + Paillier safe-prime pool"
+
+# NOTE: This POC is included as a workspace member (see root Cargo.toml).
+# Unlike the older poc1-poc15 directories which used standalone `[workspace]`
+# blocks, poc16 joins the parent workspace so it inherits the Cargo.lock
+# (with the core2 0.4.0 yanked-pin per glass_pumpkin =1.9.0) and the
+# cggmp24 [patch] redirect to the Calhooon public fork. This keeps the
+# POC build reproducible across fresh clones.
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# MPC stack — inherits the workspace [patch] redirect to Calhooon's fork
+# at commit 6c6421ee (which exposes set_additive_shift). We additionally
+# request the `state-machine` feature for the inline-drive POC; cargo
+# unions this with the workspace's existing feature set.
+cggmp24 = { workspace = true, features = ["state-machine"] }
+cggmp24-keygen = { workspace = true, features = ["state-machine"] }
+
+# MPC protocol infrastructure (inherits workspace version + features)
+round-based = { workspace = true, features = ["sim"] }
+generic-ec = { workspace = true }
+
+# Crypto for at-rest pool encryption (BRC-42 HMAC + AES-256-GCM per
+# §16.1 share-encryption pattern)
+aes-gcm = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+
+# Std / rand / serde
+rand = { workspace = true }
+rand_core = "0.6"
+serde = { workspace = true }
+serde_json = { workspace = true }
+hex = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# WASM entropy — CRITICAL: "js" feature required for wasm32-unknown-unknown
+# (POC-only; not used by other workspace crates that target native).
+getrandom = { version = "0.2", features = ["js"] }

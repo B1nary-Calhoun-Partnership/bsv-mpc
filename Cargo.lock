@@ -1920,6 +1920,27 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7edddbd0b52d732b21ad9a5fab5c704c14cd949e5e9a1ec5929a24fded1b904c"
 
 [[package]]
+name = "poc16-sm-inline"
+version = "0.1.0"
+dependencies = [
+ "aes-gcm",
+ "anyhow",
+ "cggmp24",
+ "cggmp24-keygen",
+ "generic-ec",
+ "getrandom 0.2.17",
+ "hex",
+ "hmac",
+ "rand 0.8.5",
+ "rand_core 0.6.4",
+ "round-based",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "polyval"
 version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
