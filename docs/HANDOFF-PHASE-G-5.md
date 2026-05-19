@@ -1,5 +1,26 @@
 # Handoff — Phase G Step 5 (merge gate) pickup
 
+> **STATUS: CLOSED 2026-05-19.** All three G-5 sub-tests landed green
+> on main with verifiable artifacts. Phase G is merge-gate-green; this
+> handoff is retained for historical context but the next session
+> should start from `docs/NEXT-STEPS.md` Phase H, not from here.
+>
+> Merge-gate evidence:
+> - **G-5a wasm32 build**: `cargo build -p bsv-mpc-core --target
+>   wasm32-unknown-unknown` clean (local + CI ci.yml `wasm` job green).
+> - **G-5b wasm32 DKG runtime**: `crates/bsv-mpc-core/tests/wasm32_dkg.rs`
+>   passes via `wasm-pack test --node` (commits `2f4aea9` + fmt fixup
+>   `433d4f6`; CI ci.yml `wasm` job green).
+> - **G-5c native lib tests**: `cargo test --workspace --lib` = 404
+>   tests, 0 failed.
+> - **G-5d Phase E mainnet TXID re-run**: real-sats e2e produced
+>   [`442bd391cf8eda299f82dc1e4aeb1a9cb4f33610365d44c9c1c0e55d32f171b9`](https://whatsonchain.com/tx/442bd391cf8eda299f82dc1e4aeb1a9cb4f33610365d44c9c1c0e55d32f171b9)
+>   (joint pubkey `02aa325a…`, DER 70 bytes, broadcast
+>   `SEEN_ON_NETWORK` via gorillapool ARC).
+> - **G-5e merge-gate commit**: this commit (citing the new TXID).
+>
+> See `docs/PHASE-G-AUDIT.md` §7 for the full check-off list.
+
 > For the next Claude session picking up Phase G at the merge-gate
 > step. Read this + `docs/PHASE-G-AUDIT.md` §7 first; then plan the
 > Phase E mainnet TXID re-run + wasm32 build verification.

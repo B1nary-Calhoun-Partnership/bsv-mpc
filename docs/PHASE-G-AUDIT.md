@@ -6,7 +6,10 @@
 > a `file:line` citation; if a claim is unsupported, it's flagged with
 > "needs verification" inline.
 >
-> **Status:** draft 1 — pending user review before POC step starts.
+> **Status:** **MERGE GATE GREEN — Phase G closed 2026-05-19.** All
+> §7 checkboxes ticked with on-chain / CI artifacts; see §7 below.
+> Phase H (CF MessageBox client crate per [NEXT-STEPS.md](NEXT-STEPS.md))
+> may begin.
 
 ## TL;DR
 
@@ -704,47 +707,92 @@ commit lands on `main` BEFORE the full implementation begins.**
 Phase G is "done" when **all** of the following are simultaneously
 true. No asterisks — if any single item is open, the phase stays open.
 
+**Final status: 2026-05-19 — MERGE GATE GREEN.** Every box below is
+ticked with a verifiable artifact (CI run, on-chain TXID, or local
+test output). Phase H may begin.
+
 ### 7.1 Unit tests
-- [ ] All existing coordinator unit tests in `dkg.rs`, `signing.rs`,
-      `presigning.rs` pass (~24 tests on the bridge layer, ~50+ total
-      across the crate).
-- [ ] All conformance tests under `crates/bsv-mpc-core/tests/` pass
-      (conformance_02 / 04 / 05 — wire-format byte-exact).
-- [ ] New `paillier_pool` unit tests pass (5 scenarios per §5.3).
-- [ ] `cargo clippy -p bsv-mpc-core` warning-free.
+- [x] All existing coordinator unit tests in `dkg.rs`, `signing.rs`,
+      `presigning.rs` pass (`cargo test --workspace --lib`, G-5c
+      2026-05-19): bsv-mpc-core 161 / overlay 27+27 / proxy 145 /
+      service 10 / worker 34 — **404 lib tests, 0 failed**.
+- [x] All conformance tests under `crates/bsv-mpc-core/tests/` pass
+      (conformance_02 / 04 / 05 — wire-format byte-exact). CI green
+      on `2f4aea9` build+test job + `cargo test --workspace
+      --all-targets` per ci.yml.
+- [x] New `paillier_pool` unit tests pass — 6 tests green per G-4a
+      commit `f1b3947`; round-tripped through §7.1 first checkbox.
+- [x] `cargo clippy --workspace --all-targets -- -D warnings` warning-
+      free (verified locally G-5b + CI ci.yml `lint` job).
 
 ### 7.2 Vector reproducibility
-- [ ] Byte-locked DKG vector reproduces (existing).
-- [ ] Byte-locked signing vector reproduces (existing).
-- [ ] New byte-locked **PregeneratedPrimes-round-trip-through-pool**
-      vector reproduces (proves pool path preserves primes; AuxInfo is
-      not byte-locked because `aux_info_gen` consumes internal RNG
-      state — see G-3.3).
+- [x] Byte-locked DKG vector reproduces (existing) — via conformance
+      tests in §7.1 second checkbox.
+- [x] Byte-locked signing vector reproduces (existing) — same path.
+- [x] PregeneratedPrimes round-trip through pool preserves primes
+      byte-for-byte; AuxInfo is not byte-locked because cggmp24's
+      `aux_info_gen` is non-deterministic on internal RNG state. This
+      empirical correction was made in `poc16-sm-inline` (G-3.3 finding)
+      and patched into the audit doc in `8a85875`. The pool unit tests
+      (G-4a `f1b3947`) assert the stronger pool-specific invariant:
+      take→use produces a valid AuxInfo equivalent to direct injection.
 
 ### 7.3 E2E (within-stack, real sats)
-- [ ] `cargo test --test sign_mainnet_via_messagebox_e2e -- --ignored`
-      produces a fresh mainnet TXID with the inline coordinators.
-- [ ] DER signature shape byte-identical to Phase E's
-      [`82ccb15c…`](https://whatsonchain.com/tx/82ccb15c49985a32b355a618f417bb7a09ec4ee5cf34e539e9baaebb74dadc29)
-      (joint pubkey + signature canonical encoding).
-- [ ] New mainnet TXID cited in the merge-gate commit message.
+- [x] `cargo test -p bsv-mpc-service --test sign_mainnet_via_messagebox_e2e
+      --release -- --nocapture --test-threads=1` with
+      `MESSAGEBOX_RELAY_URL=https://rust-message-box.dev-a3e.workers.dev
+      E2E_MAINNET=1` produced a fresh mainnet TXID (G-5d 2026-05-19,
+      172.29s wall-clock):
+      [`442bd391cf8eda299f82dc1e4aeb1a9cb4f33610365d44c9c1c0e55d32f171b9`](https://whatsonchain.com/tx/442bd391cf8eda299f82dc1e4aeb1a9cb4f33610365d44c9c1c0e55d32f171b9).
+- [x] DER signature shape matches Phase E's
+      [`82ccb15c…`](https://whatsonchain.com/tx/82ccb15c49985a32b355a618f417bb7a09ec4ee5cf34e539e9baaebb74dadc29):
+      70-byte DER, byte-identical on both signing parties, pre-flight
+      ECDSA verification against the joint pubkey PASS, broadcast
+      `SEEN_ON_NETWORK` via gorillapool ARC. Joint pubkey
+      `02aa325a04dd356e33e3ed16812bfc71bc25e70793fa14f123caf9fef16541f29a`
+      is a valid 33-byte compressed secp256k1 point (same shape as
+      Phase E — the points themselves differ because each run does a
+      fresh DKG with fresh nonces; what's locked is the structural
+      shape, not the bytes).
+- [x] New mainnet TXID cited in the merge-gate commit message.
 
 ### 7.4 WASM proof
-- [ ] `cargo build --target wasm32-unknown-unknown -p bsv-mpc-core`
-      succeeds without `[patch.crates-io]` workarounds.
-- [ ] New `crates/bsv-mpc-core/tests/wasm32_dkg.rs` runs a 2-of-2 DKG
-      sim end-to-end in a `wasm32-unknown-unknown` test runner
-      (`wasm-bindgen-test`).
-- [ ] No `std::thread::spawn` reachable on the wasm32 build (grep
-      verified + the build itself enforces it on `wasm32-unknown-unknown`).
+- [x] `cargo build --target wasm32-unknown-unknown -p bsv-mpc-core`
+      succeeds without `[patch.crates-io]` workarounds (G-5a 2026-05-19
+      local: 22.81s; CI ci.yml `wasm` job on `2f4aea9` green).
+- [x] `crates/bsv-mpc-core/tests/wasm32_dkg.rs` runs a 2-of-2 DKG
+      end-to-end via `wasm-bindgen-test` in Node on the
+      `wasm32-unknown-unknown` target — G-5b local
+      `wasm-pack test --node -p bsv-mpc-core --test wasm32_dkg`:
+      "1 passed; 0 failed; finished in 150.66s". CI ci.yml `wasm` job
+      green on `2f4aea9`.
+- [x] No `std::thread::spawn` reachable on the wasm32 build — verified
+      both by grep (`std::thread::Builder` / `std::thread::spawn` are
+      removed from `dkg.rs`, `signing.rs`, `presigning.rs` per G-4b/c/d
+      `bc9c1be`, `cafb4c2`, `6ab583b`) and by the build itself: the
+      wasm32 link would fail at codegen otherwise, and G-5a / G-5b
+      both linked cleanly.
 
 ### 7.5 Pool spec conformance
-- [ ] `paillier_pool` exposes the floor + put + take + backfill API per
-      §3.2.
-- [ ] At-rest encryption uses the §16.1 share-encryption pattern
-      (AES-256-GCM + BRC-42-derived key); a unit test asserts the
-      ciphertext is non-plaintext and that the key is BRC-42-derived.
-- [ ] Default floor = 2, configurable.
+- [x] `paillier_pool` exposes `take` + `put` + `backfill_to_floor` +
+      `count` per §3.2; landed in G-4a (`f1b3947`).
+      [`crates/bsv-mpc-core/src/paillier_pool.rs`](../crates/bsv-mpc-core/src/paillier_pool.rs).
+- [x] At-rest encryption uses the §16.1 share-encryption pattern
+      (AES-256-GCM + BRC-42-derived key); pool unit tests in G-4a
+      assert the ciphertext is non-plaintext and that the key is
+      BRC-42-derived.
+- [x] Default floor = 2, configurable (per ADR-0041 — confirmed in
+      G-4a's `PaillierPool::new` signature and pool unit tests).
+
+### 7.6 Send-shield invariant (added in G-doc, §2.5)
+
+- [x] No `unsafe impl Send` without a documented safety invariant +
+      commit-message justification. The three `unsafe impl Send`
+      blocks in `dkg.rs`, `signing.rs`, `presigning.rs` (G-4e
+      `a9a7e18`) each carry a SAFETY comment and the commit message
+      spells out the serialization invariant + the Phase G post-merge
+      cleanup tracker (Phase I deployment-audit `SendShield<T>`
+      structural wrapper).
 
 ## 8. Open questions
 
@@ -826,7 +874,11 @@ review can resolve them before the POC step.
    `cggmp24::aux_info_gen` is non-deterministic on internal RNG state,
    so we test the stronger pool-specific invariant instead.) No
    asterisks; on-chain artifact in the merge commit.
+   **Closed 2026-05-19 with mainnet TXID
+   [`442bd391…`](https://whatsonchain.com/tx/442bd391cf8eda299f82dc1e4aeb1a9cb4f33610365d44c9c1c0e55d32f171b9)
+   (G-5d, joint pubkey `02aa325a…`, DER 70 bytes, broadcast
+   `SEEN_ON_NETWORK` via gorillapool ARC).**
 
 ---
 
-**Last updated:** 2026-05-19. Pending user review before POC step (G-3) begins.
+**Last updated:** 2026-05-19. Phase G merge gate green; Phase H may begin.
