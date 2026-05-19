@@ -13,7 +13,7 @@ hard gates (per audit `§6.2` as rewritten in §2.5b):
 | Gate | What it proves | Pass criterion |
 |---|---|---|
 | **H-3.1** | wasm32 build works | `cargo build --target wasm32-unknown-unknown -p poc17-cf-outbound-ws` clean |
-| **H-3.2** | Socket.IO handshake from a CF DO via JS-bundled `socket.io-client@4.x` | `wrangler dev` test: DO `fetch /open` triggers Socket.IO `GET /socket.io/?EIO=4&transport=polling` → 200 + Engine.IO handshake JSON; upgrades to WS within 5s |
+| **H-3.2** | Socket.IO handshake from a CF DO via **pure-Rust client** (vendored Calhoun codec + `worker::Fetch` + `web_sys::WebSocket`) | `wrangler dev` test: DO `fetch /open` triggers Socket.IO `GET /socket.io/?EIO=4&transport=polling` → 200 + Engine.IO handshake JSON; upgrades to WS within 5s |
 | **H-3.3** | BRC-103 mutual auth completes over `authMessage` event | New `SocketIoTransport` (Rust impl of `bsv_rs::auth::Transport`) drives `bsv_rs::auth::Peer` through the BRC-103 `InitialRequest` → `InitialResponse` handshake; channel becomes identity-bound |
 | **H-3.4** | Round-trip a canonical CBOR envelope | POST `/relay` to DO; DO emits `sendMessage` to live relay's `/socket.io/`; DO receives echo back on a `sendMessage` event from its own subscribed room; body byte-identical |
 | **H-3.5** | Forced-hibernation reconnect | `wrangler dev` + `state.abort()` to force DO eviction; subsequent fetch wakes; Socket.IO re-handshakes; BRC-103 re-authenticates; `/listMessages` backfill recovers; missed envelope reaches consumer byte-exact |
@@ -46,14 +46,25 @@ After all five pass, Phase H is POC-green and the next phase step
    OQ8). Phase H merges only when both targets converge on the
    canonical wire AND a fresh real-sats mainnet TXID through the new
    native path matches G-5d's shape.
-5. **wasm32 substrate: JS-bundled `socket.io-client@4.x` via
-   wasm-bindgen.** `rust-socketio` v0.6.0 does NOT support
-   `wasm32-unknown-unknown` (see §Empirical findings below); upstreaming
-   wasm32 to it is tracked as a Phase H post-merge ecosystem
-   contribution, NOT a Phase H blocker.
-6. **Native substrate: `rust-socketio` v0.6.0** as-is. ~5k stars,
-   maintained, production-grade. Workspace deps already include
-   compatible `reqwest`, `tokio-tungstenite`, `tokio` etc.
+5. **Substrate: pure Rust+WASM via vendored Calhoun codec** (audit
+   §11.2 revised). The Engine.IO v4 + Socket.IO v5 codec at
+   `~/bsv/bsv-messagebox-cloudflare-public/src/engineio/codec.rs`
+   (613 LOC, MIT, byte-identical to `rust-message-box/src/engineio/codec.rs`)
+   is direction-agnostic and wasm32-compatible by construction. The
+   POC vendors it (with attribution) and builds a minimal Rust
+   Engine.IO + Socket.IO CLIENT on top — ~1000 LOC total including
+   the codec. **wasm32 transport substrate**: `worker::Fetch` for
+   Engine.IO polling phase + `web_sys::WebSocket` for the WS upgrade
+   phase. **Native transport substrate**: `reqwest` + `tokio-tungstenite`.
+   Same codec on both targets.
+6. **`rust-socketio` is NOT used.** v0.6.0 doesn't support
+   `wasm32-unknown-unknown` (see §Empirical findings below);
+   upstreaming wasm32 to it is tracked as a post-Phase-H ecosystem
+   follow-up, not on the critical path. **JS bundle of
+   `socket.io-client@4.x` is Plan B fallback only** — invoke only if
+   `web_sys::WebSocket` doesn't work inside CF DO scope and a pure-Rust
+   WS substrate proves unreachable. The "pure Rust+WASM" project goal
+   makes A1 (vendor codec) the Plan A primary.
 7. **Upstream PR for `SocketIoTransport` → `bsv-rs`** (audit §11.2 /
    OQ7). bsv-rs is **Calhoun-controlled** at
    `git@github.com:Calhooon/bsv-rs.git` — trivial coordination, no
@@ -146,48 +157,67 @@ for `SocketIoTransport::new(&relay_url)` — keep everything else.
 
 ```
 poc/poc17-cf-outbound-ws/
-  Cargo.toml         # worker = "0.7" or "0.8" + wasm-bindgen + js-sys
-                     # bsv-rs (Calhooon fork) with a feature flag for
-                     # the new SocketIoTransport (not yet upstreamed)
+  Cargo.toml         # worker = "0.8", wasm-bindgen, js-sys (for
+                     # web_sys::WebSocket only — NOT for an npm JS dep),
+                     # bsv-rs with [auth, wallet, transaction, wasm] features,
+                     # serde, serde_json
   wrangler.toml      # gitignored! pulls from secrets.md for CF token
-  wrangler.toml.example  # tracked public template
+  wrangler.toml.example  # tracked public template (account_id placeholder)
+  package.json       # MINIMAL — only wrangler as a devDep; no socket.io-client
+                     # (we're pure-Rust per audit §11.2 revised)
   src/
-    lib.rs           # CF Worker entry + DO impl
-    socketio.rs      # thin wrapper over JS socket.io-client@4.x
-                     # (target-conditional: this whole module is wasm32-only)
-    transport.rs     # SocketIoTransport impl of bsv_rs::auth::Transport
-    do.rs            # Durable Object holding the Peer + WS state
+    lib.rs           # CF Worker entry + DO routing
+    engineio_codec.rs  # VENDORED from bsv-messagebox-cloudflare-public/src/
+                       # engineio/codec.rs (MIT, © Calhooon Contributors) —
+                       # 613 LOC, attribution header preserved
+    socketio_client.rs # NEW minimal Engine.IO + Socket.IO CLIENT on top
+                       # of engineio_codec.rs. ~300 LOC. State machine
+                       # (CONNECTING → CONNECTED → UPGRADING → UPGRADED) +
+                       # event emit/on dispatch + heartbeat.
+    transport_wasm.rs  # web_sys::WebSocket + worker::Fetch substrate impl
+                       # used by socketio_client.rs (wasm32 only)
+    transport.rs       # SocketIoTransport impl of bsv_rs::auth::Transport
+                       # — wraps socketio_client.rs's emit/on for the
+                       # 'authMessage' event channel
+    do.rs              # Durable Object: holds the Peer + reconstructs
+                       # socketio_client on each wake (audit §3 hibernation
+                       # contract — JS handle would not survive; pure-Rust
+                       # state is reconstructed from serialize_attachment).
   README.md          # what this POC proves + how to run
-  TESTING.md         # gates per audit §6.2 + how to verify each
+  TESTING.md         # gates per audit §6.2 + verification commands
 ```
 
 `wrangler.toml` follows the established pattern (gitignored, secrets
-in `secrets.md`, public `wrangler.toml.example` template).
+in `secrets.md`, public `wrangler.toml.example` template). `package.json`
+is intentionally minimal — wrangler tooling only, no JS deps for the
+client (pure Rust+WASM).
 
 ### Substrate decisions for this POC
 
-- **JS dep**: `socket.io-client@4.x` bundled via `wasm-bindgen` +
-  `js-sys`. Add the npm package via wrangler's bundling.
-- **Rust deps**: `worker` (CF SDK), `wasm-bindgen`, `js-sys`,
-  `serde`, `serde_json`, `bsv-rs` (path or git dep with the new
-  `SocketIoTransport` feature flag — see Step 4 notes below).
+- **JS dep**: **none** for the Socket.IO client (pure Rust+WASM, audit §11.2 revised). The vendored `engineio_codec.rs` (MIT, © Calhooon Contributors) handles all packet encode/decode in Rust.
+- **Rust deps**: `worker = "0.8"` (CF SDK; `Fetch` for HTTP polling), `wasm-bindgen` + `js-sys` (for `web_sys::WebSocket` only on the WS-upgrade phase), `serde`, `serde_json`, `bsv-rs = { version = "0.3.7", features = ["auth", "wallet", "transaction", "wasm"] }` (per the proven feature set used by `~/bsv/rust-message-box/Cargo.toml:36` + `~/bsv/bsv-messagebox-cloudflare-public/Cargo.toml:36`).
+- **`web_sys` features**: `WebSocket`, `MessageEvent`, `CloseEvent`, `Event`, `BinaryType`.
+- **The Phase H POC's first hard gate (H-3.2)**: does `web_sys::WebSocket::new(url)` actually work inside a CF DO `fetch()` handler? If yes (expected), Plan A1 lights up end-to-end. If no, fall back to Plan B (JS bundle) — but per audit §11.2 revised, that's a last resort, not a default.
 
-### `SocketIoTransport` sketch (~150-250 LOC)
+### `SocketIoTransport` sketch (~150-250 LOC) — pure-Rust
 
-The minimal implementation pattern for the POC:
+The minimal implementation pattern for the POC, on top of the pure-Rust `socketio_client.rs` (built over the vendored `engineio_codec.rs`):
 
 ```rust
-use bsv::auth::{Transport, TransportCallback};
-use bsv::auth::AuthMessage;
+use bsv::auth::{Transport, TransportCallback, AuthMessage};
 use std::sync::Arc;
+use parking_lot::RwLock;  // or std::sync::RwLock; wasm32-friendly
 
-// SocketIo trait abstraction (in poc17 first, eventually moves to bsv-mpc-messagebox).
-// The wasm32 impl wraps the JS socket.io-client@4.x package.
+// SocketIo trait abstraction (in poc17 first; moves to bsv-mpc-messagebox in H-4).
+// Both targets implement this trait over the SAME vendored codec; only the
+// transport substrate differs (worker::Fetch + web_sys::WebSocket on wasm32;
+// reqwest + tokio-tungstenite on native).
 #[async_trait]
 trait SocketIo: Send + Sync {
     async fn connect(&self, url: &str) -> Result<()>;
     async fn emit(&self, event: &str, payload: &str) -> Result<()>;
     fn on(&self, event: &str, cb: Box<dyn Fn(String) + Send + Sync>);
+    async fn disconnect(&self);
 }
 
 pub struct SocketIoTransport<S: SocketIo> {
@@ -198,14 +228,18 @@ pub struct SocketIoTransport<S: SocketIo> {
 impl<S: SocketIo> SocketIoTransport<S> {
     pub fn new(inner: Arc<S>) -> Self {
         let t = Self { inner: inner.clone(), callback: Default::default() };
-        // wire inbound: on('authMessage', payload) → t.callback(AuthMessage::from_json(payload))
+        // Wire inbound: on('authMessage', payload) → invoke registered TransportCallback
+        // with the parsed AuthMessage. The Peer state machine consumes it.
         let cb_ref = t.callback.clone();
         inner.on("authMessage", Box::new(move |json_str| {
-            let msg = serde_json::from_str::<AuthMessage>(&json_str).unwrap();
-            if let Some(cb) = &*cb_ref.read().unwrap() {
+            let msg = match serde_json::from_str::<AuthMessage>(&json_str) {
+                Ok(m) => m,
+                Err(_) => return,  // malformed inbound; drop (Peer logs)
+            };
+            if let Some(cb) = &*cb_ref.read() {
                 let fut = cb(msg);
                 wasm_bindgen_futures::spawn_local(async move {
-                    let _ = fut.await;  // best-effort error swallow on wasm32
+                    let _ = fut.await;  // best-effort error swallow
                 });
             }
         }));
@@ -220,13 +254,21 @@ impl<S: SocketIo> Transport for SocketIoTransport<S> {
         self.inner.emit("authMessage", &json).await
     }
     fn set_callback(&self, cb: Box<TransportCallback>) {
-        *self.callback.write().unwrap() = Some(cb);
+        *self.callback.write() = Some(cb);
     }
     fn clear_callback(&self) {
-        *self.callback.write().unwrap() = None;
+        *self.callback.write() = None;
     }
 }
 ```
+
+**The Rust `SocketIo` impl** for wasm32 (in `transport_wasm.rs`) drives:
+1. Initial Engine.IO handshake via `worker::Fetch` (`GET /socket.io/?EIO=4&transport=polling&t=...`) — receives the Open packet + session id, decodes via vendored `engineio_codec.rs`.
+2. Upgrades to WS via `web_sys::WebSocket::new(&format!("{relay}/socket.io/?EIO=4&transport=websocket&sid={sid}"))`.
+3. Handles the Engine.IO ping/upgrade dance (`2probe` → `3probe` → `5` Upgrade) on the new WS, again via the vendored codec.
+4. Once upgraded, exposes `emit(event, payload)` / `on(event, cb)` over the WS — the Socket.IO `EVENT` packet shape inside Engine.IO `message` (`4`) frames.
+
+For native (in `transport_native.rs`, NOT in the POC but landing in H-4): same flow with `reqwest` + `tokio-tungstenite` instead of `worker::Fetch` + `web_sys::WebSocket`. Same codec.
 
 ### Five gates — verification path per gate
 
@@ -275,11 +317,12 @@ OQ1, OQ2, OQ5 obsoleted by §2.5b. OQ3, OQ4, OQ7, OQ8 resolved per §11
 3. **`docs/HANDOFF-PHASE-G-5.md`** — POC-step handoff structure precedent (Phase G's handoff into its merge-gate step; mirror the cadence).
 4. **`~/bsv/message-box-client/src/MessageBoxClient.ts:332`** — canonical TS path; `AuthSocketClient` construction.
 5. **`~/bsv/authsocket-client/src/SocketClientTransport.ts:17-28`** — the TS `SocketClientTransport` reference impl whose Rust analog is `SocketIoTransport`.
-6. **`~/bsv/bsv-messagebox-cloudflare-public/src/engineio/auth.rs:1-72`** — server-side BRC-103-over-Socket.IO state machine.
-7. **`~/bsv/bsv-messagebox-cloudflare-public/src/lib.rs:97-98`** — server route registration for `/socket.io/*`.
-8. **`~/bsv/bsv-rs/src/auth/transports/http.rs:29-41`** — `Transport` trait literal.
-9. **`~/bsv/bsv-rs/src/auth/peer.rs:127-149`** — `Peer::new` + `PeerOptions`.
-10. **`crates/bsv-mpc-messagebox/src/auth.rs:100-115`** — existing native `Peer` construction site.
+6. **`~/bsv/bsv-messagebox-cloudflare-public/src/engineio/codec.rs`** (613 LOC, MIT) — **the Engine.IO v4 + Socket.IO v5 packet codec we vendor verbatim**. Direction-agnostic; encodes + decodes both client- and server-bound packets. Byte-identical to `~/bsv/rust-message-box/src/engineio/codec.rs`. The foundation of Plan A pure-Rust+WASM per audit §11.2 revised.
+7. **`~/bsv/bsv-messagebox-cloudflare-public/src/engineio/auth.rs:1-72`** — server-side BRC-103-over-Socket.IO state machine (the wire-side counterpart to our `SocketIoTransport`).
+8. **`~/bsv/bsv-messagebox-cloudflare-public/src/lib.rs:97-98`** — server route registration for `/socket.io/*`.
+9. **`~/bsv/bsv-rs/src/auth/transports/http.rs:29-41`** — `Transport` trait literal.
+10. **`~/bsv/bsv-rs/src/auth/peer.rs:127-149`** — `Peer::new` + `PeerOptions`.
+11. **`crates/bsv-mpc-messagebox/src/auth.rs:100-115`** — existing native `Peer` construction site.
 
 ## What I am NOT doing in this handoff
 

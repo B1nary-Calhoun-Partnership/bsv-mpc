@@ -6,12 +6,16 @@
 > a `file:line` citation; if a claim is unsupported, it's flagged with
 > "needs verification" inline.
 >
-> **Status:** draft 1 → **patched 2026-05-19**: §2.5 superseded by §2.5b
-> after a follow-up investigation found the server protocol exposes
-> Socket.IO + BRC-103 alongside the raw-WS path. The wasm32 client uses
-> Socket.IO + BRC-103 (the browser-compatible canonical path), not the
-> three raw-WS workarounds originally proposed. Server is unchanged.
-> See §2.5 banner for the redirect.
+> **Status:** draft 1 → **patched 2026-05-19** (twice same-day):
+>   1. §2.5 superseded by §2.5b — server exposes Socket.IO + BRC-103
+>      alongside raw-WS; the wasm32 client uses Socket.IO + BRC-103,
+>      not the three raw-WS workarounds. Server is unchanged.
+>   2. §11.2 revised — pure Rust+WASM Plan A leverages the existing
+>      Calhoun-owned `engineio/codec.rs` (613 LOC, MIT, byte-identical
+>      in both Rust servers); JS-bundle of `socket.io-client@4.x` is
+>      Plan B fallback only; `rust-socketio` wasm32 upstream PR is a
+>      post-merge ecosystem follow-up, not on the Phase H critical
+>      path.
 
 ## TL;DR
 
@@ -828,46 +832,99 @@ connection multiplexing N rooms via `joinRoom`). No tradeoff worth
 making against multi-tenant — its only benefit is shared memory,
 which is irrelevant on CF DOs.
 
-### 11.2 OQ7 — Socket.IO substrate: unify on `rust-socketio` + upstream `SocketIoTransport` to `bsv-rs`
+### 11.2 OQ7 — Socket.IO substrate: pure Rust+WASM, leverage existing Calhoun-owned codec — **revised 2026-05-19**
 
-**Resolved**: single Rust implementation across both targets, with
-upstream contributions wherever possible. Concretely:
+> **Correction over the draft 1 §11.2.** The original ranking led with
+> `rust-socketio` (an external crate that turned out not to support
+> wasm32) and listed "bundle the canonical JS `socket.io-client@4.x`"
+> as a fall-back. User has clarified that the project goal is **pure
+> Rust + WASM end-to-end**; JS bundling is Plan B only. This nuances
+> OQ7 substantially. Below supersedes the original §11.2.
 
-1. **`SocketIo` trait inside `bsv-mpc-messagebox`** — minimal abstraction:
-   `connect`, `emit(event, payload)`, `on(event, callback)`, `disconnect`.
-   ~50 LOC.
+**Empirical finding (Phase H pre-scaffold prep, 2026-05-19)**:
+`bsv-messagebox-cloudflare-public/src/engineio/codec.rs` (and the
+byte-identical copy in `rust-message-box/src/engineio/codec.rs`, both
+on the Calhoun-controlled `Calhooon/bsv-messagebox-cloudflare`
+upstream) contains a **complete, direction-agnostic Engine.IO v4 +
+Socket.IO v5 packet codec in pure Rust** — 613 LOC, depends only on
+`serde_json` + Rust std, wasm32-compatible by construction, MIT
+licensed (© Calhooon Contributors). This codec encodes + decodes both
+server-bound AND client-bound packets identically; nothing in it is
+server-only. We can vendor + extend for a client crate without
+touching the existing servers.
 
-2. **Native impl**: adapt `rust-socketio` (mature, in-prod crate)
-   behind the trait. H-3 POC verifies it works at our scale.
+**Plan A (pure Rust+WASM), in order of preference**:
 
-3. **wasm32 impl**: prefer the same `rust-socketio` if it supports
-   `wasm32-unknown-unknown`. Empirical check is part of H-3.
-   - If supported: single Rust impl for both targets. **Ideal shape.**
-   - If not: two god-tier paths in order of preference:
-     - **(a)** Contribute wasm32 support to `rust-socketio` upstream
-       — ecosystem-level fix; pays back across the whole Rust BSV
-       ecosystem; matches [[feedback-god-tier-full-stack]] "fix the
-       ecosystem, not just our crate."
-     - **(b)** Bundle the canonical JS `socket.io-client@4.x` via
-       `wasm-bindgen` + `js-sys` (~50-100 LOC FFI) as a fallback.
-       Acceptable if upstreaming wasm32 to `rust-socketio` blows the
-       Phase H timeline.
+1. **A1: Vendor + extend the existing Calhoun codec.** Pull
+   `engineio/codec.rs` into our new client crate (with attribution
+   header citing the Calhooon source) and build a minimal Engine.IO
+   + Socket.IO CLIENT on top:
+   - **HTTP polling** (Engine.IO `transport=polling` handshake phase):
+     `worker::Fetch` on both targets — the `worker` crate's outbound
+     fetch works inside CF Workers + DOs, and on native the proxy
+     consumer can use `reqwest`.
+   - **WS upgrade** (Engine.IO `transport=websocket` post-handshake):
+     `web_sys::WebSocket` on wasm32 (Phase H POC H-3.2 verifies this
+     works inside CF DO scope — that's the load-bearing empirical
+     question); `tokio-tungstenite` on native.
+   - **State machine**: CONNECTING → CONNECTED → UPGRADING →
+     UPGRADED → CLOSED. ~100 LOC.
+   - **Socket.IO event layer**: `emit(name, json)` /
+     `on(name, callback)` over the codec. ~100 LOC.
+   - **SocketIoTransport** (this is the BRC-103 layer): impl of
+     `bsv_rs::auth::Transport`, wraps `emit('authMessage', ...)` /
+     `on('authMessage', ...)`. ~150 LOC.
+   - **Total**: ~1000 LOC including the vendored codec.
+   - **Maintenance**: low. Engine.IO + Socket.IO protocols are
+     stable; the codec doesn't churn.
 
-4. **`SocketIoTransport`** — Rust impl of `bsv_rs::auth::Transport`
-   over the `SocketIo` trait, dispatching BRC-103 `AuthMessage` frames
-   on `socket.emit('authMessage', ...)` + `socket.on('authMessage', ...)`.
-   Rust analog of the TS `@bsv/authsocket-client::SocketClientTransport`
-   pattern. **Contribute upstream to `bsv-rs`** at
-   `~/bsv/bsv-rs/src/auth/transports/` so the broader Rust BSV
-   ecosystem gets the canonical Socket.IO + BRC-103 client. The new
-   transport lives alongside the existing `SimplifiedFetchTransport`
-   (HTTP per-request signing) and `WebSocketTransport` (raw WS +
-   BRC-103 frame-by-frame).
+2. **A2: Contribute wasm32 support to `rust-socketio` upstream.**
+   Larger ecosystem contribution; replaces `reqwest+blocking+native-tls`,
+   `tokio-tungstenite`, `native-tls` with wasm32-compatible alternates
+   inside the external crate. ~500-1000 LOC substrate rewrite + wait
+   for upstream review. **Defer to Phase H post-merge** as an
+   ecosystem follow-up (track in STATUS.md "upstream contributions").
+   Doing this would *also* benefit the broader Rust BSV ecosystem, but
+   it's NOT on the Phase H critical path because A1 already gives us
+   pure Rust+WASM via Calhoun-owned code.
 
-5. **Optional follow-up (out of Phase H scope)**: publish a thin
-   `bsv-authsocket-rs` Rust crate wrapping the upstream
-   `SocketIoTransport` + `Peer`. Rust analog of TS
-   `@bsv/authsocket-client`. Tracked but not gating Phase H.
+**Plan B (fallback only — invoke if A1 hits an unforeseen blocker)**:
+bundle the canonical JS `socket.io-client@4.x` via `wasm-bindgen` +
+`js-sys` (~50-100 LOC FFI). Only if `web_sys::WebSocket` turns out
+unusable inside CF DO scope and we can't get to ground on a pure-Rust
+WS substrate. Acceptable as a last resort; suboptimal because it
+violates the "pure Rust+WASM" project goal.
+
+**`SocketIo` trait** (inside `bsv-mpc-messagebox`) — minimal
+abstraction: `connect(url)`, `emit(event, payload)`,
+`on(event, callback)`, `disconnect`. ~50 LOC. Native impl uses the
+vendored codec + `reqwest` + `tokio-tungstenite`; wasm32 impl uses
+the vendored codec + `worker::Fetch` + `web_sys::WebSocket`. Same
+codec on both targets.
+
+**`SocketIoTransport`** — Rust impl of `bsv_rs::auth::Transport` over
+the `SocketIo` trait, dispatching BRC-103 `AuthMessage` frames on
+`emit('authMessage', ...)` + `on('authMessage', ...)`. Rust analog of
+TS `@bsv/authsocket-client::SocketClientTransport`. **Contribute
+upstream to `bsv-rs`** at `~/bsv/bsv-rs/src/auth/transports/`
+alongside the existing `SimplifiedFetchTransport` (HTTP per-request)
+and `WebSocketTransport` (raw WS frame-by-frame). bsv-rs is
+Calhoun-controlled (`Calhooon/bsv-rs`); upstream PR is trivial.
+
+**Ecosystem follow-ups (out of Phase H critical path but tracked)**:
+
+- **Extract codec into a shared crate** (`bsv-engineio-rs`?). Currently
+  duplicated byte-for-byte in `bsv-messagebox-cloudflare-public` and
+  `rust-message-box`. A shared crate would (a) eliminate the
+  code-clone in the two servers, (b) be the canonical Rust Engine.IO +
+  Socket.IO codec for the BSV ecosystem, (c) let our new client
+  depend on it instead of vendoring. Coordination work; Phase H
+  post-merge.
+- **Publish a `bsv-authsocket-rs` crate** wrapping the upstream
+  `SocketIoTransport` + `Peer`. Rust analog of TS
+  `@bsv/authsocket-client`. Phase H post-merge.
+- **A2 (wasm32 to `rust-socketio`)**: still worth doing as an
+  ecosystem contribution after Phase H closes. Tracked in STATUS.md.
 
 ### 11.3 OQ8 — Native unification: pulled INTO Phase H scope
 
@@ -901,11 +958,15 @@ Not a post-merge cleanup. Reasoning:
 
 | Sub-goal | Status | Owner |
 |---|---|---|
-| `SocketIo` trait + `SocketIoTransport` (BRC-103) | new in Phase H | bsv-mpc-messagebox + upstream PR to bsv-rs |
-| `rust-socketio` wasm32 support | new in Phase H if missing upstream | upstream PR to `rust-socketio` (if needed) OR JS-bundle fallback |
+| **Vendor + extend Calhoun Engine.IO + Socket.IO codec** (per §11.2 revised) | new in Phase H | `bsv-mpc-messagebox` — `engineio/codec.rs` ported from `bsv-messagebox-cloudflare-public/src/engineio/codec.rs` with attribution |
+| Minimal pure-Rust Engine.IO + Socket.IO **client** on top of the vendored codec | new in Phase H | `bsv-mpc-messagebox::socketio_client` (~300 LOC over the codec) |
+| `SocketIo` trait + `SocketIoTransport` (BRC-103) | new in Phase H | `bsv-mpc-messagebox` + upstream PR to `bsv-rs` |
 | `bsv-mpc-messagebox` cfg-gate (§2.1-§2.4) | new in Phase H | `ws_native.rs` + `transport_wasm.rs` split |
 | **Native client migrated to Socket.IO + BRC-103** | new in Phase H per §11.3 | `bsv-mpc-messagebox` |
 | `bsv-mpc-worker` (CF Worker) embedding the wasm32 client + DO | Phase I scope (unchanged) | — |
+
+Removed from the new Phase H scope (vs draft 1 §11.4):
+- `rust-socketio` wasm32 support — Plan A is the vendored codec; rust-socketio wasm32 PR remains an ecosystem follow-up post-Phase-H, not on the critical path.
 
 Removed from Phase H scope:
 - The old §2.5 BRC-31 workarounds (a/b/c). MOOT per §2.5b.
@@ -938,13 +999,17 @@ Supersedes the §7 checklist where it diverges:
       from BOTH native and wasm32. Proves Phase K's transport
       precondition without requiring the joint ceremony.
 
-**Upstream contributions** (§11.5 new):
+**Upstream contributions** (§11.5 new, **revised per §11.2 patch**):
 - [ ] `SocketIoTransport` filed upstream as a PR to `bsv-rs`
       (`~/bsv/bsv-rs/src/auth/transports/`). PR open and either merged
-      or assigned for review before Phase H merges.
-- [ ] If `rust-socketio` lacked wasm32 support: corresponding PR
-      filed upstream + green CI on the PR branch + we depend on the
-      branch (or merged version) in Phase H.
+      or assigned for review before Phase H merges. bsv-rs is
+      Calhoun-controlled — trivial coordination.
+- [ ] **NOT a Phase H gate** but tracked in STATUS.md follow-ups:
+      shared `bsv-engineio-rs` crate extraction (currently duplicated
+      byte-for-byte in `bsv-messagebox-cloudflare-public` and
+      `rust-message-box`); wasm32 PR to `rust-socketio` (ecosystem
+      contribution, not needed for Phase H since A1 vendor-codec path
+      gives pure Rust+WASM); `bsv-authsocket-rs` crate publication.
 
 **Doc + tracker** (§7.5) — extended:
 - [ ] `docs/PHASE-H-AUDIT.md` §7 + §11 checkboxes ticked in merge-gate commit.
@@ -963,9 +1028,11 @@ BRC-103 client.
 
 ---
 
-**Last updated:** 2026-05-19 (patched same-day with §2.5b after
-follow-up investigation; expanded same-day with §11 after god-tier
-review on OQ4/OQ7/OQ8). Pending user review before POC step (H-3)
-begins. OQ3 confirmed; OQ1/OQ2/OQ5 obsolete; **OQ4/OQ7/OQ8 resolved
-per §11**; OQ6 is the only remaining trivial choice (POC location —
-recommend in-repo, dev CF account, no production data).
+**Last updated:** 2026-05-19 (three same-day patches on top of draft 1):
+§2.5b (Socket.IO + BRC-103 substrate); §11 (god-tier scope expansion
+on OQ4/OQ7/OQ8 — pull native unification into scope); §11.2 revised
+(pure Rust+WASM Plan A via vendored codec; JS bundle is Plan B
+fallback only — user-corrected). POC step (H-3) ready to begin.
+OQ3 confirmed; OQ1/OQ2/OQ5 obsolete; **OQ4/OQ7/OQ8 resolved per §11
++ §11.2 revised**; OQ6 is the only remaining trivial choice (POC
+location — recommend in-repo, dev CF account, no production data).

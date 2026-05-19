@@ -123,10 +123,11 @@ All phases independently shippable + gated. Each commits to `main` only after it
 
 **Step 3 (POC)** — `poc/poc17-cf-outbound-ws/`: minimum deployable CF Worker that proves the Socket.IO + BRC-103 substrate works end-to-end. Five gates per §6.2 (rewritten in §2.5b context): (a) wasm32 build clean, (b) Socket.IO handshake from DO via chosen substrate (rust-socketio if it supports wasm32, else bundled JS `socket.io-client@4.x`), (c) BRC-103 mutual auth completes over `authMessage` event, (d) canonical CBOR envelope round-trips byte-exact through the live Calhoun relay, (e) forced-hibernation reconnect green.
 
-**Step 4 (implement)** — Cfg-gate inside existing `bsv-mpc-messagebox` crate:
-  - New `SocketIo` trait + `SocketIoTransport` (Rust impl of `bsv_rs::auth::Transport` over Socket.IO `authMessage` event). **Contributed upstream to `bsv-rs` at `src/auth/transports/`** so the broader Rust BSV ecosystem gets a canonical-TS-conformant client.
-  - Native impl over `rust-socketio` (mature crate); wasm32 impl over the same crate if it supports wasm32, else JS `socket.io-client@4.x` via wasm-bindgen.
-  - **If `rust-socketio` lacks wasm32 support:** contribute it upstream OR fall back to JS bundle. Decision in H-3.
+**Step 4 (implement)** — Cfg-gate inside existing `bsv-mpc-messagebox` crate. **Substrate per audit §11.2 revised — pure Rust+WASM, NO JS dep**:
+  - **Vendor** `engineio/codec.rs` (613 LOC, MIT, © Calhooon Contributors) from `~/bsv/bsv-messagebox-cloudflare-public/src/engineio/codec.rs` (byte-identical to `~/bsv/rust-message-box/src/engineio/codec.rs`) into `crates/bsv-mpc-messagebox/src/engineio_codec.rs` with attribution. Direction-agnostic Engine.IO v4 + Socket.IO v5 packet codec. wasm32-compatible by construction.
+  - **Build minimal Rust client** on top of the vendored codec (`socketio_client.rs`, ~300 LOC): state machine (CONNECTING → CONNECTED → UPGRADING → UPGRADED), event `emit`/`on` API, heartbeat. cfg-gated transport substrate: `worker::Fetch` + `web_sys::WebSocket` on wasm32; `reqwest` + `tokio-tungstenite` on native. Same codec on both targets.
+  - **`SocketIo` trait + `SocketIoTransport`** — Rust impl of `bsv_rs::auth::Transport` over Socket.IO `authMessage` event (Rust analog of TS `@bsv/authsocket-client::SocketClientTransport`). **Contributed upstream to `bsv-rs`** at `src/auth/transports/`. bsv-rs is Calhoun-controlled — trivial coordination.
+  - **JS bundle of `socket.io-client@4.x` is Plan B fallback only** — invoke only if `web_sys::WebSocket` doesn't work inside CF DO scope and a pure-Rust WS substrate proves unreachable.
   - **Native client migrated to Socket.IO + BRC-103** per §11.3 — replaces the existing raw-WS + 7-BRC-31-headers path with the canonical wire. Path A: implementation conforms to TS, never inverse.
   - `crates/bsv-mpc-messagebox/src/ws.rs` split into `ws_native.rs` + `transport_wasm.rs` behind `#[cfg(target_arch = "wasm32")]`; new `transport.rs` exposing the unified API to consumers.
 
@@ -135,7 +136,7 @@ All phases independently shippable + gated. Each commits to `main` only after it
   - **wasm32 deployed-Worker forced-hibernation round-trip** — canonical envelope byte-exact, BRC-103-authed.
   - **Cross-stack readiness probe** — canonical envelope round-trips byte-exact against Binary's TS `message-box-server` from BOTH targets. Proves Phase K's transport precondition.
   - **Upstream `SocketIoTransport` PR open or merged** on `bsv-rs`.
-  - **Upstream `rust-socketio` wasm32 PR** (if needed) open or merged.
+  - **NOT a Phase H gate** but tracked in STATUS.md follow-ups: shared `bsv-engineio-rs` crate extraction; wasm32 PR to `rust-socketio` (ecosystem follow-up); `bsv-authsocket-rs` crate publication.
 
 ---
 

@@ -65,8 +65,16 @@ port. See [LESSONS.md](LESSONS.md) for the full technical writeup.
 
 ## Upstream contributions due in Phase H
 
-| Target repo | What | Why |
+Per audit §11.2 **revised** (pure Rust+WASM, leverage existing Calhoun-owned `engineio/codec.rs`; JS bundle is Plan B fallback only):
+
+| Target repo | What | When |
 |---|---|---|
-| `bsv-rs` (`~/bsv/bsv-rs/src/auth/transports/`) | new `SocketIoTransport` Rust impl of `bsv_rs::auth::Transport` over Socket.IO `authMessage` event | Rust analog of TS `@bsv/authsocket-client::SocketClientTransport`; canonical-TS-conformant BRC-103 client available to the whole Rust BSV ecosystem |
-| `rust-socketio` upstream (if needed) | wasm32-unknown-unknown target support | If `rust-socketio` doesn't already support wasm32, contribute it so the Rust ecosystem can use one Socket.IO impl across native + wasm32 |
-| (optional, post-Phase-H) | publish `bsv-authsocket-rs` crate | Rust analog of TS `@bsv/authsocket-client`, wrapping upstream `SocketIoTransport` + `Peer` |
+| `bsv-rs` (`~/bsv/bsv-rs/src/auth/transports/`) | new `SocketIoTransport` Rust impl of `bsv_rs::auth::Transport` over Socket.IO `authMessage` event — Rust analog of TS `@bsv/authsocket-client::SocketClientTransport` | **Phase H gate** (PR open/merged before merge-gate commit) |
+
+## Ecosystem follow-ups (NOT Phase H gates — tracked here for visibility)
+
+| Target | What | Why |
+|---|---|---|
+| New crate `bsv-engineio-rs` (or co-located) | Extract `engineio/codec.rs` from `bsv-messagebox-cloudflare-public` + `rust-message-box` into a shared crate; refactor both servers + our new client to depend on it | Currently the codec is duplicated byte-for-byte across both Rust servers. Shared crate = DRY + canonical Rust impl of Engine.IO v4 + Socket.IO v5 wire for the BSV ecosystem. Coordination work; post-Phase-H. |
+| `rust-socketio` upstream (`1c3t3a/rust-socketio`) | wasm32-unknown-unknown target support | Plan A1 (vendor codec) gives pure Rust+WASM without needing `rust-socketio` at all, so this is no longer Phase H gating. Still worth doing as a broader-ecosystem contribution — replaces `reqwest+blocking+native-tls`, `tokio-tungstenite`, `native-tls` with wasm32-compatible alternates inside the external crate. Post-Phase-H. |
+| New crate `bsv-authsocket-rs` | Rust analog of TS `@bsv/authsocket-client` — wraps upstream `SocketIoTransport` + `Peer` for the broader BSV ecosystem | Post-Phase-H crate publication, depends on the bsv-rs upstream PR landing first. |
