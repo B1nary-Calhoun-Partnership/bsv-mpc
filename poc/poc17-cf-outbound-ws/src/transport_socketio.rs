@@ -57,6 +57,8 @@ use std::sync::{Arc, Mutex as StdMutex};
 use async_trait::async_trait;
 use bsv::auth::transports::{Transport, TransportCallback};
 use bsv::auth::types::AuthMessage;
+use bsv::primitives::PublicKey;
+use bsv::wallet::WalletInterface;
 use bsv::{Error, Result};
 use serde_json::Value;
 
@@ -281,4 +283,217 @@ pub async fn run_dispatch(
     _snoop: Option<futures::channel::oneshot::Sender<bsv::primitives::PublicKey>>,
 ) {
     // wasm32-only — see #[cfg(target_arch = "wasm32")] mod dispatch.
+}
+
+// ============================================================================
+// Application-event envelope layer (H-3.4)
+// ============================================================================
+
+/// One application-level event decoded from a post-BRC-103-handshake
+/// `MessageType::General` AuthMessage's payload. The payload shape is the
+/// canonical `{eventName, data}` JSON envelope used by
+/// `~/bsv/authsocket-client/src/AuthSocketClient.ts:82-84`
+/// (`encodeEventPayload`) on the wire — byte-identical between the TS
+/// canonical and this Rust client. Server-side suffixes
+/// `sendMessage`/`sendMessageAck` event names with `-${roomId}` (see
+/// `~/bsv/bsv-messagebox-cloudflare-public/src/engineio/session.rs:1574-1580`)
+/// so receivers can route by event_name alone without re-parsing data.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AppEvent {
+    /// The signing identity from the inbound General's `identity_key`
+    /// field. For server-emitted application events this is always the
+    /// server's identity key; left typed as `PublicKey` so the same shape
+    /// generalizes to peer-to-peer events (Phase I cosigner gossip).
+    pub sender: PublicKey,
+    /// The `eventName` field from the payload JSON. Examples emitted by
+    /// the live Calhoun relay: `"sendMessage-<roomId>"`,
+    /// `"sendMessageAck-<roomId>"`, `"authenticated"`. Empty string when
+    /// the payload was missing the field (still surfaces so callers can
+    /// observe malformed traffic instead of silently dropping).
+    pub event_name: String,
+    /// The `data` field from the payload JSON. Type varies by event:
+    /// `joinRoom` carries a string roomId, `sendMessage`/`sendMessageAck`
+    /// carry a `{roomId, message: {...}}` object, `authenticated` carries
+    /// `{}` (per session.rs:1080-1095). Left as `serde_json::Value` so
+    /// callers parse the per-event shape themselves.
+    pub data: Value,
+}
+
+/// Install an inbound listener that decodes every post-BRC-103 General
+/// message payload as the canonical `{eventName, data}` envelope (matching
+/// `~/bsv/authsocket-client/src/AuthSocketClient.ts:82-84`) and forwards
+/// it on an unbounded `mpsc` channel. The returned `Receiver` is the
+/// caller's queue of inbound application events; the `u32` is the
+/// `Peer::listen_for_general_messages` callback id (pass it to
+/// `Peer::stop_listening_for_general_messages` on teardown if needed).
+///
+/// Why `Peer::listen_for_general_messages` is safe here even though
+/// `Peer::initiate_handshake` is not: the callback registration touches
+/// only `tokio::sync::RwLock<HashMap<...>>` which is runtime-agnostic
+/// (per tokio docs: `tokio::sync::*` works on any executor — verified
+/// empirically in H-3.3b where `Peer::start()` already uses the same
+/// `RwLock`s without panic). The wasm32 blocker is specifically
+/// `tokio::time::timeout` at `~/bsv/bsv-rs/src/auth/peer.rs:681`, which
+/// this path never reaches.
+pub async fn install_app_event_listener<W, T>(
+    peer: &bsv::auth::Peer<W, T>,
+) -> (futures::channel::mpsc::UnboundedReceiver<AppEvent>, u32)
+where
+    W: WalletInterface + 'static,
+    T: Transport + 'static,
+{
+    let (tx, rx) = futures::channel::mpsc::unbounded::<AppEvent>();
+    let id = peer
+        .listen_for_general_messages(move |sender, payload| {
+            let tx = tx.clone();
+            Box::pin(async move {
+                // Decode the canonical `{eventName, data}` envelope.
+                // Malformed payloads are dropped (event_name="") rather
+                // than erroring — the inbound path is best-effort by
+                // design (the server's signature has already been
+                // verified by `Peer::process_general_message`
+                // upstream of this callback at
+                // `~/bsv/bsv-rs/src/auth/peer.rs:944`, so any
+                // payload-decode failure is a non-malicious wire bug).
+                let envelope = parse_app_event_payload(&payload);
+                let _ = tx.unbounded_send(AppEvent {
+                    sender,
+                    event_name: envelope.0,
+                    data: envelope.1,
+                });
+                Ok(())
+            })
+        })
+        .await;
+    (rx, id)
+}
+
+/// Parse a `{eventName, data}` JSON envelope from a General message's
+/// `payload` bytes. Returns `("", Value::Null)` on parse failure so
+/// callers can observe malformed traffic without panicking.
+///
+/// Exposed for unit testing (see the `tests` module below) — the
+/// inbound listener uses this helper directly.
+fn parse_app_event_payload(payload: &[u8]) -> (String, Value) {
+    match serde_json::from_slice::<Value>(payload) {
+        Ok(json) => {
+            let event_name = json
+                .get("eventName")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let data = json.get("data").cloned().unwrap_or(Value::Null);
+            (event_name, data)
+        }
+        Err(_) => (String::new(), Value::Null),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    // Unit tests for parse_app_event_payload — the canonical envelope
+    // decoder. Wire-shape pinned against the TS encoding at
+    // `~/bsv/authsocket-client/src/AuthSocketClient.ts:82-84`:
+    //   private encodeEventPayload(eventName: string, data: any): number[] {
+    //       const obj = { eventName, data }
+    //       return Utils.toArray(JSON.stringify(obj), 'utf8')
+    //   }
+    // So the wire is `Utils.toArray(JSON.stringify({eventName, data}))` —
+    // i.e. UTF-8 bytes of a JSON object with exactly those two top-level
+    // keys. We assert byte-exact decode against literal vectors.
+
+    #[test]
+    fn parse_app_event_decodes_joinroom_envelope() {
+        // Canonical joinRoom payload — TS emits `{eventName: "joinRoom",
+        // data: roomId}` where roomId is a plain string.
+        let payload = br#"{"eventName":"joinRoom","data":"02abc...xyz-payment_inbox"}"#;
+        let (event_name, data) = parse_app_event_payload(payload);
+        assert_eq!(event_name, "joinRoom");
+        assert_eq!(data, json!("02abc...xyz-payment_inbox"));
+    }
+
+    #[test]
+    fn parse_app_event_decodes_sendmessage_envelope() {
+        // Canonical sendMessage payload — TS emits
+        // `{eventName: "sendMessage", data: {roomId, message: {...}}}`.
+        let payload = br#"{"eventName":"sendMessage","data":{"roomId":"02abc-test","message":{"messageId":"h34","body":"hello"}}}"#;
+        let (event_name, data) = parse_app_event_payload(payload);
+        assert_eq!(event_name, "sendMessage");
+        assert_eq!(
+            data,
+            json!({"roomId":"02abc-test","message":{"messageId":"h34","body":"hello"}})
+        );
+    }
+
+    #[test]
+    fn parse_app_event_decodes_sendmessageack_with_room_suffix() {
+        // Inbound sendMessageAck event name has `-{roomId}` server-side
+        // suffix per `~/bsv/bsv-messagebox-cloudflare-public/src/engineio/session.rs:1574-1580`.
+        let payload = br#"{"eventName":"sendMessageAck-02abc-h34-test","data":{"status":"success","messageId":"h34"}}"#;
+        let (event_name, data) = parse_app_event_payload(payload);
+        assert_eq!(event_name, "sendMessageAck-02abc-h34-test");
+        assert_eq!(data["status"], json!("success"));
+        assert_eq!(data["messageId"], json!("h34"));
+    }
+
+    #[test]
+    fn parse_app_event_handles_empty_data() {
+        // The post-auth `authenticated` event carries `data: {}` per
+        // `~/bsv/bsv-messagebox-cloudflare-public/src/engineio/session.rs:1080-1095`.
+        let payload = br#"{"eventName":"authenticated","data":{}}"#;
+        let (event_name, data) = parse_app_event_payload(payload);
+        assert_eq!(event_name, "authenticated");
+        assert_eq!(data, json!({}));
+    }
+
+    #[test]
+    fn parse_app_event_returns_empty_on_malformed_json() {
+        // Non-JSON payload — server shouldn't emit this, but we don't
+        // panic either. Empty event_name signals the inbound observer
+        // that the envelope was unparseable.
+        let payload = b"this is not json";
+        let (event_name, data) = parse_app_event_payload(payload);
+        assert_eq!(event_name, "");
+        assert_eq!(data, Value::Null);
+    }
+
+    #[test]
+    fn parse_app_event_returns_empty_on_missing_fields() {
+        // Well-formed JSON but missing both expected fields.
+        let payload = br#"{"foo":"bar"}"#;
+        let (event_name, data) = parse_app_event_payload(payload);
+        assert_eq!(event_name, "");
+        assert_eq!(data, Value::Null);
+    }
+
+    #[test]
+    fn parse_app_event_handles_event_name_only() {
+        // `eventName` present, `data` missing — surface event_name and
+        // null data rather than dropping the entire envelope.
+        let payload = br#"{"eventName":"someEvent"}"#;
+        let (event_name, data) = parse_app_event_payload(payload);
+        assert_eq!(event_name, "someEvent");
+        assert_eq!(data, Value::Null);
+    }
+
+    #[test]
+    fn parse_app_event_byte_exact_against_ts_emit_vector() {
+        // Vector test: this is the EXACT byte sequence the TS canonical
+        // client at `~/bsv/authsocket-client/src/AuthSocketClient.ts:82-84`
+        // produces for emit("sendMessage", {roomId: "abc-test", message:
+        // {messageId: "v1", body: "hi"}}) — verified by reading
+        // `Utils.toArray(JSON.stringify({eventName, data}), 'utf8')`
+        // which is just UTF-8 bytes of `JSON.stringify(...)`. JS
+        // JSON.stringify produces no whitespace and preserves insertion
+        // order of object literals; our parser matches.
+        let canonical_ts_bytes: &[u8] = b"{\"eventName\":\"sendMessage\",\"data\":{\"roomId\":\"abc-test\",\"message\":{\"messageId\":\"v1\",\"body\":\"hi\"}}}";
+        let (event_name, data) = parse_app_event_payload(canonical_ts_bytes);
+        assert_eq!(event_name, "sendMessage");
+        assert_eq!(data["roomId"], json!("abc-test"));
+        assert_eq!(data["message"]["messageId"], json!("v1"));
+        assert_eq!(data["message"]["body"], json!("hi"));
+    }
 }
