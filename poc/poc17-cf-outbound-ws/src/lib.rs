@@ -40,27 +40,48 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         .get("/health", |_req, _ctx| {
             Response::ok("poc17-cf-outbound-ws — Phase H POC. See README.md for gates.\n")
         })
-        // H-3.2a gate: drive the Engine.IO polling handshake against the
-        // live relay and return the parsed Open packet payload as JSON.
+        // H-3.2 gate: drive the full Engine.IO 4 client handshake
+        // against the live relay — polling phase (H-3.2a) followed by
+        // the WS upgrade dance (H-3.2b). Returns parsed Open payload +
+        // upgrade-result JSON.
         .get_async("/open", |_req, ctx| async move {
             let relay = ctx
                 .env
                 .var("RELAY_URL")
                 .map(|v| v.to_string())
                 .unwrap_or_else(|_| DEFAULT_RELAY.to_string());
-            match transport_wasm::polling_handshake(&relay).await {
-                Ok(handshake) => Response::from_json(&serde_json::json!({
-                    "socketio_status": "engineio_open_received",
-                    "relay": relay,
-                    "sid": handshake.sid,
-                    "upgrades": handshake.upgrades,
-                    "pingInterval": handshake.ping_interval,
-                    "pingTimeout": handshake.ping_timeout,
-                    "maxPayload": handshake.max_payload,
-                    "gate": "H-3.2a",
-                })),
-                Err(e) => Response::error(format!("handshake failed: {e}"), 502),
-            }
+
+            // H-3.2a: polling handshake.
+            let handshake = match transport_wasm::polling_handshake(&relay).await {
+                Ok(h) => h,
+                Err(e) => return Response::error(format!("polling handshake failed: {e}"), 502),
+            };
+
+            // H-3.2b: WS upgrade via web_sys::WebSocket. Returns once
+            // the `5` Upgrade packet has been sent after a successful
+            // probe/pong exchange.
+            let upgrade = match transport_wasm::upgrade_to_websocket(&relay, &handshake.sid).await {
+                Ok(u) => u,
+                Err(e) => {
+                    return Response::error(
+                        format!("ws upgrade failed (sid={}): {e}", handshake.sid),
+                        502,
+                    )
+                }
+            };
+
+            Response::from_json(&serde_json::json!({
+                "socketio_status": "ws_upgraded",
+                "relay": relay,
+                "sid": handshake.sid,
+                "upgrades": handshake.upgrades,
+                "pingInterval": handshake.ping_interval,
+                "pingTimeout": handshake.ping_timeout,
+                "maxPayload": handshake.max_payload,
+                "ws_url": upgrade.ws_url,
+                "probe_round_trip_ms": upgrade.probe_round_trip_ms,
+                "gate": "H-3.2 (H-3.2a polling + H-3.2b ws-upgrade)",
+            }))
         })
         .run(req, env)
         .await
