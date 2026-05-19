@@ -6,21 +6,30 @@
 > a `file:line` citation; if a claim is unsupported, it's flagged with
 > "needs verification" inline.
 >
-> **Status:** draft 1 — pending user review before POC step (H-3) begins.
+> **Status:** draft 1 → **patched 2026-05-19**: §2.5 superseded by §2.5b
+> after a follow-up investigation found the server protocol exposes
+> Socket.IO + BRC-103 alongside the raw-WS path. The wasm32 client uses
+> Socket.IO + BRC-103 (the browser-compatible canonical path), not the
+> three raw-WS workarounds originally proposed. Server is unchanged.
+> See §2.5 banner for the redirect.
 
 ## TL;DR
 
 Three interlocking design decisions for Phase H:
 
-1. **Substrate: `web_sys::WebSocket` via `wasm-bindgen`.** No outbound-WS
-   API in `workers-rs` 0.7 or 0.8; CF Workers' JS-runtime
-   `fetch(url, { Upgrade: 'websocket' })` is not yet exposed in the
-   Rust SDK. `web_sys::WebSocket` works in browser-targeted wasm32 by
-   construction; whether the CF Worker / DO runtime exposes
-   `globalThis.WebSocket` to the WASM module is the load-bearing
-   empirical question the Phase H POC will burn. Fall-back if it
-   doesn't: a paired JS sidecar Worker bridging via JSON frame relay
-   (~300-500 LOC TS, well-scoped escape hatch).
+1. **Substrate: Socket.IO + BRC-103** (see §2.5b — supersedes the
+   original §2.5 raw-WS+BRC-31 workarounds). Use the same
+   browser-compatible path that the canonical TS `@bsv/message-box-client`
+   v2.0.7 uses against the same servers — `socket.io-client`
+   transport with BRC-103 mutual-auth post-handshake over the
+   `authMessage` event channel. **Verified live**: the Calhoun
+   production relay (`https://rust-message-box.dev-a3e.workers.dev`,
+   `wrangler.toml` in `~/bsv/rust-message-box/`) exposes `/socket.io/`
+   alongside `/ws` — a probe `GET /socket.io/?EIO=4&transport=polling`
+   returns Engine.IO handshake JSON with a session id and the
+   `["websocket"]` upgrade list. No server change is needed; we conform
+   to the canonical TS via Path A. (Original raw-WS analysis preserved
+   in §1.1 + §2.5 for the reasoning trail; both are SUPERSEDED.)
 
 2. **Hibernation contract: outbound WS does NOT survive DO hibernation —
    reconnect-on-wake with `/listMessages` backfill is mandatory.** The
@@ -333,7 +342,13 @@ Internal differences:
   pre-issue a token via a `POST /upgrade-token` then pass via URL query
   param. **Empirical question for the POC** — see §6.
 
-### 2.5 The BRC-31-on-WS-upgrade constraint
+### 2.5 The BRC-31-on-WS-upgrade constraint **— SUPERSEDED, see §2.5b**
+
+> 🚫 **This subsection is preserved as historical analysis only.** All
+> three workaround candidates below require server-side changes to the
+> message-box protocol, which is a community standard and IMMUTABLE.
+> The right answer is **Socket.IO + BRC-103** — the browser-compatible
+> path the canonical TS client already uses. **See [§2.5b](#25b-socketio--brc-103-the-canonical-browser-compatible-path-supersedes-25)** for the corrected design.
 
 `web_sys::WebSocket::new(url)` accepts only a URL + an optional
 sub-protocols array. There is no header-injection path in the browser
@@ -369,6 +384,162 @@ this; if not, fall-back to (b).
 
 **This is the highest-risk substrate-level open question.** Putting it
 in §8 for explicit user resolution before POC starts.
+
+### 2.5b Socket.IO + BRC-103 — the canonical browser-compatible path (supersedes 2.5)
+
+This subsection was added 2026-05-19 after a follow-up four-agent
+investigation while reviewing the draft 1. The empirical finding
+overturns §2.5: the canonical TS client `@bsv/message-box-client`
+v2.0.7 does not use raw WebSocket at all — it uses Socket.IO with
+post-handshake BRC-103 mutual auth. The same Rust servers we already
+target expose this path alongside `/ws`. We do not need to invent a
+workaround or change the server.
+
+#### What the canonical TS client actually does
+
+`~/bsv/message-box-client/src/MessageBoxClient.ts:332` constructs the
+WebSocket transport via `AuthSocketClient(targetHost, { wallet, originator })`.
+`AuthSocketClient` is in a sister package at
+`~/bsv/authsocket-client/src/AuthSocketClient.ts:103-114`, and its
+implementation is:
+
+```typescript
+const socket = realIo(url, opts.managerOptions)          // socket.io-client@4.x
+const transport = new SocketClientTransport(socket)      // wraps socket as a BRC-103 Transport
+const peer = new Peer(opts.wallet, transport, ...)       // @bsv/sdk Peer = BRC-103 state machine
+return new AuthSocketClientImpl(socket, peer)
+```
+
+The wire shape:
+
+1. **Socket.IO HTTP(S) handshake to `/socket.io/?EIO=4&transport=...`** —
+   anonymous (no auth headers, no BRC-31). Server returns a session id
+   + `upgrades: ["websocket"]` per Engine.IO 4.
+2. **Socket.IO upgrades to WebSocket** — anonymous still.
+3. **BRC-103 handshake over the `authMessage` Socket.IO event** —
+   `~/bsv/authsocket-client/src/SocketClientTransport.ts:17-28` —
+   `socket.emit('authMessage', message)` + `socket.on('authMessage', ...)`.
+   Client and server exchange `AuthMessage` frames (initialRequest →
+   initialResponse → general) per BRC-103. After this, the socket is
+   bound to the verified identity.
+4. **App-level events** (`joinRoom`, `sendMessage`, etc.) emit on
+   Socket.IO normally, with no per-frame signing — channel trust from
+   the BRC-103 handshake.
+
+#### The Rust servers already serve this path (Calhoun included)
+
+`~/bsv/bsv-messagebox-cloudflare-public/src/lib.rs:97-98` registers
+the route `/socket.io/*` → `route_socketio_request` (lib.rs:373-455).
+Engine.IO + Socket.IO frame handling lives in `src/engineio/` +
+`src/socketio_worker.rs`. The BRC-103 state machine on the server side
+is `src/engineio/auth.rs:1-72` — its module comment is explicit:
+
+> *"BRC-103 mutual authentication driver for Socket.IO `authMessage`
+> events (M10 #61 — Phase B). That matches the TypeScript
+> SocketServerTransport/SocketClientTransport pair from the
+> @bsv/authsocket and @bsv/authsocket-client libraries."*
+
+**Live verification (2026-05-19)**:
+```
+$ curl -sS 'https://rust-message-box.dev-a3e.workers.dev/socket.io/?EIO=4&transport=polling'
+0{"maxPayload":1000000,"pingInterval":25000,"pingTimeout":20000,"sid":"OjG_sVWIRbe8BaQW80ax2Q","upgrades":["websocket"]}
+```
+
+Worker URL is in `~/bsv/rust-message-box/wrangler.toml` (and verifiable
+via the Cloudflare API token; the project name + custom domain are
+recorded there).
+
+`rust-message-box` and `bsv-messagebox-cloudflare-public` are byte-
+identical handlers per the sister-agent server matrix. The Socket.IO
+route is on both.
+
+#### `bsv_rs::auth::Peer` already has BRC-103 — we just need a new Transport
+
+`~/bsv/bsv-rs/src/auth/transports/` exposes the `Transport` trait. The
+existing `SimplifiedFetchTransport` is used by the native client's HTTP
+routes; a `WebSocketTransport` (raw-WS + BRC-103 frame-by-frame) also
+exists. **Phase H adds `SocketIoTransport`** — the Rust analog of the
+TS `SocketClientTransport`. Its job is:
+
+- Hold a Socket.IO client handle.
+- `send(AuthMessage)` → `socket.emit('authMessage', message_json)`.
+- Register a `socket.on('authMessage', ...)` callback that
+  `Peer.onData()` consumes.
+- Lazily open the Socket.IO connection on first `send`.
+
+Once `SocketIoTransport` exists, the existing `MessageBoxClient` in
+`crates/bsv-mpc-messagebox/` can swap its hand-crafted `MessageBoxAuth`
++ `sign_ws_upgrade` flow for `bsv_rs::auth::Peer<ProtoWallet, SocketIoTransport>`
+on wasm32 — and the BRC-103 protocol details are handled inside
+`bsv-rs` rather than open-coded here.
+
+#### Implementation strategy for Socket.IO in Rust wasm32
+
+Two options:
+
+**(i) Bundle the JS `socket.io-client@4.x` via `wasm-bindgen` + `js-sys`.**
+Add `socket.io-client` as a JS dep in the wasm32 build; expose its
+`io()` factory + `Socket` methods via `wasm-bindgen` `extern "C"`
+bindings; Rust `SocketIoTransport` calls through. ~50-100 LOC of FFI
+glue. Conformance to canonical TS is structural — we literally use the
+same JS library the TS client uses.
+
+**(ii) Implement Engine.IO + Socket.IO in Rust wasm32 from scratch.**
+~500-800 LOC for Engine.IO 4 packet framing (open/close/ping/pong/
+message/upgrade), polling + WS-upgrade transport, Socket.IO event
+multiplexing. No JS dep. Subtle correctness risks (binary framing,
+upgrade race, reconnect semantics).
+
+**Audit recommendation: (i)**. Reasons:
+- Path A says conform to TS; the TS client is literally this JS lib.
+- Maintenance burden is orders of magnitude lower; Socket.IO
+  protocol evolves under @bsv/socket.io-client's own maintainers.
+- The JS dep stays inside the wasm32 build; native is unaffected.
+- ~50-100 LOC of FFI vs ~500-800 LOC of protocol implementation.
+
+POC step (§6) gates: (i) — bundle works, BRC-103 handshake completes,
+canonical envelope round-trips.
+
+#### Why this is strictly better than the §2.5 options
+
+| Axis | §2.5 (a-c) raw-WS workarounds | §2.5b Socket.IO + BRC-103 |
+|---|---|---|
+| Server change | required | **none** |
+| Conforms to canonical TS | no | **yes** (Path A) |
+| Server-side already implemented | no | **yes** (engineio/auth.rs:1-72) |
+| Browser-side already proven | no | **yes** (canonical TS client) |
+| Auth strength | partial (workarounds had different security postures) | full BRC-103 mutual auth — same as TS |
+| Rust dep cost | hand-crafted server tweak + Rust client | new `SocketIoTransport` (~100 LOC) + JS dep |
+| Long-term direction | drift from canonical | unifies wasm32 + (eventually) native on canonical |
+
+#### Consequence: native could eventually move to Socket.IO too
+
+The existing native Rust client uses raw WS + 7 BRC-31 headers — a
+Rust-only convenience path that only works because tokio-tungstenite
+gives raw upgrade access. If we also unify NATIVE on Socket.IO +
+BRC-103, both targets converge on the canonical TS wire and the
+`MessageBoxAuth` + `sign_ws_upgrade` hand-crafted code path can be
+deleted. **Out of Phase H scope**; tracked as a Phase H post-merge
+follow-up.
+
+#### Naming change implied
+
+§2.1's `ws_wasm.rs` is misnamed if the wasm32 path uses Socket.IO.
+Rename to `transport_wasm.rs` (or `socketio_wasm.rs`). The split is
+still `ws_native.rs` (raw WS + BRC-31) + `transport_wasm.rs` (Socket.IO
++ BRC-103) behind the same `cfg(target_arch = "wasm32")` gate.
+
+#### Updated open questions (supersedes the OQs in §8 marked)
+
+- **OQ1 (substrate)** is resolved: Socket.IO + BRC-103.
+- **OQ2 (BRC-31 workaround order)** is moot: no workaround needed.
+- **OQ5 (server-side tweak ownership)** is moot: no server change.
+- New: **OQ7 (Socket.IO substrate choice)** — bundle JS
+  `socket.io-client@4.x` (recommended) vs. write a Rust Engine.IO
+  client from scratch.
+- New: **OQ8 (native unification)** — should native ALSO move to
+  Socket.IO + BRC-103 as a Phase H post-merge cleanup, or keep the
+  current raw-WS + BRC-31 path for Phase A-F regression safety?
 
 ## 3. Design direction B — Hibernation + reconnect flow
 
@@ -496,15 +667,15 @@ poc/poc17-cf-outbound-ws/
   README.md           # what this POC proves + how to test
 ```
 
-### 6.2 Gates (each a hard pass/fail)
+### 6.2 Gates (each a hard pass/fail) — **rewritten per §2.5b**
 
 | Gate | Scenario | Pass criterion |
 |---|---|---|
-| **H-3.1** | `cargo build --target wasm32-unknown-unknown -p poc17-cf-outbound-ws` | clean build, no link errors |
-| **H-3.2** | `web_sys::WebSocket::new()` works inside DO `fetch()` handler | `wrangler dev` test: DO returns "ws_open=true" within 5s of `fetch /open` |
-| **H-3.3** | Round-trip canonical envelope through live relay | POST `/relay` to DO, DO sends via WS to `wss://rust-message-box.dev-a3e.workers.dev/ws`, receives echo back from self-room, returns body byte-identical |
-| **H-3.4** | Forced-hibernation reconnect | `wrangler dev` + `state.abort()` to force evict DO; subsequent fetch wakes the DO; DO drains `/listMessages` first; missed envelope reaches consumer byte-exact |
-| **H-3.5** | BRC-31 upgrade auth works through chosen workaround | sub-protocol or token-query (§2.5) path verified end-to-end against the live relay |
+| **H-3.1** | `cargo build --target wasm32-unknown-unknown -p poc17-cf-outbound-ws` | clean build, no link errors. Bundles `socket.io-client@4.x` JS via wasm-bindgen. |
+| **H-3.2** | Socket.IO handshake from DO via JS-bundled `socket.io-client` | `wrangler dev` test: DO `fetch /open` triggers Socket.IO `GET /socket.io/?EIO=4&transport=polling` to live relay; receives 200 with session id; upgrades to WS within 5s. |
+| **H-3.3** | BRC-103 mutual auth completes over `authMessage` event | DO sends BRC-103 `InitialRequest` via `socket.emit('authMessage', ...)`; receives server `InitialResponse`; channel becomes identity-bound. New `SocketIoTransport` (Rust impl of `bsv_rs::auth::Transport`) drives `bsv_rs::auth::Peer` through the handshake. |
+| **H-3.4** | Round-trip canonical envelope | POST `/relay` to DO; DO `emit('sendMessage', envelope)` to live relay's `/socket.io/`; DO receives the echo back on a `sendMessage` event from its own subscribed room; body byte-identical (CBOR `MessageEnvelope` per MPC-Spec §05). |
+| **H-3.5** | Forced-hibernation reconnect | `wrangler dev` + `state.abort()` to force DO eviction; subsequent fetch wakes DO; DO re-runs Socket.IO connect → BRC-103 handshake → `/listMessages` drain → resubscribe; missed envelope reaches consumer byte-exact. |
 
 ### 6.3 What the POC does NOT do
 
@@ -536,13 +707,16 @@ true. No asterisks.
 ### 7.4 Deployed-Worker live test (the merge gate)
 - [ ] Test Worker (`poc17-cf-outbound-ws` final shape OR
       a small `e2e/phase-h-worker/`) deploys via `wrangler deploy`.
-- [ ] Worker opens WS to live `rust-message-box.dev-a3e.workers.dev`,
-      round-trips a canonical envelope byte-exact.
+- [ ] Worker connects to `/socket.io/` on live
+      `rust-message-box.dev-a3e.workers.dev` via bundled
+      `socket.io-client@4.x` (§2.5b) and completes the BRC-103
+      handshake over the `authMessage` Socket.IO event.
+- [ ] Round-trips a canonical CBOR envelope byte-exact through the
+      live relay.
 - [ ] **Forced-hibernation reconnect test**: evict the DO mid-flight;
-      next fetch wakes; `/listMessages` backfill recovers; envelope
-      reaches the consumer.
-- [ ] BRC-31 upgrade-auth path verified end-to-end (whichever §2.5
-      workaround is chosen).
+      next fetch wakes; Socket.IO re-handshakes; BRC-103 re-authenticates;
+      `/listMessages` backfill recovers; missed envelope reaches the
+      consumer.
 
 ### 7.5 Doc + tracker
 - [ ] `docs/PHASE-H-AUDIT.md` checkboxes ticked in the merge-gate commit.
@@ -556,12 +730,14 @@ the POC step begins.
 
 | | Question | Default if no answer |
 |---|---|---|
-| **OQ1** | Substrate (a) `web_sys::WebSocket` vs fall-back (d) sidecar JS Worker — start with (a); if POC H-3.2 fails, switch. Right? | yes |
-| **OQ2** | BRC-31 upgrade workaround §2.5 — start with (a) sub-protocol field encoding; if `rust-message-box` server doesn't support, fall-back to (b) `POST /ws-upgrade-token` + query param. Which order? | (a) → (b) → (c) |
-| **OQ3** | Cfg-gate inside existing `bsv-mpc-messagebox` vs separate `bsv-mpc-messagebox-worker` sibling crate — audit recommends cfg-gate (§2.2). Sign off on the direction change? | cfg-gate (this proposal) |
+| ~~OQ1~~ | ~~Substrate `web_sys::WebSocket` vs sidecar JS Worker~~ — **MOOT per §2.5b**: substrate is Socket.IO + BRC-103, not raw WS. | resolved |
+| ~~OQ2~~ | ~~BRC-31 upgrade workaround order~~ — **MOOT per §2.5b**: no workaround needed; Socket.IO carries BRC-103 post-handshake. | resolved |
+| **OQ3** | Cfg-gate inside existing `bsv-mpc-messagebox` vs separate `bsv-mpc-messagebox-worker` sibling crate — audit recommends cfg-gate (§2.2). User confirmed 2026-05-19. | ✓ confirmed |
 | **OQ4** | DO topology — per-identity DO (recommended in NEXT-STEPS.md Q3 default) — confirm? | per-identity |
-| **OQ5** | Server tweak on `rust-message-box` to support OQ2 (a) sub-protocol — if (a) is chosen, who lands the server-side change? Calhoun-side, since `rust-message-box` is the Calhoun stack. ETA: 1 small PR alongside H-3 POC. | yes, Calhoun-side, before H-3 |
+| ~~OQ5~~ | ~~Server tweak on `rust-message-box`~~ — **MOOT per §2.5b**: no server change. The server protocol is immutable; the canonical path (Socket.IO + BRC-103) is already exposed. | resolved |
 | **OQ6** | Should H-3 POC's deployed-Worker LIVE in the bsv-mpc repo or in a separate dev account? — recommend in-repo under `poc/poc17-cf-outbound-ws/`, dev CF account, no production data. | yes |
+| **OQ7** | Socket.IO client substrate (§2.5b) — (i) bundle JS `socket.io-client@4.x` via wasm-bindgen (recommended) vs (ii) write a Rust Engine.IO/Socket.IO client. | (i) bundle JS |
+| **OQ8** | Native unification — should the existing native Rust client ALSO move to Socket.IO + BRC-103 as a Phase H post-merge cleanup, OR keep the current raw-WS + BRC-31 path for Phase A-F regression safety? | post-merge cleanup; not Phase H scope |
 
 ## 9. References
 
@@ -615,10 +791,17 @@ the POC step begins.
    crate** — §2.2 makes the case for the divergence; the merge-gate
    commit propagates it to umbrella #2.
 
-4. **The one Phase H wasm32 gotcha**: `web_sys::WebSocket::new(url)`
-   has no header-injection path, so BRC-31 upgrade auth must move to
-   sub-protocol field encoding or pre-issued token. POC step
-   H-3.5 verifies whichever workaround the user picks.
+4. **The wasm32 wire is Socket.IO + BRC-103, not raw WS + BRC-31.**
+   The canonical TS `@bsv/message-box-client` uses Socket.IO with
+   post-handshake BRC-103 mutual auth via the `authMessage` event;
+   the Calhoun Rust relay already serves this path at `/socket.io/`
+   alongside `/ws` (verified by live curl + lib.rs:97-98 +
+   engineio/auth.rs:1-72). The wasm32 client bundles the same JS
+   `socket.io-client@4.x` the canonical TS uses and adds a new
+   `SocketIoTransport` Rust impl on top of `bsv_rs::auth::Peer`'s
+   `Transport` trait. **No server change. Path A conformant.**
+   §2.5b makes the case; §2.5 is preserved as the historical
+   reasoning trail.
 
 5. **Merge gate is real.** No asterisks: a deployed-Worker
    forced-hibernation round-trip with a fresh canonical envelope
@@ -627,4 +810,8 @@ the POC step begins.
 
 ---
 
-**Last updated:** 2026-05-19. Pending user review before POC step (H-3) begins.
+**Last updated:** 2026-05-19 (patched same-day with §2.5b after follow-up
+investigation — see TL;DR + §2.5 banner). Pending user review before
+POC step (H-3) begins. OQ3 (cfg-gate direction) confirmed by user;
+OQ1/OQ2/OQ5 obsoleted by §2.5b; OQ7/OQ8 are the live unresolved
+substrate-choice questions.
