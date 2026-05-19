@@ -13,23 +13,27 @@
 //!
 //! 2. **Aux info generation** (multi-round): Produces Paillier parameters
 //!    required for the signing protocol. This is computationally expensive
-//!    due to safe prime generation.
+//!    due to safe prime generation. Use [`DkgCoordinator::with_pool`] to
+//!    inject pre-generated primes from a [`crate::paillier_pool::PaillierPool`]
+//!    per MPC-Spec §06.10.1 / ADR-0041.
 //!
 //! After both complete, the results are combined via `KeyShare::from_parts()`
 //! into a complete `KeyShare` that can be used for signing.
 //!
-//! ## State Machine Architecture
+//! ## State Machine Architecture (Phase G inline)
 //!
 //! The cggmp24 protocol is driven by `round_based::state_machine::StateMachine`,
-//! which is `!Send` (cannot cross tokio task boundaries). The coordinator solves
-//! this by running the SM in a dedicated `std::thread`, bridged to the async
-//! caller via `std::sync::mpsc` channels.
+//! which is `!Send` (internal `Rc<RefCell<_>>` state). Phase G of this crate
+//! discovered that `proceed()` is non-blocking by construction — it returns
+//! `NeedsOneMoreMessage` when it needs input. So the coordinator can host the
+//! SM directly as a `Box<dyn StateMachine<...>>` struct field, with no thread,
+//! no channels, and no tokio dependency. The pattern was empirically validated
+//! by `poc/poc16-sm-inline/` before this production module adopted it; see
+//! `docs/PHASE-G-AUDIT.md`.
 //!
-//! The caller's view is simple:
+//! The caller's view is unchanged from the previous threaded design:
 //! 1. Call `init()` to start and get the first outgoing messages.
 //! 2. Call `process_round(incoming)` repeatedly until `Complete`.
-//!
-//! Internally, each call feeds messages to the SM thread and collects its output.
 //!
 //! ## Wire Message Format
 //!
@@ -44,18 +48,17 @@
 //! protocol aborts and identifies the cheating party. This is a key security
 //! property of CGGMP'24.
 
-use std::sync::mpsc;
-use std::thread;
+use std::collections::VecDeque;
 
 use cggmp24::security_level::SecurityLevel128;
 use cggmp24::supported_curves::Secp256k1;
 use cggmp24::ExecutionId;
-use round_based::state_machine::{ProceedResult, StateMachine};
+use round_based::state_machine::{wrap_protocol, ProceedResult, StateMachine};
 use serde::{Deserialize, Serialize};
-use sha2::Digest;
-use tracing;
+use sha2::{Digest, Sha256};
 
 use crate::error::{MpcError, Result};
+use crate::paillier_pool::{PaillierPool, PrimePoolStorage};
 use crate::types::{
     DkgResult, EncryptedShare, JointPublicKey, RoundMessage, SessionId, ShareIndex, ThresholdConfig,
 };
@@ -130,30 +133,6 @@ enum DkgPhase {
 }
 
 // ---------------------------------------------------------------------------
-// Channel message types between coordinator and SM thread
-// ---------------------------------------------------------------------------
-
-/// Messages sent from the coordinator to the SM thread.
-enum SmInbound {
-    /// Feed an incoming wire message to the state machine.
-    IncomingMessage(Vec<u8>),
-}
-
-/// Messages sent from the SM thread back to the coordinator.
-enum SmOutbound {
-    /// The SM produced an outgoing wire message.
-    OutgoingMessage(Vec<u8>),
-    /// The SM needs one more incoming message before it can proceed.
-    NeedsMessage,
-    /// The keygen sub-protocol completed. Contains the serialized IncompleteKeyShare.
-    KeygenComplete(Vec<u8>),
-    /// The aux info sub-protocol completed. Contains the serialized AuxInfo.
-    AuxInfoComplete(Vec<u8>),
-    /// The SM encountered an error.
-    Error(String),
-}
-
-// ---------------------------------------------------------------------------
 // DkgRoundResult
 // ---------------------------------------------------------------------------
 
@@ -170,6 +149,33 @@ pub enum DkgRoundResult {
 }
 
 // ---------------------------------------------------------------------------
+// Inline-SM type aliases (Phase G)
+// ---------------------------------------------------------------------------
+
+/// Boxed `StateMachine` for the keygen sub-protocol. The Output is what the
+/// cggmp24 keygen future returns; the Msg type is what cggmp24-keygen emits
+/// over the wire for the threshold keygen variant. We box because the
+/// `impl StateMachine` returned by `wrap_protocol` has an opaque Future
+/// generic and can't be named directly in a struct field.
+type KeygenSm = Box<
+    dyn StateMachine<
+        Output = std::result::Result<cggmp24::IncompleteKeyShare<Secp256k1>, cggmp24::KeygenError>,
+        Msg = cggmp24::keygen::ThresholdMsg<Secp256k1, SecurityLevel128, Sha256>,
+    >,
+>;
+
+/// Boxed `StateMachine` for the aux_info_gen sub-protocol.
+type AuxInfoSm = Box<
+    dyn StateMachine<
+        Output = std::result::Result<
+            cggmp24::key_share::AuxInfo<SecurityLevel128>,
+            cggmp24::key_refresh::KeyRefreshError,
+        >,
+        Msg = cggmp24::key_refresh::msg::Msg<Sha256, SecurityLevel128>,
+    >,
+>;
+
+// ---------------------------------------------------------------------------
 // DkgCoordinator
 // ---------------------------------------------------------------------------
 
@@ -184,8 +190,10 @@ pub enum DkgRoundResult {
 /// 2. **Aux info gen**: Multi-round protocol producing Paillier parameters
 /// 3. **Combine**: `KeyShare::from_parts(incomplete, aux_info)` -> complete share
 ///
-/// Each phase runs as a `round_based::StateMachine` in a dedicated thread
-/// (the SM is `!Send`), communicating with this coordinator via channels.
+/// Each phase's `round_based::StateMachine` lives directly on this struct (see
+/// `KeygenSm` / `AuxInfoSm` aliases above). The Phase G rewrite removed the
+/// previous `std::thread` + `std::sync::mpsc` bridge; `proceed()` is driven
+/// inline.
 ///
 /// # Example
 ///
@@ -222,14 +230,18 @@ pub struct DkgCoordinator {
     /// Which sub-protocol phase we are in.
     phase: DkgPhase,
 
-    // Channel handles for communicating with the SM thread.
-    // These are None before init() and after completion.
-    /// Send incoming messages to the SM thread.
-    sm_tx: Option<mpsc::Sender<SmInbound>>,
-    /// Receive outgoing messages and status from the SM thread.
-    sm_rx: Option<mpsc::Receiver<SmOutbound>>,
-    /// Handle to the SM thread (for join on completion or error).
-    sm_thread: Option<thread::JoinHandle<()>>,
+    /// The active keygen state machine, or `None` after keygen completed.
+    keygen_sm: Option<KeygenSm>,
+    /// The active aux_info state machine, or `None` before keygen completed
+    /// or after aux_info completed.
+    aux_info_sm: Option<AuxInfoSm>,
+    /// Incoming wire messages buffered across `process_round()` calls. The
+    /// SM consumes one at a time via `received_msg()`; if a caller hands us
+    /// more messages than the SM is ready for, the surplus waits here.
+    wire_buffer: VecDeque<WireMessage>,
+    /// Monotonic message-id for `round_based::Incoming<M>::id`. Each
+    /// message we feed to the SM gets a unique ascending id.
+    next_msg_id: u64,
 
     /// Serialized IncompleteKeyShare from the keygen phase.
     /// Stored between keygen completion and aux info start.
@@ -248,7 +260,8 @@ pub struct DkgCoordinator {
     /// Optional pre-generated Paillier primes for aux info generation.
     /// If None, safe primes will be generated on-the-fly (slow, ~30-60s).
     /// If Some, these pre-generated primes are used (fast).
-    /// Use `set_pregenerated_primes()` to provide them.
+    /// Use [`set_pregenerated_primes`](Self::set_pregenerated_primes) or
+    /// [`with_pool`](Self::with_pool) to provide them.
     pregenerated_primes: Option<cggmp24::PregeneratedPrimes<SecurityLevel128>>,
 }
 
@@ -277,9 +290,10 @@ impl DkgCoordinator {
             my_index,
             current_round: 0,
             phase: DkgPhase::NotStarted,
-            sm_tx: None,
-            sm_rx: None,
-            sm_thread: None,
+            keygen_sm: None,
+            aux_info_sm: None,
+            wire_buffer: VecDeque::new(),
+            next_msg_id: 0,
             incomplete_share_json: None,
             keygen_joint_pubkey: None,
             eid_bytes,
@@ -301,10 +315,26 @@ impl DkgCoordinator {
         self.pregenerated_primes = Some(primes);
     }
 
+    /// Pull pre-generated Paillier primes from a [`PaillierPool`] and stash
+    /// them for the auxinfo phase. If the pool is empty, this is a no-op
+    /// and the auxinfo phase falls back to inline `safe_primes::generate()`.
+    ///
+    /// Per MPC-Spec §06.10.1 / ADR-0041 — the pool is RECOMMENDED for
+    /// `profile-edge` / `profile-mobile` deployments. Builder-style so it
+    /// chains cleanly with `DkgCoordinator::new(...)`.
+    ///
+    /// Must be called before `init()`.
+    pub fn with_pool<S: PrimePoolStorage>(mut self, pool: &PaillierPool<S>) -> Self {
+        if let Ok(Some(primes)) = pool.take() {
+            self.pregenerated_primes = Some(primes);
+        }
+        self
+    }
+
     /// Initialize the DKG ceremony by starting the keygen sub-protocol.
     ///
-    /// This spawns a background thread running the cggmp24 keygen state machine,
-    /// then collects and returns the first batch of outgoing messages.
+    /// Creates the keygen `StateMachine`, drives it inline until it needs an
+    /// incoming message, and returns the collected outgoing messages.
     ///
     /// # Returns
     ///
@@ -312,7 +342,8 @@ impl DkgCoordinator {
     ///
     /// # Errors
     ///
-    /// Returns [`MpcError::Dkg`] if the keygen state machine fails to start.
+    /// Returns [`MpcError::Dkg`] if the keygen state machine fails to start
+    /// or produces an error during initial driving.
     pub fn init(&mut self) -> Result<Vec<RoundMessage>> {
         if self.phase != DkgPhase::NotStarted {
             return Err(MpcError::Dkg(
@@ -320,7 +351,6 @@ impl DkgCoordinator {
             ));
         }
 
-        // Validate party index is in range
         if self.my_index.0 >= self.config.parties {
             return Err(MpcError::Dkg(format!(
                 "party index {} >= total parties {}",
@@ -331,24 +361,39 @@ impl DkgCoordinator {
         self.phase = DkgPhase::Keygen;
         self.current_round = 1;
 
-        self.start_keygen_sm()?;
-        self.collect_outgoing_messages()
+        // Construct the keygen SM via wrap_protocol. The closure captures
+        // copies of all needed values, so the resulting StateMachineImpl is
+        // 'static (no external borrows). The future creates its own OsRng
+        // reference internally — same shape used in the threaded version
+        // pre-Phase-G.
+        let eid_bytes = self.eid_bytes;
+        let my_index = self.my_index.0;
+        let n = self.config.parties;
+        let t = self.config.threshold;
+        let sm: KeygenSm = Box::new(wrap_protocol(move |party| async move {
+            let eid = ExecutionId::new(&eid_bytes);
+            cggmp24::keygen::<Secp256k1>(eid, my_index, n)
+                .set_threshold(t)
+                .start(&mut rand::rngs::OsRng, party)
+                .await
+        }));
+        self.keygen_sm = Some(sm);
+
+        let mut outgoing = Vec::new();
+        match self.drive_keygen(&mut outgoing)? {
+            None => Ok(outgoing),
+            Some(_share) => Err(MpcError::Dkg(
+                "keygen completed without any rounds (unexpected)".into(),
+            )),
+        }
     }
 
     /// Process incoming messages from the current round and advance the protocol.
     ///
-    /// This feeds the incoming messages to the running state machine and collects
-    /// its outgoing messages. When a sub-protocol completes (keygen or aux info),
-    /// the coordinator automatically transitions to the next phase.
-    ///
-    /// # Arguments
-    ///
-    /// * `messages` -- All messages received for the current round from other parties.
-    ///
-    /// # Returns
-    ///
-    /// [`DkgRoundResult::NextRound`] with outgoing messages, or
-    /// [`DkgRoundResult::Complete`] with the final DKG result.
+    /// Buffers all incoming messages, then drives whichever phase SM is
+    /// active. When a phase completes, automatically transitions and drives
+    /// the next phase too (keygen → auxinfo). Returns `Complete` once both
+    /// phases finish.
     pub fn process_round(&mut self, messages: Vec<RoundMessage>) -> Result<DkgRoundResult> {
         match self.phase {
             DkgPhase::NotStarted => {
@@ -362,20 +407,51 @@ impl DkgCoordinator {
             DkgPhase::Keygen | DkgPhase::AuxInfo => {}
         }
 
-        // Feed all incoming messages to the SM thread
-        let tx = self
-            .sm_tx
-            .as_ref()
-            .ok_or_else(|| MpcError::Dkg("SM channel not available (internal error)".into()))?;
-
+        // Buffer all incoming payloads. Each RoundMessage.payload may be
+        // either a single WireMessage (legacy) or a JSON array of them
+        // (bundled). Decode + push onto the buffer in order.
         for msg in &messages {
-            let wire_bytes = &msg.payload;
-            tx.send(SmInbound::IncomingMessage(wire_bytes.clone()))
-                .map_err(|e| MpcError::Dkg(format!("failed to send to SM thread: {e}")))?;
+            self.buffer_incoming_payload(&msg.payload)?;
         }
 
-        // Collect outgoing messages from the SM
-        self.collect_round_result()
+        let mut outgoing = Vec::new();
+
+        // Drive whichever phase is active. On keygen completion, transition
+        // to auxinfo and drive it too — emit any messages it produces in
+        // this same round so callers see the auxinfo's first batch.
+        if self.phase == DkgPhase::Keygen {
+            match self.drive_keygen(&mut outgoing)? {
+                None => {
+                    self.current_round += 1;
+                    return Ok(DkgRoundResult::NextRound(outgoing));
+                }
+                Some(incomplete_share) => {
+                    self.handle_keygen_complete(incomplete_share)?;
+                    // Fall through to auxinfo drive.
+                }
+            }
+        }
+
+        if self.phase == DkgPhase::AuxInfo {
+            match self.drive_aux_info(&mut outgoing)? {
+                None => {
+                    self.current_round += 1;
+                    return Ok(DkgRoundResult::NextRound(outgoing));
+                }
+                Some(aux_info) => {
+                    self.phase = DkgPhase::Complete;
+                    return self.assemble_dkg_result(aux_info);
+                }
+            }
+        }
+
+        // Shouldn't reach here — Keygen branch either returns or transitions
+        // to AuxInfo; AuxInfo branch either returns or transitions to
+        // Complete (and returns).
+        Err(MpcError::Dkg(format!(
+            "unexpected DKG state after drive: phase={:?}",
+            self.phase
+        )))
     }
 
     /// Get the current round number (0 = not started).
@@ -393,7 +469,7 @@ impl DkgCoordinator {
         self.my_index
     }
 
-    /// Get the current protocol phase.
+    /// Get the current protocol phase as a stable string.
     pub fn phase(&self) -> &str {
         match self.phase {
             DkgPhase::NotStarted => "not_started",
@@ -404,283 +480,197 @@ impl DkgCoordinator {
     }
 
     // -----------------------------------------------------------------------
-    // Internal: Start the keygen state machine in a background thread
+    // Internal: inline SM drive helpers
     // -----------------------------------------------------------------------
 
-    fn start_keygen_sm(&mut self) -> Result<()> {
-        let (inbound_tx, inbound_rx) = mpsc::channel::<SmInbound>();
-        let (outbound_tx, outbound_rx) = mpsc::channel::<SmOutbound>();
+    /// Drive the keygen SM until it either needs more input (`Ok(None)`),
+    /// completes (`Ok(Some(IncompleteKeyShare))`), or errors. Appends any
+    /// emitted outbound messages to `outgoing`.
+    fn drive_keygen(
+        &mut self,
+        outgoing: &mut Vec<RoundMessage>,
+    ) -> Result<Option<cggmp24::IncompleteKeyShare<Secp256k1>>> {
+        let mut sm = self
+            .keygen_sm
+            .take()
+            .ok_or_else(|| MpcError::Dkg("drive_keygen: SM not present".into()))?;
 
-        let eid_bytes = self.eid_bytes;
-        let my_index = self.my_index.0;
-        let n = self.config.parties;
-        let t = self.config.threshold;
+        let result = drive_inline(
+            sm.as_mut(),
+            &mut self.wire_buffer,
+            &mut self.next_msg_id,
+            self.my_index.0,
+            self.session_id,
+            self.current_round,
+            outgoing,
+            "keygen",
+        );
 
-        let thread_handle = thread::Builder::new()
-            .name(format!("dkg-keygen-{my_index}"))
-            .spawn(move || {
-                run_keygen_sm(eid_bytes, my_index, n, t, inbound_rx, outbound_tx);
-            })
-            .map_err(|e| MpcError::Dkg(format!("failed to spawn keygen thread: {e}")))?;
+        match result? {
+            DriveStep::NeedsInput => {
+                self.keygen_sm = Some(sm);
+                Ok(None)
+            }
+            DriveStep::Complete(share) => Ok(Some(share)),
+        }
+    }
 
-        self.sm_tx = Some(inbound_tx);
-        self.sm_rx = Some(outbound_rx);
-        self.sm_thread = Some(thread_handle);
+    /// Drive the auxinfo SM. Same shape as [`drive_keygen`] but with the
+    /// auxinfo Msg/Output types.
+    fn drive_aux_info(
+        &mut self,
+        outgoing: &mut Vec<RoundMessage>,
+    ) -> Result<Option<cggmp24::key_share::AuxInfo<SecurityLevel128>>> {
+        let mut sm = self
+            .aux_info_sm
+            .take()
+            .ok_or_else(|| MpcError::Dkg("drive_aux_info: SM not present".into()))?;
 
+        let result = drive_inline(
+            sm.as_mut(),
+            &mut self.wire_buffer,
+            &mut self.next_msg_id,
+            self.my_index.0,
+            self.session_id,
+            self.current_round,
+            outgoing,
+            "auxinfo",
+        );
+
+        match result? {
+            DriveStep::NeedsInput => {
+                self.aux_info_sm = Some(sm);
+                Ok(None)
+            }
+            DriveStep::Complete(aux_info) => Ok(Some(aux_info)),
+        }
+    }
+
+    /// Push one incoming RoundMessage payload onto `wire_buffer`. The
+    /// payload is either a single JSON `WireMessage` or a JSON array.
+    fn buffer_incoming_payload(&mut self, wire_bytes: &[u8]) -> Result<()> {
+        if wire_bytes.first() == Some(&b'[') {
+            let bundle: Vec<WireMessage> = serde_json::from_slice(wire_bytes).map_err(|e| {
+                MpcError::Dkg(format!("failed to deserialize bundled incoming: {e}"))
+            })?;
+            self.wire_buffer.extend(bundle);
+        } else {
+            let wire: WireMessage = serde_json::from_slice(wire_bytes)
+                .map_err(|e| MpcError::Dkg(format!("failed to deserialize incoming: {e}")))?;
+            self.wire_buffer.push_back(wire);
+        }
         Ok(())
     }
 
-    // -----------------------------------------------------------------------
-    // Internal: Start the aux info state machine in a background thread
-    // -----------------------------------------------------------------------
+    /// Handle the keygen-complete event: extract the joint pubkey, stash the
+    /// serialized incomplete share, construct the auxinfo SM, and transition
+    /// to the AuxInfo phase.
+    fn handle_keygen_complete(
+        &mut self,
+        incomplete_share: cggmp24::IncompleteKeyShare<Secp256k1>,
+    ) -> Result<()> {
+        tracing::info!(
+            party = self.my_index.0,
+            "keygen phase complete, starting aux info generation"
+        );
 
-    fn start_aux_info_sm(&mut self) -> Result<()> {
-        let (inbound_tx, inbound_rx) = mpsc::channel::<SmInbound>();
-        let (outbound_tx, outbound_rx) = mpsc::channel::<SmOutbound>();
+        // Capture joint pubkey for the canonical auxinfo ExecutionId.
+        let compressed = incomplete_share.shared_public_key.to_bytes(true);
+        if compressed.len() != 33 {
+            return Err(MpcError::Dkg(format!(
+                "keygen joint pubkey is not 33 bytes (got {})",
+                compressed.len()
+            )));
+        }
+        let mut jpk = [0u8; 33];
+        jpk.copy_from_slice(&compressed);
+        self.keygen_joint_pubkey = Some(jpk);
 
-        // Canonical ExecutionId per MPC-Spec §02.2 for phase=DkgAuxInfo.
-        // §02.4 requires the keygen-output joint pubkey here (auxinfo is
-        // a non-keygen phase, so the all-zero carve-out does NOT apply).
-        let joint_pubkey = self.keygen_joint_pubkey.ok_or_else(|| {
-            MpcError::Dkg(
-                "keygen joint pubkey not captured — start_aux_info_sm called \
-                 before KeygenComplete (internal error)"
-                    .into(),
-            )
-        })?;
+        // Serialize and stash for later combine in assemble_dkg_result.
+        let share_json = serde_json::to_vec(&incomplete_share)
+            .map_err(|e| MpcError::Dkg(format!("failed to serialize incomplete share: {e}")))?;
+        self.incomplete_share_json = Some(share_json);
+
+        // Build the auxinfo SM. ExecutionId per MPC-Spec §02.4 includes the
+        // joint pubkey (auxinfo is non-keygen, so the all-zero carve-out
+        // does NOT apply).
         let aux_eid_bytes =
             crate::canonical::canonical_execution_id(&crate::canonical::ExecutionParams::new_v1(
                 crate::canonical::PhaseTag::DkgAuxInfo,
                 self.session_id,
-                joint_pubkey,
+                jpk,
             ));
-
         let my_index = self.my_index.0;
         let n = self.config.parties;
-        let primes = self.pregenerated_primes.take();
+        let primes_opt = self.pregenerated_primes.take();
 
-        let thread_handle = thread::Builder::new()
-            .name(format!("dkg-auxinfo-{my_index}"))
-            .spawn(move || {
-                run_aux_info_sm(aux_eid_bytes, my_index, n, primes, inbound_rx, outbound_tx);
-            })
-            .map_err(|e| MpcError::Dkg(format!("failed to spawn aux info thread: {e}")))?;
+        let sm: AuxInfoSm = Box::new(wrap_protocol(move |party| async move {
+            let eid = ExecutionId::new(&aux_eid_bytes);
+            let primes = match primes_opt {
+                Some(p) => {
+                    tracing::info!(party = my_index, "using pre-generated Paillier primes");
+                    p
+                }
+                None => {
+                    tracing::info!(
+                        party = my_index,
+                        "generating Paillier safe primes (this may take 30-60s)..."
+                    );
+                    cggmp24::PregeneratedPrimes::<SecurityLevel128>::generate(
+                        &mut rand::rngs::OsRng,
+                    )
+                }
+            };
+            cggmp24::aux_info_gen(eid, my_index, n, primes)
+                .start(&mut rand::rngs::OsRng, party)
+                .await
+        }));
 
-        // Drop old channel handles (keygen thread already exited)
-        self.sm_tx = Some(inbound_tx);
-        self.sm_rx = Some(outbound_rx);
-        self.sm_thread = Some(thread_handle);
+        self.aux_info_sm = Some(sm);
+        self.phase = DkgPhase::AuxInfo;
+        self.current_round += 1;
 
         Ok(())
-    }
-
-    // -----------------------------------------------------------------------
-    // Internal: Collect outgoing messages from the SM thread
-    // -----------------------------------------------------------------------
-
-    /// Collect the initial batch of outgoing messages after starting a phase.
-    fn collect_outgoing_messages(&mut self) -> Result<Vec<RoundMessage>> {
-        let rx = self
-            .sm_rx
-            .as_ref()
-            .ok_or_else(|| MpcError::Dkg("SM channel not available (internal error)".into()))?;
-
-        let mut outgoing = Vec::new();
-
-        loop {
-            let msg = rx.recv().map_err(|e| {
-                MpcError::Dkg(format!("SM thread channel closed unexpectedly: {e}"))
-            })?;
-
-            match msg {
-                SmOutbound::OutgoingMessage(wire_bytes) => {
-                    outgoing.push(self.wire_bytes_to_round_message(wire_bytes)?);
-                }
-                SmOutbound::NeedsMessage => {
-                    // SM is waiting for incoming messages — return what we have
-                    break;
-                }
-                SmOutbound::KeygenComplete(_share_json) => {
-                    // Keygen finished on first call — unusual but handle it.
-                    // This shouldn't happen for threshold keygen which always needs
-                    // at least one round of message exchange.
-                    return Err(MpcError::Dkg(
-                        "keygen completed without any rounds (unexpected)".into(),
-                    ));
-                }
-                SmOutbound::AuxInfoComplete(_) => {
-                    return Err(MpcError::Dkg(
-                        "aux info completed on first call (unexpected)".into(),
-                    ));
-                }
-                SmOutbound::Error(e) => {
-                    return Err(MpcError::Dkg(e));
-                }
-            }
-        }
-
-        Ok(outgoing)
-    }
-
-    /// Collect messages after feeding incoming messages for a round.
-    /// Handles phase transitions (keygen -> aux_info -> complete).
-    fn collect_round_result(&mut self) -> Result<DkgRoundResult> {
-        let rx = self
-            .sm_rx
-            .as_ref()
-            .ok_or_else(|| MpcError::Dkg("SM channel not available (internal error)".into()))?;
-
-        let mut outgoing = Vec::new();
-
-        loop {
-            let msg = rx.recv().map_err(|e| {
-                MpcError::Dkg(format!("SM thread channel closed unexpectedly: {e}"))
-            })?;
-
-            match msg {
-                SmOutbound::OutgoingMessage(wire_bytes) => {
-                    outgoing.push(self.wire_bytes_to_round_message(wire_bytes)?);
-                }
-                SmOutbound::NeedsMessage => {
-                    // SM needs more input — return outgoing messages collected so far
-                    self.current_round += 1;
-                    return Ok(DkgRoundResult::NextRound(outgoing));
-                }
-                SmOutbound::KeygenComplete(share_json) => {
-                    tracing::info!(
-                        party = self.my_index.0,
-                        "keygen phase complete, starting aux info generation"
-                    );
-
-                    // Capture the joint pubkey from the keygen output so the
-                    // auxinfo phase can derive its canonical ExecutionId per
-                    // MPC-Spec §02.4. Deserialize just to peek at
-                    // `shared_public_key`; the bytes stay stored for
-                    // assemble_dkg_result.
-                    let peek: cggmp24::IncompleteKeyShare<Secp256k1> =
-                        serde_json::from_slice(&share_json).map_err(|e| {
-                            MpcError::Dkg(format!(
-                                "failed to peek joint pubkey from keygen output: {e}"
-                            ))
-                        })?;
-                    let compressed = peek.shared_public_key.to_bytes(true);
-                    if compressed.len() != 33 {
-                        return Err(MpcError::Dkg(format!(
-                            "keygen joint pubkey is not 33 bytes (got {})",
-                            compressed.len()
-                        )));
-                    }
-                    let mut jpk = [0u8; 33];
-                    jpk.copy_from_slice(&compressed);
-                    self.keygen_joint_pubkey = Some(jpk);
-
-                    // Store the incomplete share and clean up keygen thread
-                    self.incomplete_share_json = Some(share_json);
-                    self.cleanup_sm_thread();
-
-                    // Transition to aux info phase
-                    self.phase = DkgPhase::AuxInfo;
-                    self.start_aux_info_sm()?;
-
-                    // Collect the first outgoing messages from aux info
-                    let aux_msgs = self.collect_outgoing_messages()?;
-
-                    // Combine any remaining keygen outgoing msgs with aux info msgs
-                    outgoing.extend(aux_msgs);
-                    self.current_round += 1;
-
-                    return Ok(DkgRoundResult::NextRound(outgoing));
-                }
-                SmOutbound::AuxInfoComplete(aux_info_json) => {
-                    tracing::info!(
-                        party = self.my_index.0,
-                        "aux info phase complete, assembling KeyShare"
-                    );
-
-                    self.cleanup_sm_thread();
-                    self.phase = DkgPhase::Complete;
-
-                    // Assemble the final DKG result
-                    return self.assemble_dkg_result(aux_info_json);
-                }
-                SmOutbound::Error(e) => {
-                    self.cleanup_sm_thread();
-                    return Err(MpcError::Dkg(e));
-                }
-            }
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // Internal: Convert wire bytes to RoundMessage
-    // -----------------------------------------------------------------------
-
-    fn wire_bytes_to_round_message(&self, wire_bytes: Vec<u8>) -> Result<RoundMessage> {
-        // Peek at the wire message to extract routing info
-        let wire: WireMessage = serde_json::from_slice(&wire_bytes)
-            .map_err(|e| MpcError::Dkg(format!("failed to parse wire message: {e}")))?;
-
-        Ok(RoundMessage {
-            session_id: self.session_id,
-            round: self.current_round,
-            from: ShareIndex(wire.sender),
-            to: if wire.is_broadcast {
-                None
-            } else {
-                // For p2p messages in a 2-party setup, the recipient is the other party.
-                // In general, we don't know the specific recipient from WireMessage alone,
-                // since round_based::Outgoing uses Recipient enum which may specify an index.
-                // The transport layer handles routing based on the to field.
-                None // Let transport layer figure out routing from the wire message itself
-            },
-            payload: wire_bytes,
-        })
     }
 
     // -----------------------------------------------------------------------
     // Internal: Assemble the final DKG result
     // -----------------------------------------------------------------------
 
-    fn assemble_dkg_result(&self, aux_info_json: Vec<u8>) -> Result<DkgRoundResult> {
+    fn assemble_dkg_result(
+        &self,
+        aux_info: cggmp24::key_share::AuxInfo<SecurityLevel128>,
+    ) -> Result<DkgRoundResult> {
         let incomplete_json = self.incomplete_share_json.as_ref().ok_or_else(|| {
             MpcError::Dkg("incomplete share not available (internal error)".into())
         })?;
 
-        // Deserialize the IncompleteKeyShare
+        // Deserialize the IncompleteKeyShare (we stashed it before
+        // transitioning to AuxInfo).
         let incomplete: cggmp24::IncompleteKeyShare<Secp256k1> =
             serde_json::from_slice(incomplete_json).map_err(|e| {
                 MpcError::Dkg(format!("failed to deserialize incomplete share: {e}"))
             })?;
 
-        // Deserialize the AuxInfo
-        let aux_info: cggmp24::key_share::AuxInfo<SecurityLevel128> =
-            serde_json::from_slice(&aux_info_json)
-                .map_err(|e| MpcError::Dkg(format!("failed to deserialize aux info: {e}")))?;
-
-        // Extract the joint public key BEFORE consuming the share
+        // Extract the joint public key BEFORE consuming the share.
         let joint_pubkey_point = incomplete.shared_public_key;
         let compressed_bytes = joint_pubkey_point.to_bytes(true);
 
-        // Derive BSV P2PKH address from the compressed public key
+        // Derive BSV P2PKH address from the compressed public key.
         let address = derive_p2pkh_address(&compressed_bytes);
 
-        // Combine into a complete KeyShare
+        // Combine into a complete KeyShare.
         let key_share =
             cggmp24::KeyShare::<Secp256k1, SecurityLevel128>::from_parts((incomplete, aux_info))
                 .map_err(|e| MpcError::Dkg(format!("failed to combine key share: {e}")))?;
 
-        // Serialize the complete KeyShare for storage
         let key_share_json = serde_json::to_vec(&key_share)
             .map_err(|e| MpcError::Dkg(format!("failed to serialize key share: {e}")))?;
 
-        // Encrypt the key share for persistent storage.
-        // We use a placeholder encryption key here — the caller should re-encrypt
-        // with a proper BRC-42 derived key before persisting.
-        // NOTE: The ciphertext is NOT actually encrypted here — it contains
-        // the raw serialized KeyShare JSON. The caller (proxy layer) must
-        // re-encrypt with a BRC-42 derived key before persisting.
-        // We use a random nonce (not zeros) so that any accidental attempt
-        // to decrypt with a real key fails cleanly with GCM auth tag mismatch.
+        // The ciphertext field stores the raw serialized KeyShare JSON; the
+        // proxy layer re-encrypts with a BRC-42-derived key before
+        // persisting. We use a random nonce so any accidental decrypt
+        // attempt fails cleanly with GCM auth-tag mismatch.
         let share = EncryptedShare {
             nonce: {
                 use rand::RngCore;
@@ -700,15 +690,10 @@ impl DkgCoordinator {
             address,
         };
 
-        // Compute session ID as SHA-256 of the joint public key bytes
-        // (in production this would include the full DKG transcript)
-        // Re-derive the DKG-output session_id by hashing the joint pubkey
-        // with the input session_id. This is a per-DKG "output identifier"
-        // distinct from the input session_id used for protocol binding.
-        // (Wire-canonical SessionId for the *next* ceremony is computed at
-        // its boundary via `crate::canonical::canonical_session_id`.)
+        // Per-DKG output identifier (distinct from the input session_id used
+        // for protocol binding).
         let session_hash_bytes = {
-            let mut hasher = sha2::Sha256::new();
+            let mut hasher = Sha256::new();
             hasher.update(b"bsv-mpc-session-");
             hasher.update(&compressed_bytes);
             hasher.update(self.session_id.as_bytes());
@@ -723,358 +708,86 @@ impl DkgCoordinator {
             session_id: SessionId(session_hash_bytes),
         }))
     }
-
-    // -----------------------------------------------------------------------
-    // Internal: Thread cleanup
-    // -----------------------------------------------------------------------
-
-    fn cleanup_sm_thread(&mut self) {
-        // Drop the sender to signal the thread to exit
-        self.sm_tx.take();
-        self.sm_rx.take();
-
-        // Join the thread if it's still running
-        if let Some(handle) = self.sm_thread.take() {
-            // Don't block indefinitely — the thread should exit quickly
-            // once its channel is dropped
-            let _ = handle.join();
-        }
-    }
-}
-
-impl Drop for DkgCoordinator {
-    fn drop(&mut self) {
-        self.cleanup_sm_thread();
-    }
 }
 
 // ---------------------------------------------------------------------------
-// State machine thread functions
+// Generic inline-drive helper (Phase G kernel)
 // ---------------------------------------------------------------------------
 
-/// Run the keygen state machine in a dedicated thread.
-///
-/// This function blocks the thread, driving the SM via `proceed()` and
-/// communicating with the coordinator via channels.
-fn run_keygen_sm(
-    eid_bytes: [u8; 32],
-    my_index: u16,
-    n: u16,
-    t: u16,
-    inbound_rx: mpsc::Receiver<SmInbound>,
-    outbound_tx: mpsc::Sender<SmOutbound>,
-) {
-    let eid = ExecutionId::new(&eid_bytes);
-
-    // Create the keygen state machine via wrap_protocol
-    let mut sm = round_based::state_machine::wrap_protocol(|party| async move {
-        cggmp24::keygen::<Secp256k1>(eid, my_index, n)
-            .set_threshold(t)
-            .start(&mut rand::rngs::OsRng, party)
-            .await
-    });
-
-    let mut msg_id: u64 = 0;
-    let mut wire_buffer: std::collections::VecDeque<WireMessage> =
-        std::collections::VecDeque::new();
-
-    loop {
-        match sm.proceed() {
-            ProceedResult::SendMsg(outgoing) => {
-                let wire = match outgoing_to_wire(my_index, outgoing) {
-                    Ok(w) => w,
-                    Err(e) => {
-                        let _ = outbound_tx.send(SmOutbound::Error(format!(
-                            "keygen: failed to create wire message: {e}"
-                        )));
-                        return;
-                    }
-                };
-                let wire_bytes = match serde_json::to_vec(&wire) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        let _ = outbound_tx.send(SmOutbound::Error(format!(
-                            "keygen: failed to serialize outgoing: {e}"
-                        )));
-                        return;
-                    }
-                };
-                if outbound_tx
-                    .send(SmOutbound::OutgoingMessage(wire_bytes))
-                    .is_err()
-                {
-                    return; // Coordinator dropped its receiver
-                }
-            }
-            ProceedResult::NeedsOneMoreMessage => {
-                let wire = if let Some(w) = wire_buffer.pop_front() {
-                    w
-                } else {
-                    if outbound_tx.send(SmOutbound::NeedsMessage).is_err() {
-                        return;
-                    }
-                    let inbound = match inbound_rx.recv() {
-                        Ok(msg) => msg,
-                        Err(_) => return,
-                    };
-                    match inbound {
-                        SmInbound::IncomingMessage(wire_bytes) => {
-                            let mut wires: std::collections::VecDeque<WireMessage> =
-                                if wire_bytes.first() == Some(&b'[') {
-                                    match serde_json::from_slice::<Vec<WireMessage>>(&wire_bytes) {
-                                        Ok(v) => v.into(),
-                                        Err(e) => {
-                                            let _ = outbound_tx.send(SmOutbound::Error(format!(
-                                            "keygen: failed to deserialize bundled incoming: {e}"
-                                        )));
-                                            return;
-                                        }
-                                    }
-                                } else {
-                                    match serde_json::from_slice::<WireMessage>(&wire_bytes) {
-                                        Ok(w) => {
-                                            let mut d = std::collections::VecDeque::new();
-                                            d.push_back(w);
-                                            d
-                                        }
-                                        Err(e) => {
-                                            let _ = outbound_tx.send(SmOutbound::Error(format!(
-                                                "keygen: failed to deserialize incoming: {e}"
-                                            )));
-                                            return;
-                                        }
-                                    }
-                                };
-                            let first = match wires.pop_front() {
-                                Some(w) => w,
-                                None => {
-                                    let _ = outbound_tx
-                                        .send(SmOutbound::Error("keygen: empty bundle".into()));
-                                    return;
-                                }
-                            };
-                            wire_buffer.extend(wires);
-                            first
-                        }
-                    }
-                };
-                msg_id += 1;
-                let incoming = match wire_to_incoming(wire, msg_id) {
-                    Ok(inc) => inc,
-                    Err(e) => {
-                        let _ = outbound_tx.send(SmOutbound::Error(format!(
-                            "keygen: failed to parse incoming message: {e}"
-                        )));
-                        return;
-                    }
-                };
-                if sm.received_msg(incoming).is_err() {
-                    let _ = outbound_tx.send(SmOutbound::Error(
-                        "keygen: SM rejected incoming message".into(),
-                    ));
-                    return;
-                }
-            }
-            ProceedResult::Yielded => {}
-            ProceedResult::Output(result) => {
-                match result {
-                    Ok(incomplete_share) => {
-                        let share_json = match serde_json::to_vec(&incomplete_share) {
-                            Ok(j) => j,
-                            Err(e) => {
-                                let _ = outbound_tx.send(SmOutbound::Error(format!(
-                                    "keygen: failed to serialize share: {e}"
-                                )));
-                                return;
-                            }
-                        };
-                        let _ = outbound_tx.send(SmOutbound::KeygenComplete(share_json));
-                    }
-                    Err(e) => {
-                        let _ = outbound_tx
-                            .send(SmOutbound::Error(format!("keygen protocol error: {e:?}")));
-                    }
-                }
-                return;
-            }
-            ProceedResult::Error(e) => {
-                let _ = outbound_tx.send(SmOutbound::Error(format!(
-                    "keygen state machine error: {e}"
-                )));
-                return;
-            }
-        }
-    }
+/// Result of one drive step on an SM. Either it needs more input from the
+/// caller (the `wire_buffer` ran dry mid-protocol), or it completed and
+/// returned its protocol output.
+enum DriveStep<O> {
+    /// SM emitted `NeedsOneMoreMessage` with no buffered input. Caller
+    /// returns `NextRound(outgoing)` to its caller.
+    NeedsInput,
+    /// SM emitted `Output(Ok(o))`. Caller transitions to next phase or
+    /// returns `Complete`.
+    Complete(O),
 }
 
-/// Run the aux info generation state machine in a dedicated thread.
+/// Drive a `StateMachine` until it either needs more input or finishes.
+/// Generic across the keygen and auxinfo SMs (different Msg + Output
+/// types). The caller passes mutable refs to all coordinator state the
+/// driver touches.
 ///
-/// This generates Paillier primes (expensive!) and then runs the
-/// aux info protocol to produce `AuxInfo`.
-fn run_aux_info_sm(
-    eid_bytes: [u8; 32],
+/// `phase_tag` is used only for error messages ("keygen" / "auxinfo").
+#[allow(clippy::too_many_arguments)]
+fn drive_inline<O, E, M, SM>(
+    sm: &mut SM,
+    wire_buffer: &mut VecDeque<WireMessage>,
+    next_msg_id: &mut u64,
     my_index: u16,
-    n: u16,
-    pregenerated_primes: Option<cggmp24::PregeneratedPrimes<SecurityLevel128>>,
-    inbound_rx: mpsc::Receiver<SmInbound>,
-    outbound_tx: mpsc::Sender<SmOutbound>,
-) {
-    let eid = ExecutionId::new(&eid_bytes);
-
-    // Use pre-generated primes if provided, otherwise generate safe primes.
-    // Safe prime generation is the EXPENSIVE part — can take 10-60 seconds.
-    let pregenerated = match pregenerated_primes {
-        Some(primes) => {
-            tracing::info!(party = my_index, "using pre-generated Paillier primes");
-            primes
-        }
-        None => {
-            tracing::info!(
-                party = my_index,
-                "generating Paillier safe primes (this may take 30-60s)..."
-            );
-            let primes =
-                cggmp24::PregeneratedPrimes::<SecurityLevel128>::generate(&mut rand::rngs::OsRng);
-            tracing::info!(party = my_index, "Paillier prime generation complete");
-            primes
-        }
-    };
-
-    // Create the aux info state machine
-    let mut sm = round_based::state_machine::wrap_protocol(|party| async move {
-        cggmp24::aux_info_gen(eid, my_index, n, pregenerated)
-            .start(&mut rand::rngs::OsRng, party)
-            .await
-    });
-
-    let mut msg_id: u64 = 0;
-    let mut wire_buffer: std::collections::VecDeque<WireMessage> =
-        std::collections::VecDeque::new();
-
+    session_id: SessionId,
+    current_round: u8,
+    outgoing: &mut Vec<RoundMessage>,
+    phase_tag: &str,
+) -> Result<DriveStep<O>>
+where
+    SM: StateMachine<Output = std::result::Result<O, E>, Msg = M> + ?Sized,
+    M: Serialize + serde::de::DeserializeOwned,
+    E: std::fmt::Display,
+{
     loop {
         match sm.proceed() {
-            ProceedResult::SendMsg(outgoing) => {
-                let wire = match outgoing_to_wire(my_index, outgoing) {
-                    Ok(w) => w,
-                    Err(e) => {
-                        let _ = outbound_tx.send(SmOutbound::Error(format!(
-                            "auxinfo: failed to create wire message: {e}"
-                        )));
-                        return;
-                    }
-                };
-                let wire_bytes = match serde_json::to_vec(&wire) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        let _ = outbound_tx.send(SmOutbound::Error(format!(
-                            "auxinfo: failed to serialize outgoing: {e}"
-                        )));
-                        return;
-                    }
-                };
-                if outbound_tx
-                    .send(SmOutbound::OutgoingMessage(wire_bytes))
-                    .is_err()
-                {
-                    return;
-                }
+            ProceedResult::SendMsg(out) => {
+                let wire = outgoing_to_wire(my_index, out)?;
+                let wire_bytes = serde_json::to_vec(&wire).map_err(|e| {
+                    MpcError::Dkg(format!("{phase_tag}: failed to serialize outgoing: {e}"))
+                })?;
+                // Transport layer handles per-recipient routing via the
+                // wire-level recipient info; we don't pin a destination here.
+                outgoing.push(RoundMessage {
+                    session_id,
+                    round: current_round,
+                    from: ShareIndex(my_index),
+                    to: None,
+                    payload: wire_bytes,
+                });
             }
             ProceedResult::NeedsOneMoreMessage => {
-                let wire = if let Some(w) = wire_buffer.pop_front() {
-                    w
-                } else {
-                    if outbound_tx.send(SmOutbound::NeedsMessage).is_err() {
-                        return;
-                    }
-                    let inbound = match inbound_rx.recv() {
-                        Ok(msg) => msg,
-                        Err(_) => return,
-                    };
-                    match inbound {
-                        SmInbound::IncomingMessage(wire_bytes) => {
-                            let mut wires: std::collections::VecDeque<WireMessage> =
-                                if wire_bytes.first() == Some(&b'[') {
-                                    match serde_json::from_slice::<Vec<WireMessage>>(&wire_bytes) {
-                                        Ok(v) => v.into(),
-                                        Err(e) => {
-                                            let _ = outbound_tx.send(SmOutbound::Error(format!(
-                                            "auxinfo: failed to deserialize bundled incoming: {e}"
-                                        )));
-                                            return;
-                                        }
-                                    }
-                                } else {
-                                    match serde_json::from_slice::<WireMessage>(&wire_bytes) {
-                                        Ok(w) => {
-                                            let mut d = std::collections::VecDeque::new();
-                                            d.push_back(w);
-                                            d
-                                        }
-                                        Err(e) => {
-                                            let _ = outbound_tx.send(SmOutbound::Error(format!(
-                                                "auxinfo: failed to deserialize incoming: {e}"
-                                            )));
-                                            return;
-                                        }
-                                    }
-                                };
-                            let first = match wires.pop_front() {
-                                Some(w) => w,
-                                None => {
-                                    let _ = outbound_tx
-                                        .send(SmOutbound::Error("auxinfo: empty bundle".into()));
-                                    return;
-                                }
-                            };
-                            wire_buffer.extend(wires);
-                            first
-                        }
-                    }
+                let Some(wire) = wire_buffer.pop_front() else {
+                    return Ok(DriveStep::NeedsInput);
                 };
-                msg_id += 1;
-                let incoming = match wire_to_incoming(wire, msg_id) {
-                    Ok(inc) => inc,
-                    Err(e) => {
-                        let _ = outbound_tx.send(SmOutbound::Error(format!(
-                            "auxinfo: failed to parse incoming message: {e}"
-                        )));
-                        return;
-                    }
-                };
-                if sm.received_msg(incoming).is_err() {
-                    let _ = outbound_tx.send(SmOutbound::Error(
-                        "auxinfo: SM rejected incoming message".into(),
-                    ));
-                    return;
-                }
+                *next_msg_id += 1;
+                let incoming = wire_to_incoming(wire, *next_msg_id).map_err(|e| {
+                    MpcError::Dkg(format!("{phase_tag}: failed to parse incoming: {e}"))
+                })?;
+                sm.received_msg(incoming).map_err(|_| {
+                    MpcError::Dkg(format!("{phase_tag}: SM rejected incoming message"))
+                })?;
             }
-            ProceedResult::Yielded => {}
-            ProceedResult::Output(result) => {
-                match result {
-                    Ok(aux_info) => {
-                        let aux_json = match serde_json::to_vec(&aux_info) {
-                            Ok(j) => j,
-                            Err(e) => {
-                                let _ = outbound_tx.send(SmOutbound::Error(format!(
-                                    "auxinfo: failed to serialize aux info: {e}"
-                                )));
-                                return;
-                            }
-                        };
-                        let _ = outbound_tx.send(SmOutbound::AuxInfoComplete(aux_json));
-                    }
-                    Err(e) => {
-                        let _ = outbound_tx
-                            .send(SmOutbound::Error(format!("aux info protocol error: {e:?}")));
-                    }
+            ProceedResult::Yielded => continue,
+            ProceedResult::Output(result) => match result {
+                Ok(o) => return Ok(DriveStep::Complete(o)),
+                Err(e) => {
+                    return Err(MpcError::Dkg(format!("{phase_tag} protocol error: {e}")));
                 }
-                return;
-            }
+            },
             ProceedResult::Error(e) => {
-                let _ = outbound_tx.send(SmOutbound::Error(format!(
-                    "aux info state machine error: {e}"
+                return Err(MpcError::Dkg(format!(
+                    "{phase_tag} state machine error: {e}"
                 )));
-                return;
             }
         }
     }
@@ -1088,28 +801,18 @@ fn run_aux_info_sm(
 ///
 /// Steps: SHA-256 -> RIPEMD-160 -> version byte (0x00) -> Base58Check
 fn derive_p2pkh_address(compressed_pubkey: &[u8]) -> String {
-    use sha2::Sha256 as Sha256Hasher;
-
-    // Step 1: SHA-256 of the compressed public key
+    // SHA-256 of the compressed public key, as a fallback identifier in
+    // case the BSV SDK path fails. Production calls always go through the
+    // BSV SDK below.
     let sha256_hash = {
-        let mut hasher = Sha256Hasher::new();
+        let mut hasher = Sha256::new();
         hasher.update(compressed_pubkey);
         hasher.finalize()
     };
 
-    // Step 2: RIPEMD-160 of the SHA-256 hash
-    // We implement RIPEMD-160 manually since we don't want to pull in another
-    // dependency. Instead, use the BSV SDK if available, or compute inline.
-    // For now, use a simple approach: the BSV SDK's PublicKey handles this.
-    //
-    // Try to use bsv::PublicKey for address derivation (most reliable).
     match bsv::PublicKey::from_bytes(compressed_pubkey) {
         Ok(pk) => pk.to_address(),
-        Err(_) => {
-            // Fallback: return hex of the pubkey hash if BSV SDK fails
-            // (should not happen for valid secp256k1 points)
-            hex::encode(&sha256_hash[..20])
-        }
+        Err(_) => hex::encode(&sha256_hash[..20]),
     }
 }
 
@@ -1357,10 +1060,6 @@ mod tests {
     // This test runs a complete DKG ceremony using cggmp24's simulation
     // infrastructure (both parties in-process) to validate that our
     // coordinator's type mappings and serialization are correct.
-    //
-    // It does NOT test the coordinator's channel-based architecture
-    // (that requires the HTTP transport pattern from POC 5).
-    // Instead, it validates the underlying crypto works end-to-end.
 
     #[tokio::test]
     async fn full_2of2_dkg_via_sim() {
@@ -1541,17 +1240,9 @@ mod tests {
     // ================================================================
     // Integration test: Two coordinators exchanging messages directly
     // ================================================================
-    //
-    // This is the most important test — it validates that our coordinator
-    // API works correctly for 2-party DKG with message exchange.
-    // We run two DkgCoordinators and manually relay messages between them.
 
     #[test]
     fn two_coordinators_keygen_message_exchange() {
-        // This test validates that init() produces messages and that the
-        // coordinator state machine can be driven through the keygen phase.
-        // We use two coordinators and relay messages between them.
-
         let config = ThresholdConfig::new(2, 2).unwrap();
         let session = SessionId::from_str_hash("coordinator-test");
 
@@ -1623,19 +1314,12 @@ mod tests {
                 }
                 (Ok(DkgRoundResult::Complete(_)), Ok(DkgRoundResult::NextRound(_)))
                 | (Ok(DkgRoundResult::NextRound(_)), Ok(DkgRoundResult::Complete(_))) => {
-                    // One completed before the other — this can happen during
-                    // the keygen→auxinfo transition. Keep driving.
-                    // In practice, both parties should complete in the same round
-                    // but the aux info phase transition may desync by one round.
                     panic!(
                         "coordinators desynchronized at round {round}: \
                          one completed but the other didn't"
                     );
                 }
                 (Err(e), _) => {
-                    // Keygen or aux info error — this is expected behavior
-                    // during the first round exchange if messages are in wrong format.
-                    // For this basic test, any error is interesting info.
                     panic!("coord0 error at round {round}: {e}");
                 }
                 (_, Err(e)) => {
