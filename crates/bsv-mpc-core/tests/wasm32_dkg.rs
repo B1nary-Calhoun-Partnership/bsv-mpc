@@ -88,8 +88,14 @@ fn two_of_two_dkg_via_inline_coordinator() {
     let msgs0 = coord0.init().expect("coord0 init should succeed on wasm32");
     let msgs1 = coord1.init().expect("coord1 init should succeed on wasm32");
 
-    assert!(!msgs0.is_empty(), "coord0 must emit initial outbound messages");
-    assert!(!msgs1.is_empty(), "coord1 must emit initial outbound messages");
+    assert!(
+        !msgs0.is_empty(),
+        "coord0 must emit initial outbound messages"
+    );
+    assert!(
+        !msgs1.is_empty(),
+        "coord1 must emit initial outbound messages"
+    );
     assert_eq!(coord0.phase(), "keygen");
     assert_eq!(coord1.phase(), "keygen");
 
