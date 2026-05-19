@@ -226,7 +226,7 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             use bsv::auth::transports::Transport;
             use bsv::auth::types::{AuthMessage, MessageType};
             use bsv::auth::{Peer, PeerOptions};
-            use bsv::primitives::{to_base64, PrivateKey, PublicKey};
+            use bsv::primitives::{to_base64, PrivateKey};
             use bsv::wallet::ProtoWallet;
             use futures::channel::oneshot;
             use rand::RngCore;
@@ -299,12 +299,16 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             let transport = SocketIoTransport::new(sender.clone());
             let callback_handle = transport.callback_handle();
 
-            // Snoop oneshot: the dispatch task captures the server's
-            // identity key off the InitialResponse before invoking
-            // Peer's callback. This is how we surface the handshake
-            // completion to the route handler without needing
-            // `Peer::initiate_handshake`'s (tokio-bound) wait machinery.
-            let (snoop_tx, snoop_rx) = oneshot::channel::<PublicKey>();
+            // Snoop oneshot: the dispatch task captures the full
+            // InitialResponse `AuthMessage` off the first inbound frame
+            // before invoking Peer's callback. This is how we surface
+            // the handshake completion to the route handler without
+            // needing `Peer::initiate_handshake`'s (tokio-bound) wait
+            // machinery. /brc103-handshake only needs `identity_key`;
+            // /envelope-roundtrip (H-3.4.C) also needs the
+            // `initial_nonce` so it can construct the BRC-31 key_id for
+            // outbound signed Generals.
+            let (snoop_tx, snoop_rx) = oneshot::channel::<AuthMessage>();
 
             // Spawn the inbound dispatch task. Consumes the WsHandle —
             // dispatch owns inbound exclusively. The dispatch sender
@@ -359,8 +363,8 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             // The CF Worker request lifecycle bounds this — if the relay
             // never replies, the request times out at ~30s rather than
             // hanging indefinitely.
-            let server_identity = match snoop_rx.await {
-                Ok(k) => k,
+            let server_response = match snoop_rx.await {
+                Ok(msg) => msg,
                 Err(e) => {
                     return Response::error(
                         format!("snoop oneshot canceled before InitialResponse arrived: {e:?}"),
@@ -368,7 +372,7 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                     )
                 }
             };
-            let server_identity_hex = server_identity.to_hex();
+            let server_identity_hex = server_response.identity_key.to_hex();
             let handshake_round_trip_ms = js_sys::Date::now() - t_send_start;
             let elapsed_ms = js_sys::Date::now() - t_start;
 

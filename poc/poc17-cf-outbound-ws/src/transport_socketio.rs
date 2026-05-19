@@ -60,6 +60,7 @@ use bsv::auth::types::AuthMessage;
 use bsv::primitives::PublicKey;
 use bsv::wallet::WalletInterface;
 use bsv::{Error, Result};
+use serde::Serialize;
 use serde_json::Value;
 
 use crate::engineio_codec::SocketIoPacket;
@@ -179,7 +180,6 @@ mod dispatch {
     use crate::engineio_codec::EngineIoPacket;
     use crate::transport_wasm::WsHandle;
     use bsv::auth::types::MessageType;
-    use bsv::primitives::PublicKey;
     use futures::channel::oneshot;
 
     /// Background dispatch task body. Consumes a [`WsHandle`] (taking
@@ -208,7 +208,7 @@ mod dispatch {
         mut ws: WsHandle,
         sender: WsSender,
         callback: Arc<StdMutex<Option<Box<TransportCallback>>>>,
-        snoop: Option<oneshot::Sender<PublicKey>>,
+        snoop: Option<oneshot::Sender<AuthMessage>>,
     ) {
         let mut snoop_slot = snoop;
         loop {
@@ -233,15 +233,19 @@ mod dispatch {
                                     Err(_) => continue,
                                 };
 
-                            // Snoop the server identity off the first
-                            // InitialResponse so the H-3.3b route can
-                            // return it as JSON proof. Note this must
-                            // happen BEFORE invoking the Peer callback
-                            // so the route doesn't race with the
-                            // session-manager mutation Peer performs.
+                            // Snoop the FULL InitialResponse off the first
+                            // post-handshake frame so the route handler can
+                            // observe BOTH the server's identity AND the
+                            // server's session-nonce (needed for the
+                            // canonical BRC-31 key_id "{our_nonce}
+                            // {server_nonce}" when emitting signed Generals
+                            // in H-3.4). The snoop fires BEFORE invoking
+                            // the Peer callback so the route doesn't race
+                            // with the session-manager mutation Peer
+                            // performs.
                             if auth_msg.message_type == MessageType::InitialResponse {
                                 if let Some(tx) = snoop_slot.take() {
-                                    let _ = tx.send(auth_msg.identity_key.clone());
+                                    let _ = tx.send(auth_msg.clone());
                                 }
                             }
 
@@ -280,7 +284,7 @@ pub async fn run_dispatch(
     _ws: crate::transport_wasm::WsHandle,
     _sender: WsSender,
     _callback: Arc<StdMutex<Option<Box<TransportCallback>>>>,
-    _snoop: Option<futures::channel::oneshot::Sender<bsv::primitives::PublicKey>>,
+    _snoop: Option<futures::channel::oneshot::Sender<AuthMessage>>,
 ) {
     // wasm32-only — see #[cfg(target_arch = "wasm32")] mod dispatch.
 }
@@ -389,6 +393,152 @@ fn parse_app_event_payload(payload: &[u8]) -> (String, Value) {
     }
 }
 
+/// Build the canonical `{eventName, data}` envelope as UTF-8 JSON bytes.
+/// Byte-identical to the TS canonical at
+/// `~/bsv/authsocket-client/src/AuthSocketClient.ts:82-84`:
+///
+/// ```ts
+/// private encodeEventPayload(eventName: string, data: any): number[] {
+///     const obj = { eventName, data }
+///     return Utils.toArray(JSON.stringify(obj), 'utf8')
+/// }
+/// ```
+///
+/// **Critical wire-compat detail**: JS `JSON.stringify` emits keys in
+/// object-literal **insertion order** (`{"eventName":...,"data":...}`).
+/// Rust `serde_json::json!({...})` defaults to a `BTreeMap`-backed
+/// `Value::Object` which produces **alphabetical order**
+/// (`{"data":...,"eventName":...}`) when serialised — unless the
+/// `preserve_order` feature is enabled. To match canonical TS without
+/// the workspace-wide feature flip, we use a typed `Envelope` struct
+/// with `#[derive(Serialize)]`, which serialises fields in
+/// **declaration order** (eventName first, data second). Verified by
+/// the byte-exact vector tests below.
+///
+/// JS `JSON.stringify` and Rust `serde_json::to_vec` produce identical
+/// byte output for ASCII keys + ASCII-or-UTF-8 string values + the
+/// numeric / object / array / null / boolean primitives used by every
+/// MessageBox event (`joinRoom`, `sendMessage`, `sendMessageAck`,
+/// `leaveRoom`, `authenticated`). Non-ASCII characters in values may
+/// diverge (TS uses `\uXXXX` escapes for some code points; serde_json
+/// defaults to raw UTF-8) — pin per-event vectors in the unit tests
+/// below if a future event introduces non-ASCII payloads.
+pub fn build_envelope_payload(event_name: &str, data: &Value) -> Vec<u8> {
+    #[derive(Serialize)]
+    struct Envelope<'a> {
+        #[serde(rename = "eventName")]
+        event_name: &'a str,
+        data: &'a Value,
+    }
+    let envelope = Envelope { event_name, data };
+    serde_json::to_vec(&envelope).unwrap_or_default()
+}
+
+/// Outcome of [`emit_signed_general`] — surfaces the values the caller
+/// would otherwise have to reconstruct (the random `msg_nonce_b64` used
+/// to derive the BRC-42 signing key + the exact `payload_bytes` that
+/// were signed). Returned for tests + telemetry; the BRC-103 wire frame
+/// has already left the WS by the time this struct exists.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EmittedGeneral {
+    /// The base64-encoded 32-byte random `nonce` field placed on the
+    /// outbound General. Half of the BRC-31 key_id `"{our_nonce} {server_nonce}"`.
+    pub msg_nonce_b64: String,
+    /// The exact UTF-8 JSON bytes of the `{eventName, data}` envelope
+    /// that became the General's `payload` field. Useful for byte-equality
+    /// assertions against a reflected `sendMessage-<roomId>` echo.
+    pub payload_bytes: Vec<u8>,
+}
+
+/// Build, sign, and emit a BRC-31 `MessageType::General` wrapping the
+/// canonical `{eventName, data}` envelope as its payload. Byte-identical
+/// to the canonical TS path at
+/// `~/bsv/authsocket-client/src/AuthSocketClient.ts:59-65`:
+///
+/// ```ts
+/// emit(eventName: string, data: any): this {
+///     const encoded = this.encodeEventPayload(eventName, data)
+///     this.peer.toPeer(encoded, this.serverIdentityKey).catch(...)
+///     return this
+/// }
+/// ```
+///
+/// Sidesteps `Peer::to_peer` for the same reason H-3.3b sidesteps
+/// `Peer::initiate_handshake` — `to_peer` routes through
+/// `get_authenticated_session(identity_key, max_wait_time)` which falls
+/// through to `initiate_handshake` on cache miss (at
+/// `~/bsv/bsv-rs/src/auth/peer.rs:376`), and `initiate_handshake` uses
+/// `tokio::time::timeout` which panics in wasm32 CF Worker scope.
+/// Reading the cached session would be safe IF we could guarantee the
+/// session manager already has the entry — which it does after H-3.3b's
+/// snoop oneshot fires AND `Peer::start()`'s callback has finished
+/// processing the InitialResponse. That ordering is fragile; constructing
+/// the General manually (Path 2) is unambiguously correct.
+///
+/// All arguments are passed explicitly so the helper has no implicit
+/// state — caller threads through the captured (server_identity,
+/// server_nonce, our_identity) tuple from the BRC-103 handshake.
+///
+/// Cryptographic shape (verified against `~/bsv/bsv-rs/src/auth/peer.rs:582-608`
+/// `Peer::sign_message`, which is what canonical TS exercises through
+/// `peer.toPeer`):
+///
+/// - `data` signed = the envelope payload bytes verbatim (per
+///   `AuthMessage::signing_data()` for `General` at `types.rs:163-166`).
+/// - `key_id` = `"{msg_nonce_b64} {server_nonce_b64}"` (per
+///   `AuthMessage::get_key_id` `_` arm at `types.rs:206-210`).
+/// - `protocol_id` = `Counterparty`-level `"auth message signature"`
+///   (per `AUTH_PROTOCOL_ID` at `types.rs:18`).
+/// - `counterparty` = `Counterparty::Other(server_identity.clone())` —
+///   ECDSA over the BRC-42-derived key for THIS particular peer.
+pub async fn emit_signed_general(
+    transport: &SocketIoTransport,
+    wallet: &bsv::wallet::ProtoWallet,
+    server_identity: &PublicKey,
+    server_nonce_b64: &str,
+    event_name: &str,
+    data: &Value,
+) -> std::result::Result<EmittedGeneral, Error> {
+    use bsv::auth::types::{MessageType, AUTH_PROTOCOL_ID};
+    use bsv::primitives::to_base64;
+    use bsv::wallet::{Counterparty, CreateSignatureArgs, Protocol, SecurityLevel};
+    use rand::RngCore;
+
+    let payload_bytes = build_envelope_payload(event_name, data);
+
+    let mut nonce_bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut nonce_bytes);
+    let msg_nonce_b64 = to_base64(&nonce_bytes);
+
+    let our_identity = wallet.identity_key();
+    let mut msg = AuthMessage::new(MessageType::General, our_identity);
+    msg.nonce = Some(msg_nonce_b64.clone());
+    msg.your_nonce = Some(server_nonce_b64.to_string());
+    msg.payload = Some(payload_bytes.clone());
+
+    let key_id = format!("{} {}", msg_nonce_b64, server_nonce_b64);
+    let protocol = Protocol::new(SecurityLevel::Counterparty, AUTH_PROTOCOL_ID);
+    let counterparty = Counterparty::Other(server_identity.clone());
+
+    let sig_result = wallet
+        .create_signature(CreateSignatureArgs {
+            data: Some(payload_bytes.clone()),
+            hash_to_directly_sign: None,
+            protocol_id: protocol,
+            key_id,
+            counterparty: Some(counterparty),
+        })
+        .map_err(|e| Error::AuthError(format!("create_signature: {e:?}")))?;
+    msg.signature = Some(sig_result.signature);
+
+    transport.send(&msg).await?;
+
+    Ok(EmittedGeneral {
+        msg_nonce_b64,
+        payload_bytes,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -495,5 +645,88 @@ mod tests {
         assert_eq!(data["roomId"], json!("abc-test"));
         assert_eq!(data["message"]["messageId"], json!("v1"));
         assert_eq!(data["message"]["body"], json!("hi"));
+    }
+
+    // ====================================================================
+    // build_envelope_payload — outbound vector tests
+    //
+    // These prove the OUTBOUND envelope wire bytes are byte-identical to
+    // what the TS canonical produces. If any of these break, the live
+    // relay will see a different `payload` shape than `peer.toPeer`
+    // produces from the TS client, and the `Peer`-installed server-side
+    // signature verifier will reject the General. These unit tests catch
+    // the regression LOCALLY before the empirical /envelope-roundtrip
+    // gate (H-3.4.C) has to.
+    // ====================================================================
+
+    #[test]
+    fn build_envelope_payload_joinroom_byte_exact() {
+        // Canonical TS `emit('joinRoom', '02abc-test_inbox')` produces:
+        //   JSON.stringify({eventName: "joinRoom", data: "02abc-test_inbox"})
+        //   = '{"eventName":"joinRoom","data":"02abc-test_inbox"}'
+        let bytes = build_envelope_payload("joinRoom", &json!("02abc-test_inbox"));
+        assert_eq!(
+            bytes.as_slice(),
+            b"{\"eventName\":\"joinRoom\",\"data\":\"02abc-test_inbox\"}".as_slice(),
+        );
+    }
+
+    #[test]
+    fn build_envelope_payload_sendmessage_byte_exact() {
+        // Canonical TS `emit('sendMessage', {roomId: "abc-test", message:
+        // {messageId: "v1", body: "hi"}})` produces:
+        //   JSON.stringify({eventName: "sendMessage", data: {roomId: "abc-test",
+        //                   message: {messageId: "v1", body: "hi"}}})
+        let bytes = build_envelope_payload(
+            "sendMessage",
+            &json!({"roomId": "abc-test", "message": {"messageId": "v1", "body": "hi"}}),
+        );
+        assert_eq!(
+            bytes.as_slice(),
+            b"{\"eventName\":\"sendMessage\",\"data\":{\"roomId\":\"abc-test\",\"message\":{\"messageId\":\"v1\",\"body\":\"hi\"}}}".as_slice(),
+        );
+    }
+
+    #[test]
+    fn build_envelope_payload_leaveroom_byte_exact() {
+        // Canonical TS `emit('leaveRoom', '02abc-test_inbox')`.
+        let bytes = build_envelope_payload("leaveRoom", &json!("02abc-test_inbox"));
+        assert_eq!(
+            bytes.as_slice(),
+            b"{\"eventName\":\"leaveRoom\",\"data\":\"02abc-test_inbox\"}".as_slice(),
+        );
+    }
+
+    #[test]
+    fn build_envelope_payload_empty_data_object() {
+        // Some events have no data — TS passes `{}` (empty object).
+        let bytes = build_envelope_payload("authenticated", &json!({}));
+        assert_eq!(
+            bytes.as_slice(),
+            b"{\"eventName\":\"authenticated\",\"data\":{}}".as_slice(),
+        );
+    }
+
+    #[test]
+    fn build_envelope_payload_round_trips_through_parser() {
+        // Property test: anything build_envelope_payload produces, the
+        // parser MUST decode back to the same (event_name, data) tuple.
+        // Covers the entire envelope layer round-trip in one assertion.
+        let cases: Vec<(&str, Value)> = vec![
+            ("joinRoom", json!("02abc-room")),
+            (
+                "sendMessage",
+                json!({"roomId": "02abc-room", "message": {"messageId": "m1", "body": "hi"}}),
+            ),
+            ("leaveRoom", json!("02abc-room")),
+            ("authenticated", json!({})),
+            ("sendMessageAck-02abc-room", json!({"status": "success"})),
+        ];
+        for (name, data) in cases {
+            let bytes = build_envelope_payload(name, &data);
+            let (decoded_name, decoded_data) = parse_app_event_payload(&bytes);
+            assert_eq!(decoded_name, name, "event_name round-trip for {name}");
+            assert_eq!(decoded_data, data, "data round-trip for {name}");
+        }
     }
 }
