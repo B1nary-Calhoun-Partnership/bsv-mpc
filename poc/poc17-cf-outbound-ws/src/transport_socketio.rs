@@ -268,3 +268,17 @@ mod dispatch {
 
 #[cfg(target_arch = "wasm32")]
 pub use dispatch::run_dispatch;
+
+#[cfg(not(target_arch = "wasm32"))]
+/// Native stub — `run_dispatch` is wasm32-only since it consumes the
+/// wasm32-only [`WsHandle`] inbound `mpsc` receiver and spawns nothing
+/// (the route handler does the spawn via `wasm_bindgen_futures::spawn_local`).
+/// Present so `cargo build --workspace --all-targets` compiles on native.
+pub async fn run_dispatch(
+    _ws: crate::transport_wasm::WsHandle,
+    _sender: WsSender,
+    _callback: Arc<StdMutex<Option<Box<TransportCallback>>>>,
+    _snoop: Option<futures::channel::oneshot::Sender<bsv::primitives::PublicKey>>,
+) {
+    // wasm32-only — see #[cfg(target_arch = "wasm32")] mod dispatch.
+}

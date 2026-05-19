@@ -66,3 +66,9 @@ workspace = true
 
 [dependencies.hex]
 workspace = true
+
+# Used by `/brc103-handshake` to generate the initial_nonce
+# (32 random bytes, base64). wasm32 entropy comes from `getrandom/js`
+# already declared above.
+[dependencies.rand]
+workspace = true

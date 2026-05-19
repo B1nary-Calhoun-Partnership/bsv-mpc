@@ -210,6 +210,179 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 "gate": "H-3.3a",
             }))
         })
+        // H-3.3b gate: BRC-103 mutual auth via SocketIoTransport + Peer.
+        // Builds on the H-3.3a substrate (polling → WS upgrade → Socket.IO
+        // CONNECT), then wires `bsv_rs::auth::Peer` over our new
+        // `SocketIoTransport`, sends an `InitialRequest` manually via the
+        // transport (Path 2; avoids `Peer::initiate_handshake` which uses
+        // `tokio::time::timeout` — non-functional in `wasm32-unknown-unknown`
+        // CF Worker scope per audit §11.2 + the server's own analysis at
+        // `~/bsv/bsv-messagebox-cloudflare-public/src/engineio/auth.rs:14-26`),
+        // and snoops the server's `InitialResponse` off the dispatch loop
+        // for the JSON proof.
+        .get_async("/brc103-handshake", |_req, ctx| async move {
+            use crate::engineio_codec::{EngineIoPacket, SocketIoPacket};
+            use crate::transport_socketio::{run_dispatch, SocketIoTransport};
+            use bsv::auth::transports::Transport;
+            use bsv::auth::types::{AuthMessage, MessageType};
+            use bsv::auth::{Peer, PeerOptions};
+            use bsv::primitives::{to_base64, PrivateKey, PublicKey};
+            use bsv::wallet::ProtoWallet;
+            use futures::channel::oneshot;
+            use rand::RngCore;
+
+            let t_start = js_sys::Date::now();
+
+            let relay = ctx
+                .env
+                .var("RELAY_URL")
+                .map(|v| v.to_string())
+                .unwrap_or_else(|_| DEFAULT_RELAY.to_string());
+
+            // Engine.IO 4 polling phase.
+            let handshake = match transport_wasm::polling_handshake(&relay).await {
+                Ok(h) => h,
+                Err(e) => return Response::error(format!("polling handshake failed: {e}"), 502),
+            };
+
+            // Engine.IO 4 WS upgrade.
+            let mut ws =
+                match transport_wasm::WsHandle::open_and_upgrade(&relay, &handshake.sid).await {
+                    Ok(h) => h,
+                    Err(e) => {
+                        return Response::error(
+                            format!("ws open+upgrade failed (sid={}): {e}", handshake.sid),
+                            502,
+                        )
+                    }
+                };
+
+            // Socket.IO 5 CONNECT exchange — same substrate as H-3.3a but
+            // inlined here so the route is self-contained.
+            let connect_pkt = SocketIoPacket::Connect {
+                nsp: "/".to_string(),
+                data: None,
+            };
+            if let Err(e) = ws.send_socketio(&connect_pkt) {
+                return Response::error(format!("send Socket.IO CONNECT: {e}"), 502);
+            }
+            loop {
+                let pkt = match ws.recv_engineio().await {
+                    Ok(p) => p,
+                    Err(e) => {
+                        return Response::error(
+                            format!("ws closed waiting for CONNECT-ack: {e}"),
+                            502,
+                        )
+                    }
+                };
+                match pkt {
+                    EngineIoPacket::Ping(payload) => {
+                        let _ = ws.send_engineio(&EngineIoPacket::Pong(payload));
+                    }
+                    EngineIoPacket::Message(payload) => {
+                        if let Ok(SocketIoPacket::Connect { .. }) = SocketIoPacket::decode(&payload)
+                        {
+                            break; // CONNECT-ack — Socket.IO ready.
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            // Build the SocketIoTransport substrate. `transport` is Clone
+            // (all internal state is `Arc`-shared or JS-handle-cheap), so
+            // we hand one clone to `Peer::new` (consumed by value) and
+            // keep this one to invoke `transport.send(&InitialRequest)`
+            // directly for the Path 2 handshake trigger.
+            let sender = ws.sender();
+            let transport = SocketIoTransport::new(sender.clone());
+            let callback_handle = transport.callback_handle();
+
+            // Snoop oneshot: the dispatch task captures the server's
+            // identity key off the InitialResponse before invoking
+            // Peer's callback. This is how we surface the handshake
+            // completion to the route handler without needing
+            // `Peer::initiate_handshake`'s (tokio-bound) wait machinery.
+            let (snoop_tx, snoop_rx) = oneshot::channel::<PublicKey>();
+
+            // Spawn the inbound dispatch task. Consumes the WsHandle —
+            // dispatch owns inbound exclusively. The dispatch sender
+            // clone is for auto-Pong on inbound Ping frames.
+            wasm_bindgen_futures::spawn_local(async move {
+                run_dispatch(ws, sender, callback_handle, Some(snoop_tx)).await;
+            });
+
+            // One-shot client identity. Phase H Step 4 will swap this
+            // for the cosigner's stable identity priv per audit §11.4.
+            let client_priv = PrivateKey::random();
+            let client_pub_hex = client_priv.public_key().to_hex();
+            let wallet = ProtoWallet::new(Some(client_priv));
+
+            // Wire Peer over our SocketIoTransport. peer.start() installs
+            // the inbound callback into our `Arc<StdMutex<...>>` slot;
+            // the dispatch task (already running) will invoke it on each
+            // decoded `authMessage` event.
+            let peer = Peer::new(PeerOptions {
+                wallet,
+                transport: transport.clone(),
+                certificates_to_request: None,
+                session_manager: None,
+                auto_persist_last_session: false,
+                originator: Some("poc17-cf-outbound-ws".to_string()),
+            });
+            peer.start();
+
+            // Construct InitialRequest manually. Per
+            // `~/bsv/bsv-rs/src/auth/types.rs:183`, `InitialRequest` is
+            // unsigned (the protocol bootstrap), so all we need is our
+            // identity_key + a random 32-byte initial_nonce.
+            let my_identity = match peer.get_identity_key().await {
+                Ok(k) => k,
+                Err(e) => {
+                    return Response::error(format!("peer.get_identity_key: {e:?}"), 500);
+                }
+            };
+            let mut nonce_bytes = [0u8; 32];
+            rand::thread_rng().fill_bytes(&mut nonce_bytes);
+            let initial_nonce_b64 = to_base64(&nonce_bytes);
+
+            let mut initial_req = AuthMessage::new(MessageType::InitialRequest, my_identity);
+            initial_req.initial_nonce = Some(initial_nonce_b64);
+
+            let t_send_start = js_sys::Date::now();
+            if let Err(e) = transport.send(&initial_req).await {
+                return Response::error(format!("transport.send InitialRequest: {e:?}"), 502);
+            }
+
+            // Await the dispatch task's snoop of the InitialResponse.
+            // The CF Worker request lifecycle bounds this — if the relay
+            // never replies, the request times out at ~30s rather than
+            // hanging indefinitely.
+            let server_identity = match snoop_rx.await {
+                Ok(k) => k,
+                Err(e) => {
+                    return Response::error(
+                        format!("snoop oneshot canceled before InitialResponse arrived: {e:?}"),
+                        502,
+                    )
+                }
+            };
+            let server_identity_hex = server_identity.to_hex();
+            let handshake_round_trip_ms = js_sys::Date::now() - t_send_start;
+            let elapsed_ms = js_sys::Date::now() - t_start;
+
+            Response::from_json(&serde_json::json!({
+                "socketio_status": "brc103_authenticated",
+                "relay": relay,
+                "engineio_sid": handshake.sid,
+                "client_identity": client_pub_hex,
+                "server_identity": server_identity_hex,
+                "handshake_round_trip_ms": handshake_round_trip_ms,
+                "elapsed_ms": elapsed_ms,
+                "gate": "H-3.3b",
+            }))
+        })
         .run(req, env)
         .await
 }
