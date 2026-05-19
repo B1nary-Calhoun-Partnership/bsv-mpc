@@ -22,6 +22,10 @@ ROUND3-PROMPT.md
 wrangler.toml
 .dev.vars
 build/
+# wrangler dev local state + npm install output
+.wrangler/
+node_modules/
+package-lock.json
 
 # Graphify (Claude Code tool) writes AST/semantic caches alongside the repo
 # whenever an agent explores the codebase. They're regenerable and noisy.
