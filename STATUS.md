@@ -20,7 +20,7 @@ trackers are:
 |---|---|---|---|
 | A–F | canonical envelopes + MessageBox wire + DKG via MB + Sign via MB | **CLOSED** | Phase E mainnet TXID [`82ccb15c…`](https://whatsonchain.com/tx/82ccb15c49985a32b355a618f417bb7a09ec4ee5cf34e539e9baaebb74dadc29) |
 | G | inline SM coordinator rewrite + Paillier safe-prime pool | **CLOSED 2026-05-19** | Mainnet TXID [`442bd391…`](https://whatsonchain.com/tx/442bd391cf8eda299f82dc1e4aeb1a9cb4f33610365d44c9c1c0e55d32f171b9) (G-5d) + wasm32 `tests/wasm32_dkg.rs` green (G-5b). Merge-gate commit `d9b1b27`. |
-| H | `bsv-mpc-messagebox` Rust client crate (WASM-compatible, outbound WS DO) | **NEXT** | — |
+| H | Socket.IO + BRC-103 wasm32 client + native unification + `bsv-rs` upstream `SocketIoTransport` | **STEPS 1-2 DONE** (~5-7 wk total); H-3 POC next | audit doc `254ff0f` + `4a1f8bc` (§2.5b) + §11 god-tier expansion landed |
 | I | wire G + H into deployed `bsv-mpc-worker` CF cosigner | blocked on H | — |
 | J | CHIP + `/capabilities` + `/health.json` (MPC-Spec §12 + §16) | blocked on I | — |
 | K | cross-stack joint mainnet TX (closes MPC-Spec #36) | blocked on J + Quaakee's rust-mpc deploy | — |
@@ -62,3 +62,11 @@ port. See [LESSONS.md](LESSONS.md) for the full technical writeup.
 | Eager startup backfill of `paillier_pool` in `bsv-mpc-service` | audit OQ4 | Spec-recommended; not on the G gate path. Phase I work. |
 | SQLite persistence backend for `bsv-mpc-service` | CLAUDE.md | Currently in-memory; not load-bearing for cross-stack tests. Phase I or later. |
 | Overlay proof publication (`publish_proof`, `query_proofs`, `count_proofs_by_node`) | CLAUDE.md | Phase J adjacent. |
+
+## Upstream contributions due in Phase H
+
+| Target repo | What | Why |
+|---|---|---|
+| `bsv-rs` (`~/bsv/bsv-rs/src/auth/transports/`) | new `SocketIoTransport` Rust impl of `bsv_rs::auth::Transport` over Socket.IO `authMessage` event | Rust analog of TS `@bsv/authsocket-client::SocketClientTransport`; canonical-TS-conformant BRC-103 client available to the whole Rust BSV ecosystem |
+| `rust-socketio` upstream (if needed) | wasm32-unknown-unknown target support | If `rust-socketio` doesn't already support wasm32, contribute it so the Rust ecosystem can use one Socket.IO impl across native + wasm32 |
+| (optional, post-Phase-H) | publish `bsv-authsocket-rs` crate | Rust analog of TS `@bsv/authsocket-client`, wrapping upstream `SocketIoTransport` + `Peer` |

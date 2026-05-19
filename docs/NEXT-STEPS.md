@@ -107,17 +107,35 @@ All phases independently shippable + gated. Each commits to `main` only after it
 
 ---
 
-### Phase H — `bsv-mpc-messagebox-worker` crate (~3-4 wk total)
+### Phase H — Socket.IO + BRC-103 wasm32 client (+ native unification + bsv-rs upstream) — **expanded scope (~5-7 wk total)**
 
-**Step 1 (investigate)** — Survey: `web_sys::WebSocket` + `wasm-bindgen` patterns for outbound WS in CF Workers, `workers-rs` repo issues + examples, the bsv-messagebox-cloudflare inbound handler at `message_hub.rs:236-256` (invert for outbound), CF DO hibernation contract (state preservation across hibernation/wake; how `WebSocket` behaves during hibernation), Workers' 30s CPU limit vs WS frame processing budget.
+> **Status: Step 1 + Step 2 landed on main 2026-05-19.** Audit doc
+> `docs/PHASE-H-AUDIT.md` includes §2.5b (Socket.IO + BRC-103
+> supersedes raw-WS workarounds) and §11 (god-tier scope expansion
+> for OQ4/OQ7/OQ8). User-confirmed direction: cfg-gate inside
+> existing `bsv-mpc-messagebox` crate (NOT a separate sibling crate);
+> Socket.IO substrate (NOT raw WebSocket); native unification pulled
+> INTO Phase H scope (NOT a post-merge cleanup).
 
-**Step 2 (document)** — `docs/PHASE-H-AUDIT.md`: client API surface (mirrors Phase B `MessageBoxClient`), DO topology, BRC-31 upgrade-signing inversion, hibernation reconnect strategy, message_box subscription state location, backfill-on-wake recipe.
+**Step 1 (investigate)** — DONE. Three parallel Explore agents + one verification agent (live curl) found: the canonical TS `@bsv/message-box-client` v2.0.7 uses Socket.IO + BRC-103 post-handshake auth (NOT raw WebSocket + BRC-31 headers). The Calhoun production relay exposes `/socket.io/` alongside `/ws` — verified via live `GET /socket.io/?EIO=4&transport=polling` returning Engine.IO handshake JSON. The Rust server's BRC-103-over-Socket.IO handler is at `~/bsv/bsv-messagebox-cloudflare-public/src/engineio/auth.rs:1-72`. `bsv_rs::auth::Peer` already has BRC-103 + a `Transport` trait. Findings in `docs/PHASE-H-AUDIT.md` §1.
 
-**Step 3 (POC)** — `poc/poc17-cf-outbound-ws/`: a minimum DO that opens an outbound WS to the live Calhoun relay via `web_sys::WebSocket`, sends a single canonical envelope to itself, receives it back via WS push, byte-exact. Gate: green round-trip + forced hibernation test (evict DO → wake → reconnect succeeds + replay missed message via `/listMessages`).
+**Step 2 (document)** — DONE. `docs/PHASE-H-AUDIT.md` (`254ff0f` draft 1 + `4a1f8bc` §2.5b patch + this commit §11 expansion). Substrate decision: Socket.IO + BRC-103. Code structure: cfg-gate inside existing `bsv-mpc-messagebox` crate (`ws_native.rs` + `transport_wasm.rs` split). Native unification pulled into Phase H per §11.3.
 
-**Step 4 (implement)** — New crate `bsv-mpc-messagebox-worker`, WASM cdylib. Use the POC's WS pattern. BRC-31 auth via the inverted middleware pattern. DO host owning the WS + per-room state. Mirror `subscribe_round_messages` + `send_round_message` API from Phase B so consumer code stays portable.
+**Step 3 (POC)** — `poc/poc17-cf-outbound-ws/`: minimum deployable CF Worker that proves the Socket.IO + BRC-103 substrate works end-to-end. Five gates per §6.2 (rewritten in §2.5b context): (a) wasm32 build clean, (b) Socket.IO handshake from DO via chosen substrate (rust-socketio if it supports wasm32, else bundled JS `socket.io-client@4.x`), (c) BRC-103 mutual auth completes over `authMessage` event, (d) canonical CBOR envelope round-trips byte-exact through the live Calhoun relay, (e) forced-hibernation reconnect green.
 
-**Step 5 (gate)** — **Unit:** event-envelope parser tests. **WASM build:** wasm32 cdylib compiles + passes clippy. **Live e2e (deployed Worker):** test Worker connects to live Calhoun relay, joins a room, round-trips byte-exact. Forced-hibernation roundtrip works. Backfill-on-wake validated.
+**Step 4 (implement)** — Cfg-gate inside existing `bsv-mpc-messagebox` crate:
+  - New `SocketIo` trait + `SocketIoTransport` (Rust impl of `bsv_rs::auth::Transport` over Socket.IO `authMessage` event). **Contributed upstream to `bsv-rs` at `src/auth/transports/`** so the broader Rust BSV ecosystem gets a canonical-TS-conformant client.
+  - Native impl over `rust-socketio` (mature crate); wasm32 impl over the same crate if it supports wasm32, else JS `socket.io-client@4.x` via wasm-bindgen.
+  - **If `rust-socketio` lacks wasm32 support:** contribute it upstream OR fall back to JS bundle. Decision in H-3.
+  - **Native client migrated to Socket.IO + BRC-103** per §11.3 — replaces the existing raw-WS + 7-BRC-31-headers path with the canonical wire. Path A: implementation conforms to TS, never inverse.
+  - `crates/bsv-mpc-messagebox/src/ws.rs` split into `ws_native.rs` + `transport_wasm.rs` behind `#[cfg(target_arch = "wasm32")]`; new `transport.rs` exposing the unified API to consumers.
+
+**Step 5 (gate)** — §7 + §11.5 of audit doc. Headlines:
+  - **Native real-sats mainnet TXID through the NEW Socket.IO + BRC-103 path** — same shape as G-5d's TXID `442bd391…`. Real ~100 sat cost. DER + joint pubkey shape match.
+  - **wasm32 deployed-Worker forced-hibernation round-trip** — canonical envelope byte-exact, BRC-103-authed.
+  - **Cross-stack readiness probe** — canonical envelope round-trips byte-exact against Binary's TS `message-box-server` from BOTH targets. Proves Phase K's transport precondition.
+  - **Upstream `SocketIoTransport` PR open or merged** on `bsv-rs`.
+  - **Upstream `rust-socketio` wasm32 PR** (if needed) open or merged.
 
 ---
 
@@ -277,7 +295,7 @@ Each phase lands as its own issue when its audit doc lands. The umbrella tracker
 | Phase | State | Artifact |
 |---|---|---|
 | **G** — inline SM + Paillier pool | **CLOSED 2026-05-19** | TXID [`442bd391…`](https://whatsonchain.com/tx/442bd391cf8eda299f82dc1e4aeb1a9cb4f33610365d44c9c1c0e55d32f171b9) + merge-gate commit `d9b1b27` |
-| **H** — `bsv-mpc-messagebox` CF Worker client crate | next | audit doc + `poc/poc17-cf-outbound-ws/` pending |
+| **H** — Socket.IO + BRC-103 wasm32 client + native unification + `bsv-rs` upstream `SocketIoTransport` | Steps 1-2 done, ~5-7 wk total | audit `254ff0f` + §2.5b `4a1f8bc` + §11 god-tier expansion; H-3 POC + H-4 impl + H-5 gate pending |
 | **I** — wire G + H into `bsv-mpc-worker` | blocked on G + H | audit doc + `poc/poc18-cf-cosigner-stub/` pending |
 | **J** — CHIP + `/capabilities` + `health.json` | blocked on I | audit doc + `poc/poc19-chip-discovery/` pending |
 | **K** — Cross-stack joint mainnet TX (closes MPC-Spec #36) | blocked on J + Quaakee's rust-mpc | audit doc + joint conformance check pending |

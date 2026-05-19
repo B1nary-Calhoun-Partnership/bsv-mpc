@@ -805,13 +805,167 @@ the POC step begins.
 
 5. **Merge gate is real.** No asterisks: a deployed-Worker
    forced-hibernation round-trip with a fresh canonical envelope
-   reaching the consumer byte-exact, BRC-31-authed, against the live
-   Calhoun relay.
+   reaching the consumer byte-exact, BRC-103-authed (via Socket.IO),
+   against the live Calhoun relay — **PLUS** a fresh real-sats mainnet
+   TXID through the new native Socket.IO + BRC-103 path proving
+   regression-safety on the existing Phase A-F flows. See §11 for the
+   god-tier expansion.
+
+## 11. God-tier scope expansion — resolutions for OQ4 / OQ7 / OQ8
+
+This section was added 2026-05-19 after the user reviewed §2.5b and
+endorsed the "no matter how long it takes" framing on the three live
+open questions. Resolutions below; quality gate (§7), POC scope (§6),
+and open questions (§8) are amended in-place to match.
+
+### 11.1 OQ4 — DO topology: per-identity
+
+**Resolved: per-identity DO.** Matches the server-side per-identity
+`MessageHub` DO at `~/bsv/bsv-messagebox-cloudflare-public/src/message_hub.rs`,
+isolates hibernation failure modes, makes BRC-31 + BRC-103 session
+lifecycle natural (one identity → one session → one DO → one Socket.IO
+connection multiplexing N rooms via `joinRoom`). No tradeoff worth
+making against multi-tenant — its only benefit is shared memory,
+which is irrelevant on CF DOs.
+
+### 11.2 OQ7 — Socket.IO substrate: unify on `rust-socketio` + upstream `SocketIoTransport` to `bsv-rs`
+
+**Resolved**: single Rust implementation across both targets, with
+upstream contributions wherever possible. Concretely:
+
+1. **`SocketIo` trait inside `bsv-mpc-messagebox`** — minimal abstraction:
+   `connect`, `emit(event, payload)`, `on(event, callback)`, `disconnect`.
+   ~50 LOC.
+
+2. **Native impl**: adapt `rust-socketio` (mature, in-prod crate)
+   behind the trait. H-3 POC verifies it works at our scale.
+
+3. **wasm32 impl**: prefer the same `rust-socketio` if it supports
+   `wasm32-unknown-unknown`. Empirical check is part of H-3.
+   - If supported: single Rust impl for both targets. **Ideal shape.**
+   - If not: two god-tier paths in order of preference:
+     - **(a)** Contribute wasm32 support to `rust-socketio` upstream
+       — ecosystem-level fix; pays back across the whole Rust BSV
+       ecosystem; matches [[feedback-god-tier-full-stack]] "fix the
+       ecosystem, not just our crate."
+     - **(b)** Bundle the canonical JS `socket.io-client@4.x` via
+       `wasm-bindgen` + `js-sys` (~50-100 LOC FFI) as a fallback.
+       Acceptable if upstreaming wasm32 to `rust-socketio` blows the
+       Phase H timeline.
+
+4. **`SocketIoTransport`** — Rust impl of `bsv_rs::auth::Transport`
+   over the `SocketIo` trait, dispatching BRC-103 `AuthMessage` frames
+   on `socket.emit('authMessage', ...)` + `socket.on('authMessage', ...)`.
+   Rust analog of the TS `@bsv/authsocket-client::SocketClientTransport`
+   pattern. **Contribute upstream to `bsv-rs`** at
+   `~/bsv/bsv-rs/src/auth/transports/` so the broader Rust BSV
+   ecosystem gets the canonical Socket.IO + BRC-103 client. The new
+   transport lives alongside the existing `SimplifiedFetchTransport`
+   (HTTP per-request signing) and `WebSocketTransport` (raw WS +
+   BRC-103 frame-by-frame).
+
+5. **Optional follow-up (out of Phase H scope)**: publish a thin
+   `bsv-authsocket-rs` Rust crate wrapping the upstream
+   `SocketIoTransport` + `Peer`. Rust analog of TS
+   `@bsv/authsocket-client`. Tracked but not gating Phase H.
+
+### 11.3 OQ8 — Native unification: pulled INTO Phase H scope
+
+**Resolved: yes, native moves to Socket.IO + BRC-103 inside Phase H.**
+Not a post-merge cleanup. Reasoning:
+
+1. **Path A violation.** The existing native client at
+   `crates/bsv-mpc-messagebox/src/ws.rs` uses raw WS + 7 BRC-31
+   headers on the HTTP/1.1 upgrade — a Rust-only convenience that
+   works only because `tokio-tungstenite` exposes raw upgrade access.
+   The canonical TS path is Socket.IO + BRC-103. Per
+   [[feedback-canonical-ts-immutable]], implementation conforms to TS,
+   never the inverse. The current native client is non-conformant.
+
+2. **Phase K (cross-stack with Binary) depends on this.** Binary's
+   relay is the TS `message-box-server`, which exposes ONLY the
+   Socket.IO path. As-is, the native Rust client cannot talk to
+   Binary's server — the lib.rs comment in `bsv-mpc-messagebox` already
+   flags this: *"raw WebSocket on the Calhoun relay; Socket.IO/EngineIO
+   on Binary's relay"*. If we defer native unification, Phase K stays
+   blocked on a hidden interop bug. Pulling it forward into Phase H
+   means Phase K's only remaining risk is the joint ceremony itself,
+   not the transport.
+
+3. **Symmetric merge gate.** Once both targets are on Socket.IO +
+   BRC-103, Phase H's merge gate exercises BOTH paths against the
+   live Calhoun relay AND envelope round-trip against Binary's TS
+   server. No asymmetry to hide bugs in.
+
+### 11.4 Phase H scope (amended)
+
+| Sub-goal | Status | Owner |
+|---|---|---|
+| `SocketIo` trait + `SocketIoTransport` (BRC-103) | new in Phase H | bsv-mpc-messagebox + upstream PR to bsv-rs |
+| `rust-socketio` wasm32 support | new in Phase H if missing upstream | upstream PR to `rust-socketio` (if needed) OR JS-bundle fallback |
+| `bsv-mpc-messagebox` cfg-gate (§2.1-§2.4) | new in Phase H | `ws_native.rs` + `transport_wasm.rs` split |
+| **Native client migrated to Socket.IO + BRC-103** | new in Phase H per §11.3 | `bsv-mpc-messagebox` |
+| `bsv-mpc-worker` (CF Worker) embedding the wasm32 client + DO | Phase I scope (unchanged) | — |
+
+Removed from Phase H scope:
+- The old §2.5 BRC-31 workarounds (a/b/c). MOOT per §2.5b.
+- The "separate `bsv-mpc-messagebox-worker` crate" approach. Cfg-gate
+  inside existing crate per OQ3.
+
+### 11.5 Phase H quality gate (Step 5), amended
+
+Supersedes the §7 checklist where it diverges:
+
+**Build + lint** (§7.1) — unchanged.
+
+**Native tests** (§7.2) — unchanged, with one addition:
+- [ ] **NEW mainnet TXID through the Socket.IO + BRC-103 native path.**
+      Same shape as the G-5d re-verify (TXID `442bd391…`): 2-of-2 DKG
+      + sign + broadcast via `bsv-mpc-service` against the live Calhoun
+      relay over the NEW transport. ~100 sats real cost. Both DER
+      signature shape AND joint pubkey shape match prior runs.
+
+**wasm32 tests** (§7.3) — unchanged.
+
+**Deployed-Worker live test** (§7.4) — extended:
+- [ ] Worker connects to `/socket.io/` on live relay via the chosen
+      substrate (rust-socketio or JS bundle).
+- [ ] BRC-103 handshake completes over `authMessage`.
+- [ ] Round-trips canonical CBOR envelope byte-exact.
+- [ ] Forced-hibernation reconnect green.
+- [ ] **NEW cross-stack readiness probe**: canonical envelope
+      round-trips byte-exact against Binary's TS `message-box-server`
+      from BOTH native and wasm32. Proves Phase K's transport
+      precondition without requiring the joint ceremony.
+
+**Upstream contributions** (§11.5 new):
+- [ ] `SocketIoTransport` filed upstream as a PR to `bsv-rs`
+      (`~/bsv/bsv-rs/src/auth/transports/`). PR open and either merged
+      or assigned for review before Phase H merges.
+- [ ] If `rust-socketio` lacked wasm32 support: corresponding PR
+      filed upstream + green CI on the PR branch + we depend on the
+      branch (or merged version) in Phase H.
+
+**Doc + tracker** (§7.5) — extended:
+- [ ] `docs/PHASE-H-AUDIT.md` §7 + §11 checkboxes ticked in merge-gate commit.
+- [ ] Umbrella issue #2 Phase H box ticked; closing comment cites:
+      new native mainnet TXID + deployed-Worker URL + cross-stack
+      envelope round-trip transcript + upstream PR links.
+
+### 11.6 Cost + timeline
+
+Phase H grows from the original ~3-4 weeks to **~5-7 weeks** to cover
+native unification + upstream contributions + cross-stack readiness.
+Acceptable per the user's "we love doing that shit no matter how long
+it takes" framing; payoff is Phase K's transport risk drops to zero
+and the Rust BSV ecosystem gets a canonical-TS-conformant Socket.IO +
+BRC-103 client.
 
 ---
 
-**Last updated:** 2026-05-19 (patched same-day with §2.5b after follow-up
-investigation — see TL;DR + §2.5 banner). Pending user review before
-POC step (H-3) begins. OQ3 (cfg-gate direction) confirmed by user;
-OQ1/OQ2/OQ5 obsoleted by §2.5b; OQ7/OQ8 are the live unresolved
-substrate-choice questions.
+**Last updated:** 2026-05-19 (patched same-day with §2.5b after
+follow-up investigation; expanded same-day with §11 after god-tier
+review on OQ4/OQ7/OQ8). Pending user review before POC step (H-3)
+begins. OQ3 confirmed; OQ1/OQ2/OQ5 obsolete; **OQ4/OQ7/OQ8 resolved
+per §11**; OQ6 is the only remaining trivial choice (POC location —
+recommend in-repo, dev CF account, no production data).
