@@ -51,6 +51,7 @@ pub mod ecdh;
 pub mod envelope;
 pub mod error;
 pub mod hd;
+pub mod paillier_pool;
 pub mod presigning;
 pub mod proof;
 pub mod refresh;
