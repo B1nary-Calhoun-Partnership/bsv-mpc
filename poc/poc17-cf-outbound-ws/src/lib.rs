@@ -9,9 +9,10 @@
 //! | Gate | What it proves | Status |
 //! |---|---|---|
 //! | H-3.1 | `cargo build --target wasm32-unknown-unknown -p poc17-cf-outbound-ws` clean | ✓ `cb923fc` |
-//! | H-3.2a | Engine.IO polling handshake against live relay via `worker::Fetch`; vendored codec decodes Open packet; sid extracted | this commit |
-//! | H-3.2b | WS upgrade via `web_sys::WebSocket`; Engine.IO probe/pong/upgrade dance | next commit |
-//! | H-3.3 | BRC-103 mutual auth completes over the `authMessage` event channel | subsequent |
+//! | H-3.2a | Engine.IO polling handshake against live relay via `worker::Fetch` | ✓ `bc8b0b4` |
+//! | H-3.2b | WS upgrade via `web_sys::WebSocket`; Engine.IO probe/pong/upgrade dance | ✓ `6ff1a53` |
+//! | H-3.3a | Long-lived `WsHandle` + Socket.IO CONNECT/ack exchange over the upgraded WS | this commit |
+//! | H-3.3b | BRC-103 mutual auth via `SocketIoTransport` driving `bsv_rs::auth::Peer` | next commit |
 //! | H-3.4 | Canonical CBOR envelope round-trips byte-exact through the live Calhoun relay | subsequent |
 //! | H-3.5 | Forced-hibernation reconnect via the DO; backfill via `/listMessages` | subsequent |
 
@@ -81,6 +82,131 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 "ws_url": upgrade.ws_url,
                 "probe_round_trip_ms": upgrade.probe_round_trip_ms,
                 "gate": "H-3.2 (H-3.2a polling + H-3.2b ws-upgrade)",
+            }))
+        })
+        // H-3.3a gate: take the upgraded WS and exchange the Socket.IO
+        // CONNECT packet to default namespace. Server replies with
+        // `40{"sid":"..."}` (Engine.IO Message wrapping Socket.IO
+        // CONNECT-ack). Proves the long-lived WsHandle + persistent mpsc
+        // inbound dispatch + the codec's Socket.IO layer all work
+        // end-to-end against the live relay.
+        .get_async("/socketio-connect", |_req, ctx| async move {
+            use crate::engineio_codec::SocketIoPacket;
+
+            let relay = ctx
+                .env
+                .var("RELAY_URL")
+                .map(|v| v.to_string())
+                .unwrap_or_else(|_| DEFAULT_RELAY.to_string());
+
+            // Engine.IO 4 polling phase.
+            let handshake = match transport_wasm::polling_handshake(&relay).await {
+                Ok(h) => h,
+                Err(e) => return Response::error(format!("polling handshake failed: {e}"), 502),
+            };
+
+            // Engine.IO 4 WS upgrade — held as a live handle for the
+            // rest of this request (drops only when ws goes out of scope).
+            let mut ws =
+                match transport_wasm::WsHandle::open_and_upgrade(&relay, &handshake.sid).await {
+                    Ok(h) => h,
+                    Err(e) => {
+                        return Response::error(
+                            format!("ws open+upgrade failed (sid={}): {e}", handshake.sid),
+                            502,
+                        )
+                    }
+                };
+
+            // Socket.IO 5 CONNECT to default namespace (`40`). The default
+            // namespace `/` is OMITTED in the wire form per the vendored
+            // codec's §SocketIoPacket doc-comment (line ~158).
+            let connect_pkt = SocketIoPacket::Connect {
+                nsp: "/".to_string(),
+                data: None,
+            };
+            if let Err(e) = ws.send_socketio(&connect_pkt) {
+                return Response::error(format!("send Socket.IO CONNECT: {e}"), 502);
+            }
+            let t_connect_start = js_sys::Date::now();
+
+            // Await CONNECT-ack. Pull frames until we find an Engine.IO
+            // Message carrying a Socket.IO CONNECT packet — the server
+            // may interleave Engine.IO Ping packets (e.g. from the
+            // upgrade-finalize handshake), which we just acknowledge and
+            // keep waiting.
+            let mut frames_seen: Vec<String> = Vec::new();
+            let socket_sid;
+            loop {
+                let pkt = match ws.recv_engineio().await {
+                    Ok(p) => p,
+                    Err(e) => {
+                        return Response::error(
+                            format!(
+                                "ws closed waiting for CONNECT-ack \
+                                 after {} frame(s) seen={:?}: {e}",
+                                frames_seen.len(),
+                                frames_seen
+                            ),
+                            502,
+                        )
+                    }
+                };
+                match pkt {
+                    crate::engineio_codec::EngineIoPacket::Ping(payload) => {
+                        // Server-initiated heartbeat — reply with Pong so
+                        // the relay doesn't time us out while we wait.
+                        let pong = crate::engineio_codec::EngineIoPacket::Pong(payload).encode();
+                        if let Err(e) = ws.send_text(&pong) {
+                            return Response::error(format!("ws send Pong: {e}"), 502);
+                        }
+                        frames_seen.push("ping/pong".to_string());
+                    }
+                    crate::engineio_codec::EngineIoPacket::Noop => {
+                        frames_seen.push("noop".to_string());
+                    }
+                    crate::engineio_codec::EngineIoPacket::Message(payload) => {
+                        // Decode the Socket.IO layer.
+                        let sio = match SocketIoPacket::decode(&payload) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                frames_seen.push(format!("socketio-decode-err:{e}"));
+                                continue;
+                            }
+                        };
+                        match sio {
+                            SocketIoPacket::Connect { nsp, data } => {
+                                let sid_from_data = data
+                                    .as_ref()
+                                    .and_then(|v| v.get("sid"))
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| s.to_string());
+                                socket_sid = sid_from_data
+                                    .unwrap_or_else(|| format!("(no sid in payload; nsp={nsp})"));
+                                break;
+                            }
+                            other => {
+                                frames_seen.push(format!("unexpected-sio:{other:?}"));
+                            }
+                        }
+                    }
+                    other => {
+                        frames_seen.push(format!("unexpected-eio:{other:?}"));
+                    }
+                }
+            }
+            let connect_round_trip_ms = js_sys::Date::now() - t_connect_start;
+
+            Response::from_json(&serde_json::json!({
+                "socketio_status": "socketio_connected",
+                "relay": relay,
+                "engineio_sid": handshake.sid,
+                "socketio_sid": socket_sid,
+                "probe_round_trip_ms": ws.probe_round_trip_ms(),
+                "connect_round_trip_ms": connect_round_trip_ms,
+                "ws_url": ws.url(),
+                "intermediate_frames": frames_seen,
+                "gate": "H-3.3a",
             }))
         })
         .run(req, env)

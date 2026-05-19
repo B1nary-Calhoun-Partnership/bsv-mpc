@@ -147,11 +147,14 @@ fn current_timestamp_ms() -> u64 {
 #[cfg(target_arch = "wasm32")]
 mod ws_upgrade {
     use super::*;
+    use crate::engineio_codec::{EngineIoPacket, SocketIoPacket};
+    use futures::channel::{mpsc, oneshot};
+    use futures::StreamExt;
     use std::cell::RefCell;
     use std::rc::Rc;
     use wasm_bindgen::prelude::*;
     use wasm_bindgen::JsCast;
-    use web_sys::{Event, MessageEvent, WebSocket};
+    use web_sys::{CloseEvent, Event, MessageEvent, WebSocket};
 
     /// Result of the H-3.2b upgrade dance — returned to the caller for
     /// inclusion in the `/open` JSON response.
@@ -161,129 +164,239 @@ mod ws_upgrade {
         pub probe_round_trip_ms: f64,
     }
 
-    /// Run the Engine.IO 4 WS upgrade dance against `<relay>` for the
-    /// given `sid` (obtained from a prior polling handshake).
+    /// Long-lived WebSocket handle held after the Engine.IO 4 upgrade
+    /// completes. Inbound text frames flow through an unbounded mpsc
+    /// channel; outbound is via [`WsHandle::send_text`] (or the
+    /// higher-level [`send_engineio`]/[`send_socketio`] helpers).
     ///
-    /// Returns once the `5` Upgrade packet has been sent. Does NOT keep
-    /// the WS alive — the connection is dropped when the `WsHandle`
-    /// goes out of scope. H-3.3+ will hold the WS for long-lived use.
-    pub async fn upgrade_to_websocket(relay_url: &str, sid: &str) -> Result<UpgradeResult, String> {
-        let base = relay_url.trim_end_matches('/');
-        // Convert https:// → wss:// (or http:// → ws://); other schemes
-        // are passed through unchanged.
-        let ws_base = if let Some(rest) = base.strip_prefix("https://") {
-            format!("wss://{rest}")
-        } else if let Some(rest) = base.strip_prefix("http://") {
-            format!("ws://{rest}")
-        } else {
-            base.to_string()
-        };
-        let url = format!("{ws_base}/socket.io/?EIO=4&transport=websocket&sid={sid}");
+    /// **Lifetime**: the underlying `web_sys::WebSocket` is closed when
+    /// `WsHandle` drops. Closures are held in the struct so they survive
+    /// across calls; dropping `WsHandle` drops the closures too, which
+    /// releases the JS-side function references.
+    pub struct WsHandle {
+        ws: WebSocket,
+        msg_rx: mpsc::UnboundedReceiver<Result<String, String>>,
+        url: String,
+        probe_round_trip_ms: f64,
+        // Held to keep the JS-side callback alive for the lifetime of
+        // the handle. Drop order matters: closures must drop BEFORE the
+        // WebSocket (otherwise JS-side handlers fire on a dropped Rust
+        // closure and panic). Rust drops fields in declaration order,
+        // so these come AFTER `ws`. Reversing order would be unsound.
+        _on_msg: Closure<dyn FnMut(MessageEvent)>,
+        _on_err: Closure<dyn FnMut(Event)>,
+        _on_close: Closure<dyn FnMut(CloseEvent)>,
+    }
 
-        let ws = WebSocket::new(&url).map_err(|e| format!("WebSocket::new({url}): {e:?}"))?;
-        ws.set_binary_type(web_sys::BinaryType::Arraybuffer);
+    impl WsHandle {
+        /// Open a WebSocket against `<relay>/socket.io/?...&transport=
+        /// websocket&sid=<sid>` and complete the Engine.IO 4 upgrade
+        /// dance (`2probe` → `3probe` → `5` Upgrade). Returns the live
+        /// handle ready for `emit`/`recv` operations.
+        pub async fn open_and_upgrade(relay_url: &str, sid: &str) -> Result<Self, String> {
+            let base = relay_url.trim_end_matches('/');
+            let ws_base = if let Some(rest) = base.strip_prefix("https://") {
+                format!("wss://{rest}")
+            } else if let Some(rest) = base.strip_prefix("http://") {
+                format!("ws://{rest}")
+            } else {
+                base.to_string()
+            };
+            let url = format!("{ws_base}/socket.io/?EIO=4&transport=websocket&sid={sid}");
 
-        // ── Wait for onopen ──
-        let (open_tx, open_rx) = futures::channel::oneshot::channel::<Result<(), String>>();
-        let open_tx = Rc::new(RefCell::new(Some(open_tx)));
+            let ws = WebSocket::new(&url).map_err(|e| format!("WebSocket::new({url}): {e:?}"))?;
+            ws.set_binary_type(web_sys::BinaryType::Arraybuffer);
 
-        let open_tx_open = open_tx.clone();
-        let on_open = Closure::wrap(Box::new(move |_e: Event| {
-            if let Some(t) = open_tx_open.borrow_mut().take() {
-                let _ = t.send(Ok(()));
-            }
-        }) as Box<dyn FnMut(Event)>);
-        ws.set_onopen(Some(on_open.as_ref().unchecked_ref()));
+            // ── Wait for onopen ──
+            let (open_tx, open_rx) = oneshot::channel::<Result<(), String>>();
+            let open_tx = Rc::new(RefCell::new(Some(open_tx)));
 
-        let open_tx_err = open_tx.clone();
-        let on_err = Closure::wrap(Box::new(move |e: Event| {
-            if let Some(t) = open_tx_err.borrow_mut().take() {
-                let _ = t.send(Err(format!("ws error before open: {e:?}")));
-            }
-        }) as Box<dyn FnMut(Event)>);
-        ws.set_onerror(Some(on_err.as_ref().unchecked_ref()));
-
-        // Channel that the message handler will fire on the FIRST inbound
-        // text frame. We set this up BEFORE awaiting open so we don't
-        // miss a server-sent message that arrives the moment the socket
-        // is established.
-        let (msg_tx, msg_rx) = futures::channel::oneshot::channel::<Result<String, String>>();
-        let msg_tx = Rc::new(RefCell::new(Some(msg_tx)));
-        let msg_tx_clone = msg_tx.clone();
-        let on_msg = Closure::wrap(Box::new(move |e: MessageEvent| {
-            // The Engine.IO transport uses text frames exclusively on the
-            // AuthSocket profile (binary frames carry Socket.IO BINARY
-            // attachments which the canonical TS @bsv/authsocket client
-            // doesn't use — confirmed in agent H-1c).
-            if let Some(text) = e.data().as_string() {
-                if let Some(t) = msg_tx_clone.borrow_mut().take() {
-                    let _ = t.send(Ok(text));
+            let open_tx_for_open = open_tx.clone();
+            let on_open: Closure<dyn FnMut(Event)> = Closure::new(move |_e: Event| {
+                if let Some(t) = open_tx_for_open.borrow_mut().take() {
+                    let _ = t.send(Ok(()));
                 }
+            });
+            ws.set_onopen(Some(on_open.as_ref().unchecked_ref()));
+
+            // ── Persistent inbound message channel (unbounded mpsc) ──
+            // Set up BEFORE awaiting open so the FIRST server-sent frame
+            // after the upgrade isn't dropped.
+            let (msg_tx, msg_rx) = mpsc::unbounded::<Result<String, String>>();
+            let msg_tx_for_msg = msg_tx.clone();
+            let on_msg: Closure<dyn FnMut(MessageEvent)> = Closure::new(move |e: MessageEvent| {
+                // Engine.IO 4 AuthSocket profile uses text frames only
+                // (confirmed in agent H-1c).
+                if let Some(text) = e.data().as_string() {
+                    let _ = msg_tx_for_msg.unbounded_send(Ok(text));
+                }
+            });
+            ws.set_onmessage(Some(on_msg.as_ref().unchecked_ref()));
+
+            let open_tx_for_err = open_tx.clone();
+            let msg_tx_for_err = msg_tx.clone();
+            let on_err: Closure<dyn FnMut(Event)> = Closure::new(move |e: Event| {
+                let err = format!("ws onerror: {e:?}");
+                // Surface the error on whichever channel is still listening.
+                if let Some(t) = open_tx_for_err.borrow_mut().take() {
+                    let _ = t.send(Err(err.clone()));
+                }
+                let _ = msg_tx_for_err.unbounded_send(Err(err));
+            });
+            ws.set_onerror(Some(on_err.as_ref().unchecked_ref()));
+
+            let msg_tx_for_close = msg_tx.clone();
+            let on_close: Closure<dyn FnMut(CloseEvent)> = Closure::new(move |e: CloseEvent| {
+                let _ = msg_tx_for_close.unbounded_send(Err(format!(
+                    "ws closed: code={} reason={:?}",
+                    e.code(),
+                    e.reason()
+                )));
+            });
+            ws.set_onclose(Some(on_close.as_ref().unchecked_ref()));
+
+            // Drop the strong refs to msg_tx so the mpsc closes when all
+            // closures drop. (Otherwise `msg_rx.next()` would never see
+            // a None — it'd hang forever on a dropped WS.)
+            drop(msg_tx);
+
+            let t_probe_start = js_sys::Date::now();
+
+            // Await the onopen event.
+            open_rx
+                .await
+                .map_err(|_| "ws open channel dropped".to_string())??;
+
+            // Send `2probe` (Engine.IO Ping with payload="probe").
+            let probe_packet = EngineIoPacket::Ping("probe".to_string()).encode();
+            ws.send_with_str(&probe_packet)
+                .map_err(|e| format!("ws send 2probe: {e:?}"))?;
+
+            let mut msg_rx_drain = msg_rx;
+            // Await the server's `3probe` reply. We pull from the
+            // persistent mpsc; any frames the server sent in the same
+            // window stay queued for subsequent recv calls.
+            let pong_text = msg_rx_drain
+                .next()
+                .await
+                .ok_or_else(|| "ws closed before pong".to_string())??;
+            match EngineIoPacket::decode(&pong_text).map_err(|e| format!("decode pong: {e}"))? {
+                EngineIoPacket::Pong(payload) if payload == "probe" => { /* expected */ }
+                other => return Err(format!("expected Pong(\"probe\"), got {other:?}")),
             }
-        }) as Box<dyn FnMut(MessageEvent)>);
-        ws.set_onmessage(Some(on_msg.as_ref().unchecked_ref()));
+            let probe_round_trip_ms = js_sys::Date::now() - t_probe_start;
 
-        let t_probe_start = js_sys::Date::now();
+            // Commit the upgrade — send Engine.IO `5` (Upgrade) packet.
+            let upgrade_packet = EngineIoPacket::Upgrade.encode();
+            ws.send_with_str(&upgrade_packet)
+                .map_err(|e| format!("ws send Upgrade: {e:?}"))?;
 
-        // Await the onopen event.
-        open_rx
-            .await
-            .map_err(|_| "ws open channel dropped".to_string())?
-            .map_err(|e| e)?;
-
-        // Send the Engine.IO Ping with "probe" payload — encoded as
-        // `2probe` via the vendored codec.
-        let probe_packet = EngineIoPacket::Ping("probe".to_string()).encode();
-        ws.send_with_str(&probe_packet)
-            .map_err(|e| format!("ws send 2probe: {e:?}"))?;
-
-        // Await the server's `3probe` reply.
-        let pong_text = msg_rx
-            .await
-            .map_err(|_| "ws message channel dropped before pong".to_string())?
-            .map_err(|e| e)?;
-        let pong_packet =
-            EngineIoPacket::decode(&pong_text).map_err(|e| format!("decode pong: {e}"))?;
-        match pong_packet {
-            EngineIoPacket::Pong(payload) if payload == "probe" => { /* expected */ }
-            other => return Err(format!("expected Pong(\"probe\"), got {other:?}")),
+            Ok(WsHandle {
+                ws,
+                msg_rx: msg_rx_drain,
+                url,
+                probe_round_trip_ms,
+                _on_msg: on_msg,
+                _on_err: on_err,
+                _on_close: on_close,
+            })
         }
-        let probe_round_trip_ms = js_sys::Date::now() - t_probe_start;
 
-        // Commit the upgrade — send Engine.IO `5` (Upgrade) packet.
-        let upgrade_packet = EngineIoPacket::Upgrade.encode();
-        ws.send_with_str(&upgrade_packet)
-            .map_err(|e| format!("ws send Upgrade: {e:?}"))?;
+        pub fn url(&self) -> &str {
+            &self.url
+        }
 
-        // Clear the callbacks so the closures can be dropped along with
-        // `ws` when this function returns. (Without these clears,
-        // `Closure::forget()` would leak; we never call forget()
-        // explicitly here — the JS-side function refs are released
-        // when `ws.set_on...(None)` runs.)
-        ws.set_onopen(None);
-        ws.set_onerror(None);
-        ws.set_onmessage(None);
-        drop(on_open);
-        drop(on_err);
-        drop(on_msg);
+        pub fn probe_round_trip_ms(&self) -> f64 {
+            self.probe_round_trip_ms
+        }
 
-        // H-3.2b explicitly does NOT keep the WS alive. The connection
-        // closes when `ws` is dropped. H-3.3+ will own the WS in a
-        // longer-lived struct.
+        /// Send a raw text frame. Lower-level than `send_engineio` /
+        /// `send_socketio`; useful for probe/upgrade-style packets.
+        pub fn send_text(&self, s: &str) -> Result<(), String> {
+            self.ws
+                .send_with_str(s)
+                .map_err(|e| format!("ws send_with_str: {e:?}"))
+        }
+
+        /// Send an [`EngineIoPacket`] (the codec encodes the wire form).
+        pub fn send_engineio(&self, pkt: &EngineIoPacket) -> Result<(), String> {
+            self.send_text(&pkt.encode())
+        }
+
+        /// Send a [`SocketIoPacket`] wrapped in Engine.IO `Message(4)`.
+        pub fn send_socketio(&self, pkt: &SocketIoPacket) -> Result<(), String> {
+            let wrapped = EngineIoPacket::Message(pkt.encode());
+            self.send_engineio(&wrapped)
+        }
+
+        /// Receive the next inbound text frame. Returns `Ok(None)` if
+        /// the channel has closed (WS dropped).
+        pub async fn recv_text(&mut self) -> Option<Result<String, String>> {
+            self.msg_rx.next().await
+        }
+
+        /// Convenience: receive the next inbound frame and decode as an
+        /// Engine.IO packet via the vendored codec.
+        pub async fn recv_engineio(&mut self) -> Result<EngineIoPacket, String> {
+            let text = self
+                .recv_text()
+                .await
+                .ok_or_else(|| "ws closed".to_string())??;
+            EngineIoPacket::decode(&text).map_err(|e| format!("decode engineio: {e}"))
+        }
+
+        /// Convenience: receive an inbound frame and decode through both
+        /// the Engine.IO and Socket.IO layers, returning the inner
+        /// Socket.IO packet (or a non-Message frame for caller inspection).
+        ///
+        /// Returns `Err` if the inbound packet is NOT an Engine.IO
+        /// `Message(...)` carrying a Socket.IO payload. Other Engine.IO
+        /// types (Ping/Pong/etc) surface via [`recv_engineio`] instead.
+        pub async fn recv_socketio(&mut self) -> Result<SocketIoPacket, String> {
+            let eio = self.recv_engineio().await?;
+            match eio {
+                EngineIoPacket::Message(payload) => {
+                    SocketIoPacket::decode(&payload).map_err(|e| format!("decode socketio: {e}"))
+                }
+                other => Err(format!("expected Engine.IO Message, got {other:?}")),
+            }
+        }
+    }
+
+    impl Drop for WsHandle {
+        fn drop(&mut self) {
+            // Detach JS-side handlers BEFORE the closures drop (which
+            // happens automatically after this fn returns). Otherwise a
+            // late-firing event would call into a dropped Rust closure.
+            self.ws.set_onmessage(None);
+            self.ws.set_onerror(None);
+            self.ws.set_onclose(None);
+            self.ws.set_onopen(None);
+            // CloseEvent code 1000 = normal closure.
+            let _ = self.ws.close_with_code(1000);
+        }
+    }
+
+    /// Convenience: H-3.2b backwards-compat — open + upgrade + drop. Same
+    /// signature as the original function but uses `WsHandle` under the
+    /// hood so we don't carry two duplicate impls.
+    pub async fn upgrade_to_websocket(relay_url: &str, sid: &str) -> Result<UpgradeResult, String> {
+        let handle = WsHandle::open_and_upgrade(relay_url, sid).await?;
         Ok(UpgradeResult {
-            ws_url: url,
-            probe_round_trip_ms,
+            ws_url: handle.url().to_string(),
+            probe_round_trip_ms: handle.probe_round_trip_ms(),
         })
     }
 }
 
 #[cfg(target_arch = "wasm32")]
-pub use ws_upgrade::{upgrade_to_websocket, UpgradeResult};
+pub use ws_upgrade::{upgrade_to_websocket, UpgradeResult, WsHandle};
 
-// Native build target: provide a stub so the workspace `cargo build
-// --all-targets` doesn't fail. The actual H-3.2b verification runs only
-// in the wasm32 CF Worker context — there's no native equivalent of
-// `web_sys::WebSocket`.
+// Native build target: stubs so the workspace `cargo build --all-targets`
+// doesn't fail. The actual H-3.2b/H-3.3 verification runs only in the
+// wasm32 CF Worker context — there's no native equivalent of
+// `web_sys::WebSocket`. Native consumers (the unified bsv-mpc-messagebox
+// in H-4) will use a tokio-tungstenite path that's not in this POC.
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(Serialize, Debug, Clone)]
 pub struct UpgradeResult {
@@ -297,4 +410,66 @@ pub async fn upgrade_to_websocket(
     _sid: &str,
 ) -> std::result::Result<UpgradeResult, String> {
     Err("upgrade_to_websocket is wasm32-only; native consumers should use a tokio-tungstenite path (not implemented in this POC)".into())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub struct WsHandle;
+
+#[cfg(not(target_arch = "wasm32"))]
+impl WsHandle {
+    // The native stub mirrors the wasm32 method surface so `lib.rs`
+    // compiles for `cargo build --workspace --all-targets`. Every method
+    // returns an "wasm32-only" error; none are reachable at runtime
+    // since `open_and_upgrade` errors out first. The actual native
+    // counterpart (tokio-tungstenite + reqwest) lands in Phase H Step 4
+    // when `bsv-mpc-messagebox` is migrated per audit §11.3.
+
+    pub async fn open_and_upgrade(
+        _relay_url: &str,
+        _sid: &str,
+    ) -> std::result::Result<Self, String> {
+        Err("WsHandle::open_and_upgrade is wasm32-only".into())
+    }
+
+    pub fn url(&self) -> &str {
+        ""
+    }
+
+    pub fn probe_round_trip_ms(&self) -> f64 {
+        0.0
+    }
+
+    pub fn send_text(&self, _s: &str) -> std::result::Result<(), String> {
+        Err("WsHandle::send_text is wasm32-only".into())
+    }
+
+    pub fn send_engineio(
+        &self,
+        _pkt: &crate::engineio_codec::EngineIoPacket,
+    ) -> std::result::Result<(), String> {
+        Err("WsHandle::send_engineio is wasm32-only".into())
+    }
+
+    pub fn send_socketio(
+        &self,
+        _pkt: &crate::engineio_codec::SocketIoPacket,
+    ) -> std::result::Result<(), String> {
+        Err("WsHandle::send_socketio is wasm32-only".into())
+    }
+
+    pub async fn recv_text(&mut self) -> Option<std::result::Result<String, String>> {
+        Some(Err("WsHandle::recv_text is wasm32-only".into()))
+    }
+
+    pub async fn recv_engineio(
+        &mut self,
+    ) -> std::result::Result<crate::engineio_codec::EngineIoPacket, String> {
+        Err("WsHandle::recv_engineio is wasm32-only".into())
+    }
+
+    pub async fn recv_socketio(
+        &mut self,
+    ) -> std::result::Result<crate::engineio_codec::SocketIoPacket, String> {
+        Err("WsHandle::recv_socketio is wasm32-only".into())
+    }
 }
