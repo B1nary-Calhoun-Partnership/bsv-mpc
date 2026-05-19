@@ -356,9 +356,82 @@ Same shape for `signing.rs` (`signing_sm`), `presigning.rs`
 **Callers (`bsv-mpc-service`, `bsv-mpc-proxy`):** no API change
 required. Public method signatures stay the same (`init_*` →
 `Vec<RoundMessage>`, `process_round` → `*RoundResult`). The change is
-purely internal.
+purely internal. ⚠ **See §2.5** for an empirical finding that nuances
+this claim on the trait-bounds dimension.
 
 **`Cargo.toml`:** no dep changes.
+
+### 2.5 The `!Send` cascade — empirical finding from G-4b CI
+
+This section was added post-hoc as a §2.4 correction, after CI on the
+G-4b commit (`bc9c1be`) went red. The §2.4 claim "callers — no API
+change required" was true for **method signatures** but wrong on the
+**trait-bounds dimension**. The inline rewrite makes the three
+coordinator types structurally `!Send`:
+
+- `Box<dyn StateMachine<...>>` holds an opaque future whose state
+  contains `Rc<RefCell<_>>` (per `round_based 0.4.1`
+  `state_machine::shared_state::SharedStateRef<M>`), which is `!Send`.
+
+Downstream callers in `bsv-mpc-service`, `bsv-mpc-proxy`, and
+`bsv-mpc-worker` rely on `Send` for:
+
+- `tokio::task::spawn_blocking(move || { coord.process_round(...) })`
+  in `bsv-mpc-service::{dkg_handler,signing_handler}.rs` and
+  `bsv-mpc-proxy::bridge.rs`. The closure F requires `Send + 'static`.
+- `LazyLock<Mutex<HashMap<String, Coordinator>>>` static state in
+  `bsv-mpc-worker/api.rs`. `LazyLock<T>: Sync` requires `T: Sync`, and
+  `Mutex<HashMap<_, Coord>>: Sync` requires `Coord: Send`.
+
+The audit doc's investigation (§1.2, G-1b agent report) correctly
+identified the SM as `!Send`. What it missed was tracing the
+downstream consequences — the inline path **eliminates the need to
+spawn**, but doesn't eliminate the existing `Mutex<HashMap<_, Coord>>`
+sharing pattern in the worker, nor the existing `spawn_blocking` calls
+in the proxy and service. Both relied on `Send`.
+
+#### Resolution (Phase G Step 4e)
+
+Three options were considered:
+
+| Option | Description | Cost | Verdict |
+|---|---|---|---|
+| **(a) Refactor to LocalSet topology** | Pin each session to a single tokio LocalSet task; no cross-thread `Coord` ownership. Type-correct, no `unsafe`. | Days of work across 3 crates; touches the runtime topology. | God-tier but slow. |
+| **(b) Switch service to `Builder::new_current_thread()`** | Single-threaded executor — `!Send` is first-class. Loses theoretical multi-core ceremony parallelism but a cosigner box rarely runs >1 concurrent ceremony. | Cargo + main.rs tweak. | Considered; deferred to Phase I deployment audit. |
+| **(c) `unsafe impl Send` on the three coordinator types** | Document a safety invariant: `Rc<RefCell<_>>` is `!Send` only because reference counting is non-atomic; under serialized access (Mutex / single `spawn_blocking` closure) there is no data race. Standard Rust pattern. | Minutes — three impls + safety comments. | **Selected for Phase G.** |
+
+The `unsafe impl Send` shield is sound under the documented invariant:
+all current callers serialize access via `Mutex` or
+`spawn_blocking(move ||)`. The unsafe is local to `bsv-mpc-core` and
+the commit message (`a9a7e18`) is explicit about the trade-off.
+
+#### Known cost (called out)
+
+A future developer who shares a `DkgCoordinator` across threads
+without serialization (no `Mutex`, no single-task ownership) violates
+the invariant and gets undefined behavior (refcount races, in worst
+case memory corruption). The unsafe impl doesn't structurally enforce
+the invariant — it only documents it.
+
+#### Follow-up — phase TBD
+
+Replace `unsafe impl Send` with a `SendShield<T>` wrapper that only
+impls `Send` when wrapped in a `Mutex` (structural invariant
+enforcement). This converts the unsafe into a typed contract.
+Tracked as a Phase G post-merge cleanup or Phase I deployment-audit
+requirement.
+
+#### What this nuances in the rest of the audit doc
+
+- §2.2 "LOC delta" — accurate for the inline rewrite. The unsafe-Send
+  shield is +9 LOC (3 impls × 3 lines each), inconsequential.
+- §2.4 "Callers: no API change required" — correct **at the method-
+  signature level**; the trait-bounds level required this §2.5 patch.
+- §7 merge gate — should add a Step 5 line: "no `unsafe impl Send`
+  without a documented safety invariant + commit-message
+  justification."
+- §10 headline — "Public API unchanged" still holds; the unsafe-Send
+  is an internal detail.
 
 ## 3. Design direction B — Paillier safe-prime pool
 
