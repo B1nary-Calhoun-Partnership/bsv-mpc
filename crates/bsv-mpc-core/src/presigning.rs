@@ -31,12 +31,15 @@
 //! generated in the background. This ensures signing requests are never
 //! blocked waiting for the 3-round offline phase.
 //!
-//! ## Usage
+//! ## Architecture (Phase G inline)
 //!
-//! The presigning protocol is cooperative — it requires communication with
-//! other parties. The manager exposes an `init_generate` / `process_generate_round`
-//! API (same pattern as `DkgCoordinator` and `SigningCoordinator`) so the
-//! transport layer can relay messages.
+//! Like `DkgCoordinator` and `SigningCoordinator`, the presigning manager
+//! hosts its `round_based::StateMachine` directly on the struct (Phase G).
+//! The SM is `!Send` (`Rc<RefCell<_>>` internally) but that's fine inline —
+//! we drive it via the shared [`crate::dkg::drive_inline`] kernel without
+//! any thread or mpsc bridge.
+//!
+//! ## Usage
 //!
 //! ```ignore
 //! let mut mgr = PresigningManager::new(session_id, share, participants, 10);
@@ -59,43 +62,42 @@
 //! }
 //! ```
 
-use std::sync::mpsc;
-use std::thread;
+use std::collections::VecDeque;
 
 use cggmp24::security_level::SecurityLevel128;
+use cggmp24::signing::PresignaturePublicData;
 use cggmp24::supported_curves::Secp256k1;
 use cggmp24::ExecutionId;
-use round_based::state_machine::{ProceedResult, StateMachine};
-use sha2::Digest;
+use round_based::state_machine::StateMachine;
+use sha2::{Digest, Sha256};
 
-use crate::dkg::{outgoing_to_wire, wire_to_incoming, WireMessage};
+use crate::dkg::{drive_inline, DriveStep, WireMessage};
 use crate::error::{MpcError, Result};
-use crate::types::{EncryptedShare, Presignature, RoundMessage, SessionId, ShareIndex};
+use crate::types::{EncryptedShare, Presignature, RoundMessage, SessionId};
 
 // ---------------------------------------------------------------------------
-// Channel message types between manager and SM thread
+// Inline-SM type alias (Phase G)
 // ---------------------------------------------------------------------------
 
-/// Messages sent from the manager to the SM thread.
-enum SmInbound {
-    /// Feed an incoming wire message to the state machine.
-    IncomingMessage(Vec<u8>),
-}
+/// Output type of the presigning SM: a `(Presignature, PresignaturePublicData)`
+/// tuple on success, `SigningError` on failure. The output is type-erased
+/// into `Box<dyn Any + Send>` when stored in the manager's `raw_pool`
+/// because `PresignaturePublicData` doesn't implement `Serialize`.
+type PresignOutput = (
+    cggmp24::Presignature<Secp256k1>,
+    PresignaturePublicData<Secp256k1>,
+);
 
-/// Messages sent from the SM thread back to the manager.
-enum SmOutbound {
-    /// The SM produced an outgoing wire message.
-    OutgoingMessage(Vec<u8>),
-    /// The SM needs one more incoming message before it can proceed.
-    NeedsMessage,
-    /// Presigning protocol completed successfully.
-    /// The presignature data is passed as `Box<dyn Any + Send>` because
-    /// cggmp24's `PresignaturePublicData` doesn't implement `Serialize`.
-    /// The concrete type is `(cggmp24::Presignature<E>, PresignaturePublicData<E>)`.
-    PresigningComplete(Box<dyn std::any::Any + Send>),
-    /// The SM encountered an error.
-    Error(String),
-}
+/// Boxed `StateMachine` for the presigning sub-protocol. Shares the wire
+/// `Msg` type with the signing coordinator (both come from the same
+/// cggmp24 SigningBuilder), but the Output differs (presignature tuple
+/// vs final Signature).
+type PresigningSm = Box<
+    dyn StateMachine<
+        Output = std::result::Result<PresignOutput, cggmp24::SigningError>,
+        Msg = cggmp24::signing::msg::Msg<Secp256k1, Sha256>,
+    >,
+>;
 
 // ---------------------------------------------------------------------------
 // PresigningRoundResult
@@ -119,7 +121,7 @@ pub enum PresigningRoundResult {
 enum GenerateState {
     /// No generation in progress.
     Idle,
-    /// Generation is running (SM thread active).
+    /// Generation is running (SM active).
     Running,
 }
 
@@ -133,12 +135,10 @@ enum GenerateState {
 /// new ones and consume them for signing. Presignatures are consumed in FIFO
 /// order (oldest first).
 ///
-/// # Generation
+/// # Generation (Phase G inline)
 ///
-/// Presignature generation uses the same SM thread bridge pattern as
-/// `DkgCoordinator` and `SigningCoordinator`:
-///
-/// 1. Call [`init_generate`](Self::init_generate) to start the presigning SM.
+/// 1. Call [`init_generate`](Self::init_generate) to construct the
+///    cggmp24 presigning SM and drive it through round 1.
 /// 2. Call [`process_generate_round`](Self::process_generate_round) with
 ///    incoming messages until it returns `Complete`.
 /// 3. The presignature is automatically added to the pool on completion.
@@ -166,13 +166,14 @@ pub struct PresigningManager {
     /// Current generation state.
     generate_state: GenerateState,
 
-    // SM bridge (active during generation)
-    /// Send incoming messages to the SM thread.
-    sm_tx: Option<mpsc::Sender<SmInbound>>,
-    /// Receive outgoing messages and status from the SM thread.
-    sm_rx: Option<mpsc::Receiver<SmOutbound>>,
-    /// Handle to the SM thread.
-    sm_thread: Option<thread::JoinHandle<()>>,
+    /// The active presigning state machine (Phase G inline architecture).
+    /// `None` when no generation is in progress.
+    presigning_sm: Option<PresigningSm>,
+    /// Incoming wire messages buffered across `process_generate_round`
+    /// calls.
+    wire_buffer: VecDeque<WireMessage>,
+    /// Monotonic message id for `round_based::Incoming<M>::id`.
+    next_msg_id: u64,
 }
 
 impl PresigningManager {
@@ -200,25 +201,24 @@ impl PresigningManager {
             eid_counter: 0,
             current_round: 0,
             generate_state: GenerateState::Idle,
-            sm_tx: None,
-            sm_rx: None,
-            sm_thread: None,
+            presigning_sm: None,
+            wire_buffer: VecDeque::new(),
+            next_msg_id: 0,
         }
     }
 
     /// Start a new presignature generation (3-round protocol).
     ///
-    /// Spawns the SM thread running cggmp24's presigning state machine,
-    /// collects initial outgoing messages, and returns them for broadcast.
+    /// Constructs the cggmp24 presigning `StateMachine` inline on this
+    /// manager and drives it through round 1, returning the collected
+    /// outgoing messages.
     ///
-    /// Only one generation can be in progress at a time. Call
-    /// [`process_generate_round`](Self::process_generate_round) to drive
-    /// the protocol to completion.
+    /// Only one generation can be in progress at a time.
     ///
     /// # Errors
     ///
     /// Returns [`MpcError::Protocol`] if a generation is already in progress,
-    /// the pool is full, or the SM fails to start.
+    /// the pool is full, or the SM fails to construct.
     pub fn init_generate(&mut self) -> Result<Vec<RoundMessage>> {
         if self.generate_state != GenerateState::Idle {
             return Err(MpcError::Protocol(
@@ -232,39 +232,65 @@ impl PresigningManager {
             ));
         }
 
-        // Validate our share index is in the participants list
-        let _my_signing_index = self
-            .participants
-            .iter()
-            .position(|&p| p == self.share.share_index.0)
-            .ok_or_else(|| {
-                MpcError::Protocol(format!(
-                    "share index {} not found in participants {:?}",
-                    self.share.share_index.0, self.participants
-                ))
-            })? as u16;
+        let my_signing_index = self.signing_index()?;
+
+        // Canonical ExecutionId per MPC-Spec §02.2 with phase=Presign and
+        // the joint pubkey from the share. The eid_counter is mixed in so
+        // multiple presig generations within the same session produce
+        // distinct EIDs (CGGMP'24 forbids EID reuse).
+        self.eid_counter += 1;
+        let canonical_eid =
+            crate::canonical::canonical_execution_id(&crate::canonical::ExecutionParams::new_v1(
+                crate::canonical::PhaseTag::Presign,
+                self.session_id,
+                crate::signing::share_joint_pubkey_or_zero(&self.share, "presigning"),
+            ));
+        let eid_bytes = {
+            let mut hasher = Sha256::new();
+            hasher.update(canonical_eid);
+            hasher.update(self.eid_counter.to_be_bytes());
+            let mut bytes = [0u8; 32];
+            bytes.copy_from_slice(&hasher.finalize());
+            bytes
+        };
+
+        // Decode KeyShare up front so caller-side errors surface as
+        // MpcError::Protocol. KeyShare derives Clone — move an owned
+        // copy into the closure so the resulting SM is 'static and can
+        // be Boxed as a struct field.
+        let key_share: cggmp24::KeyShare<Secp256k1, SecurityLevel128> =
+            serde_json::from_slice(&self.share.ciphertext)
+                .map_err(|e| MpcError::Protocol(format!("failed to deserialize key share: {e}")))?;
+        let participants_owned = self.participants.clone();
+
+        let sm: PresigningSm = Box::new(round_based::state_machine::wrap_protocol(
+            move |party| async move {
+                let eid = ExecutionId::new(&eid_bytes);
+                cggmp24::signing(eid, my_signing_index, &participants_owned, &key_share)
+                    .generate_presignature(&mut rand::rngs::OsRng, party)
+                    .await
+            },
+        ));
+        self.presigning_sm = Some(sm);
 
         self.generate_state = GenerateState::Running;
         self.current_round = 1;
 
-        self.start_presigning_sm()?;
-        self.collect_outgoing_messages()
+        let mut outgoing = Vec::new();
+        match self.drive_presigning(&mut outgoing)? {
+            None => Ok(outgoing),
+            Some(_presig) => Err(MpcError::Protocol(
+                "presigning completed without any rounds (unexpected)".into(),
+            )),
+        }
     }
 
     /// Process incoming messages for the current presigning round.
     ///
-    /// Feeds messages to the SM thread and collects results. When the SM
-    /// completes, the presignature is automatically added to the pool and
-    /// `PresigningRoundResult::Complete` is returned.
-    ///
-    /// # Arguments
-    ///
-    /// * `messages` — All messages received for the current round from other parties.
-    ///
-    /// # Returns
-    ///
-    /// [`PresigningRoundResult::NextRound`] with outgoing messages, or
-    /// [`PresigningRoundResult::Complete`] when the presignature is ready.
+    /// Buffers incoming payloads, drives the SM, and on completion adds
+    /// the resulting presignature to the pool. Returns
+    /// [`PresigningRoundResult::Complete`] when the presignature is
+    /// ready, or [`PresigningRoundResult::NextRound`] otherwise.
     pub fn process_generate_round(
         &mut self,
         messages: Vec<RoundMessage>,
@@ -275,19 +301,51 @@ impl PresigningManager {
             ));
         }
 
-        // Feed all incoming messages to the SM thread
-        let tx = self.sm_tx.as_ref().ok_or_else(|| {
-            MpcError::Protocol("SM channel not available (internal error)".into())
-        })?;
-
         for msg in &messages {
-            tx.send(SmInbound::IncomingMessage(msg.payload.clone()))
-                .map_err(|e| {
-                    MpcError::Protocol(format!("failed to send to presigning SM thread: {e}"))
-                })?;
+            self.buffer_incoming_payload(&msg.payload)?;
         }
 
-        self.collect_round_result()
+        let mut outgoing = Vec::new();
+        match self.drive_presigning(&mut outgoing)? {
+            None => {
+                self.current_round += 1;
+                Ok(PresigningRoundResult::NextRound(outgoing))
+            }
+            Some(presig_output) => {
+                tracing::info!(
+                    party = self.share.share_index.0,
+                    pool_size = self.pool.len() + 1,
+                    max = self.max_pool_size,
+                    "presigning protocol complete, adding to pool"
+                );
+
+                self.generate_state = GenerateState::Idle;
+                self.current_round = 0;
+
+                let presig_id = {
+                    let mut hasher = Sha256::new();
+                    hasher.update(b"presig-");
+                    hasher.update(self.session_id.as_bytes());
+                    hasher.update(self.eid_counter.to_be_bytes());
+                    hex::encode(hasher.finalize())
+                };
+
+                let presig = Presignature {
+                    id: presig_id,
+                    session_id: self.session_id,
+                    // PresignaturePublicData doesn't implement Serialize;
+                    // the actual presig objects are stored in raw_pool.
+                    data: vec![],
+                    created_at: chrono::Utc::now(),
+                };
+
+                self.pool.push(presig);
+                let boxed: Box<dyn std::any::Any + Send> = Box::new(presig_output);
+                self.raw_pool.push(boxed);
+
+                Ok(PresigningRoundResult::Complete)
+            }
+        }
     }
 
     /// Take one presignature from the pool for use in online signing.
@@ -296,14 +354,11 @@ impl PresigningManager {
     /// presignature can only be used once — reusing a presignature would
     /// leak the private key (nonce reuse attack).
     ///
-    /// Returns `None` if the pool is empty. In that case, the caller should
-    /// either wait for generation to complete or fall back to the 4-round
-    /// interactive signing protocol.
+    /// Returns `None` if the pool is empty.
     pub fn take(&mut self) -> Option<Presignature> {
         if self.pool.is_empty() {
             None
         } else {
-            // Remove from both pools in FIFO order (oldest first).
             if !self.raw_pool.is_empty() {
                 self.raw_pool.remove(0);
             }
@@ -331,8 +386,8 @@ impl PresigningManager {
     /// Manually add a presignature to the pool.
     ///
     /// Useful when presignatures are generated externally (e.g., via
-    /// `round_based::sim` in tests) and need to be added to the pool.
-    /// No raw data is stored — only the metadata wrapper.
+    /// `round_based::sim` in tests). No raw data is stored — only the
+    /// metadata wrapper.
     pub fn add(&mut self, presig: Presignature) {
         self.pool.push(presig);
     }
@@ -345,7 +400,6 @@ impl PresigningManager {
     /// Check whether the pool should be replenished.
     ///
     /// Returns `true` if the pool has fewer than half its maximum capacity.
-    /// The caller should trigger background presigning when this returns `true`.
     pub fn should_replenish(&self) -> bool {
         self.pool.len() < self.max_pool_size / 2
     }
@@ -366,355 +420,76 @@ impl PresigningManager {
     }
 
     // -----------------------------------------------------------------------
-    // Internal: Start the presigning state machine in a background thread
+    // Internal: inline-SM drive helpers (Phase G)
     // -----------------------------------------------------------------------
 
-    fn start_presigning_sm(&mut self) -> Result<()> {
-        let (inbound_tx, inbound_rx) = mpsc::channel::<SmInbound>();
-        let (outbound_tx, outbound_rx) = mpsc::channel::<SmOutbound>();
+    /// Drive the presigning SM until it needs more input or completes.
+    fn drive_presigning(
+        &mut self,
+        outgoing: &mut Vec<RoundMessage>,
+    ) -> Result<Option<PresignOutput>> {
+        // Capture immutable copies before taking the &mut on wire_buffer /
+        // next_msg_id (avoids borrow-checker conflict with `self.*`).
+        let signing_idx = self.signing_index()?;
+        let session_id = self.session_id;
+        let current_round = self.current_round;
 
-        let my_signing_index = self
-            .participants
+        let mut sm = self
+            .presigning_sm
+            .take()
+            .ok_or_else(|| MpcError::Protocol("drive_presigning: SM not present".into()))?;
+
+        let result = drive_inline(
+            sm.as_mut(),
+            &mut self.wire_buffer,
+            &mut self.next_msg_id,
+            signing_idx,
+            session_id,
+            current_round,
+            outgoing,
+            "presigning",
+            &MpcError::Protocol,
+        );
+
+        match result? {
+            DriveStep::NeedsInput => {
+                self.presigning_sm = Some(sm);
+                Ok(None)
+            }
+            DriveStep::Complete(presig_output) => Ok(Some(presig_output)),
+        }
+    }
+
+    /// Compute this party's signing-time index (position within
+    /// `participants`). Errors if our share index isn't in the list.
+    fn signing_index(&self) -> Result<u16> {
+        self.participants
             .iter()
             .position(|&p| p == self.share.share_index.0)
+            .map(|p| p as u16)
             .ok_or_else(|| {
                 MpcError::Protocol(format!(
                     "share index {} not found in participants {:?}",
                     self.share.share_index.0, self.participants
                 ))
-            })? as u16;
-
-        // Canonical ExecutionId per MPC-Spec §02.2 with phase=Presign and
-        // the joint pubkey from the share. The eid_counter is mixed in via
-        // a per-generation per-pool nonce so multiple presig generations
-        // within the same session produce distinct EIDs.
-        //
-        // CGGMP'24 forbids EID reuse across protocol executions — so we
-        // sub-derive: canonical_eid_pre = canonical(Phase=Presign, joint_pk)
-        // and then mix in the counter via SHA-256.
-        self.eid_counter += 1;
-        let canonical_eid =
-            crate::canonical::canonical_execution_id(&crate::canonical::ExecutionParams::new_v1(
-                crate::canonical::PhaseTag::Presign,
-                self.session_id,
-                crate::signing::share_joint_pubkey_or_zero(&self.share, "presigning"),
-            ));
-        let eid_bytes = {
-            let mut hasher = sha2::Sha256::new();
-            hasher.update(canonical_eid);
-            hasher.update(self.eid_counter.to_be_bytes());
-            let mut bytes = [0u8; 32];
-            bytes.copy_from_slice(&hasher.finalize());
-            bytes
-        };
-
-        let participants = self.participants.clone();
-        let key_share_json = self.share.ciphertext.clone();
-        let party_index = self.share.share_index.0;
-
-        let thread_handle = thread::Builder::new()
-            .name(format!("presigning-{party_index}"))
-            .spawn(move || {
-                run_presigning_sm(
-                    eid_bytes,
-                    my_signing_index,
-                    participants,
-                    key_share_json,
-                    inbound_rx,
-                    outbound_tx,
-                );
             })
-            .map_err(|e| MpcError::Protocol(format!("failed to spawn presigning thread: {e}")))?;
+    }
 
-        self.sm_tx = Some(inbound_tx);
-        self.sm_rx = Some(outbound_rx);
-        self.sm_thread = Some(thread_handle);
-
+    /// Decode one incoming `RoundMessage` payload onto the internal wire
+    /// buffer. Accepts either a single `WireMessage` JSON or a bundled
+    /// JSON array.
+    fn buffer_incoming_payload(&mut self, wire_bytes: &[u8]) -> Result<()> {
+        if wire_bytes.first() == Some(&b'[') {
+            let bundle: Vec<WireMessage> = serde_json::from_slice(wire_bytes).map_err(|e| {
+                MpcError::Protocol(format!("failed to deserialize bundled incoming: {e}"))
+            })?;
+            self.wire_buffer.extend(bundle);
+        } else {
+            let wire: WireMessage = serde_json::from_slice(wire_bytes)
+                .map_err(|e| MpcError::Protocol(format!("failed to deserialize incoming: {e}")))?;
+            self.wire_buffer.push_back(wire);
+        }
         Ok(())
-    }
-
-    // -----------------------------------------------------------------------
-    // Internal: Collect outgoing messages from the SM thread
-    // -----------------------------------------------------------------------
-
-    fn collect_outgoing_messages(&mut self) -> Result<Vec<RoundMessage>> {
-        let rx = self.sm_rx.as_ref().ok_or_else(|| {
-            MpcError::Protocol("SM channel not available (internal error)".into())
-        })?;
-
-        let mut outgoing = Vec::new();
-
-        loop {
-            let msg = rx.recv().map_err(|e| {
-                MpcError::Protocol(format!(
-                    "presigning SM thread channel closed unexpectedly: {e}"
-                ))
-            })?;
-
-            match msg {
-                SmOutbound::OutgoingMessage(wire_bytes) => {
-                    outgoing.push(self.wire_bytes_to_round_message(wire_bytes)?);
-                }
-                SmOutbound::NeedsMessage => {
-                    break;
-                }
-                SmOutbound::PresigningComplete(_) => {
-                    return Err(MpcError::Protocol(
-                        "presigning completed without any rounds (unexpected)".into(),
-                    ));
-                }
-                SmOutbound::Error(e) => {
-                    return Err(MpcError::Protocol(e));
-                }
-            }
-        }
-
-        Ok(outgoing)
-    }
-
-    /// Collect messages after feeding incoming messages for a round.
-    fn collect_round_result(&mut self) -> Result<PresigningRoundResult> {
-        let rx = self.sm_rx.as_ref().ok_or_else(|| {
-            MpcError::Protocol("SM channel not available (internal error)".into())
-        })?;
-
-        let mut outgoing = Vec::new();
-
-        loop {
-            let msg = rx.recv().map_err(|e| {
-                MpcError::Protocol(format!(
-                    "presigning SM thread channel closed unexpectedly: {e}"
-                ))
-            })?;
-
-            match msg {
-                SmOutbound::OutgoingMessage(wire_bytes) => {
-                    outgoing.push(self.wire_bytes_to_round_message(wire_bytes)?);
-                }
-                SmOutbound::NeedsMessage => {
-                    self.current_round += 1;
-                    return Ok(PresigningRoundResult::NextRound(outgoing));
-                }
-                SmOutbound::PresigningComplete(presig_output) => {
-                    tracing::info!(
-                        party = self.share.share_index.0,
-                        pool_size = self.pool.len() + 1,
-                        max = self.max_pool_size,
-                        "presigning protocol complete, adding to pool"
-                    );
-
-                    self.cleanup_sm_thread();
-                    self.generate_state = GenerateState::Idle;
-                    self.current_round = 0;
-
-                    // Create a Presignature wrapper and add to pool
-                    let presig_id = {
-                        let mut hasher = sha2::Sha256::new();
-                        hasher.update(b"presig-");
-                        hasher.update(self.session_id.as_bytes());
-                        hasher.update(self.eid_counter.to_be_bytes());
-                        hex::encode(hasher.finalize())
-                    };
-
-                    let presig = Presignature {
-                        id: presig_id,
-                        session_id: self.session_id,
-                        // Data is empty because cggmp24's PresignaturePublicData
-                        // doesn't implement Serialize. The actual presig objects
-                        // are stored in raw_pool.
-                        data: vec![],
-                        created_at: chrono::Utc::now(),
-                    };
-
-                    self.pool.push(presig);
-                    self.raw_pool.push(presig_output);
-
-                    return Ok(PresigningRoundResult::Complete);
-                }
-                SmOutbound::Error(e) => {
-                    self.cleanup_sm_thread();
-                    self.generate_state = GenerateState::Idle;
-                    self.current_round = 0;
-                    return Err(MpcError::Protocol(e));
-                }
-            }
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // Internal: Convert wire bytes to RoundMessage
-    // -----------------------------------------------------------------------
-
-    fn wire_bytes_to_round_message(&self, wire_bytes: Vec<u8>) -> Result<RoundMessage> {
-        let wire: WireMessage = serde_json::from_slice(&wire_bytes)
-            .map_err(|e| MpcError::Protocol(format!("failed to parse wire message: {e}")))?;
-
-        Ok(RoundMessage {
-            session_id: self.session_id,
-            round: self.current_round,
-            from: ShareIndex(wire.sender),
-            to: None,
-            payload: wire_bytes,
-        })
-    }
-
-    // -----------------------------------------------------------------------
-    // Internal: Thread cleanup
-    // -----------------------------------------------------------------------
-
-    fn cleanup_sm_thread(&mut self) {
-        self.sm_tx.take();
-        self.sm_rx.take();
-
-        if let Some(handle) = self.sm_thread.take() {
-            let _ = handle.join();
-        }
-    }
-}
-
-impl Drop for PresigningManager {
-    fn drop(&mut self) {
-        self.cleanup_sm_thread();
-    }
-}
-
-// ---------------------------------------------------------------------------
-// State machine thread function
-// ---------------------------------------------------------------------------
-
-/// Run the presigning state machine in a dedicated thread.
-///
-/// This function blocks the thread, driving the SM via `proceed()` and
-/// communicating with the manager via channels. Same pattern as
-/// `run_signing_sm` in `signing.rs` and `run_keygen_sm` in `dkg.rs`.
-fn run_presigning_sm(
-    eid_bytes: [u8; 32],
-    my_signing_index: u16,
-    participants: Vec<u16>,
-    key_share_json: Vec<u8>,
-    inbound_rx: mpsc::Receiver<SmInbound>,
-    outbound_tx: mpsc::Sender<SmOutbound>,
-) {
-    // Deserialize key share
-    let key_share: cggmp24::KeyShare<Secp256k1, SecurityLevel128> =
-        match serde_json::from_slice(&key_share_json) {
-            Ok(ks) => ks,
-            Err(e) => {
-                let _ = outbound_tx.send(SmOutbound::Error(format!(
-                    "failed to deserialize key share: {e}"
-                )));
-                return;
-            }
-        };
-
-    let eid = ExecutionId::new(&eid_bytes);
-
-    // Create the presigning state machine via wrap_protocol.
-    let mut sm = round_based::state_machine::wrap_protocol(|party| async move {
-        cggmp24::signing(eid, my_signing_index, &participants, &key_share)
-            .generate_presignature(&mut rand::rngs::OsRng, party)
-            .await
-    });
-
-    let mut msg_id: u64 = 0;
-
-    loop {
-        match sm.proceed() {
-            ProceedResult::SendMsg(outgoing) => {
-                let wire = match outgoing_to_wire(my_signing_index, outgoing) {
-                    Ok(w) => w,
-                    Err(e) => {
-                        let _ = outbound_tx.send(SmOutbound::Error(format!(
-                            "presigning: failed to create wire message: {e}"
-                        )));
-                        return;
-                    }
-                };
-                let wire_bytes = match serde_json::to_vec(&wire) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        let _ = outbound_tx.send(SmOutbound::Error(format!(
-                            "presigning: failed to serialize outgoing: {e}"
-                        )));
-                        return;
-                    }
-                };
-                if outbound_tx
-                    .send(SmOutbound::OutgoingMessage(wire_bytes))
-                    .is_err()
-                {
-                    return; // Manager dropped its receiver
-                }
-            }
-            ProceedResult::NeedsOneMoreMessage => {
-                // Tell manager we need input
-                if outbound_tx.send(SmOutbound::NeedsMessage).is_err() {
-                    return;
-                }
-
-                // Wait for incoming message from manager
-                let inbound = match inbound_rx.recv() {
-                    Ok(msg) => msg,
-                    Err(_) => return, // Channel closed
-                };
-
-                match inbound {
-                    SmInbound::IncomingMessage(wire_bytes) => {
-                        msg_id += 1;
-                        let wire: WireMessage = match serde_json::from_slice(&wire_bytes) {
-                            Ok(w) => w,
-                            Err(e) => {
-                                let _ = outbound_tx.send(SmOutbound::Error(format!(
-                                    "presigning: failed to deserialize incoming: {e}"
-                                )));
-                                return;
-                            }
-                        };
-                        let incoming = match wire_to_incoming(wire, msg_id) {
-                            Ok(inc) => inc,
-                            Err(e) => {
-                                let _ = outbound_tx.send(SmOutbound::Error(format!(
-                                    "presigning: failed to parse incoming message: {e}"
-                                )));
-                                return;
-                            }
-                        };
-                        if sm.received_msg(incoming).is_err() {
-                            let _ = outbound_tx.send(SmOutbound::Error(
-                                "presigning: SM rejected incoming message".into(),
-                            ));
-                            return;
-                        }
-                    }
-                }
-            }
-            ProceedResult::Yielded => {
-                // SM made progress but isn't done yet — keep looping
-            }
-            ProceedResult::Output(result) => {
-                match result {
-                    Ok(presig_output) => {
-                        // Box the presignature output as dyn Any + Send.
-                        // cggmp24's PresignaturePublicData doesn't implement Serialize,
-                        // so we pass the raw objects through the channel.
-                        let boxed: Box<dyn std::any::Any + Send> = Box::new(presig_output);
-                        let _ = outbound_tx.send(SmOutbound::PresigningComplete(boxed));
-                    }
-                    Err(e) => {
-                        let _ = outbound_tx.send(SmOutbound::Error(format!(
-                            "presigning protocol error: {e:?}"
-                        )));
-                    }
-                }
-                return;
-            }
-            ProceedResult::Error(e) => {
-                let _ = outbound_tx.send(SmOutbound::Error(format!(
-                    "presigning state machine error: {e}"
-                )));
-                return;
-            }
-        }
     }
 }
 
@@ -725,7 +500,7 @@ fn run_presigning_sm(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::ThresholdConfig;
+    use crate::types::{ShareIndex, ThresholdConfig};
     use std::collections::VecDeque;
 
     // ---- Buffered sink for simulation (from POC 1 / dkg.rs tests) ----
@@ -1126,10 +901,6 @@ mod tests {
         assert!(!presig_1.id.is_empty(), "presig 1 should have an ID");
 
         // Raw data should exist (type-erased cggmp24 presignature objects)
-        // We can't inspect the contents without knowing the concrete type,
-        // but we verify they were successfully generated.
-        // Raw data exists — we can't easily name the concrete type for downcast
-        // but its presence proves the presigning protocol completed successfully.
         let _ = raw_0;
         let _ = raw_1;
 
