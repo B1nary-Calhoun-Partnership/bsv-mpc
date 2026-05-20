@@ -57,6 +57,7 @@ cggmp24 fork change required**; the DO ships/needs only `Presignature` (which IS
 | `4937955` | **#17 CF Container P2** — full native `bsv-mpc-service` on CF Containers (root `Dockerfile` + `poc/cf-container-p2/`) | **deployed proof:** `bsv-mpc-service-container.dev-a3e.workers.dev/health` → real KSS JSON (`version 0.1.0`, `data_dir=/data`); ADR-018 native half confirmed end-to-end. Build needs libssl (native-tls); CF=amd64 |
 | `b29e699` | **#12 proxy relay combiner** — `relay_sign::combine_sign_over_relay` + `MpcBridge::sign_over_relay` (proxy = combiner over MessageBox) | **deployed proof:** proxy combiner + deployed DO co-sign over the live relay → **BSV-valid 70-byte DER** under joint pubkey `0305e6df…` (`relay_combine_deployed_e2e.rs`, `RELAY_COMBINE_E2E=1`, no sats). 145 proxy unit tests green |
 | `a518a3a` | **#5 authz steps 1-2** — caller-identity threading + owner-identity (`mpc_shares.owner_identity`); sign/ecdh/presign reject 403 unless caller==DKG-time owner (§08.1) | **39 worker unit tests** (owner ok / stranger 403 / unauth-with-owner 403 / no-owner allowed; owner round-trip + preserve-on-refresh); design `docs/AUTHZ-DESIGN.md` spec-checked §07/§08 |
+| `c4cc9fa` | **#5 authz step 3** — durable DO-SQLite auth sessions (`AuthSessionStore` trait + `mpc_auth_sessions`); BRC-31 auth moved INTO the pinned DO; entrypoint = thin forwarder | **deployed proof:** `/poc/auth-session-roundtrip` session survives **+143s isolate eviction byte-identical** (`instance_constructed_at_ms` advanced); `POST /sign/init` no-auth → **401**; `/poc/handshake` regression-free; 40 worker unit tests. Auth-session-isolate FIXED |
 
 **Deployed worker:** `https://bsv-mpc-kss.dev-a3e.workers.dev`.
 **Deployed native service (CF Container):** `https://bsv-mpc-service-container.dev-a3e.workers.dev`.
@@ -119,19 +120,21 @@ cggmp24 fork change required**; the DO ships/needs only `Presignature` (which IS
    (spec-checked §07/§08). **Steps 1-2 DONE (`a518a3a`)**: caller-identity
    threading + owner-identity authz (sign/ecdh/presign reject 403 unless
    caller==DKG-time owner), 39 worker unit tests. **REMAINING:**
-   - **Step 3** — durable auth sessions in DO SQLite (`mpc_auth_sessions`),
-     replacing the per-isolate `AUTH_SESSIONS` static → fixes auth-session-isolate.
-     A 4-file auth-path refactor (`lib.rs` entrypoint + `auth.rs` +
-     `poc.rs` + `do_storage.rs`): move BRC-31 handshake + verify INTO the pinned
-     DO, backed by DO SQLite. **Gate (deployed, no asterisks):** handshake then
-     authed request succeed across a forced isolate eviction (analog of the I-3b
-     fund-safety eviction proof). Keep `/poc/handshake` + the 17 auth unit tests
-     green.
-   - **Step 4** — authed production `/sign-relay` (requester==owner) + stable
-     proxy identity (derive `BridgeAuth` key from the share file — OQ-A2 decided).
-     **Gate:** the #12 `relay_combine_deployed_e2e` run through the AUTHED route
-     (owner accepted, stranger rejected).
-   - §08.12 BRC-52 cert verifier + §09 policy = richer follow-on (own issue).
+   - ~~**Step 3** — durable auth sessions in DO SQLite~~ **✅ DONE (`c4cc9fa`).**
+     `AuthSessionStore` trait + `mpc_auth_sessions`; BRC-31 auth moved INTO the
+     pinned DO (entrypoint = thin forwarder). **Deployed-proven:** session
+     survives +143s isolate eviction byte-identical; no-auth → 401;
+     `/poc/handshake` green; 40 worker unit tests. **Auth-session-isolate FIXED.**
+   - **Step 4 (remaining)** — authed production `/sign-relay` (requester==owner,
+     add to `is_authed_path`) + stable proxy identity (derive `BridgeAuth` key
+     from the share file — OQ-A2 decided). Couples to the createAction-over-relay
+     + presig-provisioning automation; the authed positive flow is naturally
+     exercised by the I-5 path (proxy does authed BRC-31 triggers). **Gate:** the
+     #12 `relay_combine_deployed_e2e` through the AUTHED route (owner accepted,
+     stranger rejected).
+   - Remaining #5 hardening: at-rest encryption of primes/session blobs;
+     blast-radius doc; rate limiting. §08.12 BRC-52 cert verifier + §09 policy =
+     richer follow-on (own issue).
 6. **I-5 merge gate** (task #16). Real-sats mainnet TXID: proxy (share_B) + the
    **deployed** worker (share_A) co-sign over the relay; broadcast; shape-match
    G-5d (`442bd391…`). Wallet `localhost:3321` (Origin `http://admin.com`),
@@ -184,11 +187,13 @@ cggmp24 fork change required**; the DO ships/needs only `Presignature` (which IS
   orchestrate research, then VERIFY agent output.
 
 ---
-**Last commit:** `a518a3a` (#5 authz steps 1-2 — owner-identity handler authz,
-39 worker unit tests). **Next pickup:** **#5 step 3** — durable auth sessions in
-DO SQLite (the auth-path refactor above; deployed forced-eviction proof). Then
-**#5 step 4** (authed `/sign-relay` + stable proxy key). Then **I-5 (#16)**
-real-sats TXID:
+**Last commit:** `c4cc9fa` (#5 step 3 — durable DO-SQLite auth sessions,
+deployed eviction-proven; auth-session-isolate FIXED). The two CORE #5 security
+must-fixes (handler authz + auth-session-isolate) are now both closed +
+deployed-proven. **Next pickup:** **I-5 (#16)** real-sats TXID — the hybrid sign
+path + proxy combiner + both deployment homes + auth baseline are all proven;
+fold in #5 step 4 (authed `/sign-relay` + stable proxy key from the share file)
+as part of the I-5 integration. I-5:
 swap the e2e's test key shares for a funded DKG joint key (fund the joint
 address via wallet `localhost:3321`, Origin `http://admin.com`, `E2E_MAINNET=1`),
 proxy + deployed DO co-sign over the relay, broadcast, cite the TXID.
