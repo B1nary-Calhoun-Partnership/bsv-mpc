@@ -197,9 +197,13 @@ deployed-cosigner merge gate is SATISFIED.** Everything ADR-018 is proven
 end-to-end on real Cloudflare + real mainnet.
 
 **Remaining (hardening + productionization, not merge-gate blockers):**
-- **#5 step 4** — authed production `/sign-relay` (requester==owner) + stable
-  proxy key (derive `BridgeAuth` from the share file). The I-5 baseline used the
-  unauthed `/poc/sign-relay`; production must gate per §07.6.
+- **#5 step 4** — authed production `/sign-relay` (requester==owner). ✅ **Stable
+  proxy key DONE:** `BridgeAuth::from_share_seed` derives the proxy's long-lived
+  BRC-31 / relay identity deterministically (HMAC-SHA256, domain
+  `"bsv-mpc proxy auth identity v1"`) from the secret share material, so the
+  proxy keeps the same `owner_identity` across restarts (§07.4 / OQ-A2; 2 unit
+  tests: determinism + per-share distinctness). The I-5 baseline used the
+  unauthed `/poc/sign-relay`; production must still gate per §07.6.
 - **createAction-over-relay + provisioning automation** — route the proxy's
   `createSignature`/`createAction` through the relay combiner + retire the HTTP
   `bridge.rs::sign`; native Container generates correlated presig pairs →

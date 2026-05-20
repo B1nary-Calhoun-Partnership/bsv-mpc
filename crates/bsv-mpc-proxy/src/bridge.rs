@@ -222,7 +222,11 @@ struct BridgeAuth {
 }
 
 impl BridgeAuth {
-    /// Create a new auth client with a random identity key.
+    /// Create a new auth client with a random identity key (tests only).
+    ///
+    /// Production uses [`BridgeAuth::from_share_seed`] so the proxy keeps a
+    /// stable owner identity across restarts.
+    #[cfg(test)]
     fn new() -> std::result::Result<Self, MpcError> {
         use rand::RngCore;
         let mut key_bytes = [0u8; 32];
@@ -237,6 +241,43 @@ impl BridgeAuth {
             our_nonce: None,
             server_session_nonce: None,
         })
+    }
+
+    /// Derive the proxy's **stable** BRC-31 / relay identity key
+    /// deterministically from secret share material.
+    ///
+    /// §07.4 mandates a *long-lived* identity key: the same key signs BRC-31
+    /// auth to the KSS, the §05 envelope outer-signatures over the relay, and
+    /// is recorded as the share's `owner_identity` at DKG time. A random
+    /// per-process key would orphan the share's ownership after a restart, so
+    /// the key is derived from the secret share material — binding owner
+    /// identity to control of `share_B` (AUTHZ-DESIGN §3c / OQ-A2: derive from
+    /// the share file, zero new config).
+    fn from_share_seed(share_secret: &[u8]) -> std::result::Result<Self, MpcError> {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+        const DOMAIN: &[u8] = b"bsv-mpc proxy auth identity v1";
+        // Reject the negligible chance of an out-of-range scalar by bumping a
+        // counter (probability ~2^-128 per try; the loop effectively never
+        // iterates).
+        for counter in 0u8..=u8::MAX {
+            let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(DOMAIN)
+                .map_err(|e| MpcError::Protocol(format!("hmac init: {e}")))?;
+            mac.update(share_secret);
+            mac.update(&[counter]);
+            let bytes: [u8; 32] = mac.finalize().into_bytes().into();
+            if let Ok(auth_key) = PrivateKey::from_bytes(&bytes) {
+                return Ok(Self {
+                    auth_key,
+                    server_identity_key: None,
+                    our_nonce: None,
+                    server_session_nonce: None,
+                });
+            }
+        }
+        Err(MpcError::Protocol(
+            "could not derive a valid proxy auth key from share seed".into(),
+        ))
     }
 
     /// Whether the handshake has been completed.
@@ -626,9 +667,11 @@ impl MpcBridge {
             .build()
             .map_err(|e| anyhow::anyhow!("failed to create HTTP client: {e}"))?;
 
-        // 6. Initialize BRC-31 auth client
-        let mut bridge_auth =
-            BridgeAuth::new().map_err(|e| anyhow::anyhow!("failed to create auth client: {e}"))?;
+        // 6. Initialize BRC-31 auth client with a STABLE identity derived from
+        //    the secret share material (§07.4 long-lived identity / OQ-A2), so
+        //    the proxy keeps the same `owner_identity` across restarts.
+        let mut bridge_auth = BridgeAuth::from_share_seed(&dkg_result.share.ciphertext)
+            .map_err(|e| anyhow::anyhow!("failed to derive stable proxy auth identity: {e}"))?;
 
         // 7. Check KSS health + perform BRC-31 handshake
         let health_url = format!("{}/health", config.kss_url);
@@ -1474,5 +1517,31 @@ mod tests {
         assert_eq!(bridge.participants, vec![0, 2]);
 
         let _ = tokio::fs::remove_file(&share_path).await;
+    }
+
+    #[test]
+    fn proxy_identity_is_deterministic_for_same_share() {
+        // Stable proxy identity (OQ-A2): the same secret share material must
+        // always derive the same long-lived BRC-31 / relay identity key, so a
+        // proxy restart keeps the share's `owner_identity`.
+        let secret = b"share_B raw cggmp24 key share json bytes".to_vec();
+        let a = BridgeAuth::from_share_seed(&secret).unwrap();
+        let b = BridgeAuth::from_share_seed(&secret).unwrap();
+        assert_eq!(
+            a.identity_hex(),
+            b.identity_hex(),
+            "same share must derive the same identity across restarts"
+        );
+        // Sanity: a valid 33-byte compressed pubkey (66 hex chars).
+        assert_eq!(a.identity_hex().len(), 66);
+    }
+
+    #[test]
+    fn proxy_identity_differs_per_share() {
+        // Distinct share secrets (distinct owners) must derive distinct
+        // identities — owner identity is bound to control of that share.
+        let a = BridgeAuth::from_share_seed(b"share for agent one").unwrap();
+        let b = BridgeAuth::from_share_seed(b"share for agent two").unwrap();
+        assert_ne!(a.identity_hex(), b.identity_hex());
     }
 }
