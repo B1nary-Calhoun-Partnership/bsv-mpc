@@ -180,6 +180,12 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         .post_async("/poc/persist", |req, ctx| async move {
             poc::forward_to_cosigner_do(req, &ctx.env).await
         })
+        // I-3b2: relay-handshake-from-DO — outbound Socket.IO + BRC-103 +
+        // envelope round-trip against the live MessageBox relay, driven from
+        // inside the per-identity CosignerSessionDo (wasm32 transport).
+        .get_async("/poc/handshake", |req, ctx| async move {
+            poc::forward_to_cosigner_do(req, &ctx.env).await
+        })
         .run(req, env)
         .await
 }

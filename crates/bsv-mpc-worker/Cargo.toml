@@ -5,9 +5,9 @@ edition.workspace = true
 license.workspace = true
 description = "Cloudflare Worker Key Share Service for MPC threshold signing (WASM)"
 
+# Target-agnostic deps (both the native clippy build and the wasm32 CF build).
 [dependencies]
 bsv-mpc-core = { path = "../bsv-mpc-core" }
-bsv.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -17,6 +17,33 @@ hex.workspace = true
 base64.workspace = true
 worker = "0.8"
 getrandom = { version = "0.2", features = ["js"] }
+
+# Native target — `cargo clippy --workspace --all-targets` compiles the worker
+# for the host; only the non-wasm32 code paths are checked. Uses the workspace
+# `bsv` (default features + transaction + wallet); no Socket.IO / relay deps.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+bsv.workspace = true
+
+# wasm32 target — the deployed CF Worker. `bsv` is declared DIRECTLY (NOT
+# workspace = true) with `default-features = false` so the `wasm` + `socketio`
+# features stay scoped to the wasm32 build (mirrors bsv-mpc-messagebox's wasm
+# block; the workspace `bsv` leaves default-features on, which would otherwise
+# ignore this override). The relay-handshake-from-DO path (`poc::handle_handshake`)
+# lives behind `cfg(target_arch = "wasm32")`.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+bsv = { package = "bsv-rs", version = "0.3.10", default-features = false, features = ["auth", "wallet", "transaction", "wasm", "socketio"] }
+bsv-mpc-messagebox = { path = "../bsv-mpc-messagebox" }
+futures.workspace = true
+wasm-bindgen-futures = "0.4"
+# bsv-rs's wasm `wait_with_timeout` (Peer handshake timeout) uses
+# `futures-timer::Delay`, but bsv-rs pulls `futures-timer` WITHOUT its
+# `wasm-bindgen` feature — so on wasm32-unknown-unknown `Delay::new` hits the
+# native timer-thread backend and PANICS (`thread::spawn` is unsupported),
+# aborting `Peer::to_peer` on its first poll. Depending on `futures-timer` here
+# with `wasm-bindgen` flips the (feature-unified) shared build to the
+# `gloo-timers`/`setTimeout` backend, which works in the CF isolate. Without
+# this the canonical `to_peer` handshake hangs the request.
+futures-timer = { version = "3", features = ["wasm-bindgen"] }
 
 [lib]
 crate-type = ["cdylib"]

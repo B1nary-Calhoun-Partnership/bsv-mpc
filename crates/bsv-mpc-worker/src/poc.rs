@@ -36,7 +36,13 @@ use sha2::{Digest, Sha256};
 use worker::*;
 
 /// DO name for the POC cosigner (per-identity topology; one DO instance).
-pub const POC_DO_NAME: &str = "cosigner-poc-1";
+pub const POC_DO_NAME: &str = "cosigner-poc-2";
+
+/// Live Calhoun MessageBox relay (the spec-normative §06 Socket.IO + BRC-103
+/// channel). Overridable via the `RELAY_URL` Worker var. Only referenced by
+/// the wasm32 `handle_handshake` path.
+#[cfg(target_arch = "wasm32")]
+pub const DEFAULT_RELAY_URL: &str = "https://rust-message-box.dev-a3e.workers.dev";
 
 /// Per-identity cosigner Durable Object. Holds its key-share in DO SQLite
 /// (durable across hibernation); `instance_constructed_at_ms` is in-memory
@@ -65,6 +71,7 @@ impl DurableObject for CosignerSessionDo {
         match path.as_str() {
             "/poc/identity" => self.handle_identity().await,
             "/poc/persist" => self.handle_persist().await,
+            "/poc/handshake" => self.handle_handshake().await,
             other => Response::error(format!("unknown POC route: {other}"), 404),
         }
     }
@@ -80,7 +87,11 @@ impl CosignerSessionDo {
         Ok(key.public_key().to_hex())
     }
 
-    /// Ensure the `shares` table exists (idempotent).
+    /// Ensure the `shares` table exists (idempotent). `ciphertext` is the
+    /// hex of the (encrypted) share — stored as TEXT so the DO SQLite
+    /// cursor deserializes cleanly into a `String` (a BLOB column comes
+    /// back as a JS byte-array that serde won't map to `Vec<u8>` without
+    /// `serde_bytes`; hex TEXT sidesteps that and is still ciphertext).
     fn ensure_schema(&self) -> Result<()> {
         self.state
             .storage()
@@ -88,7 +99,7 @@ impl CosignerSessionDo {
             .exec(
                 "CREATE TABLE IF NOT EXISTS shares (\
                    agent_id TEXT PRIMARY KEY, \
-                   ciphertext BLOB NOT NULL, \
+                   ciphertext TEXT NOT NULL, \
                    created_at INTEGER NOT NULL\
                  )",
                 None,
@@ -96,8 +107,8 @@ impl CosignerSessionDo {
             .map(|_| ())
     }
 
-    /// Read the persisted ciphertext blob for `agent_id`, if any.
-    fn read_share(&self, agent_id: &str) -> Result<Option<Vec<u8>>> {
+    /// Read the persisted ciphertext (hex) for `agent_id`, if any.
+    fn read_share(&self, agent_id: &str) -> Result<Option<String>> {
         let cursor = self.state.storage().sql().exec(
             "SELECT ciphertext FROM shares WHERE agent_id = ?",
             vec![agent_id.into()],
@@ -116,7 +127,7 @@ impl CosignerSessionDo {
             "client_identity": identity,
             "instance_constructed_at_ms": self.instance_constructed_at_ms,
             "share_present": share.is_some(),
-            "share_sha256": share.as_ref().map(|b| hex::encode(Sha256::digest(b))),
+            "share_hex": share,
             "do_name": POC_DO_NAME,
         }))
     }
@@ -135,7 +146,7 @@ impl CosignerSessionDo {
         let mut h = Sha256::new();
         h.update(identity.as_bytes());
         h.update(b"poc-share");
-        let want: Vec<u8> = h.finalize().to_vec();
+        let want: String = hex::encode(h.finalize());
 
         let existed = self.read_share(&identity)?.is_some();
         if !existed {
@@ -158,18 +169,202 @@ impl CosignerSessionDo {
             "route": "poc/persist",
             "client_identity": identity,
             "already_existed": existed,
-            "stored_sha256": hex::encode(&want),
-            "reloaded_sha256": hex::encode(&reloaded),
+            "stored_hex": want,
+            "reloaded_hex": reloaded,
             "reload_matches": matches,
             "instance_constructed_at_ms": self.instance_constructed_at_ms,
         }))
     }
 }
 
-/// Row shape for `SELECT ciphertext`.
+/// Row shape for `SELECT ciphertext` (hex TEXT).
 #[derive(serde::Deserialize)]
 struct ShareRow {
-    ciphertext: Vec<u8>,
+    ciphertext: String,
+}
+
+// ============================================================================
+// I-3b2 — relay-handshake-from-DO (the transport half of the cosigner POC)
+// ============================================================================
+//
+// Drives the FULL Engine.IO 4 + Socket.IO 5 + BRC-103 handshake against the
+// live MessageBox relay from inside the deployed DO, lifting poc17's proven
+// outbound-WS flow onto this crate's wasm32 `transport_wasm` substrate. The
+// DO's stable identity (`SERVER_PRIVATE_KEY`, reloaded every wake) is the
+// `Peer` wallet. This is the wasm32 mirror of the proven native flow in
+// `crates/bsv-mpc-messagebox/tests/transport_native_handshake.rs` — the only
+// substantive difference is `spawn_local` (NOT `tokio::spawn`) for dispatch.
+
+#[cfg(target_arch = "wasm32")]
+impl CosignerSessionDo {
+    /// `GET /poc/handshake` — dial the relay, complete BRC-103, and prove the
+    /// channel: learn the relay's server identity from the first inbound
+    /// General, then a best-effort `sendMessage` envelope round-trip. Returns
+    /// the learned `server_identity` (the deterministic runtime gate).
+    async fn handle_handshake(&self) -> Result<Response> {
+        use bsv::auth::transports::socketio::build_envelope_payload;
+        use bsv::auth::transports::socketio::codec::{EngineIoPacket, SocketIoPacket};
+        use bsv::auth::{
+            install_app_event_listener, run_dispatch, Peer, PeerOptions, SocketIoFrameSource,
+            SocketIoSink, SocketIoTransport,
+        };
+        use bsv::wallet::ProtoWallet;
+        use bsv_mpc_messagebox::transport_wasm::{polling_handshake, WsHandle};
+        use futures::future::{select, Either};
+        use futures::StreamExt;
+        use serde_json::json;
+        use std::time::Duration;
+        use wasm_bindgen_futures::spawn_local;
+
+        let t0 = Date::now().as_millis();
+
+        // Stable cosigner identity from the secret (reloaded every wake).
+        let priv_hex = self.env.secret("SERVER_PRIVATE_KEY")?.to_string();
+        let client_priv = PrivateKey::from_hex(&priv_hex)
+            .map_err(|e| Error::RustError(format!("SERVER_PRIVATE_KEY parse: {e:?}")))?;
+        let client_pub_hex = client_priv.public_key().to_hex();
+
+        let relay = self
+            .env
+            .var("RELAY_URL")
+            .map(|v| v.to_string())
+            .unwrap_or_else(|_| DEFAULT_RELAY_URL.to_string());
+
+        // 1. Engine.IO 4 polling handshake → sid.
+        let handshake = polling_handshake(&relay).await?;
+        // 2. WS upgrade (2probe → 3probe → 5).
+        let mut ws = WsHandle::open_and_upgrade(&relay, &handshake.sid)
+            .await
+            .map_err(Error::RustError)?;
+        let probe_round_trip_ms = ws.probe_round_trip_ms();
+        let sink = ws.sender();
+
+        // 3. Socket.IO 5 CONNECT to the default namespace `/`.
+        sink.send_socketio(&SocketIoPacket::Connect {
+            nsp: "/".to_string(),
+            data: None,
+        })
+        .map_err(Error::RustError)?;
+        loop {
+            match ws.recv_engineio().await.map_err(Error::RustError)? {
+                EngineIoPacket::Ping(payload) => {
+                    let _ = sink.send_engineio(&EngineIoPacket::Pong(payload));
+                }
+                EngineIoPacket::Message(payload) => {
+                    if let Ok(SocketIoPacket::Connect { .. }) = SocketIoPacket::decode(&payload) {
+                        break; // CONNECT-ack — Socket.IO ready.
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // 4. Wire `Peer` over the upstream `SocketIoTransport<WsSender>`; spawn
+        //    the dispatch loop with `spawn_local` (wasm32 is single-threaded —
+        //    NOT `tokio::spawn`).
+        let transport = SocketIoTransport::new(sink.clone());
+        let callback = transport.callback_handle();
+        let dispatch_sink = sink.clone();
+        let wallet = ProtoWallet::new(Some(client_priv));
+        let peer = Peer::new(PeerOptions {
+            wallet,
+            transport,
+            certificates_to_request: None,
+            session_manager: None,
+            auto_persist_last_session: true,
+            originator: Some("i-3b2-wasm".to_string()),
+        });
+        peer.start();
+        let (mut events, _cb_id) = install_app_event_listener(&peer).await;
+        spawn_local(run_dispatch(ws, dispatch_sink, callback));
+
+        // 5. joinRoom. `to_peer(_, None, _)` auto-initiates the BRC-103
+        //    handshake (InitialRequest → InitialResponse via the dispatch loop)
+        //    and signs+sends the first General internally. Ok proves the full
+        //    wasm32 canonical path end-to-end. (The internal timeout works only
+        //    because the worker crate enables `futures-timer/wasm-bindgen` —
+        //    see Cargo.toml — otherwise this poll panics in the CF isolate.)
+        let now_ms = Date::now().as_millis();
+        let message_box = format!("i3b2-{now_ms}");
+        let room_id = format!("{client_pub_hex}-{message_box}");
+        peer.to_peer(
+            &build_envelope_payload("joinRoom", &json!(room_id)),
+            None,
+            Some(20_000),
+        )
+        .await
+        .map_err(|e| Error::RustError(format!("to_peer(joinRoom): {e:?}")))?;
+        let handshake_rtt_ms = Date::now().as_millis() - t0;
+
+        // 6. Server identity = sender of the first inbound General (the relay's
+        //    `authenticated` event). Race a Delay so a silent relay can't hang.
+        let server_identity =
+            match select(events.next(), worker::Delay::from(Duration::from_secs(8))).await {
+                Either::Left((Some(ev), _)) => Some(ev.sender.to_hex()),
+                _ => None,
+            };
+
+        // 7. Best-effort envelope round-trip: send a self-addressed message and
+        //    await the relay's `sendMessage-{room}`/`sendMessageAck-{room}` echo.
+        let mut envelope_round_trip = false;
+        if let Some(server_id) = server_identity.as_deref() {
+            let send_payload = build_envelope_payload(
+                "sendMessage",
+                &json!({
+                    "messageBox": message_box,
+                    "message": {
+                        "messageId": format!("i3b2-{now_ms}"),
+                        "recipient": client_pub_hex,
+                        "body": json!({"poc": "i-3b2", "ts": now_ms}),
+                    }
+                }),
+            );
+            if peer
+                .to_peer(&send_payload, Some(server_id), Some(20_000))
+                .await
+                .is_ok()
+            {
+                let send_evt = format!("sendMessage-{room_id}");
+                let ack_evt = format!("sendMessageAck-{room_id}");
+                let deadline = Date::now().as_millis() + 8_000;
+                while Date::now().as_millis() < deadline {
+                    match select(events.next(), worker::Delay::from(Duration::from_secs(8))).await {
+                        Either::Left((Some(ev), _)) => {
+                            if ev.event_name == send_evt || ev.event_name == ack_evt {
+                                envelope_round_trip = true;
+                                break;
+                            }
+                        }
+                        _ => break,
+                    }
+                }
+            }
+        }
+
+        Response::from_json(&serde_json::json!({
+            "route": "poc/handshake",
+            "client_identity": client_pub_hex,
+            "server_identity": server_identity,
+            "envelope_round_trip": envelope_round_trip,
+            "room_id": room_id,
+            "engineio_sid": handshake.sid,
+            "probe_round_trip_ms": probe_round_trip_ms,
+            "handshake_rtt_ms": handshake_rtt_ms,
+            "relay": relay,
+            "do_name": POC_DO_NAME,
+            "instance_constructed_at_ms": self.instance_constructed_at_ms,
+        }))
+    }
+}
+
+/// Native stub — the relay-handshake POC is wasm32-only (the Socket.IO +
+/// BRC-103 transport uses `web_sys::WebSocket`). Keeps the `fetch` match arm
+/// total when the worker is compiled for the host by `clippy --all-targets`.
+#[cfg(not(target_arch = "wasm32"))]
+impl CosignerSessionDo {
+    async fn handle_handshake(&self) -> Result<Response> {
+        Response::error("/poc/handshake is wasm32-only (deployed CF Worker)", 501)
+    }
 }
 
 /// Forward a `/poc/*` request from the Worker entrypoint to the singleton
