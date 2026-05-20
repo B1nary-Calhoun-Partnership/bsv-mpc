@@ -615,6 +615,43 @@ impl SigningCoordinator {
 }
 
 // ---------------------------------------------------------------------------
+// Light issue-only path (ADR-018: the wasm DO cosigner)
+// ---------------------------------------------------------------------------
+
+/// Issue this party's partial signature for the 1-round presigned online sign,
+/// from a **serialized** cggmp24 `Presignature` — the only presignature data a
+/// light wasm cosigner needs.
+///
+/// This is the DO's hot-path op (ADR-018): the heavy presignature generation
+/// runs natively and ships this party's `Presignature` (which **is**
+/// `Serialize`, unlike `PresignaturePublicData`) to the DO; the DO issues its
+/// partial here (pure field math — fits the CF Worker budget) and broadcasts
+/// the serialized [`cggmp24::PartialSignature`]. The **combiner** (the native
+/// proxy party, which holds the shared `PresignaturePublicData` from its own
+/// presig generation) runs [`SigningCoordinator::sign_with_presignature`] +
+/// [`process_round`](SigningCoordinator::process_round) to combine — so the
+/// non-serializable public data never has to cross the boundary.
+///
+/// # Arguments
+/// * `presignature_json` — serde-JSON of this party's `cggmp24::Presignature`.
+/// * `message_hash` — the 32-byte SHA-256d BSV sighash (base key; no offset).
+///
+/// Returns the serde-JSON of this party's [`cggmp24::PartialSignature`].
+pub fn issue_partial_signature_json(
+    presignature_json: &[u8],
+    message_hash: &[u8; 32],
+) -> Result<Vec<u8>> {
+    let presig: cggmp24::signing::Presignature<Secp256k1> =
+        serde_json::from_slice(presignature_json)
+            .map_err(|e| MpcError::Signing(format!("deserialize presignature: {e}")))?;
+    let scalar = Scalar::<Secp256k1>::from_be_bytes_mod_order(*message_hash);
+    let data_to_sign = PrehashedDataToSign::from_scalar(scalar).insecure_assume_preimage_known();
+    let partial = presig.issue_partial_signature(data_to_sign);
+    serde_json::to_vec(&partial)
+        .map_err(|e| MpcError::Signing(format!("serialize partial signature: {e}")))
+}
+
+// ---------------------------------------------------------------------------
 // Signature conversion helpers
 // ---------------------------------------------------------------------------
 
@@ -1515,6 +1552,90 @@ mod tests {
         assert!(
             bsv_pubkey.verify(&message_hash, &bsv_sig),
             "BSV SDK must verify the 1-round presigned signature"
+        );
+    }
+
+    /// ADR-018 hybrid sign topology: the **wasm DO** issues its partial from a
+    /// *serialized* `Presignature` (no public data) via
+    /// [`issue_partial_signature_json`], and the **native proxy** combines (it
+    /// holds the `PresignaturePublicData`). Proves the cross-boundary path —
+    /// the `Presignature` crosses as JSON, the public data never does — yields
+    /// a BSV-valid signature.
+    #[tokio::test]
+    async fn hybrid_do_issues_proxy_combines() {
+        let config = ThresholdConfig::new(2, 2).unwrap();
+        let key_shares = dkg_key_shares(2, 2);
+        let participants: Vec<u16> = vec![0, 1];
+
+        let mut rng = rand::rngs::OsRng;
+        let eid_bytes: [u8; 32] = rand::Rng::gen(&mut rng);
+        let eid_presign = ExecutionId::new(&eid_bytes);
+        let presigs = round_based::sim::run_with_setup(
+            participants.iter().map(|i| &key_shares[usize::from(*i)]),
+            |i, party, share| {
+                let party = buffer_outgoing(party);
+                let mut party_rng = rand::rngs::OsRng;
+                let participants = participants.clone();
+                async move {
+                    cggmp24::signing(eid_presign, i, &participants, share)
+                        .generate_presignature(&mut party_rng, party)
+                        .await
+                }
+            },
+        )
+        .unwrap()
+        .expect_ok()
+        .into_vec();
+
+        let message_hash: [u8; 32] = {
+            let mut h = sha2::Sha256::new();
+            h.update(b"hybrid do/proxy sign");
+            let mut b = [0u8; 32];
+            b.copy_from_slice(&h.finalize());
+            b
+        };
+
+        let mut it = presigs.into_iter();
+        let (presig_a, _public_a) = it.next().unwrap(); // DO (party 0): Presignature only
+        let presig_b = it.next().unwrap(); // proxy (party 1): full (Presignature, PublicData)
+
+        // ── DO side (wasm light op): issue partial from SERIALIZED presig ──
+        let presig_a_json = serde_json::to_vec(&presig_a).unwrap();
+        let partial_a_json = issue_partial_signature_json(&presig_a_json, &message_hash)
+            .expect("DO issues its partial from a serialized presignature");
+        let msg_a = RoundMessage {
+            session_id: SessionId::from_str_hash("hybrid-sign"),
+            round: 1,
+            from: ShareIndex(0),
+            to: None,
+            payload: partial_a_json,
+        };
+
+        // ── Proxy side (native): issue partial_B + combine (holds public data) ──
+        let session = SessionId::from_str_hash("hybrid-sign");
+        let share1 = key_share_to_encrypted(&key_shares[1], 1, config);
+        let mut proxy = SigningCoordinator::new(session, share1, config, participants);
+        let _out_b = proxy
+            .sign_with_presignature(&message_hash, Box::new(presig_b))
+            .expect("proxy issues its partial");
+        let result = proxy
+            .process_round(vec![msg_a])
+            .expect("proxy combines DO's partial + its own");
+        let sig = match result {
+            SigningRoundResult::Complete(s) => s,
+            _ => panic!("proxy did not complete after receiving the DO's partial"),
+        };
+
+        // BSV-valid under the joint pubkey.
+        let pubkey_bytes = key_shares[0].core.shared_public_key.to_bytes(true);
+        let bsv_pubkey = bsv::PublicKey::from_bytes(&pubkey_bytes).unwrap();
+        let mut sig_bytes = [0u8; 64];
+        sig_bytes[..32].copy_from_slice(&sig.r);
+        sig_bytes[32..].copy_from_slice(&sig.s);
+        let bsv_sig = bsv::Signature::from_compact(&sig_bytes).unwrap();
+        assert!(
+            bsv_pubkey.verify(&message_hash, &bsv_sig),
+            "BSV SDK must verify the hybrid DO-issue / proxy-combine signature"
         );
     }
 }
