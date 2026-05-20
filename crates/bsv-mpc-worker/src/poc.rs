@@ -73,6 +73,7 @@ impl DurableObject for CosignerSessionDo {
             "/poc/identity" => self.handle_identity().await,
             "/poc/persist" => self.handle_persist().await,
             "/poc/share-roundtrip" => self.handle_share_roundtrip().await,
+            "/poc/dkg-bench" => self.handle_dkg_bench(req).await,
             "/poc/handshake" => self.handle_handshake().await,
             // ── KSS routes (I-4a.2: storage-backed by this DO's SQLite) ──
             // Auth is enforced at the Worker entrypoint before forwarding.
@@ -284,6 +285,109 @@ impl CosignerSessionDo {
             "share_count": store.share_count()?,
             "instance_constructed_at_ms": self.instance_constructed_at_ms,
             "do_name": POC_DO_NAME,
+        }))
+    }
+
+    /// `GET /poc/dkg-bench` — I-4b feasibility probe. Runs a FULL 2-of-2
+    /// CGGMP'24 DKG with BOTH parties inside this single wasm isolate (a
+    /// conservative ~2× upper bound on real per-party cost) using fast Blum
+    /// seeded primes, and reports wall-clock. Decides whether DKG-over-relay
+    /// fits the CF Worker CPU budget on wasm32 (vs pivoting to sign-first). If
+    /// the request dies without responding, that itself answers "doesn't fit".
+    async fn handle_dkg_bench(&self, req: Request) -> Result<Response> {
+        use bsv_mpc_core::dkg::{generate_test_primes, DkgCoordinator, DkgRoundResult};
+        use bsv_mpc_core::types::{RoundMessage, SessionId, ShareIndex, ThresholdConfig};
+
+        // `?stop=primes` returns after prime gen only — disambiguates whether
+        // the CF budget is blown by Blum prime gen vs the DKG protocol math.
+        // `?parties=1` runs ONE party's init only (keygen round-1 local cost).
+        let q = req.url().ok();
+        let stop = q
+            .as_ref()
+            .and_then(|u| {
+                u.query_pairs()
+                    .find(|(k, _)| k == "stop")
+                    .map(|(_, v)| v.to_string())
+            })
+            .unwrap_or_default();
+
+        let t0 = Date::now().as_millis();
+        let p0 = generate_test_primes(&mut rand::rngs::OsRng);
+        let p1 = generate_test_primes(&mut rand::rngs::OsRng);
+        let primes_gen_ms = Date::now().as_millis() - t0;
+        if stop == "primes" {
+            return Response::from_json(&serde_json::json!({
+                "route": "poc/dkg-bench", "checkpoint": "primes",
+                "primes_gen_ms": primes_gen_ms, "note": "2 Blum PregeneratedPrimes sets",
+            }));
+        }
+
+        let config =
+            ThresholdConfig::new(2, 2).map_err(|e| Error::RustError(format!("config: {e}")))?;
+        let session = SessionId::from_str_hash("dkg-bench");
+        let mut c0 = DkgCoordinator::new(session, config, ShareIndex(0));
+        let mut c1 = DkgCoordinator::new(session, config, ShareIndex(1));
+        c0.set_pregenerated_primes(p0);
+        c1.set_pregenerated_primes(p1);
+
+        let t_dkg = Date::now().as_millis();
+        // party1's init msgs → party0's inbox; party0's → party1's inbox.
+        let mut to0: Vec<RoundMessage> = c1
+            .init()
+            .map_err(|e| Error::RustError(format!("c1.init: {e}")))?;
+        let mut to1: Vec<RoundMessage> = c0
+            .init()
+            .map_err(|e| Error::RustError(format!("c0.init: {e}")))?;
+        if stop == "init" {
+            return Response::from_json(&serde_json::json!({
+                "route": "poc/dkg-bench", "checkpoint": "init",
+                "primes_gen_ms": primes_gen_ms,
+                "init_ms": Date::now().as_millis() - t_dkg,
+                "note": "both parties keygen round-1 init (local compute)",
+            }));
+        }
+        let mut done0 = None;
+        let mut done1 = None;
+        let mut rounds = 0u32;
+        while (done0.is_none() || done1.is_none()) && rounds < 40 {
+            rounds += 1;
+            let in1 = std::mem::take(&mut to1);
+            let in0 = std::mem::take(&mut to0);
+            if done1.is_none() {
+                match c1
+                    .process_round(in1)
+                    .map_err(|e| Error::RustError(format!("c1 round {rounds}: {e}")))?
+                {
+                    DkgRoundResult::NextRound(m) => to0 = m,
+                    DkgRoundResult::Complete(d) => done1 = Some(d),
+                }
+            }
+            if done0.is_none() {
+                match c0
+                    .process_round(in0)
+                    .map_err(|e| Error::RustError(format!("c0 round {rounds}: {e}")))?
+                {
+                    DkgRoundResult::NextRound(m) => to1 = m,
+                    DkgRoundResult::Complete(d) => done0 = Some(d),
+                }
+            }
+        }
+        let dkg_ms = Date::now().as_millis() - t_dkg;
+        let joint_match = match (&done0, &done1) {
+            (Some(a), Some(b)) => a.joint_key.compressed == b.joint_key.compressed,
+            _ => false,
+        };
+
+        Response::from_json(&serde_json::json!({
+            "route": "poc/dkg-bench",
+            "completed": done0.is_some() && done1.is_some(),
+            "joint_match": joint_match,
+            "rounds": rounds,
+            "primes_gen_ms": primes_gen_ms,
+            "dkg_ms": dkg_ms,
+            "total_ms": Date::now().as_millis() - t0,
+            "joint_pubkey": done0.as_ref().map(|d| hex::encode(&d.joint_key.compressed)),
+            "note": "2-party DKG in ONE wasm isolate (~2x per-party); Blum seeded primes",
         }))
     }
 

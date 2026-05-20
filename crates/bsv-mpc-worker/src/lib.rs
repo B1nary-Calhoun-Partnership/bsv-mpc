@@ -195,6 +195,10 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         .get_async("/poc/share-roundtrip", |req, ctx| async move {
             poc::forward_to_cosigner_do(req, &ctx.env).await
         })
+        // I-4b probe: full 2-party DKG in one wasm isolate, timed (CF CPU fit).
+        .get_async("/poc/dkg-bench", |req, ctx| async move {
+            poc::forward_to_cosigner_do(req, &ctx.env).await
+        })
         // I-3b2: relay-handshake-from-DO — outbound Socket.IO + BRC-103 +
         // envelope round-trip against the live MessageBox relay, driven from
         // inside the per-identity CosignerSessionDo (wasm32 transport).

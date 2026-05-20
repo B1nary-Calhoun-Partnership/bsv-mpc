@@ -17,6 +17,7 @@ hex.workspace = true
 base64.workspace = true
 worker = "0.8"
 getrandom = { version = "0.2", features = ["js"] }
+rand = { workspace = true }
 
 # Native target — `cargo clippy --workspace --all-targets` compiles the worker
 # for the host; only the non-wasm32 code paths are checked. Uses the workspace

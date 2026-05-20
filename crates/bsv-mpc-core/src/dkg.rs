@@ -867,7 +867,6 @@ pub use self::WireMessage as DkgWireMessage;
 /// Blum primes are faster to generate than safe primes and are used in POCs
 /// for testing. Production code should use `PregeneratedPrimes::generate()`
 /// which generates safe primes.
-#[cfg(test)]
 fn generate_blum_prime(rng: &mut impl rand::RngCore, bits_size: u32) -> cggmp24::backend::Integer {
     use cggmp24::backend::Integer;
     loop {
@@ -878,9 +877,13 @@ fn generate_blum_prime(rng: &mut impl rand::RngCore, bits_size: u32) -> cggmp24:
     }
 }
 
-/// Generate pregenerated primes using Blum primes (faster, for testing only).
-#[cfg(test)]
-fn generate_test_primes(
+/// Generate pregenerated primes using **Blum** primes — much faster than safe
+/// primes, for **testing / benchmarking only** (the auxinfo ZK-proof compute is
+/// the same regardless of prime type, so this is representative for perf
+/// probes). Production seeding uses `PregeneratedPrimes::generate` (safe
+/// primes). `#[doc(hidden)]` — not part of the supported API.
+#[doc(hidden)]
+pub fn generate_test_primes(
     rng: &mut impl rand::RngCore,
 ) -> cggmp24::key_refresh::PregeneratedPrimes<SecurityLevel128> {
     use cggmp24::security_level::SecurityLevel;
