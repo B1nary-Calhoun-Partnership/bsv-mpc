@@ -95,10 +95,18 @@ impl<'a> DoSqlStorage<'a> {
                agent_id TEXT PRIMARY KEY, \
                share_json TEXT NOT NULL, \
                created_at TEXT NOT NULL, \
-               updated_at TEXT NOT NULL\
+               updated_at TEXT NOT NULL, \
+               owner_identity TEXT NOT NULL DEFAULT ''\
              )",
             None,
         )?;
+        // Migration for DOs whose `mpc_shares` predates `owner_identity` (#5):
+        // ADD COLUMN is idempotent-by-intent — swallow the "duplicate column"
+        // error so re-running ensure_schema on an already-migrated DO is a no-op.
+        let _ = sql.exec(
+            "ALTER TABLE mpc_shares ADD COLUMN owner_identity TEXT NOT NULL DEFAULT ''",
+            None,
+        );
         sql.exec(
             "CREATE TABLE IF NOT EXISTS mpc_protocol_state (\
                session_id TEXT PRIMARY KEY, \
@@ -178,19 +186,62 @@ impl<'a> DoSqlStorage<'a> {
     // ── Share CRUD ──────────────────────────────────────────────────────
 
     /// Store (upsert) an encrypted key share for an agent. Used on DKG
-    /// completion and key refresh.
+    /// completion and key refresh. Owner is left unchanged (see
+    /// [`store_share_with_owner`]).
     pub fn store_share(&self, agent_id: &str, share: &EncryptedShare) -> Result<()> {
+        self.store_share_with_owner(agent_id, share, "")
+    }
+
+    /// Store an encrypted key share recording its authorized `owner_identity`
+    /// (§08.1 — the DKG-time BRC-31 identity). On upsert, an empty
+    /// `owner_identity` preserves the existing owner (the `excluded` value is
+    /// only applied when non-empty), so a key-refresh that doesn't
+    /// re-authenticate the owner won't silently drop it.
+    pub fn store_share_with_owner(
+        &self,
+        agent_id: &str,
+        share: &EncryptedShare,
+        owner_identity: &str,
+    ) -> Result<()> {
         let json = serde_json::to_string(share)
             .map_err(|e| Error::RustError(format!("serialize EncryptedShare: {e}")))?;
         let now = Self::now_ms().to_string();
         self.sql().exec(
-            "INSERT INTO mpc_shares (agent_id, share_json, created_at, updated_at) \
-             VALUES (?, ?, ?, ?) \
+            "INSERT INTO mpc_shares (agent_id, share_json, created_at, updated_at, owner_identity) \
+             VALUES (?, ?, ?, ?, ?) \
              ON CONFLICT(agent_id) DO UPDATE SET \
-               share_json = excluded.share_json, updated_at = excluded.updated_at",
-            vec![agent_id.into(), json.into(), now.clone().into(), now.into()],
+               share_json = excluded.share_json, updated_at = excluded.updated_at, \
+               owner_identity = CASE WHEN excluded.owner_identity = '' \
+                 THEN mpc_shares.owner_identity ELSE excluded.owner_identity END",
+            vec![
+                agent_id.into(),
+                json.into(),
+                now.clone().into(),
+                now.into(),
+                owner_identity.into(),
+            ],
         )?;
         Ok(())
+    }
+
+    /// Read the share's authorized owner identity (hex), if recorded + non-empty.
+    pub fn get_share_owner(&self, agent_id: &str) -> Result<Option<String>> {
+        #[derive(Deserialize)]
+        struct OwnerRow {
+            owner_identity: String,
+        }
+        let rows: Vec<OwnerRow> = self
+            .sql()
+            .exec(
+                "SELECT owner_identity FROM mpc_shares WHERE agent_id = ?",
+                vec![agent_id.into()],
+            )?
+            .to_array()?;
+        Ok(rows
+            .into_iter()
+            .next()
+            .map(|r| r.owner_identity)
+            .filter(|o| !o.is_empty()))
     }
 
     /// Retrieve an encrypted key share. `None` if DKG has not run for `agent_id`.
@@ -395,15 +446,20 @@ impl<'a> DoSqlStorage<'a> {
 /// Bridge the inherent `worker::Result` API to the handler-facing
 /// `Result<_, String>` [`MpcStore`] trait (the deployed worker's backend).
 impl MpcStore for DoSqlStorage<'_> {
-    fn store_share(
+    fn store_share_with_owner(
         &self,
         agent_id: &str,
         share: &EncryptedShare,
+        owner_identity: &str,
     ) -> std::result::Result<(), String> {
-        DoSqlStorage::store_share(self, agent_id, share).map_err(|e| e.to_string())
+        DoSqlStorage::store_share_with_owner(self, agent_id, share, owner_identity)
+            .map_err(|e| e.to_string())
     }
     fn get_share(&self, agent_id: &str) -> std::result::Result<Option<EncryptedShare>, String> {
         DoSqlStorage::get_share(self, agent_id).map_err(|e| e.to_string())
+    }
+    fn get_share_owner(&self, agent_id: &str) -> std::result::Result<Option<String>, String> {
+        DoSqlStorage::get_share_owner(self, agent_id).map_err(|e| e.to_string())
     }
     fn get_share_metadata(
         &self,

@@ -47,6 +47,11 @@ struct StoredShare {
     share: EncryptedShare,
     created_at: String,
     updated_at: String,
+    /// BRC-31 identity key (hex) of the party that ran DKG for this share —
+    /// the only principal authorized to sign/ECDH with it (§08.1: the
+    /// long-lived identity key, NOT the joint pubkey). Empty for shares stored
+    /// without an owner (dev / unauthenticated mode).
+    owner_identity: String,
 }
 
 /// A stored presignature.
@@ -85,8 +90,20 @@ pub struct ShareMetadata {
 /// return `Result<_, String>` — the common denominator between the in-memory
 /// (`String`) and worker (`worker::Error`) error types.
 pub trait MpcStore {
-    fn store_share(&self, agent_id: &str, share: &EncryptedShare) -> Result<(), String>;
+    /// Store a share recording its `owner_identity` (the DKG-time BRC-31
+    /// identity authorized to sign with it — §08.1). Used at DKG completion.
+    /// (The owner-less `store_share` lives as an inherent method on each
+    /// backend for tests / refresh; the trait surface is owner-aware.)
+    fn store_share_with_owner(
+        &self,
+        agent_id: &str,
+        share: &EncryptedShare,
+        owner_identity: &str,
+    ) -> Result<(), String>;
     fn get_share(&self, agent_id: &str) -> Result<Option<EncryptedShare>, String>;
+    /// Read the share's authorized owner identity (hex pubkey), if recorded.
+    /// `None` (or empty) means no owner is bound (dev / legacy share).
+    fn get_share_owner(&self, agent_id: &str) -> Result<Option<String>, String>;
     fn get_share_metadata(&self, agent_id: &str) -> Result<Option<ShareMetadata>, String>;
     fn share_count(&self) -> Result<usize, String>;
     fn total_presignature_count(&self) -> Result<u64, String>;
@@ -100,11 +117,19 @@ pub trait MpcStore {
 pub struct ShareStorage;
 
 impl MpcStore for ShareStorage {
-    fn store_share(&self, agent_id: &str, share: &EncryptedShare) -> Result<(), String> {
-        ShareStorage::store_share(self, agent_id, share)
+    fn store_share_with_owner(
+        &self,
+        agent_id: &str,
+        share: &EncryptedShare,
+        owner_identity: &str,
+    ) -> Result<(), String> {
+        ShareStorage::store_share_with_owner(self, agent_id, share, owner_identity)
     }
     fn get_share(&self, agent_id: &str) -> Result<Option<EncryptedShare>, String> {
         ShareStorage::get_share(self, agent_id)
+    }
+    fn get_share_owner(&self, agent_id: &str) -> Result<Option<String>, String> {
+        ShareStorage::get_share_owner(self, agent_id)
     }
     fn get_share_metadata(&self, agent_id: &str) -> Result<Option<ShareMetadata>, String> {
         ShareStorage::get_share_metadata(self, agent_id)
@@ -133,14 +158,41 @@ impl ShareStorage {
     ///
     /// If the agent already has a share, this replaces it (used during key refresh).
     pub fn store_share(&self, agent_id: &str, share: &EncryptedShare) -> Result<(), String> {
+        self.store_share_with_owner(agent_id, share, "")
+    }
+
+    /// Store an encrypted key share recording its authorized `owner_identity`
+    /// (§08.1). Preserves a prior owner on upsert when `owner_identity` is empty
+    /// (e.g. key refresh that doesn't re-authenticate the owner).
+    pub fn store_share_with_owner(
+        &self,
+        agent_id: &str,
+        share: &EncryptedShare,
+        owner_identity: &str,
+    ) -> Result<(), String> {
         let mut storage = STORAGE.lock().map_err(|e| format!("lock poisoned: {e}"))?;
         let now = chrono::Utc::now().to_rfc3339();
+        let owner = if owner_identity.is_empty() {
+            storage
+                .shares
+                .get(agent_id)
+                .map(|s| s.owner_identity.clone())
+                .unwrap_or_default()
+        } else {
+            owner_identity.to_string()
+        };
+        let created_at = storage
+            .shares
+            .get(agent_id)
+            .map(|s| s.created_at.clone())
+            .unwrap_or_else(|| now.clone());
         storage.shares.insert(
             agent_id.to_string(),
             StoredShare {
                 share: share.clone(),
-                created_at: now.clone(),
+                created_at,
                 updated_at: now,
+                owner_identity: owner,
             },
         );
         Ok(())
@@ -152,6 +204,16 @@ impl ShareStorage {
     pub fn get_share(&self, agent_id: &str) -> Result<Option<EncryptedShare>, String> {
         let storage = STORAGE.lock().map_err(|e| format!("lock poisoned: {e}"))?;
         Ok(storage.shares.get(agent_id).map(|s| s.share.clone()))
+    }
+
+    /// Retrieve the share's authorized owner identity (hex), if recorded.
+    pub fn get_share_owner(&self, agent_id: &str) -> Result<Option<String>, String> {
+        let storage = STORAGE.lock().map_err(|e| format!("lock poisoned: {e}"))?;
+        Ok(storage
+            .shares
+            .get(agent_id)
+            .map(|s| s.owner_identity.clone())
+            .filter(|o| !o.is_empty()))
     }
 
     /// Delete an agent's key share and all associated data (cascading).
@@ -531,5 +593,37 @@ mod tests {
         let retrieved = storage.get_share("agent-up").unwrap().unwrap();
         assert_eq!(retrieved.ciphertext, vec![99, 98, 97]);
         assert_eq!(storage.share_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn owner_identity_round_trip_and_preserve() {
+        // §08.1 / #5: store records the owner; get_share_owner returns it.
+        let _guard = test_lock();
+        let storage = ShareStorage::new();
+        storage.reset();
+
+        let share = make_test_share("agent-own");
+        // No owner recorded by the owner-less path.
+        storage.store_share("agent-own", &share).unwrap();
+        assert_eq!(storage.get_share_owner("agent-own").unwrap(), None);
+
+        // Recording an owner sticks.
+        storage
+            .store_share_with_owner("agent-own", &share, "02ownerkey")
+            .unwrap();
+        assert_eq!(
+            storage.get_share_owner("agent-own").unwrap().as_deref(),
+            Some("02ownerkey")
+        );
+
+        // An owner-less upsert (e.g. refresh) preserves the existing owner.
+        let mut share2 = make_test_share("agent-own");
+        share2.ciphertext = vec![1, 2, 3];
+        storage.store_share("agent-own", &share2).unwrap();
+        assert_eq!(
+            storage.get_share_owner("agent-own").unwrap().as_deref(),
+            Some("02ownerkey"),
+            "owner-less upsert must not drop the bound owner"
+        );
     }
 }

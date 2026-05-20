@@ -72,6 +72,10 @@ use crate::storage::MpcStore;
 struct DkgSession {
     coordinator: DkgCoordinator,
     agent_id: String,
+    /// BRC-31 identity that ran this DKG — recorded as the share's
+    /// `owner_identity` on completion (§08.1 / #5). Empty in unauthenticated
+    /// dev mode.
+    owner_identity: String,
 }
 
 /// Live DKG ceremonies, keyed by DKG session ID.
@@ -334,6 +338,56 @@ fn unbundle_incoming_message(msg: &RoundMessage) -> std::result::Result<Vec<Roun
     Ok(vec![msg.clone()])
 }
 
+// ── Authorization helpers (#5 / §08.1) ─────────────────────────────────────
+
+/// BRC-31 identity-key header (MUST match `auth.rs` `headers::IDENTITY_KEY`).
+/// Verified at the Worker entrypoint by `verify_or_allow` before the request is
+/// forwarded to this DO, so by the time a handler reads it the value is the
+/// authenticated caller (the DO is only reachable via the entrypoint binding).
+const AUTH_IDENTITY_HEADER: &str = "x-bsv-auth-identity-key";
+
+/// The authenticated caller's BRC-31 identity (hex), or `None` when absent
+/// (unauthenticated dev mode).
+fn caller_identity(req: &Request) -> Option<String> {
+    req.headers()
+        .get(AUTH_IDENTITY_HEADER)
+        .ok()
+        .flatten()
+        .filter(|s| !s.is_empty())
+}
+
+/// Enforce that the authenticated caller owns the share it is operating on
+/// (§08.1: only the DKG-time identity may sign/ECDH/presign). Returns
+/// `Ok(None)` when authorized (or when no owner is bound — a dev/legacy share,
+/// where the entrypoint BRC-31 gate still applies), or `Ok(Some(403))` to
+/// return when the caller is not the owner — checked BEFORE any share material
+/// is used.
+fn authz_owner_or_reject(
+    caller: Option<&str>,
+    store: &dyn MpcStore,
+    agent_id: &str,
+) -> Result<Option<Response>> {
+    let owner = store.get_share_owner(agent_id).map_err(Error::from)?;
+    if is_owner_authorized(caller, owner.as_deref()) {
+        return Ok(None);
+    }
+    let who = caller.unwrap_or("<unauthenticated>");
+    Ok(Some(Response::error(
+        format!("Forbidden: identity {who} is not authorized for this share"),
+        403,
+    )?))
+}
+
+/// Pure authorization decision (§08.1 / #5): a caller is authorized iff there is
+/// no bound owner (dev/legacy share — the entrypoint BRC-31 gate still applied)
+/// or the caller's identity exactly equals the bound owner.
+fn is_owner_authorized(caller: Option<&str>, owner: Option<&str>) -> bool {
+    match owner {
+        None => true,
+        Some(o) => caller == Some(o),
+    }
+}
+
 // ── Handlers ──────────────────────────────────────────────────────────────
 
 /// Handle `POST /dkg/init` — start a Distributed Key Generation ceremony.
@@ -345,7 +399,9 @@ fn unbundle_incoming_message(msg: &RoundMessage) -> std::result::Result<Vec<Roun
 /// 5. Store the live coordinator in the global session map.
 /// 6. Return the bundled round 1 message.
 pub async fn handle_dkg_init(mut req: Request) -> Result<Response> {
-    // TODO: Verify BRC-31 auth: auth::verify_request(&req)?
+    // Capture the authenticated caller (verified at the entrypoint) BEFORE the
+    // body consumes `req` — it becomes the share's owner_identity (§08.1 / #5).
+    let owner_identity = caller_identity(&req).unwrap_or_default();
     let body: DkgInitRequest = req.json().await?;
 
     // Validate threshold config
@@ -374,6 +430,7 @@ pub async fn handle_dkg_init(mut req: Request) -> Result<Response> {
             DkgSession {
                 coordinator,
                 agent_id: body.agent_id,
+                owner_identity,
             },
         );
 
@@ -400,8 +457,9 @@ pub async fn handle_dkg_round(mut req: Request, store: &dyn MpcStore) -> Result<
     // Unbundle the incoming message
     let incoming = unbundle_incoming_message(&body.round_message).map_err(Error::from)?;
 
-    // Look up and process with the live coordinator; capture the owning agent_id.
-    let (result, agent_id) = {
+    // Look up and process with the live coordinator; capture the owning
+    // agent_id + owner_identity (§08.1 / #5).
+    let (result, agent_id, owner_identity) = {
         let mut sessions = DKG_SESSIONS
             .lock()
             .map_err(|e| Error::from(e.to_string()))?;
@@ -414,7 +472,11 @@ pub async fn handle_dkg_round(mut req: Request, store: &dyn MpcStore) -> Result<
             .coordinator
             .process_round(incoming)
             .map_err(|e| Error::from(e.to_string()))?;
-        (result, session.agent_id.clone())
+        (
+            result,
+            session.agent_id.clone(),
+            session.owner_identity.clone(),
+        )
     };
 
     match result {
@@ -430,9 +492,10 @@ pub async fn handle_dkg_round(mut req: Request, store: &dyn MpcStore) -> Result<
         }
         DkgRoundResult::Complete(dkg_result) => {
             // Persist the encrypted share under the OWNING agent_id (retained
-            // from /dkg/init) — to DO SQLite on the deployed worker.
+            // from /dkg/init), recording owner_identity (§08.1 / #5) — to DO
+            // SQLite on the deployed worker.
             store
-                .store_share(&agent_id, &dkg_result.share)
+                .store_share_with_owner(&agent_id, &dkg_result.share, &owner_identity)
                 .map_err(Error::from)?;
 
             // Clean up the live coordinator
@@ -462,8 +525,14 @@ pub async fn handle_dkg_round(mut req: Request, store: &dyn MpcStore) -> Result<
 /// 6. Store the live coordinator for subsequent rounds.
 /// 7. Return the bundled round 1 message.
 pub async fn handle_sign_init(mut req: Request, store: &dyn MpcStore) -> Result<Response> {
-    // TODO: Verify BRC-31 auth and agent authorization
+    let caller = caller_identity(&req);
     let body: SignInitRequest = req.json().await?;
+
+    // §08.1 / #5: only the share's owner may sign with it — checked BEFORE the
+    // share is loaded/used.
+    if let Some(resp) = authz_owner_or_reject(caller.as_deref(), store, &body.agent_id)? {
+        return Ok(resp);
+    }
 
     // Load the agent's share
     let share = store
@@ -589,8 +658,13 @@ pub async fn handle_sign_round(mut req: Request) -> Result<Response> {
 /// 5. Store the live manager for subsequent rounds.
 /// 6. Return the round 1 messages.
 pub async fn handle_presign_init(mut req: Request, store: &dyn MpcStore) -> Result<Response> {
-    // TODO: Verify BRC-31 auth and agent authorization
+    let caller = caller_identity(&req);
     let body: PresignInitRequest = req.json().await?;
+
+    // §08.1 / #5: only the share's owner may presign with it.
+    if let Some(resp) = authz_owner_or_reject(caller.as_deref(), store, &body.agent_id)? {
+        return Ok(resp);
+    }
 
     if body.count == 0 || body.count > 100 {
         return Response::error("count must be between 1 and 100", 400);
@@ -698,8 +772,13 @@ pub async fn handle_presign_round(mut req: Request) -> Result<Response> {
 ///
 /// Proven in POC 3 (key derivation) and POC 9 (encrypt/decrypt).
 pub async fn handle_ecdh(mut req: Request, store: &dyn MpcStore) -> Result<Response> {
-    // TODO: Verify BRC-31 auth and agent authorization
+    let caller = caller_identity(&req);
     let body: EcdhRequest = req.json().await?;
+
+    // §08.1 / #5: only the share's owner may run partial ECDH with it.
+    if let Some(resp) = authz_owner_or_reject(caller.as_deref(), store, &body.agent_id)? {
+        return Ok(resp);
+    }
 
     // Parse the counterparty public key
     let cp_bytes = hex::decode(&body.counterparty_pub)
@@ -763,6 +842,32 @@ pub async fn handle_get_share_metadata(agent_id: &str, store: &dyn MpcStore) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn authz_owner_match_is_authorized() {
+        // §08.1 / #5: the bound owner is authorized.
+        assert!(is_owner_authorized(Some("02abc"), Some("02abc")));
+    }
+
+    #[test]
+    fn authz_stranger_is_rejected() {
+        // A different authenticated identity must NOT sign with someone else's share.
+        assert!(!is_owner_authorized(Some("02deadbeef"), Some("02abc")));
+    }
+
+    #[test]
+    fn authz_unauthenticated_rejected_when_owner_bound() {
+        // No caller identity but a bound owner → reject.
+        assert!(!is_owner_authorized(None, Some("02abc")));
+    }
+
+    #[test]
+    fn authz_no_owner_bound_is_allowed() {
+        // Dev/legacy share with no bound owner — entrypoint BRC-31 gate still
+        // applies; handler authz is a no-op.
+        assert!(is_owner_authorized(Some("02abc"), None));
+        assert!(is_owner_authorized(None, None));
+    }
 
     #[test]
     fn test_generate_session_id() {
