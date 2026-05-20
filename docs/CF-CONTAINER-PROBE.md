@@ -26,7 +26,15 @@
   CONTAINER runs any image (our native Rust binary) — so the heavy logic stays Rust.
 
 ## Plan
-- [ ] **P1 — minimal platform probe.** `poc/poc-cf-container/`: tiny Rust axum
+- [x] **P1 — minimal platform probe — DONE + PROVEN (2026-05-20).** Deployed
+  after the token got `Workers Scripts:Edit` + `Containers:Edit` + `User
+  Details:Read`. App `bsv-mpc-container-probe-bsvmpccontainer`; image in
+  `registry.cloudflare.com/.../:b214e6fe` (instance_type `lite`); worker
+  `https://bsv-mpc-container-probe.dev-a3e.workers.dev`. **Runtime proof:**
+  `GET /health` → `{"runtime":"native-rust-on-cf-container","status":"ok"}`,
+  cold start **~1.75s**, warm **~130ms**. ⇒ native Rust deploys + runs +
+  is reachable on CF Containers. ADR-018 native half VALIDATED.
+- [ ] ~~P1 (orig)~~ `poc/poc-cf-container/`: tiny Rust axum
   `/health` binary + Dockerfile + minimal JS Worker (`@cloudflare/containers`) +
   `[[containers]]`. `wrangler deploy` → curl the Worker URL → routes to container
   → `/health` 200. Validates: account plan, deploy pipeline, Rust-in-CF-Container,
@@ -66,6 +74,23 @@ a token with **Containers** permissions. Account in use: `Dev@calhounjohn.com`
 ~/bsv/mpc/bsv-mpc/secrets.md)" && wrangler deploy` → curl the returned URL
 `/health` → expect `{"status":"ok","service":"poc-cf-container",...}`. That
 closes P1. Then P2 (swap image to build+run `bsv-mpc-service`).
+
+## Update 2 — token perms split (2026-05-20)
+Tried a second token (`CLOUDFLARE_CONTAINERS_TOKEN`, `cfut_…`, saved in secrets.md).
+Result: it **passed the Containers gate** (`/containers/me` OK) but **failed on
+Workers** (`/accounts/<id>/workers/services/bsv-mpc-container-probe` → code 10000
+"Authentication error") + missing `User->User Details->Read`.
+
+So: **old `CLOUDFLARE_API_TOKEN`** = Workers ✅ / Containers ❌; **new `cfut_`
+token** = Containers ✅ / Workers ❌. `wrangler deploy` is atomic on ONE token →
+**need a single token with BOTH**.
+
+**User action:** in the dashboard, edit ONE token to have all of:
+`Workers Scripts: Edit` + `Containers: Edit` + `User Details: Read` (+ the deploy
+also touches the managed registry, covered by Containers). Easiest: open the
+`cfut_` token and ADD `Workers Scripts: Edit` + `User Details: Read` (it already
+has Containers). Put the resulting all-in-one token in secrets.md as
+`CLOUDFLARE_API_TOKEN` (replace), then resume `wrangler deploy`.
 
 ## Findings so far
 - ✅ The Rust→Docker→CF build pipeline works (image built); the code/Dockerfile
