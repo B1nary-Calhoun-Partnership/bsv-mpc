@@ -281,9 +281,9 @@ impl CosignerSessionDo {
         // 5. joinRoom. `to_peer(_, None, _)` auto-initiates the BRC-103
         //    handshake (InitialRequest → InitialResponse via the dispatch loop)
         //    and signs+sends the first General internally. Ok proves the full
-        //    wasm32 canonical path end-to-end. (The internal timeout works only
-        //    because the worker crate enables `futures-timer/wasm-bindgen` —
-        //    see Cargo.toml — otherwise this poll panics in the CF isolate.)
+        //    wasm32 canonical path end-to-end. (Requires bsv-rs >= 0.3.11,
+        //    whose `wasm` feature enables `futures-timer/wasm-bindgen`; older
+        //    versions panic on the handshake-timeout poll in the CF isolate.)
         let now_ms = Date::now().as_millis();
         let message_box = format!("i3b2-{now_ms}");
         let room_id = format!("{client_pub_hex}-{message_box}");

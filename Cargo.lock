@@ -367,7 +367,6 @@ dependencies = [
  "bsv-rs",
  "chrono",
  "futures",
- "futures-timer",
  "getrandom 0.2.17",
  "hex",
  "serde",
@@ -411,9 +410,9 @@ dependencies = [
 
 [[package]]
 name = "bsv-rs"
-version = "0.3.10"
+version = "0.3.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3fb54b8151b96442d6df3859e486cc47d59715a64fc16f07c437dd6b29616033"
+checksum = "1b8198c2ff431f4b63bf5e0819da2eb68366eff1905b3ba0ea3eccf9889de25a"
 dependencies = [
  "aes",
  "aes-gcm",

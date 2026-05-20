@@ -31,19 +31,10 @@ bsv.workspace = true
 # ignore this override). The relay-handshake-from-DO path (`poc::handle_handshake`)
 # lives behind `cfg(target_arch = "wasm32")`.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-bsv = { package = "bsv-rs", version = "0.3.10", default-features = false, features = ["auth", "wallet", "transaction", "wasm", "socketio"] }
+bsv = { package = "bsv-rs", version = "0.3.11", default-features = false, features = ["auth", "wallet", "transaction", "wasm", "socketio"] }
 bsv-mpc-messagebox = { path = "../bsv-mpc-messagebox" }
 futures.workspace = true
 wasm-bindgen-futures = "0.4"
-# bsv-rs's wasm `wait_with_timeout` (Peer handshake timeout) uses
-# `futures-timer::Delay`, but bsv-rs pulls `futures-timer` WITHOUT its
-# `wasm-bindgen` feature — so on wasm32-unknown-unknown `Delay::new` hits the
-# native timer-thread backend and PANICS (`thread::spawn` is unsupported),
-# aborting `Peer::to_peer` on its first poll. Depending on `futures-timer` here
-# with `wasm-bindgen` flips the (feature-unified) shared build to the
-# `gloo-timers`/`setTimeout` backend, which works in the CF isolate. Without
-# this the canonical `to_peer` handshake hangs the request.
-futures-timer = { version = "3", features = ["wasm-bindgen"] }
 
 [lib]
 crate-type = ["cdylib"]
