@@ -70,7 +70,7 @@ pub mod client;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod http;
 #[cfg(not(target_arch = "wasm32"))]
-pub mod ws;
+pub mod subscribe;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use client::{
@@ -79,4 +79,4 @@ pub use client::{
 };
 pub use error::{MessageBoxError, Result};
 #[cfg(not(target_arch = "wasm32"))]
-pub use ws::{subscribe, InboundEnvelopeEvent, InboundVia, WsSubscription};
+pub use subscribe::{subscribe, InboundEnvelopeEvent, InboundVia, WsSubscription};

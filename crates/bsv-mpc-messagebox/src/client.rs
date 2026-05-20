@@ -44,9 +44,9 @@ use tracing::warn;
 use crate::auth::MessageBoxAuth;
 use crate::error::{MessageBoxError, Result};
 use crate::http;
+use crate::subscribe::{self, InboundEnvelopeEvent, InboundVia, WsSubscription};
 use crate::types::{MessagePayload, SendMessageRequest};
 use crate::wire;
-use crate::ws::{self, InboundEnvelopeEvent, InboundVia, WsSubscription};
 
 /// One typed envelope event delivered on an [`EnvelopeSubscription`] —
 /// the canonical [`MessageEnvelope`] already decoded from the relay's
@@ -176,7 +176,7 @@ impl MessageBoxClient {
     /// Subscribe to multiple mailboxes at once on a single WS — cheaper
     /// than one WS per box for callers that consume several at a time.
     pub async fn subscribe_many(&self, boxes: Vec<String>) -> Result<EnvelopeSubscription> {
-        let ws_sub = ws::subscribe(self.auth.clone(), boxes).await?;
+        let ws_sub = subscribe::subscribe(self.auth.clone(), boxes).await?;
         Ok(EnvelopeSubscription::new(ws_sub))
     }
 
