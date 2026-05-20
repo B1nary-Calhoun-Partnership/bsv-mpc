@@ -104,71 +104,73 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             let config = auth::AuthConfig::from_env(&ctx.env)?;
             auth::handle_initial_request(req, &config).await
         })
-        // ── DKG protocol endpoints (BRC-31 protected) ───────────────
+        // ── KSS protocol endpoints (BRC-31 protected) ──────────────────
+        // I-4a.2: auth is verified at the entrypoint, then the request is
+        // forwarded to the per-cosigner CosignerSessionDo, where the handler
+        // runs over DO-SQLite storage (durable shares) + the DO isolate's
+        // pinned live coordinators. The handler bodies live in `api.rs`; the
+        // DO's `fetch` dispatches by path.
         .post_async("/dkg/init", |req, ctx| async move {
             let config = auth::AuthConfig::from_env(&ctx.env)?;
             if let Err(resp) = auth::verify_or_allow(&req, &config) {
                 return Ok(resp);
             }
-            api::handle_dkg_init(req, &ctx).await
+            poc::forward_to_cosigner_do(req, &ctx.env).await
         })
         .post_async("/dkg/round", |req, ctx| async move {
             let config = auth::AuthConfig::from_env(&ctx.env)?;
             if let Err(resp) = auth::verify_or_allow(&req, &config) {
                 return Ok(resp);
             }
-            api::handle_dkg_round(req, &ctx).await
+            poc::forward_to_cosigner_do(req, &ctx.env).await
         })
-        // ── Signing protocol endpoints (BRC-31 protected) ───────────
         .post_async("/sign/init", |req, ctx| async move {
             let config = auth::AuthConfig::from_env(&ctx.env)?;
             if let Err(resp) = auth::verify_or_allow(&req, &config) {
                 return Ok(resp);
             }
-            api::handle_sign_init(req, &ctx).await
+            poc::forward_to_cosigner_do(req, &ctx.env).await
         })
         .post_async("/sign/round", |req, ctx| async move {
             let config = auth::AuthConfig::from_env(&ctx.env)?;
             if let Err(resp) = auth::verify_or_allow(&req, &config) {
                 return Ok(resp);
             }
-            api::handle_sign_round(req, &ctx).await
+            poc::forward_to_cosigner_do(req, &ctx.env).await
         })
-        // ── Presigning protocol endpoints (BRC-31 protected) ────────
         .post_async("/presign/init", |req, ctx| async move {
             let config = auth::AuthConfig::from_env(&ctx.env)?;
             if let Err(resp) = auth::verify_or_allow(&req, &config) {
                 return Ok(resp);
             }
-            api::handle_presign_init(req, &ctx).await
+            poc::forward_to_cosigner_do(req, &ctx.env).await
         })
         .post_async("/presign/round", |req, ctx| async move {
             let config = auth::AuthConfig::from_env(&ctx.env)?;
             if let Err(resp) = auth::verify_or_allow(&req, &config) {
                 return Ok(resp);
             }
-            api::handle_presign_round(req, &ctx).await
+            poc::forward_to_cosigner_do(req, &ctx.env).await
         })
-        // ── Partial ECDH endpoint (BRC-31 protected) ───────────────
         .post_async("/ecdh", |req, ctx| async move {
             let config = auth::AuthConfig::from_env(&ctx.env)?;
             if let Err(resp) = auth::verify_or_allow(&req, &config) {
                 return Ok(resp);
             }
-            api::handle_ecdh(req, &ctx).await
+            poc::forward_to_cosigner_do(req, &ctx.env).await
         })
         // ── Read-only endpoints (no auth required) ──────────────────
-        .get_async("/health", |_req, ctx| async move {
-            api::handle_health(&ctx).await
+        .get_async("/health", |req, ctx| async move {
+            poc::forward_to_cosigner_do(req, &ctx.env).await
         })
         .get_async("/shares/:agent_id", |req, ctx| async move {
-            // Share metadata requires auth in production
+            // Share metadata requires auth in production. The DO parses the
+            // agent_id from the request path.
             let config = auth::AuthConfig::from_env(&ctx.env)?;
             if let Err(resp) = auth::verify_or_allow(&req, &config) {
                 return Ok(resp);
             }
-            let agent_id = ctx.param("agent_id").unwrap();
-            api::handle_get_share_metadata(agent_id, &ctx).await
+            poc::forward_to_cosigner_do(req, &ctx.env).await
         })
         // ── Phase I-3b POC: DO SQLite persistence + hibernation ─────
         // Forwarded to the per-identity CosignerSessionDo (DO SQLite +

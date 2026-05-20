@@ -29,7 +29,7 @@ use bsv_mpc_core::types::EncryptedShare;
 use serde::Deserialize;
 use worker::{Date, Error, Result, SqlStorage, State};
 
-use crate::storage::ShareMetadata;
+use crate::storage::{MpcStore, ShareMetadata};
 
 /// DO-SQLite-backed storage, scoped to one Durable Object's co-located SQLite.
 /// Cheap to construct (borrows `&State`); each method opens a fresh
@@ -334,5 +334,32 @@ impl<'a> DoSqlStorage<'a> {
             .exec("SELECT COUNT(*) AS n FROM mpc_presignatures", None)?
             .to_array()?;
         Ok(rows.first().map(|r| r.n as u64).unwrap_or(0))
+    }
+}
+
+/// Bridge the inherent `worker::Result` API to the handler-facing
+/// `Result<_, String>` [`MpcStore`] trait (the deployed worker's backend).
+impl MpcStore for DoSqlStorage<'_> {
+    fn store_share(
+        &self,
+        agent_id: &str,
+        share: &EncryptedShare,
+    ) -> std::result::Result<(), String> {
+        DoSqlStorage::store_share(self, agent_id, share).map_err(|e| e.to_string())
+    }
+    fn get_share(&self, agent_id: &str) -> std::result::Result<Option<EncryptedShare>, String> {
+        DoSqlStorage::get_share(self, agent_id).map_err(|e| e.to_string())
+    }
+    fn get_share_metadata(
+        &self,
+        agent_id: &str,
+    ) -> std::result::Result<Option<ShareMetadata>, String> {
+        DoSqlStorage::get_share_metadata(self, agent_id).map_err(|e| e.to_string())
+    }
+    fn share_count(&self) -> std::result::Result<usize, String> {
+        DoSqlStorage::share_count(self).map_err(|e| e.to_string())
+    }
+    fn total_presignature_count(&self) -> std::result::Result<u64, String> {
+        DoSqlStorage::total_presignature_count(self).map_err(|e| e.to_string())
     }
 }

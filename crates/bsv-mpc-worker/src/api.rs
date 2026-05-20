@@ -55,17 +55,27 @@ use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use worker::*;
 
-use crate::storage::ShareStorage;
+use crate::storage::MpcStore;
 
 // ── Live Coordinator State ────────────────────────────────────────────────
 //
 // Protocol coordinators (DKG, signing, presigning) contain threads and channels
-// that cannot be serialized. We keep them alive in memory between HTTP requests.
-// In production CF Worker, these would use DO WebSocket or deterministic replay
-// (see POC 10 in CLAUDE.md).
+// that cannot be serialized. They are kept alive in these statics between
+// requests. On the deployed worker the KSS routes are forwarded to a single
+// per-cosigner Durable Object isolate (see `crate::poc::forward_to_cosigner_do`),
+// so these statics live in that one DO's isolate and persist across the short
+// ceremony (per-session DO pinning) — durable share storage is on DO SQLite.
 
-/// Live DKG coordinators, keyed by DKG session ID.
-static DKG_SESSIONS: LazyLock<Mutex<HashMap<String, DkgCoordinator>>> =
+/// A live DKG ceremony: the coordinator plus the `agent_id` that owns the
+/// resulting share (retained from `/dkg/init` so completion stores the share
+/// under the correct agent — not the session id).
+struct DkgSession {
+    coordinator: DkgCoordinator,
+    agent_id: String,
+}
+
+/// Live DKG ceremonies, keyed by DKG session ID.
+static DKG_SESSIONS: LazyLock<Mutex<HashMap<String, DkgSession>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Live signing coordinators, keyed by signing session ID.
@@ -334,7 +344,7 @@ fn unbundle_incoming_message(msg: &RoundMessage) -> std::result::Result<Vec<Roun
 /// 4. Call `coordinator.init()` to generate round 1 messages.
 /// 5. Store the live coordinator in the global session map.
 /// 6. Return the bundled round 1 message.
-pub async fn handle_dkg_init(mut req: Request, _ctx: &RouteContext<()>) -> Result<Response> {
+pub async fn handle_dkg_init(mut req: Request) -> Result<Response> {
     // TODO: Verify BRC-31 auth: auth::verify_request(&req)?
     let body: DkgInitRequest = req.json().await?;
 
@@ -355,11 +365,17 @@ pub async fn handle_dkg_init(mut req: Request, _ctx: &RouteContext<()>) -> Resul
     // Bundle all round messages into a single transport message
     let round_message = bundle_outgoing_messages(&messages).map_err(Error::from)?;
 
-    // Store the live coordinator for subsequent rounds
+    // Store the live ceremony (coordinator + owning agent_id) for later rounds.
     DKG_SESSIONS
         .lock()
         .map_err(|e| Error::from(e.to_string()))?
-        .insert(session_id_str.clone(), coordinator);
+        .insert(
+            session_id_str.clone(),
+            DkgSession {
+                coordinator,
+                agent_id: body.agent_id,
+            },
+        );
 
     let response = DkgInitResponse {
         session_id: session_id_str,
@@ -377,26 +393,28 @@ pub async fn handle_dkg_init(mut req: Request, _ctx: &RouteContext<()>) -> Resul
 /// 3. Unbundle incoming messages and feed to the coordinator.
 /// 4. If more rounds remain: bundle outgoing messages and return.
 /// 5. If DKG is complete: store the encrypted share, clean up, return joint public key.
-pub async fn handle_dkg_round(mut req: Request, _ctx: &RouteContext<()>) -> Result<Response> {
+pub async fn handle_dkg_round(mut req: Request, store: &dyn MpcStore) -> Result<Response> {
     // TODO: Verify BRC-31 auth
     let body: DkgRoundRequest = req.json().await?;
 
     // Unbundle the incoming message
     let incoming = unbundle_incoming_message(&body.round_message).map_err(Error::from)?;
 
-    // Look up and process with the live coordinator
-    let result = {
+    // Look up and process with the live coordinator; capture the owning agent_id.
+    let (result, agent_id) = {
         let mut sessions = DKG_SESSIONS
             .lock()
             .map_err(|e| Error::from(e.to_string()))?;
 
-        let coordinator = sessions
+        let session = sessions
             .get_mut(&body.session_id)
             .ok_or_else(|| Error::from(format!("DKG session not found: {}", body.session_id)))?;
 
-        coordinator
+        let result = session
+            .coordinator
             .process_round(incoming)
-            .map_err(|e| Error::from(e.to_string()))?
+            .map_err(|e| Error::from(e.to_string()))?;
+        (result, session.agent_id.clone())
     };
 
     match result {
@@ -411,14 +429,10 @@ pub async fn handle_dkg_round(mut req: Request, _ctx: &RouteContext<()>) -> Resu
             Response::from_json(&response)
         }
         DkgRoundResult::Complete(dkg_result) => {
-            // Store the encrypted share
-            let storage = ShareStorage::new();
-            // The agent_id comes from the DKG init request — we need to retrieve it.
-            // For now, use the session_id prefix as a workaround.
-            // TODO: Store agent_id during DKG init and retrieve it here.
-            // For development, we extract it from the share's session_id.
-            storage
-                .store_share(&dkg_result.session_id.hex(), &dkg_result.share)
+            // Persist the encrypted share under the OWNING agent_id (retained
+            // from /dkg/init) — to DO SQLite on the deployed worker.
+            store
+                .store_share(&agent_id, &dkg_result.share)
                 .map_err(Error::from)?;
 
             // Clean up the live coordinator
@@ -447,13 +461,12 @@ pub async fn handle_dkg_round(mut req: Request, _ctx: &RouteContext<()>) -> Resu
 /// 5. Call `coordinator.sign()` to generate round 1 messages.
 /// 6. Store the live coordinator for subsequent rounds.
 /// 7. Return the bundled round 1 message.
-pub async fn handle_sign_init(mut req: Request, _ctx: &RouteContext<()>) -> Result<Response> {
+pub async fn handle_sign_init(mut req: Request, store: &dyn MpcStore) -> Result<Response> {
     // TODO: Verify BRC-31 auth and agent authorization
     let body: SignInitRequest = req.json().await?;
 
     // Load the agent's share
-    let storage = ShareStorage::new();
-    let share = storage
+    let share = store
         .get_share(&body.agent_id)
         .map_err(Error::from)?
         .ok_or_else(|| Error::from(format!("No share found for agent: {}", body.agent_id)))?;
@@ -512,7 +525,7 @@ pub async fn handle_sign_init(mut req: Request, _ctx: &RouteContext<()>) -> Resu
 /// 3. Unbundle incoming messages and feed to the coordinator.
 /// 4. If more rounds remain: return the next round's messages.
 /// 5. If signing is complete: clean up, return the ECDSA signature.
-pub async fn handle_sign_round(mut req: Request, _ctx: &RouteContext<()>) -> Result<Response> {
+pub async fn handle_sign_round(mut req: Request) -> Result<Response> {
     // TODO: Verify BRC-31 auth
     let body: SignRoundRequest = req.json().await?;
 
@@ -575,7 +588,7 @@ pub async fn handle_sign_round(mut req: Request, _ctx: &RouteContext<()>) -> Res
 /// 4. Create a PresigningManager and call `init_generate()`.
 /// 5. Store the live manager for subsequent rounds.
 /// 6. Return the round 1 messages.
-pub async fn handle_presign_init(mut req: Request, _ctx: &RouteContext<()>) -> Result<Response> {
+pub async fn handle_presign_init(mut req: Request, store: &dyn MpcStore) -> Result<Response> {
     // TODO: Verify BRC-31 auth and agent authorization
     let body: PresignInitRequest = req.json().await?;
 
@@ -584,8 +597,7 @@ pub async fn handle_presign_init(mut req: Request, _ctx: &RouteContext<()>) -> R
     }
 
     // Load the agent's share
-    let storage = ShareStorage::new();
-    let share = storage
+    let share = store
         .get_share(&body.agent_id)
         .map_err(Error::from)?
         .ok_or_else(|| Error::from(format!("No share found for agent: {}", body.agent_id)))?;
@@ -625,7 +637,7 @@ pub async fn handle_presign_init(mut req: Request, _ctx: &RouteContext<()>) -> R
 /// 3. Feed incoming messages to the manager.
 /// 4. If more rounds remain: return the next round's messages.
 /// 5. If complete: the presignature is added to the manager's pool. Clean up.
-pub async fn handle_presign_round(mut req: Request, _ctx: &RouteContext<()>) -> Result<Response> {
+pub async fn handle_presign_round(mut req: Request) -> Result<Response> {
     // TODO: Verify BRC-31 auth
     let body: PresignRoundRequest = req.json().await?;
 
@@ -685,7 +697,7 @@ pub async fn handle_presign_round(mut req: Request, _ctx: &RouteContext<()>) -> 
 /// "self" and "other" counterparty types.
 ///
 /// Proven in POC 3 (key derivation) and POC 9 (encrypt/decrypt).
-pub async fn handle_ecdh(mut req: Request, _ctx: &RouteContext<()>) -> Result<Response> {
+pub async fn handle_ecdh(mut req: Request, store: &dyn MpcStore) -> Result<Response> {
     // TODO: Verify BRC-31 auth and agent authorization
     let body: EcdhRequest = req.json().await?;
 
@@ -696,8 +708,7 @@ pub async fn handle_ecdh(mut req: Request, _ctx: &RouteContext<()>) -> Result<Re
         .map_err(|e| Error::from(format!("invalid counterparty_pub: {e}")))?;
 
     // Load the agent's share
-    let storage = ShareStorage::new();
-    let share = storage
+    let share = store
         .get_share(&body.agent_id)
         .map_err(Error::from)?
         .ok_or_else(|| Error::from(format!("No share found for agent: {}", body.agent_id)))?;
@@ -721,11 +732,9 @@ pub async fn handle_ecdh(mut req: Request, _ctx: &RouteContext<()>) -> Result<Re
 ///
 /// No authentication required. Returns service status, version, share count,
 /// and total presignature inventory.
-pub async fn handle_health(_ctx: &RouteContext<()>) -> Result<Response> {
-    let storage = ShareStorage::new();
-
-    let share_count = storage.share_count().unwrap_or(0);
-    let total_presignatures = storage.total_presignature_count().unwrap_or(0);
+pub async fn handle_health(store: &dyn MpcStore) -> Result<Response> {
+    let share_count = store.share_count().unwrap_or(0);
+    let total_presignatures = store.total_presignature_count().unwrap_or(0);
 
     let response = HealthResponse {
         status: "ok".to_string(),
@@ -741,14 +750,9 @@ pub async fn handle_health(_ctx: &RouteContext<()>) -> Result<Response> {
 ///
 /// Returns session ID, share index, threshold config, timestamps, and
 /// presignature count. Never exposes the encrypted share data itself.
-pub async fn handle_get_share_metadata(
-    agent_id: &str,
-    _ctx: &RouteContext<()>,
-) -> Result<Response> {
+pub async fn handle_get_share_metadata(agent_id: &str, store: &dyn MpcStore) -> Result<Response> {
     // TODO: Verify BRC-31 auth and check requester == agent_id
-    let storage = ShareStorage::new();
-
-    match storage.get_share_metadata(agent_id).map_err(Error::from)? {
+    match store.get_share_metadata(agent_id).map_err(Error::from)? {
         Some(metadata) => Response::from_json(&metadata),
         None => Response::error(format!("No share found for agent: {agent_id}"), 404),
     }

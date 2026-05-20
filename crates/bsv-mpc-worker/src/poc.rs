@@ -69,11 +69,44 @@ impl DurableObject for CosignerSessionDo {
     async fn fetch(&self, req: Request) -> Result<Response> {
         let path = req.path();
         match path.as_str() {
+            // ── POC routes (substrate proofs) ──────────────────────────
             "/poc/identity" => self.handle_identity().await,
             "/poc/persist" => self.handle_persist().await,
             "/poc/share-roundtrip" => self.handle_share_roundtrip().await,
             "/poc/handshake" => self.handle_handshake().await,
-            other => Response::error(format!("unknown POC route: {other}"), 404),
+            // ── KSS routes (I-4a.2: storage-backed by this DO's SQLite) ──
+            // Auth is enforced at the Worker entrypoint before forwarding.
+            // The live coordinators live in this DO isolate's statics (per-
+            // session pinning); durable shares live in DO SQLite.
+            "/dkg/init" => crate::api::handle_dkg_init(req).await,
+            "/dkg/round" => {
+                let store = self.kss_store()?;
+                crate::api::handle_dkg_round(req, &store).await
+            }
+            "/sign/init" => {
+                let store = self.kss_store()?;
+                crate::api::handle_sign_init(req, &store).await
+            }
+            "/sign/round" => crate::api::handle_sign_round(req).await,
+            "/presign/init" => {
+                let store = self.kss_store()?;
+                crate::api::handle_presign_init(req, &store).await
+            }
+            "/presign/round" => crate::api::handle_presign_round(req).await,
+            "/ecdh" => {
+                let store = self.kss_store()?;
+                crate::api::handle_ecdh(req, &store).await
+            }
+            "/health" => {
+                let store = self.kss_store()?;
+                crate::api::handle_health(&store).await
+            }
+            p if p.starts_with("/shares/") => {
+                let agent_id = p.trim_start_matches("/shares/").to_string();
+                let store = self.kss_store()?;
+                crate::api::handle_get_share_metadata(&agent_id, &store).await
+            }
+            other => Response::error(format!("unknown route: {other}"), 404),
         }
     }
 }
@@ -86,6 +119,15 @@ impl CosignerSessionDo {
         let key = PrivateKey::from_hex(&priv_hex)
             .map_err(|e| Error::RustError(format!("SERVER_PRIVATE_KEY parse: {e:?}")))?;
         Ok(key.public_key().to_hex())
+    }
+
+    /// Build the DO-SQLite-backed KSS store (schema ensured) for the KSS
+    /// handlers. The store's tables are co-located in this DO's SQLite, so a
+    /// DKG-completed share persists durably (survives eviction).
+    fn kss_store(&self) -> Result<crate::do_storage::DoSqlStorage<'_>> {
+        let store = crate::do_storage::DoSqlStorage::new(&self.state);
+        store.ensure_schema()?;
+        Ok(store)
     }
 
     /// Ensure the `shares` table exists (idempotent). `ciphertext` is the

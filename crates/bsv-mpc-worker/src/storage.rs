@@ -79,14 +79,43 @@ pub struct ShareMetadata {
     pub presignature_count: u64,
 }
 
+/// Storage backend the KSS handlers depend on, abstracted so the handlers run
+/// over either the in-memory [`ShareStorage`] (native unit tests) or the
+/// DO-SQLite [`crate::do_storage::DoSqlStorage`] (the deployed worker). Methods
+/// return `Result<_, String>` — the common denominator between the in-memory
+/// (`String`) and worker (`worker::Error`) error types.
+pub trait MpcStore {
+    fn store_share(&self, agent_id: &str, share: &EncryptedShare) -> Result<(), String>;
+    fn get_share(&self, agent_id: &str) -> Result<Option<EncryptedShare>, String>;
+    fn get_share_metadata(&self, agent_id: &str) -> Result<Option<ShareMetadata>, String>;
+    fn share_count(&self) -> Result<usize, String>;
+    fn total_presignature_count(&self) -> Result<u64, String>;
+}
+
 /// In-memory share storage wrapper.
 ///
 /// All methods access the global `STORAGE` static. The struct itself is a
-/// zero-sized marker that provides typed method access.
-///
-/// In production, this will wrap a Durable Object's transactional storage API
-/// with SQLite tables for shares, presigning_state, and presignatures.
+/// zero-sized marker that provides typed method access. Used by native unit
+/// tests; the deployed worker uses [`crate::do_storage::DoSqlStorage`].
 pub struct ShareStorage;
+
+impl MpcStore for ShareStorage {
+    fn store_share(&self, agent_id: &str, share: &EncryptedShare) -> Result<(), String> {
+        ShareStorage::store_share(self, agent_id, share)
+    }
+    fn get_share(&self, agent_id: &str) -> Result<Option<EncryptedShare>, String> {
+        ShareStorage::get_share(self, agent_id)
+    }
+    fn get_share_metadata(&self, agent_id: &str) -> Result<Option<ShareMetadata>, String> {
+        ShareStorage::get_share_metadata(self, agent_id)
+    }
+    fn share_count(&self) -> Result<usize, String> {
+        ShareStorage::share_count(self)
+    }
+    fn total_presignature_count(&self) -> Result<u64, String> {
+        ShareStorage::total_presignature_count(self)
+    }
+}
 
 #[allow(dead_code)] // methods form the public storage API, called by handlers and tests
 impl ShareStorage {
