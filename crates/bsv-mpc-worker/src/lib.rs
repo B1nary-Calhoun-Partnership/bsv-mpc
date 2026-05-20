@@ -50,6 +50,7 @@
 
 mod api;
 pub mod auth;
+mod poc;
 mod storage;
 
 use worker::*;
@@ -167,6 +168,17 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             }
             let agent_id = ctx.param("agent_id").unwrap();
             api::handle_get_share_metadata(agent_id, &ctx).await
+        })
+        // ── Phase I-3b POC: DO SQLite persistence + hibernation ─────
+        // Forwarded to the per-identity CosignerSessionDo (DO SQLite +
+        // stable identity from SERVER_PRIVATE_KEY). Proves the fund-safety
+        // persistence primitive on the deployed Worker (gated at runtime by
+        // the I-3c deploy + forced-hibernation harness).
+        .get_async("/poc/identity", |req, ctx| async move {
+            poc::forward_to_cosigner_do(req, &ctx.env).await
+        })
+        .post_async("/poc/persist", |req, ctx| async move {
+            poc::forward_to_cosigner_do(req, &ctx.env).await
         })
         .run(req, env)
         .await
