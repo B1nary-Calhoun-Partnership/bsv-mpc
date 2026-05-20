@@ -121,6 +121,41 @@ Steps 1–2 are pure-Rust + unit-provable now; step 3 is the deployed
 auth-session-isolate fix; step 4 folds authz into the proven relay path. I-5
 (#16) gates on 1–4 being green.
 
+## 5a. MPC-Spec conformance (verified 2026-05-20)
+
+Checked against `~/bsv/mpc/MPC-Spec` before implementing (spec-first):
+
+- **§08.1 / §07.4** — the owner credential is the cosigner's **long-lived
+  BRC-100 identity key**, *explicitly NOT the joint pubkey* ("The identity key
+  is NOT the joint pubkey … the identity key is the cosigner's persistent
+  on-network identity"). This is exactly §3a's model and confirms `agent_id`
+  (joint pubkey) is an identifier, not a credential.
+- **§07.4 / §08.1** — that identity key is **long-lived / persistent** → §3c
+  (stable proxy identity) is **spec-mandated**, not optional. The same key signs
+  the §05 envelope outer-signature, so the proxy's relay-signing key and its
+  BRC-31 identity are one key.
+- **§07.7** — implementations MAY cache BRC-31 session state (the reference
+  middleware is **KV-backed**), TTL ≤ 1h. §3b's **DO-SQLite session store is the
+  CF-native analog** of that KV cache → conformant. (Invalidation on cert/policy
+  rotation per §07.7 is future, with BRC-52.)
+- **§07.5 / §05** — relay ceremony messages already carry **per-envelope
+  BRC-31** (our `wrap_round_message` signs; the combiner verifies via
+  `unwrap_envelope_to_round_message`) → the #15/#12 relay path already conforms
+  at the envelope layer.
+- **§07.6** — only `/health` (+ `/`, `/api-docs`, overlay) MAY be unauthed; "no
+  endpoint is trusted by location." So `/poc/*` are **test-only** (deterministic
+  proofs) and MUST NOT be the production path; the production `/sign-relay`
+  (§4 route table) MUST gate on BRC-31 — §4 step 4.
+- **§08.12 (future, beyond #5 baseline)** — spec mandates adding a **BRC-52 cert
+  verifier** in `auth.rs` alongside the BRC-31 session check, and §09 policy
+  generalizes "who may authorize signing" beyond a single owner. #5 delivers the
+  BRC-31 + owner-identity **baseline**; BRC-52 certs + §09 policy are the richer
+  follow-on layer (own issue).
+
+All of this is **100% Cloudflare-native**: durable sessions + shares + owner in
+the per-identity DO's SQLite; BRC-31 at the Worker entrypoint; relay over the
+canonical MessageBox.
+
 ## 6. Open questions
 
 - **OQ-A1:** owner = a single identity, or a set (multiple authorized proxies /
