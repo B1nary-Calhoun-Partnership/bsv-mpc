@@ -677,6 +677,38 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 "gate": "H-3.4",
             }))
         })
+        // H-3.5a gate: DO scaffolding. Forwards `/relay-via-do/identity`
+        // to the EngineIoSessionDo bound as `ENGINEIO_SESSION_DO` in
+        // wrangler.toml. The DO is keyed by `id_from_name("cosigner-test-1")`
+        // (per-identity topology lock — audit §11.1; future Phase I
+        // injects real cosigner IDs from the DKG ceremony output). Two
+        // consecutive curls MUST return the same `client_identity` hex
+        // because the DO loads its priv from the stable
+        // `SERVER_PRIVATE_KEY` secret every fetch.
+        //
+        // Empirical harness: `wrangler deploy` + curl against the deployed
+        // worker URL. NO local `wrangler dev` simulation — per the locked
+        // H-3.5 discipline, the truth is the deployed CF runtime.
+        .get_async("/relay-via-do/identity", |req, ctx| async move {
+            let namespace = match ctx.env.durable_object("ENGINEIO_SESSION_DO") {
+                Ok(ns) => ns,
+                Err(e) => {
+                    return Response::error(
+                        format!("missing ENGINEIO_SESSION_DO binding: {e:?}"),
+                        500,
+                    )
+                }
+            };
+            let id = match namespace.id_from_name("cosigner-test-1") {
+                Ok(id) => id,
+                Err(e) => return Response::error(format!("id_from_name failed: {e:?}"), 500),
+            };
+            let stub = match id.get_stub() {
+                Ok(s) => s,
+                Err(e) => return Response::error(format!("get_stub failed: {e:?}"), 500),
+            };
+            stub.fetch_with_request(req).await
+        })
         .run(req, env)
         .await
 }
