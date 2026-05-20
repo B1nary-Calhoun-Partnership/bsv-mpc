@@ -117,6 +117,61 @@ impl<'a> DoSqlStorage<'a> {
              )",
             None,
         )?;
+        sql.exec(
+            "CREATE TABLE IF NOT EXISTS mpc_primes (\
+               session_id TEXT PRIMARY KEY, \
+               primes_json TEXT NOT NULL, \
+               created_at INTEGER NOT NULL\
+             )",
+            None,
+        )?;
+        Ok(())
+    }
+
+    // ── Pregenerated Paillier primes (I-4b: seeded off-worker) ───────────
+    //
+    // CGGMP'24 auxinfo safe-prime generation is too CPU-heavy for the wasm32
+    // CF isolate, so primes are generated natively off-worker, POSTed to
+    // `/ceremony/seed-primes`, and stashed here (opaque serde JSON of
+    // `PregeneratedPrimes<SecurityLevel128>`) until the DKG loop consumes them
+    // at coordinator init. Persisted so a seed call + a later ceremony-start
+    // call survive an eviction in between. (Validated by deserialization at
+    // consumption time, in the I-4b.2 cosigner loop.)
+
+    /// Store (upsert) the serialized pregenerated primes for a DKG session.
+    pub fn store_primes(&self, session_id: &str, primes_json: &str) -> Result<()> {
+        self.sql().exec(
+            "INSERT INTO mpc_primes (session_id, primes_json, created_at) \
+             VALUES (?, ?, ?) \
+             ON CONFLICT(session_id) DO UPDATE SET \
+               primes_json = excluded.primes_json, created_at = excluded.created_at",
+            vec![session_id.into(), primes_json.into(), Self::now_ms().into()],
+        )?;
+        Ok(())
+    }
+
+    /// Read the serialized primes for a session, if seeded.
+    pub fn get_primes(&self, session_id: &str) -> Result<Option<String>> {
+        #[derive(Deserialize)]
+        struct PrimesRow {
+            primes_json: String,
+        }
+        let rows: Vec<PrimesRow> = self
+            .sql()
+            .exec(
+                "SELECT primes_json FROM mpc_primes WHERE session_id = ?",
+                vec![session_id.into()],
+            )?
+            .to_array()?;
+        Ok(rows.into_iter().next().map(|r| r.primes_json))
+    }
+
+    /// Delete the primes for a session (consume-once after the ceremony).
+    pub fn delete_primes(&self, session_id: &str) -> Result<()> {
+        self.sql().exec(
+            "DELETE FROM mpc_primes WHERE session_id = ?",
+            vec![session_id.into()],
+        )?;
         Ok(())
     }
 

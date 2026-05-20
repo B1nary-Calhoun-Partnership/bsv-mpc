@@ -88,6 +88,7 @@ impl DurableObject for CosignerSessionDo {
                 crate::api::handle_sign_init(req, &store).await
             }
             "/sign/round" => crate::api::handle_sign_round(req).await,
+            "/ceremony/seed-primes" => self.handle_seed_primes(req).await,
             "/presign/init" => {
                 let store = self.kss_store()?;
                 crate::api::handle_presign_init(req, &store).await
@@ -283,6 +284,43 @@ impl CosignerSessionDo {
             "share_count": store.share_count()?,
             "instance_constructed_at_ms": self.instance_constructed_at_ms,
             "do_name": POC_DO_NAME,
+        }))
+    }
+
+    /// `POST /ceremony/seed-primes {session_id, primes_json}` — I-4b.1.
+    /// Persist off-worker-generated Paillier `PregeneratedPrimes` (serde JSON)
+    /// to DO SQLite so the DKG loop can consume them at coordinator init
+    /// without the (CF-CPU-prohibitive) in-wasm safe-prime generation. Auth is
+    /// enforced at the Worker entrypoint before this is forwarded. Idempotent:
+    /// re-seeding the same session reports `already_existed` (the eviction-
+    /// survival proof) and confirms the stored blob is byte-identical.
+    async fn handle_seed_primes(&self, mut req: Request) -> Result<Response> {
+        #[derive(serde::Deserialize)]
+        struct SeedPrimesRequest {
+            session_id: String,
+            primes_json: String,
+        }
+        let body: SeedPrimesRequest = req.json().await?;
+        if body.session_id.is_empty() || body.primes_json.is_empty() {
+            return Response::error("session_id and primes_json are required", 400);
+        }
+
+        let store = self.kss_store()?;
+        let already_existed = store.get_primes(&body.session_id)?.is_some();
+        if !already_existed {
+            store.store_primes(&body.session_id, &body.primes_json)?;
+        }
+        let reloaded = store.get_primes(&body.session_id)?;
+        let reload_matches = reloaded.as_deref() == Some(body.primes_json.as_str());
+
+        Response::from_json(&serde_json::json!({
+            "route": "ceremony/seed-primes",
+            "session_id": body.session_id,
+            "already_existed": already_existed,
+            "stored": reloaded.is_some(),
+            "reload_matches": reload_matches,
+            "primes_len": body.primes_json.len(),
+            "instance_constructed_at_ms": self.instance_constructed_at_ms,
         }))
     }
 }

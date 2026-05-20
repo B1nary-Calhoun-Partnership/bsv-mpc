@@ -159,6 +159,14 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             }
             poc::forward_to_cosigner_do(req, &ctx.env).await
         })
+        // I-4b.1: seed off-worker-generated Paillier primes for DKG (auth'd).
+        .post_async("/ceremony/seed-primes", |req, ctx| async move {
+            let config = auth::AuthConfig::from_env(&ctx.env)?;
+            if let Err(resp) = auth::verify_or_allow(&req, &config) {
+                return Ok(resp);
+            }
+            poc::forward_to_cosigner_do(req, &ctx.env).await
+        })
         // ── Read-only endpoints (no auth required) ──────────────────
         .get_async("/health", |req, ctx| async move {
             poc::forward_to_cosigner_do(req, &ctx.env).await
