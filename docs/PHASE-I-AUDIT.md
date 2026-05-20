@@ -64,22 +64,17 @@ poc17's `EngineIoSessionDo`. The DO holds `share_A` (in DO SQLite), dials an
 outbound Socket.IO + BRC-103 WS to the relay, joins its DKG/sign rooms, and
 drives ceremonies with the *other* party over the relay.
 
-**OQ-I1 (KEY DESIGN DECISION — needs sign-off):** what is the cross-cosigner
-topology? Today proxy↔KSS is HTTP (`bridge.rs`), explicitly a "within-stack,
-non-spec-normative" shortcut (root CLAUDE.md / §06.14). The spec-normative
-§06 path is relay-mediated. Options:
-- **(a) Relay replaces proxy↔KSS** — the proxy's party and the worker's party
-  co-sign over the relay; HTTP `bridge.rs` retired for signing. Fully
-  spec-normative; bigger change.
-- **(b) Relay is additive** — keep proxy↔KSS HTTP for the within-stack 2P
-  path; use the relay only for worker↔*independent-cosigner* (decentralized
-  multi-node). Worker is reachable both ways.
-- **(c) Phase I proves the worker-as-relay-cosigner in isolation** (worker ↔
-  a second cosigner — e.g. a native `bsv-mpc-service` instance — over the
-  relay, like `dkg_via_messagebox_e2e` but cross-impl), and defers the
-  proxy-path decision to Phase I-b / J.
-Recommendation: **(c)** for the POC + merge gate (proves the deployed worker
-cosigns over the relay with real sats), then decide (a) vs (b) once proven.
+**Topology (OQ-I1 RESOLVED → relay replaces proxy↔KSS HTTP):** the relay is
+the signing channel between the proxy's party (`share_B`) and the worker's
+party (`share_A`). The HTTP `bridge.rs` signing path is retired; both
+parties are spec-normative §06 relay cosigners. The **proxy** (native)
+drives ceremonies via the native `MessageBoxClient` + the `bsv-mpc-service`
+handler pattern (`MessageBoxListener` + `DkgHandler`/`SigningHandler`); the
+**worker** (wasm32, deployed) drives them via the §3.2 wasm32 cosigner loop.
+Sequencing within Phase I: the deployed-worker substrate (Step 3 POC) is
+topology-agnostic, so it lands first; the proxy `bridge.rs` migration +
+the worker cosigner loop land in Step 4; the merge gate is proxy↔deployed-
+worker over the relay.
 
 ### 3.2 wasm32 cosigner loop
 
@@ -141,15 +136,12 @@ in-memory state (incl. the live WS). So:
   state is **ephemeral** — but an *active* ceremony has continuous WS traffic
   that keeps the DO warm, so mid-ceremony eviction is unlikely; if it does
   happen the ceremony fails + retries (no fund loss, share is safe).
-- **Liveness/wake trigger (OQ-I2):** how does a ceremony reach a hibernated
-  worker? Options: (i) **wake-on-HTTP** — the proxy/initiator pokes the
-  worker (HTTP) which wakes the DO → it connects + drives the ceremony
-  (fits today's proxy→worker model); (ii) **Alarm keep-warm** — a periodic
-  DO Alarm (<60s) keeps the WS subscribed to catch unsolicited relay pushes
-  (cost tradeoff; alarms can delay up to ~1 min); (iii) **backfill on wake**
-  via `/listMessages`. Recommendation: **(i) wake-on-HTTP** for the POC
-  (deterministic, no keep-warm cost), with Alarm-driven reconnect as a
-  resilience layer.
+- **Liveness/wake trigger (OQ-I2 RESOLVED → wake-on-HTTP + Alarm reconnect):**
+  the proxy/initiator pokes the worker over HTTP → the DO wakes, dials the
+  relay, and drives the ceremony (deterministic, no keep-warm cost). A
+  periodic DO Alarm provides reconnect resilience (re-establish the WS if it
+  dropped). Alarms can lag up to ~1 min, so they are the resilience layer,
+  not the primary trigger.
 
 ### 3.5 Deploy / secrets / identity
 
@@ -166,9 +158,13 @@ wake — never in-memory-only). New `[[migrations]]` tag with
   envelope round-trip + forced-hibernation reconnect against the live relay
   (lift poc17's harness; satisfies #3's deferred wasm32-runtime/deployed-worker).
   + DO SQLite share persist/reload across a forced eviction.
-- [ ] **Step 4 — Implement** — DO cosigner loop (§3.2) + DO SQLite storage
-  (§3.3, replace the in-memory `STORAGE` static) + wake/liveness (§3.4) +
-  route KSS handlers through the DO.
+- [ ] **Step 4 — Implement** — (a) bump `worker` crate to 0.8.x; (b) worker
+  wasm32 DO cosigner loop (§3.2) + DO SQLite storage (§3.3, replace the
+  in-memory `STORAGE` static) + wake-on-HTTP/Alarm (§3.4) + route KSS
+  handlers through the DO; (c) **migrate `bsv-mpc-proxy` `bridge.rs`** signing/
+  DKG path from HTTP to the MessageBox relay transport (native
+  `MessageBoxClient` + the `bsv-mpc-service` handler pattern) — retiring the
+  HTTP `/sign|/dkg` round-trips (OQ-I1).
 - [ ] **Step 5 — Quality gate / merge** — see §6.
 
 ## 5. 🔒 Fund-safety gate (non-negotiable)
@@ -182,23 +178,30 @@ Before any mainnet sats touch a worker-held joint key:
 ## 6. Merge gate
 
 - [ ] **Deployed-cosigner real-sats mainnet TXID** — 2-of-2 DKG + sign +
-  broadcast with one party the *deployed* CF Worker cosigner, shape-matching
+  broadcast with the **proxy's party (native, over the relay) co-signing
+  with the *deployed* CF Worker cosigner** (OQ-I1 topology), shape-matching
   G-5d (`442bd391…`: DER + `SIGHASH_ALL|FORKID`, joint P2PKH, low-s,
   pre-flight verify).
 - [ ] wasm32 runtime proof of the transport (Phase H #39/#40 satisfied here).
 - [ ] `cargo build --workspace --all-targets` + clippy `-D warnings` + fmt clean; CI green.
 
-## 7. Open questions for review
+## 7. Decisions (resolved 2026-05-20)
 
-- **OQ-I1** — cross-cosigner topology (§3.1): relay-replaces-HTTP (a) /
-  additive (b) / prove-in-isolation-first (c). Rec: **(c)**.
-- **OQ-I2** — wake/liveness (§3.4): wake-on-HTTP (i) / Alarm keep-warm (ii) /
-  backfill (iii). Rec: **(i)** + Alarm reconnect.
-- **OQ-I3** — `worker` crate: stay on 0.7.5 (SQLite + alarms + outbound WS
-  confirmed present) or bump to 0.8.x (current)? Rec: bump to 0.8.x to track
-  upstream + guarantee the APIs.
-- **OQ-I4** — second cosigner for the POC/merge gate: a native
-  `bsv-mpc-service` instance (cross-impl, like `dkg_via_messagebox_e2e`)? Rec: yes.
+- **OQ-I1 — cross-cosigner topology: RESOLVED → relay REPLACES proxy↔KSS HTTP.**
+  The relay becomes the signing channel between the proxy's party (holds
+  `share_B`) and the worker's party (holds `share_A`); the HTTP `bridge.rs`
+  signing path (`/sign/init`, `/sign/round`, `/dkg/*`) is retired. Both
+  parties are spec-normative §06 relay cosigners. **Scope implication:**
+  Phase I modifies `bsv-mpc-proxy` too — its signing/DKG path migrates from
+  HTTP to the MessageBox transport (native `MessageBoxClient` + the
+  service's handler pattern), in addition to the wasm32 worker cosigner.
+- **OQ-I2 — wake/liveness: RESOLVED → wake-on-HTTP + Alarm reconnect.** The
+  initiator pokes the worker over HTTP → DO wakes, dials the relay, drives
+  the ceremony; a periodic DO Alarm provides reconnect resilience.
+- **OQ-I3 — `worker` crate: RESOLVED → bump to 0.8.x** (current; SQLite +
+  alarms + outbound WS confirmed). Migrate the worker crate off 0.7.5.
+- **OQ-I4 — second cosigner: the proxy's party** (native, via the migrated
+  MessageBox path) co-signs with the deployed worker for the merge gate.
 
 ## 8. Risks
 
