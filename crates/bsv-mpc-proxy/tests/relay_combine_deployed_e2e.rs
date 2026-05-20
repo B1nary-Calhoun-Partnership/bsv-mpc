@@ -26,8 +26,6 @@ use bsv_mpc_core::types::{
     EncryptedShare, JointPublicKey, SessionId, ShareIndex, SigningResult, ThresholdConfig,
 };
 use bsv_mpc_proxy::relay_sign::{combine_sign_over_relay, DoTrigger};
-use cggmp24::signing::PresignaturePublicData;
-use cggmp24::supported_curves::Secp256k1;
 use rand::RngCore;
 
 const DEFAULT_WORKER: &str = "https://bsv-mpc-kss.dev-a3e.workers.dev";
@@ -117,13 +115,8 @@ fn gen_presig_pair(share0: EncryptedShare, share1: EncryptedShare) -> (Vec<u8>, 
     assert_eq!(m0.pool_size(), 1);
     assert_eq!(m1.pool_size(), 1);
     let (_w0, box0) = m0.take_raw().expect("m0 take_raw");
-    let (presig_a, _pub_a) = *box0
-        .downcast::<(
-            cggmp24::Presignature<Secp256k1>,
-            PresignaturePublicData<Secp256k1>,
-        )>()
-        .expect("box0 downcast");
-    let presig_a_json = serde_json::to_vec(&presig_a).expect("serialize Presignature_A");
+    let presig_a_json = bsv_mpc_core::presigning::serialize_party_presignature(box0)
+        .expect("serialize Presignature_A");
     let (_w1, box1) = m1.take_raw().expect("m1 take_raw");
     (presig_a_json, box1)
 }

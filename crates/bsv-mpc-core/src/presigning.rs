@@ -503,6 +503,28 @@ impl PresigningManager {
     }
 }
 
+/// Serialize the cggmp24 presignature from a [`PresigningManager::take_raw`]
+/// box, ready to ship into a remote party's presignature pool (the cosigner DO
+/// via `/ceremony/ingest-presig`). The bytes are exactly what
+/// [`crate::signing::issue_partial_signature_json`] consumes — the public data
+/// is dropped (only the combiner needs it, and it is not `Serialize`).
+///
+/// **SECURITY (ADR-018):** a presignature alone is sufficient to *issue that
+/// party's partial* (`issue_partial_signature_json` takes no key share). So a
+/// party's presignature MUST only be shipped from that party's own host
+/// directly to its pool — `Presignature_A` flows **cosigner/container → DO**,
+/// never via the proxy. A proxy holding both `Presignature_A` and
+/// `Presignature_B` could issue both partials and forge a full signature alone,
+/// defeating the threshold.
+pub fn serialize_party_presignature(raw: Box<dyn std::any::Any + Send>) -> Result<Vec<u8>> {
+    let output = raw.downcast::<PresignOutput>().map_err(|_| {
+        MpcError::Serialization("raw presignature box is not a PresignOutput".into())
+    })?;
+    let (presig, _public_data) = *output;
+    serde_json::to_vec(&presig)
+        .map_err(|e| MpcError::Serialization(format!("serialize presignature: {e}")))
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -980,5 +1002,106 @@ mod tests {
         let p0 = mgr_0.take().unwrap();
         let p1 = mgr_0.take().unwrap();
         assert_ne!(p0.id, p1.id, "presignature IDs should be unique");
+    }
+
+    /// **#4a gate** — `serialize_party_presignature` extracts a *usable*
+    /// `Presignature_A` from a `PresigningManager::take_raw` box: the serialized
+    /// bytes, fed through `issue_partial_signature_json` (the DO's light op) and
+    /// combined with party 1's coordinator, yield a **BSV-valid** 2-of-2
+    /// signature under the joint key. This is the provisioning pipeline the
+    /// container will run before shipping `Presignature_A` to the DO pool.
+    #[tokio::test]
+    async fn serialize_party_presignature_drives_valid_2of2_signature() {
+        use crate::signing::{
+            issue_partial_signature_json, SigningCoordinator, SigningRoundResult,
+        };
+
+        let key_shares = run_dkg_2of2().await;
+        let session_id = SessionId::from_str_hash("ser-presig-gate");
+        let config = ThresholdConfig::new(2, 2).unwrap();
+        let participants = vec![0u16, 1u16];
+        let share_0 = wrap_key_share(&key_shares[0], 0, config, &session_id);
+        let share_1 = wrap_key_share(&key_shares[1], 1, config, &session_id);
+
+        // Generate one correlated presignature pair (party 0 = "cosigner").
+        let mut mgr_0 = PresigningManager::new(session_id, share_0, participants.clone(), 1);
+        let mut mgr_1 =
+            PresigningManager::new(session_id, share_1.clone(), participants.clone(), 1);
+        let mut out_0 = mgr_0.init_generate().unwrap();
+        let mut out_1 = mgr_1.init_generate().unwrap();
+        for _ in 0..20 {
+            let r0 = mgr_0.process_generate_round(out_1.clone()).unwrap();
+            let r1 = mgr_1.process_generate_round(out_0.clone()).unwrap();
+            match (r0, r1) {
+                (PresigningRoundResult::Complete, PresigningRoundResult::Complete) => break,
+                (PresigningRoundResult::NextRound(m0), PresigningRoundResult::NextRound(m1)) => {
+                    out_0 = m0;
+                    out_1 = m1;
+                }
+                (PresigningRoundResult::Complete, PresigningRoundResult::NextRound(m1)) => {
+                    out_0 = vec![];
+                    out_1 = m1;
+                }
+                (PresigningRoundResult::NextRound(m0), PresigningRoundResult::Complete) => {
+                    out_0 = m0;
+                    out_1 = vec![];
+                }
+            }
+        }
+        assert_eq!(mgr_0.pool_size(), 1);
+        assert_eq!(mgr_1.pool_size(), 1);
+
+        // Party 0 (cosigner): extract + serialize Presignature_A via the helper.
+        let (_meta_a, raw_a) = mgr_0.take_raw().unwrap();
+        let presig_a_json =
+            super::serialize_party_presignature(raw_a).expect("serialize_party_presignature");
+        assert!(
+            !presig_a_json.is_empty(),
+            "serialized presignature must be non-empty"
+        );
+
+        // Party 1 (combiner): keep the full raw box.
+        let (_meta_b, raw_b) = mgr_1.take_raw().unwrap();
+
+        let message_hash: [u8; 32] = {
+            let mut h = Sha256::new();
+            h.update(b"#4a serialize-presig gate");
+            let mut b = [0u8; 32];
+            b.copy_from_slice(&h.finalize());
+            b
+        };
+
+        // DO light op: issue party-0's partial from the serialized presig only.
+        let partial_a_json = issue_partial_signature_json(&presig_a_json, &message_hash)
+            .expect("issue partial from serialized Presignature_A");
+        let msg_a = RoundMessage {
+            session_id,
+            round: 1,
+            from: ShareIndex(0),
+            to: None,
+            payload: partial_a_json,
+        };
+
+        // Combiner: issue its own partial + combine.
+        let mut combiner = SigningCoordinator::new(session_id, share_1, config, participants);
+        combiner
+            .sign_with_presignature(&message_hash, raw_b)
+            .expect("combiner issues its partial");
+        let sig = match combiner.process_round(vec![msg_a]).expect("combine") {
+            SigningRoundResult::Complete(s) => s,
+            _ => panic!("combiner did not complete in 1 round"),
+        };
+
+        // BSV-valid under the joint pubkey.
+        let pubkey_bytes = key_shares[0].core.shared_public_key.to_bytes(true);
+        let bsv_pubkey = bsv::PublicKey::from_bytes(&pubkey_bytes).unwrap();
+        let mut sig_bytes = [0u8; 64];
+        sig_bytes[..32].copy_from_slice(&sig.r);
+        sig_bytes[32..].copy_from_slice(&sig.s);
+        let bsv_sig = bsv::Signature::from_compact(&sig_bytes).unwrap();
+        assert!(
+            bsv_pubkey.verify(&message_hash, &bsv_sig),
+            "the helper-serialized Presignature_A MUST drive a BSV-valid 2-of-2 signature"
+        );
     }
 }
