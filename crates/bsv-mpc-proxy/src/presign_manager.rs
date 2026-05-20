@@ -31,11 +31,35 @@
 //! Multiple handler tasks can concurrently read the pool size, but only
 //! one can take/add presignatures at a time.
 
-use std::sync::Arc;
+use std::any::Any;
+use std::sync::{Arc, Mutex};
 
 use bsv_mpc_core::types::Presignature;
 
 use crate::server::AppState;
+
+/// A pooled presignature plus its non-serializable raw output.
+///
+/// The relay **combiner** (the proxy) needs the full
+/// `(Presignature, PresignaturePublicData)` from
+/// [`bsv_mpc_core::presigning::PresigningManager::take_raw`] — the public data
+/// is not `Serialize` and never crosses the proxy↔cosigner boundary (handoff
+/// §1 / ADR-018). The serializable `presig` is retained for the legacy 1-round
+/// HTTP sign path and for metadata/logging.
+///
+/// The raw output is `Box<dyn Any + Send>` (cggmp24's type-erased presig data),
+/// which is `Send` but not `Sync`. The pool lives behind `AppState`'s
+/// `Arc<RwLock<…>>`, which axum requires to be `Sync`, so the box is wrapped in
+/// a `Mutex` purely as a `Sync` shim — it is never actually contended (the
+/// entry is owned by the caller once removed from the pool, and the box is
+/// moved out with `into_inner`).
+pub struct PooledPresignature {
+    /// The serializable presignature (legacy HTTP sign path; metadata).
+    pub presig: Presignature,
+    /// Type-erased `(Presignature, PresignaturePublicData)` for the relay
+    /// combiner ([`crate::relay_sign::combine_sign_over_relay`]).
+    raw: Mutex<Box<dyn Any + Send>>,
+}
 
 /// Manages a FIFO pool of pre-computed presignatures.
 ///
@@ -49,7 +73,12 @@ pub struct PresignManager {
     /// from the front. This ensures older presignatures are used first,
     /// which is important because presignatures have a limited lifetime
     /// (though in practice they last indefinitely in the CGGMP'24 protocol).
-    pool: Vec<Presignature>,
+    ///
+    /// In **relay mode** this pool's FIFO order MUST stay in lockstep with the
+    /// cosigner DO's presignature pool (both consume oldest-first), so the
+    /// proxy's `Presignature_B` is combined against the correlated
+    /// `Presignature_A` the DO consumes.
+    pool: Vec<PooledPresignature>,
 
     /// Maximum pool capacity.
     ///
@@ -75,7 +104,8 @@ impl PresignManager {
         }
     }
 
-    /// Take one presignature from the front of the pool (FIFO).
+    /// Take one presignature from the front of the pool (FIFO), discarding its
+    /// raw output — the **legacy 1-round HTTP sign path**.
     ///
     /// Returns `None` if the pool is empty. The caller should fall back to
     /// the full 4-round signing protocol when no presignature is available.
@@ -84,17 +114,42 @@ impl PresignManager {
             None
         } else {
             self.total_consumed += 1;
-            Some(self.pool.remove(0))
+            Some(self.pool.remove(0).presig)
         }
     }
 
-    /// Add a presignature to the back of the pool.
+    /// Take one presignature's **raw** output from the front of the pool (FIFO)
+    /// — the box `(Presignature, PresignaturePublicData)` the **relay combiner**
+    /// feeds to `SigningCoordinator::sign_with_presignature`.
+    ///
+    /// Returns `None` if the pool is empty.
+    pub fn take_raw(&mut self) -> Option<Box<dyn Any + Send>> {
+        if self.pool.is_empty() {
+            None
+        } else {
+            self.total_consumed += 1;
+            // We own the entry now; unwrap the Sync shim. `into_inner` only
+            // fails on a poisoned mutex, which is impossible here (never locked).
+            Some(
+                self.pool
+                    .remove(0)
+                    .raw
+                    .into_inner()
+                    .expect("presig raw mutex never poisoned"),
+            )
+        }
+    }
+
+    /// Add a presignature (with its raw output) to the back of the pool.
     ///
     /// If the pool is at capacity, the presignature is silently dropped.
     /// This can happen if signing traffic drops while replenishment is active.
-    pub fn add(&mut self, presig: Presignature) {
+    pub fn add(&mut self, presig: Presignature, raw: Box<dyn Any + Send>) {
         if self.pool.len() < self.max_size {
-            self.pool.push(presig);
+            self.pool.push(PooledPresignature {
+                presig,
+                raw: Mutex::new(raw),
+            });
             self.total_generated += 1;
         } else {
             tracing::trace!(
@@ -194,11 +249,11 @@ pub async fn background_replenish(state: Arc<AppState>) {
             continue;
         }
 
-        match state.bridge.presign().await {
-            Ok(presig) => {
+        match state.bridge.presign_raw().await {
+            Ok((presig, raw)) => {
                 let mut mgr = state.presign_manager.write().await;
                 let pool_size_before = mgr.len();
-                mgr.add(presig);
+                mgr.add(presig, raw);
                 tracing::debug!(
                     pool_size_before,
                     pool_size_after = mgr.len(),
@@ -263,5 +318,39 @@ mod tests {
         let mgr = PresignManager::new(10);
         assert_eq!(mgr.total_generated(), 0);
         assert_eq!(mgr.total_consumed(), 0);
+    }
+
+    fn dummy_presig(id: &str) -> Presignature {
+        Presignature {
+            id: id.to_string(),
+            session_id: bsv_mpc_core::types::SessionId::from_str_hash("pool-test"),
+            data: vec![],
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn add_then_take_raw_returns_the_box() {
+        // The relay combiner consumes the raw `(Presignature, PublicData)` box;
+        // verify the pool stores and hands it back intact through the Sync shim.
+        let mut mgr = PresignManager::new(4);
+        let raw: Box<dyn Any + Send> = Box::new(0xC0FFEEu64);
+        mgr.add(dummy_presig("a"), raw);
+        assert_eq!(mgr.len(), 1);
+        let got = mgr.take_raw().expect("raw present");
+        assert_eq!(*got.downcast::<u64>().expect("downcast"), 0xC0FFEE);
+        assert_eq!(mgr.len(), 0);
+        assert_eq!(mgr.total_consumed(), 1);
+    }
+
+    #[test]
+    fn take_returns_presig_and_is_fifo() {
+        // Legacy HTTP path still gets the serializable Presignature, oldest-first.
+        let mut mgr = PresignManager::new(4);
+        mgr.add(dummy_presig("first"), Box::new(1u8));
+        mgr.add(dummy_presig("second"), Box::new(2u8));
+        assert_eq!(mgr.take().expect("first").id, "first");
+        assert_eq!(mgr.take().expect("second").id, "second");
+        assert!(mgr.take().is_none());
     }
 }

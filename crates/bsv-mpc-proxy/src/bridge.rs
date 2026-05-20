@@ -868,13 +868,17 @@ impl MpcBridge {
         .map_err(|e| MpcError::Signing(format!("signing task panicked: {e}")))?
     }
 
-    /// Run the presigning protocol to generate a reusable presignature.
+    /// Run the presigning protocol, returning the **raw** presignature output
+    /// `(Presignature, Box<dyn Any + Send>)` — the box carries the
+    /// non-serializable `PresignaturePublicData` the relay combiner needs.
     ///
     /// Creates an ephemeral `PresigningManager` with pool_size=1 and drives
     /// the 3-round offline protocol by exchanging messages with the KSS.
     ///
     /// Called by the background replenishment task during idle time.
-    pub async fn presign(&self) -> bsv_mpc_core::error::Result<Presignature> {
+    pub async fn presign_raw(
+        &self,
+    ) -> bsv_mpc_core::error::Result<(Presignature, Box<dyn std::any::Any + Send>)> {
         let share = self.share.clone();
         let session_id = self.session_id;
         let participants = self.participants.clone();
@@ -961,14 +965,15 @@ impl MpcBridge {
                         proxy_wire_msgs = next_msgs;
                     }
                     PresigningRoundResult::Complete => {
-                        // Presignature added to manager's internal pool — take it
-                        let presig = mgr.take().ok_or_else(|| {
+                        // Presignature added to manager's internal pool — take
+                        // the raw output (Presignature + PresignaturePublicData).
+                        let (presig, raw) = mgr.take_raw().ok_or_else(|| {
                             MpcError::Protocol(
                                 "presigning completed but no presignature in pool".into(),
                             )
                         })?;
                         tracing::info!(presig_id = %presig.id, "presigning: complete");
-                        return Ok(presig);
+                        return Ok((presig, raw));
                     }
                 }
             }
