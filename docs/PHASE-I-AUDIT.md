@@ -154,10 +154,20 @@ wake — never in-memory-only). New `[[migrations]]` tag with
 
 - [x] **Step 1 — Investigate** (3-agent swarm, 2026-05-20).
 - [→] **Step 2 — Audit doc** (this file).
-- [ ] **Step 3 — POC** — deployed worker: outbound Socket.IO + BRC-103 +
+- [x] **Step 3 — POC** — deployed worker: outbound Socket.IO + BRC-103 +
   envelope round-trip + forced-hibernation reconnect against the live relay
   (lift poc17's harness; satisfies #3's deferred wasm32-runtime/deployed-worker).
   + DO SQLite share persist/reload across a forced eviction.
+  **DONE 2026-05-20:** I-3b (`55e0a42`) DO-SQLite persist + forced-eviction
+  proof; I-3b2 (`efc6bc5`) `/poc/handshake` deployed-proven
+  (`server_identity=02d7c923…`, `envelope_round_trip=true`, rtt≈307ms).
+  **Root-cause fix:** bsv-rs's wasm `wait_with_timeout` pulled
+  `futures-timer` without its `wasm-bindgen` feature → `Delay::new` panics
+  on `wasm32` (native timer-thread). The worker now enables
+  `futures-timer/wasm-bindgen` (feature-unified) → `gloo-timers`/`setTimeout`
+  backend. This is why poc17's manual InitialRequest worked but canonical
+  `to_peer` hung. Upstream follow-up: bsv-rs's own `wasm` feature should
+  enable `futures-timer/wasm-bindgen`.
 - [ ] **Step 4 — Implement** — (a) bump `worker` crate to 0.8.x; (b) worker
   wasm32 DO cosigner loop (§3.2) + DO SQLite storage (§3.3, replace the
   in-memory `STORAGE` static) + wake-on-HTTP/Alarm (§3.4) + route KSS

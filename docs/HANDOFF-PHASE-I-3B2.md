@@ -1,10 +1,42 @@
-# Handoff — Phase I Step 3, pickup at I-3b2 (relay-handshake-from-DO)
+# Handoff — Phase I Step 3 (I-3b2 DONE) → pick up at Step 4
 
 > For the next session continuing Phase I. Read this +
 > `docs/PHASE-I-AUDIT.md` + GitHub issue **bsv-mpc#4** first.
 >
-> **Status:** Phase H CLOSED. Phase I Steps 1–2 done; Step 3 I-3a + I-3b
-> done **and deployed-proven**. Pick up at **I-3b2**.
+> **Status:** Phase H CLOSED. Phase I Steps 1–2 done; **Step 3 COMPLETE**
+> (I-3a + I-3b + I-3b2, all deployed-proven). **Pick up at Step 4.**
+
+## I-3b2 DONE (2026-05-20) — relay-handshake-from-DO, deployed-proven
+
+`CosignerSessionDo::handle_handshake` (`GET /poc/handshake`) lands on `main`
+as `efc6bc5`. The deployed worker dials the live relay over `transport_wasm`,
+runs Engine.IO 4 + Socket.IO 5 + BRC-103 via the canonical upstream path
+(`spawn_local(run_dispatch)` + `peer.to_peer(joinRoom, None, _)`), and does an
+envelope round-trip. **Runtime proof** (`/poc/handshake`, clean build):
+`client_identity=03cc87ed…`, `server_identity=02d7c923…` (live relay),
+`envelope_round_trip=true`, `handshake_rtt≈307ms`, HTTP 200 in 1.4s.
+
+**Root-cause fix (the god-tier one):** canonical `to_peer` HUNG on wasm.
+Cause: bsv-rs's wasm `wait_with_timeout` (Peer handshake timeout) uses
+`futures-timer::Delay`, but bsv-rs pulls `futures-timer` WITHOUT its
+`wasm-bindgen` feature → on `wasm32-unknown-unknown` `Delay::new` panics
+(native timer-thread, `thread::spawn` unsupported) on `to_peer`'s first poll
+and aborts the request. The worker now depends on
+`futures-timer = { features = ["wasm-bindgen"] }`; Cargo feature unification
+flips the shared build to the `gloo-timers`/`setTimeout` backend that works in
+the CF isolate. (This is why poc17 worked — it used a manual InitialRequest,
+never `to_peer`.) **Upstream follow-up worth filing:** bsv-rs's own `wasm`
+feature should enable `futures-timer/wasm-bindgen` so every wasm consumer of
+`Peer::to_peer` is fixed, not just this worker — needs a 0.3.11 republish
+(deliberate, user-approved).
+
+**Carry into Step 4:** the full wasm32 cosigner loop also drives `to_peer` /
+timers on wasm — the `futures-timer/wasm-bindgen` dep is now load-bearing for
+ALL wasm relay traffic, not just the POC. Keep it.
+
+---
+
+## (historical) original I-3b2 pickup notes follow
 
 ## TL;DR — the next concrete action
 
