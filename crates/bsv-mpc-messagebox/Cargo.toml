@@ -30,6 +30,10 @@ sha2.workspace = true
 # wasm32 target block below.
 rand.workspace = true
 
+# Async trait — used by the target-agnostic `transport_socketio`
+# `impl bsv::auth::Transport for SocketIoTransport` on BOTH targets.
+async-trait = "0.1"
+
 # Error handling
 thiserror.workspace = true
 anyhow.workspace = true
@@ -72,7 +76,6 @@ worker = "0.7"
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
-async-trait = "0.1"
 getrandom = { version = "0.2", features = ["js"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies.web-sys]

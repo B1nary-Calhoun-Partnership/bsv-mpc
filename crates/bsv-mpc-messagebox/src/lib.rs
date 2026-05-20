@@ -47,6 +47,19 @@ pub mod error;
 pub mod types;
 pub mod wire;
 
+// Transport substrate (Phase H Step 4 — Socket.IO + BRC-103).
+// `transport_socketio` is target-agnostic: the `SocketIoTransport` impl
+// of `bsv::auth::Transport`, the `run_dispatch` inbound loop, and the
+// app-event envelope helpers. It `use`-aliases the WS substrate per
+// target — `transport_wasm` (`web_sys::WebSocket` + `worker::Fetch`) on
+// wasm32, `transport_native` (`tokio-tungstenite` + `reqwest`) on native
+// — both mirroring the same `WsHandle`/`WsSender` method surface.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod transport_native;
+pub mod transport_socketio;
+#[cfg(target_arch = "wasm32")]
+pub mod transport_wasm;
+
 // Native-only modules — the existing raw-WS + BRC-104
 // SimplifiedFetchTransport path. These pull `tokio` / `reqwest` /
 // `tokio-tungstenite`, none of which compile to

@@ -259,12 +259,15 @@ name = "bsv-mpc-messagebox"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "base64 0.22.1",
  "bsv-mpc-core",
  "bsv-rs",
  "chrono",
  "futures",
+ "getrandom 0.2.17",
  "hex",
+ "js-sys",
  "rand 0.8.5",
  "reqwest",
  "serde",
@@ -277,6 +280,10 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+ "worker",
 ]
 
 [[package]]
