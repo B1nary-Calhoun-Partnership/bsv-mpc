@@ -75,6 +75,7 @@ impl DurableObject for CosignerSessionDo {
             "/poc/share-roundtrip" => self.handle_share_roundtrip().await,
             "/poc/dkg-bench" => self.handle_dkg_bench(req).await,
             "/poc/issue-partial" => self.handle_issue_partial(req).await,
+            "/poc/presig-pool" => self.handle_presig_pool(req).await,
             "/poc/handshake" => self.handle_handshake().await,
             // ── KSS routes (I-4a.2: storage-backed by this DO's SQLite) ──
             // Auth is enforced at the Worker entrypoint before forwarding.
@@ -91,6 +92,7 @@ impl DurableObject for CosignerSessionDo {
             }
             "/sign/round" => crate::api::handle_sign_round(req).await,
             "/ceremony/seed-primes" => self.handle_seed_primes(req).await,
+            "/ceremony/ingest-presig" => self.handle_ingest_presig(req).await,
             "/presign/init" => {
                 let store = self.kss_store()?;
                 crate::api::handle_presign_init(req, &store).await
@@ -461,6 +463,114 @@ impl CosignerSessionDo {
             "stored": reloaded.is_some(),
             "reload_matches": reload_matches,
             "primes_len": body.primes_json.len(),
+            "instance_constructed_at_ms": self.instance_constructed_at_ms,
+        }))
+    }
+
+    /// `POST /ceremony/ingest-presig {session_id, presig_id, presignature_hex}`
+    /// — #14 presig provisioning. The native CF Container generates a 2-party
+    /// presignature with the proxy and ships **this party's** serialized
+    /// `Presignature` (hex of its serde JSON) here; we stock it in the DO's
+    /// `mpc_presignatures` FIFO pool (`store_presignature`) so the light
+    /// online-sign loop can consume one per signature. `PresignaturePublicData`
+    /// is NOT shipped — only the combiner (native proxy) needs it (ADR-018).
+    ///
+    /// Auth is enforced at the Worker entrypoint before forwarding. The presig
+    /// is stored under **this DO's own cosigner identity** (derived from
+    /// `SERVER_PRIVATE_KEY`), never a client-supplied agent_id — the requester
+    /// cannot stock another agent's pool (handler-level authz, #5). The blob is
+    /// stored opaque (validated at consumption time by `issue_partial_signature_json`,
+    /// mirroring the seed-primes precedent).
+    async fn handle_ingest_presig(&self, mut req: Request) -> Result<Response> {
+        #[derive(serde::Deserialize)]
+        struct IngestPresigRequest {
+            session_id: String,
+            presig_id: String,
+            presignature_hex: String,
+        }
+        let body: IngestPresigRequest = req.json().await?;
+        if body.session_id.is_empty() || body.presig_id.is_empty() {
+            return Response::error("session_id and presig_id are required", 400);
+        }
+        let presig_bytes = hex::decode(&body.presignature_hex)
+            .map_err(|e| Error::RustError(format!("presignature_hex: {e}")))?;
+        if presig_bytes.is_empty() {
+            return Response::error("presignature_hex is empty", 400);
+        }
+
+        let agent_id = self.identity_hex()?;
+        let store = self.kss_store()?;
+        store.store_presignature(&agent_id, &body.session_id, &body.presig_id, &presig_bytes)?;
+        let pool_count = store.presignature_count(&agent_id)?;
+
+        Response::from_json(&serde_json::json!({
+            "route": "ceremony/ingest-presig",
+            "agent_id": agent_id,
+            "session_id": body.session_id,
+            "presig_id": body.presig_id,
+            "presig_len": presig_bytes.len(),
+            "pool_count": pool_count,
+            "instance_constructed_at_ms": self.instance_constructed_at_ms,
+        }))
+    }
+
+    /// `POST /poc/presig-pool {presignature_hex, sighash_hex}` — #14 deployed
+    /// runtime proof of the full provisioning → consumption → light-sign path
+    /// on the wasm DO. Drains the pool, stocks the posted presignature, consumes
+    /// the oldest (asserting the bytes survive the SQLite hex round-trip
+    /// byte-identical), then issues this party's partial from the *consumed*
+    /// presig. Because `issue_partial_signature` is deterministic, `partial_hex`
+    /// must equal the native `EXPECTED_PARTIAL_HEX` fixture — a 110% byte-
+    /// identical gate that the pool path does not corrupt the presignature.
+    async fn handle_presig_pool(&self, mut req: Request) -> Result<Response> {
+        #[derive(serde::Deserialize)]
+        struct PresigPoolRequest {
+            presignature_hex: String,
+            sighash_hex: String,
+        }
+        let body: PresigPoolRequest = req.json().await?;
+
+        let presig_bytes = hex::decode(&body.presignature_hex)
+            .map_err(|e| Error::RustError(format!("presignature_hex: {e}")))?;
+        let sighash_bytes = hex::decode(&body.sighash_hex)
+            .map_err(|e| Error::RustError(format!("sighash_hex: {e}")))?;
+        if sighash_bytes.len() != 32 {
+            return Response::error("sighash must be 32 bytes", 400);
+        }
+        let mut sighash = [0u8; 32];
+        sighash.copy_from_slice(&sighash_bytes);
+
+        let agent_id = self.identity_hex()?;
+        let store = self.kss_store()?;
+
+        // Drain any leftovers so the proof is deterministic regardless of prior
+        // runs (this is the POC DO; no funded pool to protect).
+        let mut drained = 0u32;
+        while store.consume_presignature(&agent_id)?.is_some() && drained < 1000 {
+            drained += 1;
+        }
+
+        let presig_id = format!("poc-presig-{}", Date::now().as_millis());
+        store.store_presignature(&agent_id, "poc-presig-pool", &presig_id, &presig_bytes)?;
+        let count_after_store = store.presignature_count(&agent_id)?;
+
+        let consumed = store
+            .consume_presignature(&agent_id)?
+            .ok_or_else(|| Error::RustError("pool empty after store".into()))?;
+        let count_after_consume = store.presignature_count(&agent_id)?;
+        let round_trip_matches = consumed == presig_bytes;
+
+        let partial_json = bsv_mpc_core::signing::issue_partial_signature_json(&consumed, &sighash)
+            .map_err(|e| Error::RustError(format!("issue_partial from consumed presig: {e}")))?;
+
+        Response::from_json(&serde_json::json!({
+            "route": "poc/presig-pool",
+            "agent_id": agent_id,
+            "drained_leftovers": drained,
+            "count_after_store": count_after_store,
+            "count_after_consume": count_after_consume,
+            "round_trip_matches": round_trip_matches,
+            "partial_hex": hex::encode(&partial_json),
             "instance_constructed_at_ms": self.instance_constructed_at_ms,
         }))
     }

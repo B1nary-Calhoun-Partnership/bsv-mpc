@@ -167,6 +167,14 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             }
             poc::forward_to_cosigner_do(req, &ctx.env).await
         })
+        // #14: ingest a native-generated presignature into the DO pool (auth'd).
+        .post_async("/ceremony/ingest-presig", |req, ctx| async move {
+            let config = auth::AuthConfig::from_env(&ctx.env)?;
+            if let Err(resp) = auth::verify_or_allow(&req, &config) {
+                return Ok(resp);
+            }
+            poc::forward_to_cosigner_do(req, &ctx.env).await
+        })
         // ── Read-only endpoints (no auth required) ──────────────────
         .get_async("/health", |req, ctx| async move {
             poc::forward_to_cosigner_do(req, &ctx.env).await
@@ -202,6 +210,10 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         // ADR-018: the wasm DO's light online-sign op — issue a partial from a
         // posted presignature. Proves the hybrid hot path on deployed wasm.
         .post_async("/poc/issue-partial", |req, ctx| async move {
+            poc::forward_to_cosigner_do(req, &ctx.env).await
+        })
+        // #14: deployed runtime proof of provision → consume → light-sign.
+        .post_async("/poc/presig-pool", |req, ctx| async move {
             poc::forward_to_cosigner_do(req, &ctx.env).await
         })
         // I-3b2: relay-handshake-from-DO — outbound Socket.IO + BRC-103 +
