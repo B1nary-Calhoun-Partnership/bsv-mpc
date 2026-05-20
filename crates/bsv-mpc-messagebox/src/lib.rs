@@ -43,6 +43,7 @@
 
 pub mod auth;
 pub mod client;
+pub mod engineio;
 pub mod error;
 pub mod http;
 pub mod types;
