@@ -1466,6 +1466,21 @@ pub async fn create_action_impl(state: &AppState, body: Value) -> Value {
             }
         };
 
+        // PRE-FLIGHT (fail-closed): verify the MPC signature under the root key
+        // BEFORE assembling/broadcasting — a bad relay sig must never reach the
+        // network (no sats risked on a malformed signature).
+        match Signature::from_der(&signing_result.signature) {
+            Ok(sig) => {
+                if !sig.is_low_s() {
+                    return json!({"error": format!("input {i}: signature not low-s (BIP-62) — refusing to broadcast")});
+                }
+                if !root_pubkey.verify(&sighash, &sig) {
+                    return json!({"error": format!("input {i}: signature failed pre-flight verify under joint key — refusing to broadcast")});
+                }
+            }
+            Err(e) => return json!({"error": format!("input {i}: invalid DER signature: {e}")}),
+        }
+
         // Build checksig format: DER signature + sighash type byte (0x41)
         let mut sig_checksig = signing_result.signature;
         sig_checksig.push(sighash_type as u8);

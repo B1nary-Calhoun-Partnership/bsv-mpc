@@ -233,7 +233,23 @@ pub async fn run(config: ProxyConfig) -> anyhow::Result<()> {
         presign_manager::background_replenish(bg_state).await;
     });
 
-    let app = Router::new()
+    let app = build_router(state);
+
+    let addr = format!("0.0.0.0:{}", config.port);
+    tracing::info!("MPC Signing Proxy listening on {addr}");
+
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    axum::serve(listener, app).await?;
+
+    Ok(())
+}
+
+/// Build the BRC-100 router for a given [`AppState`].
+///
+/// Shared by [`run`] (the production server) and library consumers / tests that
+/// want to serve a pre-assembled state (e.g., the real-sats createAction gate).
+pub fn build_router(state: Arc<AppState>) -> Router {
+    Router::new()
         // ── Core signing (MPC) ───────────────────────────────────────────
         //
         // These endpoints trigger actual 2PC threshold signing ceremonies
@@ -312,13 +328,5 @@ pub async fn run(config: ProxyConfig) -> anyhow::Result<()> {
         // here after validating this cosigner's SHIP token. See
         // bsv-mpc-overlay/src/chip.rs docs for architecture rationale.
         .route("/capabilities", get(wallet_api::capabilities))
-        .with_state(state);
-
-    let addr = format!("0.0.0.0:{}", config.port);
-    tracing::info!("MPC Signing Proxy listening on {addr}");
-
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
-    axum::serve(listener, app).await?;
-
-    Ok(())
+        .with_state(state)
 }
