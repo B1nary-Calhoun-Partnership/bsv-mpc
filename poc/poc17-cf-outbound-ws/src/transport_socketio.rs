@@ -331,14 +331,16 @@ pub struct AppEvent {
 /// `Peer::listen_for_general_messages` callback id (pass it to
 /// `Peer::stop_listening_for_general_messages` on teardown if needed).
 ///
-/// Why `Peer::listen_for_general_messages` is safe here even though
-/// `Peer::initiate_handshake` is not: the callback registration touches
-/// only `tokio::sync::RwLock<HashMap<...>>` which is runtime-agnostic
-/// (per tokio docs: `tokio::sync::*` works on any executor — verified
-/// empirically in H-3.3b where `Peer::start()` already uses the same
-/// `RwLock`s without panic). The wasm32 blocker is specifically
-/// `tokio::time::timeout` at `~/bsv/bsv-rs/src/auth/peer.rs:681`, which
-/// this path never reaches.
+/// Requires `Peer::start()` to have been called on the same Peer so
+/// the start-callback routes inbound Generals to the
+/// `general_message_callbacks` map this helper subscribes to.
+///
+/// **Requires bsv-rs ≥ 0.3.9** for wasm32 targets. v0.3.8's
+/// `Peer::start()` inbound path calls `session.touch()` →
+/// `current_time_ms()` → `std::time::SystemTime::now()` which panics
+/// on `wasm32-unknown-unknown` (no system-time impl). v0.3.9 cfg-gates
+/// the time call to `js_sys::Date::now()` on wasm32 under the
+/// existing `wasm` feature.
 pub async fn install_app_event_listener<W, T>(
     peer: &bsv::auth::Peer<W, T>,
 ) -> (futures::channel::mpsc::UnboundedReceiver<AppEvent>, u32)
@@ -351,14 +353,6 @@ where
         .listen_for_general_messages(move |sender, payload| {
             let tx = tx.clone();
             Box::pin(async move {
-                // Decode the canonical `{eventName, data}` envelope.
-                // Malformed payloads are dropped (event_name="") rather
-                // than erroring — the inbound path is best-effort by
-                // design (the server's signature has already been
-                // verified by `Peer::process_general_message`
-                // upstream of this callback at
-                // `~/bsv/bsv-rs/src/auth/peer.rs:944`, so any
-                // payload-decode failure is a non-malicious wire bug).
                 let envelope = parse_app_event_payload(&payload);
                 let _ = tx.unbounded_send(AppEvent {
                     sender,

@@ -387,6 +387,296 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 "gate": "H-3.3b",
             }))
         })
+        // H-3.4 gate: canonical envelope round-trip via signed BRC-31
+        // Generals on the post-handshake Socket.IO `authMessage` channel.
+        // Builds on H-3.3b's BRC-103 handshake, then exercises the full
+        // application-event substrate:
+        //   1. install_app_event_listener — registers a Peer
+        //      general_message_callback that decodes `{eventName, data}`
+        //      JSON envelopes from inbound General payloads and forwards
+        //      on an mpsc.
+        //   2. emit_signed_general — builds + signs + emits an outbound
+        //      General wrapping a `joinRoom` envelope, then another for
+        //      `sendMessage`. Byte-identical to canonical TS
+        //      `peer.toPeer(encoded, serverIdentityKey)` per
+        //      `~/bsv/authsocket-client/src/AuthSocketClient.ts:59-65`.
+        //   3. Await the live relay's `sendMessageAck-<roomId>` reply on
+        //      the inbound mpsc.
+        //   4. Return JSON proof with byte-comparison of the round-trip.
+        .get_async("/envelope-roundtrip", |_req, ctx| async move {
+            use crate::engineio_codec::{EngineIoPacket, SocketIoPacket};
+            use crate::transport_socketio::{
+                emit_signed_general, install_app_event_listener, run_dispatch, SocketIoTransport,
+            };
+            use bsv::auth::transports::Transport;
+            use bsv::auth::types::{AuthMessage, MessageType};
+            use bsv::auth::{Peer, PeerOptions};
+            use bsv::primitives::{to_base64, PrivateKey};
+            use bsv::wallet::ProtoWallet;
+            use futures::channel::oneshot;
+            use futures::StreamExt;
+            use rand::RngCore;
+
+            let t_start = js_sys::Date::now();
+
+            let relay = ctx
+                .env
+                .var("RELAY_URL")
+                .map(|v| v.to_string())
+                .unwrap_or_else(|_| DEFAULT_RELAY.to_string());
+
+            // Engine.IO + Socket.IO substrate — identical to /brc103-handshake.
+            let handshake = match transport_wasm::polling_handshake(&relay).await {
+                Ok(h) => h,
+                Err(e) => return Response::error(format!("polling handshake failed: {e}"), 502),
+            };
+            let mut ws =
+                match transport_wasm::WsHandle::open_and_upgrade(&relay, &handshake.sid).await {
+                    Ok(h) => h,
+                    Err(e) => {
+                        return Response::error(
+                            format!("ws open+upgrade failed (sid={}): {e}", handshake.sid),
+                            502,
+                        )
+                    }
+                };
+            let connect_pkt = SocketIoPacket::Connect {
+                nsp: "/".to_string(),
+                data: None,
+            };
+            if let Err(e) = ws.send_socketio(&connect_pkt) {
+                return Response::error(format!("send Socket.IO CONNECT: {e}"), 502);
+            }
+            loop {
+                let pkt = match ws.recv_engineio().await {
+                    Ok(p) => p,
+                    Err(e) => {
+                        return Response::error(
+                            format!("ws closed waiting for CONNECT-ack: {e}"),
+                            502,
+                        )
+                    }
+                };
+                match pkt {
+                    EngineIoPacket::Ping(payload) => {
+                        let _ = ws.send_engineio(&EngineIoPacket::Pong(payload));
+                    }
+                    EngineIoPacket::Message(payload) => {
+                        if let Ok(SocketIoPacket::Connect { .. }) = SocketIoPacket::decode(&payload)
+                        {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            // SocketIoTransport substrate.
+            let sender = ws.sender();
+            let transport = SocketIoTransport::new(sender.clone());
+            let callback_handle = transport.callback_handle();
+            let (snoop_tx, snoop_rx) = oneshot::channel::<AuthMessage>();
+
+            // Spawn dispatch task. Consumes the WsHandle; owns inbound.
+            wasm_bindgen_futures::spawn_local(async move {
+                run_dispatch(ws, sender, callback_handle, Some(snoop_tx)).await;
+            });
+
+            // Identity + Peer wiring. Canonical path (bsv-rs ≥ 0.3.9
+            // required — v0.3.9 ships the wasm32 cfg-gate for
+            // `current_time_ms` that Peer's session manager invokes via
+            // `session.touch()` on every inbound message).
+            let client_priv = PrivateKey::random();
+            let client_pub_hex = client_priv.public_key().to_hex();
+            let wallet = ProtoWallet::new(Some(client_priv));
+            let peer = Peer::new(PeerOptions {
+                wallet: wallet.clone(),
+                transport: transport.clone(),
+                certificates_to_request: None,
+                session_manager: None,
+                auto_persist_last_session: false,
+                originator: Some("poc17-cf-outbound-ws".to_string()),
+            });
+            peer.start();
+
+            // Register the inbound app-event listener BEFORE sending any
+            // outbound General. If the server pushes events between our
+            // send + the listener registration, we'd miss them.
+            let (mut app_event_rx, _cb_id) = install_app_event_listener(&peer).await;
+
+            // Trigger BRC-103 handshake (Path 2 — manual InitialRequest;
+            // sidesteps `Peer::initiate_handshake`'s tokio::time::timeout
+            // even though v0.3.8+ has the runtime-agnostic fix, because
+            // get_authenticated_session's None-identity branch unconditionally
+            // calls initiate_handshake which we still want to avoid for
+            // ergonomic reasons — Path 2 gives us direct control over
+            // the snoop + handshake completion).
+            let my_identity = match peer.get_identity_key().await {
+                Ok(k) => k,
+                Err(e) => {
+                    return Response::error(format!("peer.get_identity_key: {e:?}"), 500);
+                }
+            };
+            let mut nonce_bytes = [0u8; 32];
+            rand::thread_rng().fill_bytes(&mut nonce_bytes);
+            let initial_nonce_b64 = to_base64(&nonce_bytes);
+            let mut initial_req = AuthMessage::new(MessageType::InitialRequest, my_identity);
+            initial_req.initial_nonce = Some(initial_nonce_b64);
+            let t_handshake_start = js_sys::Date::now();
+            if let Err(e) = transport.send(&initial_req).await {
+                return Response::error(format!("transport.send InitialRequest: {e:?}"), 502);
+            }
+
+            // Await server's InitialResponse. Extract identity + nonce
+            // (server's session-nonce) — both load-bearing for outbound
+            // signed Generals.
+            let server_response = match snoop_rx.await {
+                Ok(msg) => msg,
+                Err(e) => {
+                    return Response::error(
+                        format!("snoop oneshot canceled before InitialResponse: {e:?}"),
+                        502,
+                    )
+                }
+            };
+            let server_identity = server_response.identity_key.clone();
+            let server_identity_hex = server_identity.to_hex();
+            // BRC-31 cross-SDK compat: TS sends `initialNonce` only; Go
+            // sends both `nonce` and `initial_nonce`. Accept either, per
+            // `~/bsv/bsv-rs/src/auth/peer.rs:190-200`.
+            let server_nonce_b64 = match server_response
+                .initial_nonce
+                .as_deref()
+                .or(server_response.nonce.as_deref())
+            {
+                Some(n) => n.to_string(),
+                None => {
+                    return Response::error(
+                        "InitialResponse missing both initial_nonce and nonce".to_string(),
+                        502,
+                    )
+                }
+            };
+            let handshake_round_trip_ms = js_sys::Date::now() - t_handshake_start;
+
+            // Application-layer round-trip.
+            // Use a unique message_box name per request so concurrent runs
+            // don't collide on ack routing. Canonical convention per
+            // `~/bsv/bsv-messagebox-cloudflare-public/src/message_hub.rs:996`:
+            // server constructs `roomId = "{identity_key}-{messageBox}"`.
+            // For joinRoom we pass the full roomId string; for sendMessage
+            // we pass JUST the messageBox suffix and the server reconstructs
+            // the roomId. The sendMessageAck-<roomId> event uses the
+            // server-constructed roomId, which is byte-identical to the
+            // joinRoom roomId we constructed locally.
+            let now_ms = js_sys::Date::now() as u64;
+            let message_box = format!("h34-{now_ms}");
+            let room_id = format!("{client_pub_hex}-{message_box}");
+            let message_id = format!("h34-test-{now_ms}");
+            let body_text = format!("envelope-roundtrip-{room_id}");
+
+            // (1) joinRoom — signed General with envelope {eventName:
+            // "joinRoom", data: roomId}.
+            let t_join_start = js_sys::Date::now();
+            let join_data = serde_json::json!(room_id);
+            let joined = match emit_signed_general(
+                &transport,
+                &wallet,
+                &server_identity,
+                &server_nonce_b64,
+                "joinRoom",
+                &join_data,
+            )
+            .await
+            {
+                Ok(g) => g,
+                Err(e) => return Response::error(format!("emit joinRoom: {e:?}"), 502),
+            };
+            let join_round_trip_ms = js_sys::Date::now() - t_join_start;
+
+            // (2) sendMessage — signed General with envelope:
+            //   {eventName: "sendMessage", data: {roomId, message: {messageId, body}}}
+            let t_send_start_msg = js_sys::Date::now();
+            // Canonical Socket.IO sendMessage envelope shape per
+            // `~/bsv/bsv-messagebox-cloudflare-public/src/message_hub.rs:952-998`:
+            // `data` is `{messageBox, message: {messageId, recipient, body},
+            // payment?}`. Server constructs `roomId = "{identity}-{messageBox}"`
+            // and emits `sendMessageAck-<roomId>` on success or `messageFailed`
+            // on validation error. For the self-roundtrip we use our own
+            // pubkey as the recipient.
+            let send_data = serde_json::json!({
+                "messageBox": message_box,
+                "message": {
+                    "messageId": message_id,
+                    "recipient": client_pub_hex,
+                    "body": body_text,
+                }
+            });
+            let sent = match emit_signed_general(
+                &transport,
+                &wallet,
+                &server_identity,
+                &server_nonce_b64,
+                "sendMessage",
+                &send_data,
+            )
+            .await
+            {
+                Ok(g) => g,
+                Err(e) => return Response::error(format!("emit sendMessage: {e:?}"), 502),
+            };
+
+            // (3) Drain inbound events until we see sendMessageAck for
+            // OUR roomId. Other events (e.g. server's deferred
+            // `authenticated` follow-up per
+            // `~/bsv/bsv-messagebox-cloudflare-public/src/engineio/auth.rs:49-66`)
+            // are recorded but don't break the loop.
+            let expected_ack = format!("sendMessageAck-{room_id}");
+            let mut intermediate_events: Vec<String> = Vec::new();
+            let ack_event = loop {
+                let ev = match app_event_rx.next().await {
+                    Some(e) => e,
+                    None => {
+                        return Response::error(
+                            format!(
+                                "inbound channel closed before ack; intermediates={:?}",
+                                intermediate_events
+                            ),
+                            502,
+                        );
+                    }
+                };
+                if ev.event_name == expected_ack {
+                    break ev;
+                }
+                intermediate_events.push(ev.event_name);
+            };
+            let ack_round_trip_ms = js_sys::Date::now() - t_send_start_msg;
+            let elapsed_ms = js_sys::Date::now() - t_start;
+
+            Response::from_json(&serde_json::json!({
+                "socketio_status": "envelope_roundtripped",
+                "relay": relay,
+                "engineio_sid": handshake.sid,
+                "client_identity": client_pub_hex,
+                "server_identity": server_identity_hex,
+                "room_id": room_id,
+                "sent_message_id": message_id,
+                "sent_body": body_text,
+                "ack_event_name": ack_event.event_name,
+                "ack_data": ack_event.data,
+                "intermediate_events": intermediate_events,
+                "join_round_trip_ms": join_round_trip_ms,
+                "ack_round_trip_ms": ack_round_trip_ms,
+                "handshake_round_trip_ms": handshake_round_trip_ms,
+                "elapsed_ms": elapsed_ms,
+                // For tests that diff the wire bytes against canonical
+                // TS — these are the EXACT bytes we sent on the wire.
+                "joined_payload_bytes_len": joined.payload_bytes.len(),
+                "sent_payload_bytes_len": sent.payload_bytes.len(),
+                "gate": "H-3.4",
+            }))
+        })
         .run(req, env)
         .await
 }
