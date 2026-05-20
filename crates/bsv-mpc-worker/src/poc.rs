@@ -74,6 +74,7 @@ impl DurableObject for CosignerSessionDo {
             "/poc/persist" => self.handle_persist().await,
             "/poc/share-roundtrip" => self.handle_share_roundtrip().await,
             "/poc/dkg-bench" => self.handle_dkg_bench(req).await,
+            "/poc/issue-partial" => self.handle_issue_partial(req).await,
             "/poc/handshake" => self.handle_handshake().await,
             // ── KSS routes (I-4a.2: storage-backed by this DO's SQLite) ──
             // Auth is enforced at the Worker entrypoint before forwarding.
@@ -388,6 +389,42 @@ impl CosignerSessionDo {
             "total_ms": Date::now().as_millis() - t0,
             "joint_pubkey": done0.as_ref().map(|d| hex::encode(&d.joint_key.compressed)),
             "note": "2-party DKG in ONE wasm isolate (~2x per-party); Blum seeded primes",
+        }))
+    }
+
+    /// `POST /poc/issue-partial {presignature_hex, sighash_hex}` — proves the
+    /// ADR-018 wasm DO light-sign op on the **deployed** worker: deserialize a
+    /// cggmp24 `Presignature` (hex of its serde JSON), issue this party's
+    /// partial signature, return it (hex of serde JSON). Pure field math — the
+    /// hot path that must fit the CF Worker budget. (POC: the presignature is
+    /// posted; production reads it from the DO `mpc_presignatures` pool.)
+    async fn handle_issue_partial(&self, mut req: Request) -> Result<Response> {
+        #[derive(serde::Deserialize)]
+        struct IssuePartialRequest {
+            presignature_hex: String,
+            sighash_hex: String,
+        }
+        let body: IssuePartialRequest = req.json().await?;
+
+        let presig_json = hex::decode(&body.presignature_hex)
+            .map_err(|e| Error::RustError(format!("presignature_hex: {e}")))?;
+        let sighash_bytes = hex::decode(&body.sighash_hex)
+            .map_err(|e| Error::RustError(format!("sighash_hex: {e}")))?;
+        if sighash_bytes.len() != 32 {
+            return Response::error("sighash must be 32 bytes", 400);
+        }
+        let mut sighash = [0u8; 32];
+        sighash.copy_from_slice(&sighash_bytes);
+
+        let partial_json =
+            bsv_mpc_core::signing::issue_partial_signature_json(&presig_json, &sighash)
+                .map_err(|e| Error::RustError(format!("issue_partial: {e}")))?;
+
+        Response::from_json(&serde_json::json!({
+            "route": "poc/issue-partial",
+            "ok": true,
+            "partial_hex": hex::encode(&partial_json),
+            "instance_constructed_at_ms": self.instance_constructed_at_ms,
         }))
     }
 

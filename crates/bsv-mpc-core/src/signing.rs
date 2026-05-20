@@ -1555,6 +1555,52 @@ mod tests {
         );
     }
 
+    /// Fixture printer for the **deployed** `/poc/issue-partial` proof.
+    /// `issue_partial_signature` is deterministic (the randomness was consumed
+    /// at presig generation), so the deployed wasm worker must return a
+    /// byte-identical partial. Run with `--ignored --nocapture`, then POST
+    /// `PRESIG_A_HEX`/`SIGHASH_HEX` to the worker and assert the returned
+    /// `partial_hex == EXPECTED_PARTIAL_HEX`.
+    #[tokio::test]
+    #[ignore = "fixture printer for the deployed /poc/issue-partial proof"]
+    async fn print_issue_partial_fixture() {
+        let key_shares = dkg_key_shares(2, 2);
+        let participants: Vec<u16> = vec![0, 1];
+        let mut rng = rand::rngs::OsRng;
+        let eid_bytes: [u8; 32] = rand::Rng::gen(&mut rng);
+        let eid_presign = ExecutionId::new(&eid_bytes);
+        let presigs = round_based::sim::run_with_setup(
+            participants.iter().map(|i| &key_shares[usize::from(*i)]),
+            |i, party, share| {
+                let party = buffer_outgoing(party);
+                let mut party_rng = rand::rngs::OsRng;
+                let participants = participants.clone();
+                async move {
+                    cggmp24::signing(eid_presign, i, &participants, share)
+                        .generate_presignature(&mut party_rng, party)
+                        .await
+                }
+            },
+        )
+        .unwrap()
+        .expect_ok()
+        .into_vec();
+
+        let (presig_a, _) = presigs.into_iter().next().unwrap();
+        let presig_a_json = serde_json::to_vec(&presig_a).unwrap();
+        let sighash: [u8; 32] = {
+            let mut h = sha2::Sha256::new();
+            h.update(b"deployed issue-partial fixture v1");
+            let mut b = [0u8; 32];
+            b.copy_from_slice(&h.finalize());
+            b
+        };
+        let expected = issue_partial_signature_json(&presig_a_json, &sighash).unwrap();
+        println!("PRESIG_A_HEX={}", hex::encode(&presig_a_json));
+        println!("SIGHASH_HEX={}", hex::encode(sighash));
+        println!("EXPECTED_PARTIAL_HEX={}", hex::encode(&expected));
+    }
+
     /// ADR-018 hybrid sign topology: the **wasm DO** issues its partial from a
     /// *serialized* `Presignature` (no public data) via
     /// [`issue_partial_signature_json`], and the **native proxy** combines (it

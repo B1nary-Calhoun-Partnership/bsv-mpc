@@ -199,6 +199,11 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         .get_async("/poc/dkg-bench", |req, ctx| async move {
             poc::forward_to_cosigner_do(req, &ctx.env).await
         })
+        // ADR-018: the wasm DO's light online-sign op — issue a partial from a
+        // posted presignature. Proves the hybrid hot path on deployed wasm.
+        .post_async("/poc/issue-partial", |req, ctx| async move {
+            poc::forward_to_cosigner_do(req, &ctx.env).await
+        })
         // I-3b2: relay-handshake-from-DO — outbound Socket.IO + BRC-103 +
         // envelope round-trip against the live MessageBox relay, driven from
         // inside the per-identity CosignerSessionDo (wasm32 transport).
