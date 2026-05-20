@@ -16,10 +16,11 @@
 //! - **Send-side** ([`http::send_message`]): wraps an [`envelope::MessageEnvelope`]
 //!   in a MessageBox JSON body, posts to `POST /sendMessage` with BRC-31
 //!   mutual auth headers.
-//! - **Receive-side** ([`ws::subscribe`]): connects to `/ws` (raw WebSocket
-//!   on the Calhoun relay; Socket.IO/EngineIO on Binary's relay — both
-//!   surface the same `{event, data}` JSON event envelope), subscribes to
-//!   the caller's identity inbox, yields decoded envelopes as a `Stream`.
+//! - **Receive-side** ([`subscribe::subscribe`]): connects over a
+//!   Socket.IO and BRC-103 channel (signed `joinRoom`/`sendMessage`
+//!   Generals via the upstream `bsv::auth::SocketIoTransport`),
+//!   subscribes to the caller's identity inbox, and yields decoded
+//!   envelopes as a `Stream`.
 //! - **Fallback** ([`http::list_messages`]): HTTP polling of `/listMessages`
 //!   for environments without WS or for backfill after WS reconnect (§06.12).
 //!

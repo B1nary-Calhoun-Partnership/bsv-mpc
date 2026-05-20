@@ -4,12 +4,13 @@
 //!
 //! Composes the lower-level modules in this crate:
 //!
-//! - [`crate::auth::MessageBoxAuth`] — BRC-31 mutual auth (HTTP routes
-//!   via `bsv-rs::Peer + SimplifiedFetchTransport`; WS upgrade via the
-//!   one-shot `/.well-known/auth` handshake — see `auth.rs` docs).
+//! - [`crate::auth::MessageBoxAuth`] — BRC-31 mutual auth for the HTTP
+//!   routes via `bsv-rs::Peer + SimplifiedFetchTransport`.
 //! - [`crate::http`] — `POST /sendMessage`, `POST /listMessages`,
 //!   `POST /acknowledgeMessage`.
-//! - [`crate::ws`] — `/ws` subscribe with §06.12 reconnect + heartbeat.
+//! - [`crate::subscribe`] — Socket.IO + BRC-103 live subscribe (signed
+//!   `joinRoom`/`sendMessage` Generals over the upstream
+//!   `bsv::auth::SocketIoTransport`) with §06.12 reconnect + backfill.
 //! - [`crate::wire`] — canonical CBOR envelope ↔ MessageBox body wrap.
 //!
 //! The crate-root re-exports both this `MessageBoxClient` API and the
