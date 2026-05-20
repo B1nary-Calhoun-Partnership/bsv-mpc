@@ -331,6 +331,19 @@ impl DkgCoordinator {
         self.pregenerated_primes = Some(primes);
     }
 
+    /// Set pregenerated primes from their serde-JSON form — the shape used to
+    /// seed primes into a deployed wasm32 cosigner (which can't generate safe
+    /// primes within the CF Worker CPU budget). The JSON is the
+    /// `serde_json` encoding of `cggmp24::PregeneratedPrimes<SecurityLevel128>`.
+    ///
+    /// Must be called before `init()`.
+    pub fn set_pregenerated_primes_from_json(&mut self, json: &str) -> Result<()> {
+        let primes: cggmp24::PregeneratedPrimes<SecurityLevel128> = serde_json::from_str(json)
+            .map_err(|e| MpcError::Serialization(format!("PregeneratedPrimes JSON: {e}")))?;
+        self.pregenerated_primes = Some(primes);
+        Ok(())
+    }
+
     /// Pull pre-generated Paillier primes from a [`PaillierPool`] and stash
     /// them for the auxinfo phase. If the pool is empty, this is a no-op
     /// and the auxinfo phase falls back to inline `safe_primes::generate()`.
@@ -979,6 +992,33 @@ mod tests {
         assert_eq!(coord.config().parties, 3);
         assert_eq!(coord.my_index(), ShareIndex(0));
         assert_eq!(coord.phase(), "not_started");
+    }
+
+    #[test]
+    fn set_pregenerated_primes_from_json_round_trips() {
+        // The off-worker seed transport: primes → serde JSON → into a fresh
+        // coordinator. Uses fast Blum test primes (real seeding uses safe
+        // primes from `PregeneratedPrimes::generate`). Proves the wasm cosigner
+        // can reload seeded primes (I-4b).
+        let primes = generate_test_primes(&mut rand::rngs::OsRng);
+        let json = serde_json::to_string(&primes).expect("serialize primes");
+
+        let config = ThresholdConfig::new(2, 2).unwrap();
+        let session = SessionId::from_str_hash("primes-json");
+        let mut coord = DkgCoordinator::new(session, config, ShareIndex(0));
+        assert!(coord.pregenerated_primes.is_none());
+
+        coord
+            .set_pregenerated_primes_from_json(&json)
+            .expect("load primes from json");
+        assert!(coord.pregenerated_primes.is_some());
+
+        // Malformed JSON is a clean Serialization error, not a panic.
+        let mut coord2 = DkgCoordinator::new(session, config, ShareIndex(0));
+        let err = coord2
+            .set_pregenerated_primes_from_json("not json")
+            .unwrap_err();
+        assert!(matches!(err, MpcError::Serialization(_)));
     }
 
     #[test]
