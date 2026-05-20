@@ -52,6 +52,8 @@ cggmp24 fork change required**; the DO ships/needs only `Presignature` (which IS
 | `a60155b` | `/poc/issue-partial` deployed | **deployed-wasm partial byte-identical to native** |
 | `f94eadd`/`5ee6547` | CF Container probe P1 | **native Rust on CF Container reachable** (~1.75s cold/~130ms warm) |
 | `d6ccf57` | **#14 presig provisioning** — `/ceremony/ingest-presig` (authed, stores under the DO's own identity) + `/poc/presig-pool` | **deployed proof:** pool store→consume **byte-identical** (`round_trip_matches=true`, count 1→0), partial from the *consumed* presig byte-identical to native fixture (`…d2c14a`) |
+| `c0c9fbf` | **#15 Part A** DO relay sign loop — `/poc/sign-relay` (consume→issue→wrap §05→relay→self round-trip) | **deployed proof:** `sent=true`, `received_back=true`, `partial_roundtrip_matches=true`, partial byte-identical to fixture; full wrap→relay→strict-decode→unwrap on deployed wasm; `/poc/handshake` re-checked green |
+| `5f26db9` | **#15 Part B (I-4b.2 gate)** native combiner harness `sign_relay_deployed_e2e.rs` | **deployed DO co-signs over the LIVE relay → BSV-valid 2-of-2 sig** (combiner received party-0 partial from DO `03cc87ed…`, combined → 70-byte DER under joint pubkey, **no sats**). Local pure-crypto control also PASS |
 
 **Deployed worker:** `https://bsv-mpc-kss.dev-a3e.workers.dev`.
 **Container probe:** `https://bsv-mpc-container-probe.dev-a3e.workers.dev`.
@@ -84,10 +86,15 @@ cggmp24 fork change required**; the DO ships/needs only `Presignature` (which IS
    actually POST to `/ceremony/ingest-presig` after each presig gen (couples to
    the proxy `bridge.rs` migration, #12). The DO `consume` is wired into the
    sign loop in step 2.
-2. **Worker relay sign loop** (task #15, I-4b.2 revised). DO: wake-on-HTTP → dial
-   relay (I-3b2 proven) → pop a presig → `issue_partial_signature_json` → send
-   the partial over the relay. Wire: `wire::wrap_envelope_to_body` /
-   `unwrap_envelope_to_round_message`, box `mpc-sign`, room `{id}-mpc-sign`.
+2. ~~**Worker relay sign loop** (task #15, I-4b.2)~~ **✅ DONE (`c0c9fbf` +
+   `5f26db9`).** `/poc/sign-relay`: DO consumes a presig → issues its partial →
+   wraps it as a canonical §05 `MessageEnvelope` → dials the relay → sends to the
+   recipient on box `mpc-sign` (room `{recipient}-mpc-sign`). The **deployed DO
+   co-signs over the live relay → BSV-valid 2-of-2 signature** (native combiner
+   harness `sign_relay_deployed_e2e.rs`, `SIGN_RELAY_E2E=1`, no sats).
+   **REMAINING:** the production path is the `/poc/sign-relay` route; folding it
+   into an authed, wake-on-HTTP production endpoint couples to the proxy
+   `bridge.rs` migration (#12) and I-5.
 3. **CF Container P2** (task #17). Swap the probe image for the full
    `bsv-mpc-service` build (Dockerfile at workspace root, `cargo build --release
    -p bsv-mpc-service`; heavy ~5-15min compile; needs `git` + network for the
@@ -151,10 +158,10 @@ cggmp24 fork change required**; the DO ships/needs only `Presignature` (which IS
   orchestrate research, then VERIFY agent output.
 
 ---
-**Last commit:** `d6ccf57` (#14 presig provisioning, deployed-proven). **Next
-pickup:** the worker relay sign loop (#15) — DO wake-on-HTTP → dial relay
-(I-3b2 proven) → `consume_presignature` → `issue_partial_signature_json` → send
-the partial over the relay (`wire::wrap_envelope_to_body`, box `mpc-sign`, room
-`{id}-mpc-sign`). The DO consume side is in place; #15 wires it to the relay.
-Alternatively CF Container P2 (#17) on the container track. The crypto is
-locked; build the integration on top.
+**Last commit:** `5f26db9` (#15 I-4b.2 — deployed DO co-signs over the live
+relay → BSV-valid 2-of-2, no sats). **Next pickup:** CF Container P2 (#17, the
+heavy native presig-gen home) **or** the proxy `bridge.rs` HTTP→relay migration
+(#12, makes the proxy the real combiner). Then close the #5 security must-fixes
+(handler authz + auth-session-isolate) and land I-5 (#16, real-sats TXID) — the
+hybrid sign path is now end-to-end proven; I-5 just swaps test key shares for a
+funded DKG joint key and broadcasts. The crypto + relay transport are locked.
