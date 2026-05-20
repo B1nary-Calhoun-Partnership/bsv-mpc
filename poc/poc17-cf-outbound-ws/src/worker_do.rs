@@ -28,7 +28,31 @@
 //!   hibernate DOs; every H-3.5 sub-gate proof is `wrangler deploy` +
 //!   `curl` against the deployed worker URL.
 
+use serde::{Deserialize, Serialize};
 use worker::*;
+
+/// Storage key under `state.storage()` where the persisted BRC-103
+/// session telemetry lives. Single key per DO instance.
+const STORAGE_KEY_BRC103_SESSION: &str = "brc103_session";
+
+/// BRC-103 session telemetry persisted to `state.storage()` after every
+/// successful handshake. H-3.5 plan §"Refined: what we DO persist":
+/// telemetry-only (last_known_peer_identity_hex + persisted_at_ms +
+/// relay_url), NOT the full `PeerSession`. Strategy 1 (re-handshake on
+/// every wake) means cached session nonces are useless across DO
+/// eviction — the relay's per-sid `SessionState` resets too. We persist
+/// peer_identity_hex purely as a "did the relay's identity flip
+/// under us" sanity check across wake cycles, and persisted_at_ms for
+/// ops dashboards / hibernation diagnostics.
+///
+/// Size ~200 bytes (66 hex chars + small scalar + relay URL). Well under
+/// any storage cap.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct PersistedBrc103Session {
+    last_known_peer_identity_hex: String,
+    persisted_at_ms: u64,
+    relay_url: String,
+}
 
 /// The Durable Object class. One instance per cosigner identity (per
 /// audit §11.1).
@@ -71,8 +95,9 @@ struct EstablishedSession {
 impl EngineIoSessionDo {
     /// `GET /relay-via-do/identity` — returns this DO's stable
     /// `client_identity` pubkey hex derived from the `SERVER_PRIVATE_KEY`
-    /// secret. Two consecutive curls MUST return the same hex (H-3.5a
-    /// empirical bar). Does NOT touch the network.
+    /// secret, plus any persisted BRC-103 session telemetry from
+    /// `state.storage()` (H-3.5d). Does NOT touch the network or
+    /// re-write storage — reading the persisted record is idempotent.
     async fn handle_identity(&self) -> Result<Response> {
         let priv_hex = self
             .env
@@ -93,12 +118,23 @@ impl EngineIoSessionDo {
         })?;
         let client_pub_hex = client_priv.public_key().to_hex();
 
+        // H-3.5d: surface the last-handshake telemetry from
+        // state.storage. None until the first successful handshake.
+        let persisted: Option<PersistedBrc103Session> = self
+            .state
+            .storage()
+            .get(STORAGE_KEY_BRC103_SESSION)
+            .await
+            .ok()
+            .flatten();
+
         Response::from_json(&serde_json::json!({
             "socketio_status": "do_identity",
             "do_id": self.state.id().to_string(),
             "do_name": "cosigner-test-1",
             "client_identity": client_pub_hex,
-            "gate": "H-3.5a",
+            "persisted_session": persisted,
+            "gate": "H-3.5d",
         }))
     }
 
@@ -365,6 +401,48 @@ impl EngineIoSessionDo {
             })?
             .to_string();
         let handshake_round_trip_ms = js_sys::Date::now() - t_send_start;
+
+        // H-3.5d: persist BRC-103 telemetry. Read existing record first
+        // so the sanity-check "did the relay's identity flip" warning
+        // fires before we overwrite. The check is log-only — a re-keyed
+        // relay is a LEGITIMATE state (e.g., key rotation); we proceed
+        // either way. Strategy 1 means we don't reuse the cached session,
+        // so no need to compare nonces.
+        let new_server_identity_hex = server_identity.to_hex();
+        let existing: Option<PersistedBrc103Session> = self
+            .state
+            .storage()
+            .get(STORAGE_KEY_BRC103_SESSION)
+            .await
+            .ok()
+            .flatten();
+        if let Some(ref prev) = existing {
+            if prev.last_known_peer_identity_hex != new_server_identity_hex {
+                console_warn!(
+                    "H-3.5d: relay identity flipped under us! prev={} new={} (proceeding — possible relay rotation)",
+                    prev.last_known_peer_identity_hex,
+                    new_server_identity_hex,
+                );
+            }
+        }
+        let snapshot = PersistedBrc103Session {
+            last_known_peer_identity_hex: new_server_identity_hex.clone(),
+            persisted_at_ms: js_sys::Date::now() as u64,
+            relay_url: relay.clone(),
+        };
+        if let Err(e) = self
+            .state
+            .storage()
+            .put(STORAGE_KEY_BRC103_SESSION, &snapshot)
+            .await
+        {
+            // Non-fatal — the handshake itself succeeded, so the route
+            // can still return its JSON proof. Persist failure surfaces
+            // in DO logs for ops follow-up.
+            console_warn!(
+                "H-3.5d: state.storage.put(brc103_session) failed: {e:?} (handshake proceeded)"
+            );
+        }
 
         Ok(EstablishedSession {
             transport,
