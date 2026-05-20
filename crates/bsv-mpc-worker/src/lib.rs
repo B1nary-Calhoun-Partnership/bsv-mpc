@@ -216,6 +216,11 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         .post_async("/poc/presig-pool", |req, ctx| async move {
             poc::forward_to_cosigner_do(req, &ctx.env).await
         })
+        // #15 (I-4b.2): DO relay sign loop — issue partial → wrap §05 → send
+        // over the live relay (self-addressed round-trip proof when no recipient).
+        .post_async("/poc/sign-relay", |req, ctx| async move {
+            poc::forward_to_cosigner_do(req, &ctx.env).await
+        })
         // I-3b2: relay-handshake-from-DO — outbound Socket.IO + BRC-103 +
         // envelope round-trip against the live MessageBox relay, driven from
         // inside the per-identity CosignerSessionDo (wasm32 transport).

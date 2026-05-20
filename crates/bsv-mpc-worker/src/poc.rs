@@ -76,6 +76,7 @@ impl DurableObject for CosignerSessionDo {
             "/poc/dkg-bench" => self.handle_dkg_bench(req).await,
             "/poc/issue-partial" => self.handle_issue_partial(req).await,
             "/poc/presig-pool" => self.handle_presig_pool(req).await,
+            "/poc/sign-relay" => self.handle_sign_relay(req).await,
             "/poc/handshake" => self.handle_handshake().await,
             // ── KSS routes (I-4a.2: storage-backed by this DO's SQLite) ──
             // Auth is enforced at the Worker entrypoint before forwarding.
@@ -748,6 +749,302 @@ impl CosignerSessionDo {
             "instance_constructed_at_ms": self.instance_constructed_at_ms,
         }))
     }
+
+    /// `POST /poc/sign-relay` — #15 (I-4b.2) the wasm DO's relay sign loop.
+    /// Consumes a presignature from the pool, issues this party's partial
+    /// (`issue_partial_signature_json`), wraps it as a canonical §05
+    /// `MessageEnvelope` (BRC-78 ECIES to the recipient + BRC-31 outer sig),
+    /// dials the live MessageBox relay (the I-3b2-proven path), and sends the
+    /// wrapped partial to `recipient` on box `mpc-sign`.
+    ///
+    /// Request body:
+    /// - `presignature_hex`, `sighash_hex` — as `/poc/presig-pool` (#14).
+    /// - `recipient_pub_hex` (optional) — the combiner identity. **Defaults to
+    ///   this DO's own identity**, in which case the DO joins its own
+    ///   `{id}-mpc-sign` room, receives the wrapped partial back over the relay,
+    ///   unwraps it (BRC-78 decrypt + BRC-31 verify), and asserts the recovered
+    ///   partial is byte-identical to the issued one — a deterministic, curl-
+    ///   only proof of the full wrap → relay → unwrap path on deployed wasm.
+    /// - `from_index`/`to_index` (optional, default 0/1) — signing-time indices;
+    ///   the combiner keys the partial by `from_index`.
+    /// - `joint_pubkey_hex` (optional, 33-byte) — envelope field 3.
+    /// - `session_id_hex` (optional, 32-byte).
+    ///
+    /// For an external combiner (`recipient_pub_hex` ≠ self) the DO only sends;
+    /// the combiner's receive+combine is proven by the native harness (Part B).
+    async fn handle_sign_relay(&self, mut req: Request) -> Result<Response> {
+        use bsv::auth::transports::socketio::build_envelope_payload;
+        use bsv::auth::transports::socketio::codec::{EngineIoPacket, SocketIoPacket};
+        use bsv::auth::{
+            install_app_event_listener, run_dispatch, Peer, PeerOptions, SocketIoFrameSource,
+            SocketIoSink, SocketIoTransport,
+        };
+        use bsv::primitives::ec::PublicKey;
+        use bsv::wallet::ProtoWallet;
+        use bsv_mpc_core::envelope::{
+            unwrap_envelope_to_round_message, wrap_round_message, WrapParams,
+        };
+        use bsv_mpc_core::types::{RoundMessage, SessionId, ShareIndex};
+        use bsv_mpc_messagebox::transport_wasm::{polling_handshake, WsHandle};
+        use bsv_mpc_messagebox::types::BOX_SIGN;
+        use bsv_mpc_messagebox::wire::{unwrap_body_to_envelope, wrap_envelope_to_body};
+        use futures::future::{select, Either};
+        use futures::StreamExt;
+        use serde_json::json;
+        use std::time::Duration;
+        use wasm_bindgen_futures::spawn_local;
+
+        #[derive(serde::Deserialize)]
+        struct SignRelayRequest {
+            presignature_hex: String,
+            sighash_hex: String,
+            #[serde(default)]
+            recipient_pub_hex: Option<String>,
+            #[serde(default)]
+            from_index: Option<u16>,
+            #[serde(default)]
+            to_index: Option<u16>,
+            #[serde(default)]
+            joint_pubkey_hex: Option<String>,
+            #[serde(default)]
+            session_id_hex: Option<String>,
+        }
+        let body: SignRelayRequest = req.json().await?;
+
+        // ── 1. Decode inputs ────────────────────────────────────────────
+        let presig_bytes = hex::decode(&body.presignature_hex)
+            .map_err(|e| Error::RustError(format!("presignature_hex: {e}")))?;
+        let sighash_bytes = hex::decode(&body.sighash_hex)
+            .map_err(|e| Error::RustError(format!("sighash_hex: {e}")))?;
+        if sighash_bytes.len() != 32 {
+            return Response::error("sighash must be 32 bytes", 400);
+        }
+        let mut sighash = [0u8; 32];
+        sighash.copy_from_slice(&sighash_bytes);
+
+        let from_index = body.from_index.unwrap_or(0);
+        let to_index = body.to_index.unwrap_or(1);
+
+        let joint_pubkey = match &body.joint_pubkey_hex {
+            Some(h) => {
+                let b = hex::decode(h)
+                    .map_err(|e| Error::RustError(format!("joint_pubkey_hex: {e}")))?;
+                if b.len() != 33 {
+                    return Response::error("joint_pubkey_hex must be 33 bytes", 400);
+                }
+                let mut a = [0u8; 33];
+                a.copy_from_slice(&b);
+                a
+            }
+            None => [0u8; 33],
+        };
+
+        let session_id = match &body.session_id_hex {
+            Some(h) => {
+                let b =
+                    hex::decode(h).map_err(|e| Error::RustError(format!("session_id_hex: {e}")))?;
+                if b.len() != 32 {
+                    return Response::error("session_id_hex must be 32 bytes", 400);
+                }
+                let mut a = [0u8; 32];
+                a.copy_from_slice(&b);
+                SessionId(a)
+            }
+            None => SessionId::from_str_hash("poc-sign-relay"),
+        };
+
+        // ── 2. Identity (reloaded every wake) ───────────────────────────
+        let priv_hex = self.env.secret("SERVER_PRIVATE_KEY")?.to_string();
+        let client_priv = PrivateKey::from_hex(&priv_hex)
+            .map_err(|e| Error::RustError(format!("SERVER_PRIVATE_KEY parse: {e:?}")))?;
+        let client_pub_hex = client_priv.public_key().to_hex();
+        let recipient_pub_hex = body
+            .recipient_pub_hex
+            .clone()
+            .unwrap_or_else(|| client_pub_hex.clone());
+        let is_self = recipient_pub_hex == client_pub_hex;
+        let recipient_pub = PublicKey::from_hex(&recipient_pub_hex)
+            .map_err(|e| Error::RustError(format!("recipient_pub_hex: {e:?}")))?;
+
+        // ── 3. Pool: stock + consume, then issue this party's partial ────
+        let agent_id = client_pub_hex.clone();
+        let store = self.kss_store()?;
+        let presig_id = format!("poc-sign-relay-{}", Date::now().as_millis());
+        store.store_presignature(&agent_id, "poc-sign-relay", &presig_id, &presig_bytes)?;
+        let consumed = store
+            .consume_presignature(&agent_id)?
+            .ok_or_else(|| Error::RustError("pool empty after store".into()))?;
+        let round_trip_matches = consumed == presig_bytes;
+        let partial_json = bsv_mpc_core::signing::issue_partial_signature_json(&consumed, &sighash)
+            .map_err(|e| Error::RustError(format!("issue_partial: {e}")))?;
+
+        // ── 4. Wrap the partial as a canonical §05 MessageEnvelope ───────
+        let round_msg = RoundMessage {
+            session_id,
+            round: 1,
+            from: ShareIndex(from_index),
+            to: Some(ShareIndex(to_index)),
+            payload: partial_json.clone(),
+        };
+        let params = WrapParams {
+            to_party: to_index,
+            joint_pubkey,
+            phase: "sign".to_string(),
+            execution_id_prefix: [0u8; 8],
+            correlation_id: Some(session_id.hex()),
+            traceparent: None,
+        };
+        let envelope = wrap_round_message(&round_msg, params, &recipient_pub, &client_priv)
+            .map_err(|e| Error::RustError(format!("wrap_round_message: {e}")))?;
+        let envelope_body = wrap_envelope_to_body(&envelope);
+
+        // ── 5. Dial the relay (I-3b2-proven Socket.IO + BRC-103 path) ────
+        let t0 = Date::now().as_millis();
+        let relay = self
+            .env
+            .var("RELAY_URL")
+            .map(|v| v.to_string())
+            .unwrap_or_else(|_| DEFAULT_RELAY_URL.to_string());
+
+        let handshake = polling_handshake(&relay).await?;
+        let mut ws = WsHandle::open_and_upgrade(&relay, &handshake.sid)
+            .await
+            .map_err(Error::RustError)?;
+        let sink = ws.sender();
+
+        sink.send_socketio(&SocketIoPacket::Connect {
+            nsp: "/".to_string(),
+            data: None,
+        })
+        .map_err(Error::RustError)?;
+        loop {
+            match ws.recv_engineio().await.map_err(Error::RustError)? {
+                EngineIoPacket::Ping(payload) => {
+                    let _ = sink.send_engineio(&EngineIoPacket::Pong(payload));
+                }
+                EngineIoPacket::Message(payload) => {
+                    if let Ok(SocketIoPacket::Connect { .. }) = SocketIoPacket::decode(&payload) {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let transport = SocketIoTransport::new(sink.clone());
+        let callback = transport.callback_handle();
+        let dispatch_sink = sink.clone();
+        let wallet = ProtoWallet::new(Some(client_priv));
+        let peer = Peer::new(PeerOptions {
+            wallet,
+            transport,
+            certificates_to_request: None,
+            session_manager: None,
+            auto_persist_last_session: true,
+            originator: Some("i-4b2-sign-relay".to_string()),
+        });
+        peer.start();
+        let (mut events, _cb_id) = install_app_event_listener(&peer).await;
+        spawn_local(run_dispatch(ws, dispatch_sink, callback));
+
+        // Join our own {id}-mpc-sign room (drives the BRC-103 handshake; for a
+        // self-addressed send it is also the room the echo arrives on).
+        let own_room = format!("{client_pub_hex}-{BOX_SIGN}");
+        peer.to_peer(
+            &build_envelope_payload("joinRoom", &json!(own_room)),
+            None,
+            Some(20_000),
+        )
+        .await
+        .map_err(|e| Error::RustError(format!("to_peer(joinRoom): {e:?}")))?;
+        let handshake_rtt_ms = Date::now().as_millis() - t0;
+
+        // Server identity = sender of the first inbound General.
+        let server_identity =
+            match select(events.next(), worker::Delay::from(Duration::from_secs(8))).await {
+                Either::Left((Some(ev), _)) => Some(ev.sender.to_hex()),
+                _ => None,
+            };
+
+        // ── 6. Send the wrapped partial to `recipient` on box mpc-sign ───
+        let now_ms = Date::now().as_millis();
+        let message_id = format!("i4b2-{now_ms}");
+        let mut sent = false;
+        if let Some(server_id) = server_identity.as_deref() {
+            let send_payload = build_envelope_payload(
+                "sendMessage",
+                &json!({
+                    "messageBox": BOX_SIGN,
+                    "message": {
+                        "messageId": message_id,
+                        "recipient": recipient_pub_hex,
+                        "body": envelope_body,
+                    }
+                }),
+            );
+            sent = peer
+                .to_peer(&send_payload, Some(server_id), Some(20_000))
+                .await
+                .is_ok();
+        }
+
+        // ── 7. Self-addressed: receive it back, unwrap, byte-compare ─────
+        let recipient_room = format!("{recipient_pub_hex}-{BOX_SIGN}");
+        let mut partial_roundtrip_matches = false;
+        let mut received_back = false;
+        if sent && is_self {
+            let send_evt = format!("sendMessage-{recipient_room}");
+            let deadline = Date::now().as_millis() + 8_000;
+            while Date::now().as_millis() < deadline {
+                match select(events.next(), worker::Delay::from(Duration::from_secs(8))).await {
+                    Either::Left((Some(ev), _)) => {
+                        if ev.event_name == send_evt {
+                            received_back = true;
+                            // The live General's `data.body` is the raw wrapped
+                            // body value we sent. Unwrap → RoundMessage and
+                            // compare the recovered partial byte-for-byte.
+                            if let Some(raw_body) = ev.data.get("body") {
+                                if let Ok(env) = unwrap_body_to_envelope(raw_body) {
+                                    if let Ok(rm) = unwrap_envelope_to_round_message(
+                                        &env,
+                                        &PrivateKey::from_hex(&priv_hex).map_err(|e| {
+                                            Error::RustError(format!("priv reparse: {e:?}"))
+                                        })?,
+                                        None,
+                                    ) {
+                                        partial_roundtrip_matches = rm.payload == partial_json;
+                                    }
+                                }
+                            }
+                            break;
+                        }
+                    }
+                    _ => break,
+                }
+            }
+        }
+
+        Response::from_json(&serde_json::json!({
+            "route": "poc/sign-relay",
+            "client_identity": client_pub_hex,
+            "recipient": recipient_pub_hex,
+            "is_self": is_self,
+            "server_identity": server_identity,
+            "pool_round_trip_matches": round_trip_matches,
+            "partial_hex": hex::encode(&partial_json),
+            "envelope_len": envelope.encode_canonical().len(),
+            "message_box": BOX_SIGN,
+            "recipient_room": recipient_room,
+            "message_id": message_id,
+            "sent": sent,
+            "received_back": received_back,
+            "partial_roundtrip_matches": partial_roundtrip_matches,
+            "handshake_rtt_ms": handshake_rtt_ms,
+            "relay": relay,
+            "do_name": POC_DO_NAME,
+            "instance_constructed_at_ms": self.instance_constructed_at_ms,
+        }))
+    }
 }
 
 /// Native stub — the relay-handshake POC is wasm32-only (the Socket.IO +
@@ -757,6 +1054,10 @@ impl CosignerSessionDo {
 impl CosignerSessionDo {
     async fn handle_handshake(&self) -> Result<Response> {
         Response::error("/poc/handshake is wasm32-only (deployed CF Worker)", 501)
+    }
+
+    async fn handle_sign_relay(&self, _req: Request) -> Result<Response> {
+        Response::error("/poc/sign-relay is wasm32-only (deployed CF Worker)", 501)
     }
 }
 
