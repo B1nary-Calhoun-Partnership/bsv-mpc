@@ -67,6 +67,39 @@ ceremony; `protocol_state` persisted per round (belt-and-suspenders). Add a DO
 **deployed** worker (share_A) and a native test party over the relay (both
 agree on the joint pubkey), proven at runtime; then a sign over the same.
 
+**Verified wire format (mirror `bsv-mpc-service::dkg_handler` exactly):**
+- **Outbound** per coordinator `RoundMessage`: `wrap_round_message(&rm, params,
+  &recipient_pub, &our_priv)` → `MessageEnvelope`; `wire::wrap_envelope_to_body`
+  → `Value::String(lowercase-hex of canonical CBOR)`; then
+  `build_envelope_payload("sendMessage", {messageBox, message:{messageId,
+  recipient, body}})` → `peer.to_peer(payload, Some(server_id), _)`. Broadcast
+  (`to=None`) fans out to N unicast (one per peer).
+- **Inbound** `sendMessage-{our_room}` AppEvent: take `data.body`, wrap as
+  `{"message": <body>}`, `wire::unwrap_inbound_body` → `MessageEnvelope`;
+  `unwrap_envelope_to_round_message(&env, &our_priv, Some(&sender_pub))` →
+  `RoundMessage` → `coordinator.process_round(vec![rm])`.
+- **`WrapParams` (DKG):** `execution_id_prefix = canonical_execution_id(
+  ExecutionParams::new_v1(PhaseTag::DkgKeygen, session_id, [0u8;33]))[..8]`;
+  `joint_pubkey=[0;33]` (§05.4.3 keygen carve-out); `phase="dkg"`; box `mpc-dkg`;
+  `to_party = peer_party_index`. (Signing: `PhaseTag::Sign`, real joint_pubkey,
+  `phase="sign"`, box `mpc-sign`.)
+- **Routing:** send to peer's room `{peer_id}-{box}`; subscribe to own room
+  `{worker_id}-{box}`. Worker is party 0; peer (proxy/native) is party 1.
+
+**Paillier primes (DECISION 2026-05-20 — seed via endpoint):** CGGMP'24 auxinfo
+safe-prime generation is ~30–60s/party on native and far slower on wasm32 (would
+blow the DO CPU/request limit). `PregeneratedPrimes<SecurityLevel128>` derives
+serde, so:
+- **I-4b.1** — `POST /ceremony/seed-primes {session_id, primes_json}`: primes are
+  generated OFF-worker (native), validated by deserializing
+  `PregeneratedPrimes`, and persisted to a DO-SQLite `mpc_primes(session_id PK,
+  primes_json, created_at)` table (survives eviction between seed + ceremony).
+  Consumed at coordinator init via `DkgCoordinator::set_pregenerated_primes`.
+  Gate: seed → reload byte-identical across eviction.
+- **I-4b.2** — the cosigner loop above, loading seeded primes at DKG init. Gate:
+  2-of-2 DKG (deployed worker ↔ native party) over the relay, joint-pubkey
+  agreement; then a sign.
+
 ### I-4c — proxy `bridge.rs` HTTP→relay migration (OQ-I1)
 Swap `bridge.rs`'s `reqwest`/`BridgeAuth`/`kss_post` for `MessageBoxClient` +
 the `bsv-mpc-service` listener/handler pattern. Delete the HTTP request/response
