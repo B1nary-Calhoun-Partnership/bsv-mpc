@@ -1,0 +1,25 @@
+{
+  // #17 CF Container P2 — the full native bsv-mpc-service on Cloudflare
+  // Containers. The image is built from the workspace-root Dockerfile with the
+  // build context set to the repo root (cargo must see every workspace member's
+  // manifest). The Worker DO proxies every request to one container instance.
+  "name": "bsv-mpc-service-container",
+  "main": "worker.js",
+  "compatibility_date": "2025-05-01",
+  "containers": [
+    {
+      "class_name": "BsvMpcServiceContainer",
+      "image": "../../Dockerfile",
+      "image_build_context": "../../",
+      "max_instances": 1
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      { "class_name": "BsvMpcServiceContainer", "name": "BSV_MPC_SERVICE" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["BsvMpcServiceContainer"] }
+  ]
+}

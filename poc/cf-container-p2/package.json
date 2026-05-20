@@ -1,0 +1,8 @@
+{
+  "name": "bsv-mpc-service-container",
+  "private": true,
+  "version": "0.1.0",
+  "dependencies": {
+    "@cloudflare/containers": "^0.3.4"
+  }
+}

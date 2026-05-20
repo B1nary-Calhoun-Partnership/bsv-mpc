@@ -1,0 +1,14 @@
+# Keep the build context small + secret-free. Cargo fetches cggmp24/bsv-rs from
+# the network during the build, so only the workspace SOURCE is needed here.
+.git
+target
+**/target
+node_modules
+**/node_modules
+.wrangler
+**/.wrangler
+graphify-out
+# SECURITY: never ship secrets into the image/context.
+secrets.md
+**/secrets.md
+*.log

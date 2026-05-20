@@ -39,16 +39,29 @@
   `[[containers]]`. `wrangler deploy` → curl the Worker URL → routes to container
   → `/health` 200. Validates: account plan, deploy pipeline, Rust-in-CF-Container,
   DO→container reachability.
-- [ ] **P2 — full service.** Swap the image to build + run `bsv-mpc-service`.
-  Approach: Dockerfile at the **workspace root** (build context = whole repo),
-  `cargo build --release -p bsv-mpc-service` (fetches the cggmp21 git patch +
-  bsv-rs from crates.io — needs network + `git` in the build image; ~heavy/slow
-  ~5-15min compile). `.dockerignore` MUST exclude `target/`, `.git`,
-  `**/node_modules`. Set the container `defaultPort` to the service's bind port
-  (`bsv-mpc-service` main.rs reads `MPC_*` env; ensure it binds `0.0.0.0:$PORT`).
-  Reuse the `poc-cf-container` worker proxy shape. Curl its `/health`.
-- [ ] **P3 — decision.** Record findings in DECISIONS.md (confirm/adjust ADR-018);
-  if viable, this becomes the home for DKG + presig generation.
+- [x] **P2 — full service — DONE + PROVEN (2026-05-20).** Workspace-root
+  `Dockerfile` (build context = repo root via `image_build_context`) builds
+  `cargo build --release -p bsv-mpc-service --locked`; cggmp24/bsv-rs fetched
+  from the public network during build (no submodule). `.dockerignore` excludes
+  `target/`, `.git`, `**/node_modules`, **and `secrets.md`**. Container
+  `defaultPort=8080` ← `MPC_SERVICE_PORT=8080`, `MPC_DATA_DIR=/data`. Wrangler
+  app at `poc/cf-container-p2/` (reuses the `@cloudflare/containers` proxy
+  shape). Deployed via `CLOUDFLARE_CONTAINERS_TOKEN` as `CLOUDFLARE_API_TOKEN`.
+  **Runtime proof:** `https://bsv-mpc-service-container.dev-a3e.workers.dev/health`
+  → `{"status":"ok","version":"0.1.0","share_count":0,"total_presignatures":0,
+  "uptime_seconds":6,"data_dir":"/data"}` (the REAL `bsv-mpc-service` handler,
+  not the probe stub). Image 113MB; version `b1511a83`.
+  - **Gotcha 1 (openssl):** `bsv-rs`/`reqwest` pull `native-tls → openssl-sys`,
+    so the build stage needs `libssl-dev`+`pkg-config` and the runtime needs
+    `libssl3`. (Workspace nominally wants rustls; `bsv-rs` default-feature
+    `reqwest` forces native-tls graph-wide — real fix lives in the `bsv-rs`
+    repo; see hardening backlog #5.)
+  - **Gotcha 2 (platform):** CF Containers run **linux/amd64**; on an arm64 Mac
+    `wrangler deploy` cross-builds (emulated) — it completed fine here.
+- [x] **P3 — decision.** ADR-018's native half is CONFIRMED end-to-end: the full
+  native `bsv-mpc-service` builds, deploys, runs, and is reachable on CF
+  Containers. This is the home for heavy DKG + presig generation. No ADR change
+  needed.
 
 ## Log
 - 2026-05-20: probe started. Env verified (Docker + wrangler containers beta). Model captured.
