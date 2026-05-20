@@ -20,7 +20,7 @@ trackers are:
 |---|---|---|---|
 | A–F | canonical envelopes + MessageBox wire + DKG via MB + Sign via MB | **CLOSED** | Phase E mainnet TXID [`82ccb15c…`](https://whatsonchain.com/tx/82ccb15c49985a32b355a618f417bb7a09ec4ee5cf34e539e9baaebb74dadc29) |
 | G | inline SM coordinator rewrite + Paillier safe-prime pool | **CLOSED 2026-05-19** | Mainnet TXID [`442bd391…`](https://whatsonchain.com/tx/442bd391cf8eda299f82dc1e4aeb1a9cb4f33610365d44c9c1c0e55d32f171b9) (G-5d) + wasm32 `tests/wasm32_dkg.rs` green (G-5b). Merge-gate commit `d9b1b27`. |
-| H | Socket.IO + BRC-103 wasm32 client + native unification + `bsv-rs` upstream `SocketIoTransport` | **STEPS 1-2 DONE** (~5-7 wk total); H-3 POC next | audit doc `254ff0f` + `4a1f8bc` (§2.5b) + §11 god-tier expansion landed |
+| H | Socket.IO + BRC-103 wasm32 client + native unification + `bsv-rs` upstream `SocketIoTransport` | **STEPS 1-4 DONE**; Step 5 (real-sats) next | `bsv-rs 0.3.10` published with upstream `SocketIoTransport`; native unification on `subscribe.rs` (Socket.IO + BRC-103, raw `/ws` deleted); all `live_relay_proof` (4) + `bsv-mpc-service` e2e green; poc17 graduated (deleted H-4.6). Step 5 = fresh native real-sats mainnet TXID (G-5d shape `442bd391…`). |
 | I | wire G + H into deployed `bsv-mpc-worker` CF cosigner | blocked on H | — |
 | J | CHIP + `/capabilities` + `/health.json` (MPC-Spec §12 + §16) | blocked on I | — |
 | K | cross-stack joint mainnet TX (closes MPC-Spec #36) | blocked on J + Quaakee's rust-mpc deploy | — |
@@ -69,7 +69,7 @@ Per audit §11.2 **revised** (pure Rust+WASM, leverage existing Calhoun-owned `e
 
 | Target repo | What | When |
 |---|---|---|
-| `bsv-rs` (`~/bsv/bsv-rs/src/auth/transports/`) | new `SocketIoTransport` Rust impl of `bsv_rs::auth::Transport` over Socket.IO `authMessage` event — Rust analog of TS `@bsv/authsocket-client::SocketClientTransport` | **Phase H gate** (PR open/merged before merge-gate commit) |
+| `bsv-rs` (`~/bsv/bsv-rs/src/auth/transports/socketio/`) | new `SocketIoTransport` Rust impl of `bsv_rs::auth::Transport` over Socket.IO `authMessage` event — Rust analog of TS `@bsv/authsocket-client::SocketClientTransport` | **DONE** — PR Calhooon/bsv-rs#4 merged (`9a081dc`), published as `bsv-rs 0.3.10`; substrate-agnostic over `SocketIoSink`/`SocketIoFrameSource`, consumed by `bsv-mpc-messagebox` |
 
 ## Ecosystem follow-ups (NOT Phase H gates — tracked here for visibility)
 
