@@ -689,26 +689,36 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         // Empirical harness: `wrangler deploy` + curl against the deployed
         // worker URL. NO local `wrangler dev` simulation — per the locked
         // H-3.5 discipline, the truth is the deployed CF runtime.
-        .get_async("/relay-via-do/identity", |req, ctx| async move {
-            let namespace = match ctx.env.durable_object("ENGINEIO_SESSION_DO") {
-                Ok(ns) => ns,
-                Err(e) => {
-                    return Response::error(
-                        format!("missing ENGINEIO_SESSION_DO binding: {e:?}"),
-                        500,
-                    )
-                }
-            };
-            let id = match namespace.id_from_name("cosigner-test-1") {
-                Ok(id) => id,
-                Err(e) => return Response::error(format!("id_from_name failed: {e:?}"), 500),
-            };
-            let stub = match id.get_stub() {
-                Ok(s) => s,
-                Err(e) => return Response::error(format!("get_stub failed: {e:?}"), 500),
-            };
-            stub.fetch_with_request(req).await
-        })
+        .get_async("/relay-via-do/identity", forward_to_session_do)
+        // H-3.5b gate: full BRC-103 handshake driven by the DO. Mirrors
+        // the H-3.3b /brc103-handshake wire shape but the identity is
+        // stable from the SERVER_PRIVATE_KEY secret (not random per-request).
+        // Empirical bar: two curls return the SAME client_identity AND
+        // the SAME server_identity (relay-side stability).
+        .get_async("/relay-via-do/handshake", forward_to_session_do)
         .run(req, env)
         .await
+}
+
+/// Forward a request from the worker entry point to the singleton
+/// `EngineIoSessionDo` keyed by `id_from_name("cosigner-test-1")`. All
+/// `/relay-via-do/*` routes share this forwarder; the DO's `fetch()`
+/// match-arms on `url.path()` to dispatch internally. Single helper
+/// avoids per-route binding-lookup duplication.
+async fn forward_to_session_do(req: Request, ctx: RouteContext<()>) -> Result<Response> {
+    let namespace = match ctx.env.durable_object("ENGINEIO_SESSION_DO") {
+        Ok(ns) => ns,
+        Err(e) => {
+            return Response::error(format!("missing ENGINEIO_SESSION_DO binding: {e:?}"), 500)
+        }
+    };
+    let id = match namespace.id_from_name("cosigner-test-1") {
+        Ok(id) => id,
+        Err(e) => return Response::error(format!("id_from_name failed: {e:?}"), 500),
+    };
+    let stub = match id.get_stub() {
+        Ok(s) => s,
+        Err(e) => return Response::error(format!("get_stub failed: {e:?}"), 500),
+    };
+    stub.fetch_with_request(req).await
 }
