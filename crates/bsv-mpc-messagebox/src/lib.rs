@@ -41,18 +41,33 @@
 //! SHIP/SLAP overlay on topic `tm_mpc_signing` lives in `bsv-mpc-overlay`
 //! and is consumed by the caller, not by this crate.
 
-pub mod auth;
-pub mod client;
+// Target-agnostic modules — compile on BOTH native and wasm32.
 pub mod engineio;
 pub mod error;
-pub mod http;
 pub mod types;
 pub mod wire;
+
+// Native-only modules — the existing raw-WS + BRC-104
+// SimplifiedFetchTransport path. These pull `tokio` / `reqwest` /
+// `tokio-tungstenite`, none of which compile to
+// `wasm32-unknown-unknown`. H-4.3 adds the wasm32 transport modules
+// (`transport_wasm`, `transport_socketio`); H-4.4 unifies the native
+// path onto the same Socket.IO + BRC-103 wire and lets `client` /
+// `auth` compile on both targets. Until then, these stay native-gated.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod auth;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod client;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod http;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod ws;
 
+#[cfg(not(target_arch = "wasm32"))]
 pub use client::{
     DecodedEnvelope, DecodedRoundMessage, EnvelopeSubscription, MessageBoxClient,
     RoundMessageSubscription,
 };
 pub use error::{MessageBoxError, Result};
+#[cfg(not(target_arch = "wasm32"))]
 pub use ws::{subscribe, InboundEnvelopeEvent, InboundVia, WsSubscription};

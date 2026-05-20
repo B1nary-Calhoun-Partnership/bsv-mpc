@@ -6,24 +6,15 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+# ===========================================================================
+# Target-agnostic dependencies — used by the modules that compile on BOTH
+# native and wasm32 (`engineio::codec`, `error`, `types`, `wire`). These
+# carry NO tokio/reqwest/native-WS transitive baggage.
+# ===========================================================================
 [dependencies]
 bsv-mpc-core = { path = "../bsv-mpc-core" }
 
-# BSV SDK. We need:
-# - `auth` for `Peer`, `PeerOptions`, `SimplifiedFetchTransport`,
-#   `HttpRequest`, `HttpResponse` (BRC-104 SimplifiedFetchTransport).
-# - `http` so SimplifiedFetchTransport's reqwest backend is compiled in.
-# `auth` transitively pulls `wallet` (`ProtoWallet`) and `messages`.
-bsv = { workspace = true, features = ["auth", "http"] }
-
-# Async runtime + HTTP
-tokio.workspace = true
-reqwest.workspace = true
-
-# WebSocket
-tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
-
-# Async stream utilities
+# Async stream utilities (runtime-agnostic — futures, not tokio).
 futures.workspace = true
 
 # Serialization
@@ -35,11 +26,9 @@ base64.workspace = true
 # Crypto (BRC-31 auth signature)
 sha2.workspace = true
 
-# RNG (BRC-31 nonces)
+# RNG (BRC-31 nonces) — wasm32 entropy comes from `getrandom/js` in the
+# wasm32 target block below.
 rand.workspace = true
-
-# Time
-chrono.workspace = true
 
 # Error handling
 thiserror.workspace = true
@@ -48,8 +37,47 @@ anyhow.workspace = true
 # Logging
 tracing.workspace = true
 
-# URL helpers
+# URL helpers (target-agnostic)
 url = "2"
+
+# ===========================================================================
+# Native target — the existing raw-WS + BRC-104 SimplifiedFetchTransport
+# path (`auth`, `client`, `http`, `ws`). Migrates onto Socket.IO +
+# BRC-103 in H-4.3/H-4.4 but keeps these deps (tokio-tungstenite for the
+# native WS, reqwest for the Engine.IO polling handshake).
+# ===========================================================================
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# BSV SDK. `auth` for Peer/PeerOptions/SimplifiedFetchTransport;
+# `http` so SimplifiedFetchTransport's reqwest backend compiles in.
+bsv = { workspace = true, features = ["auth", "http"] }
+tokio.workspace = true
+reqwest.workspace = true
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+chrono.workspace = true
+
+# ===========================================================================
+# wasm32 target — the CF-Worker Socket.IO + BRC-103 path. The
+# `transport_wasm` + `transport_socketio` modules (ported in H-4.3) use
+# `web_sys::WebSocket` + `worker::Fetch`. `bsv` uses the `wasm` feature
+# (NOT `http` — reqwest doesn't compile to wasm32-unknown-unknown).
+# ===========================================================================
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# Declared directly (NOT workspace = true) so `default-features = false`
+# + the `wasm` feature stay scoped to the wasm32 build — the workspace
+# `bsv` dep doesn't set default-features, so inheriting it would ignore
+# our override (cargo warns + may hard-error in future). Pinned to the
+# same 0.3.9 the workspace uses.
+bsv = { package = "bsv-rs", version = "0.3.9", default-features = false, features = ["auth", "wallet", "transaction", "wasm"] }
+worker = "0.7"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+async-trait = "0.1"
+getrandom = { version = "0.2", features = ["js"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies.web-sys]
+version = "0.3"
+features = ["WebSocket", "MessageEvent", "CloseEvent", "Event", "BinaryType"]
 
 [dev-dependencies]
 tracing-subscriber.workspace = true
