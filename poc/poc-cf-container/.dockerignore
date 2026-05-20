@@ -1,0 +1,7 @@
+target
+*.md
+wrangler.jsonc
+worker.js
+package.json
+package-lock.json
+node_modules
