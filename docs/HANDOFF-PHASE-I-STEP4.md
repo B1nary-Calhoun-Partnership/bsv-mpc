@@ -54,9 +54,11 @@ cggmp24 fork change required**; the DO ships/needs only `Presignature` (which IS
 | `d6ccf57` | **#14 presig provisioning** — `/ceremony/ingest-presig` (authed, stores under the DO's own identity) + `/poc/presig-pool` | **deployed proof:** pool store→consume **byte-identical** (`round_trip_matches=true`, count 1→0), partial from the *consumed* presig byte-identical to native fixture (`…d2c14a`) |
 | `c0c9fbf` | **#15 Part A** DO relay sign loop — `/poc/sign-relay` (consume→issue→wrap §05→relay→self round-trip) | **deployed proof:** `sent=true`, `received_back=true`, `partial_roundtrip_matches=true`, partial byte-identical to fixture; full wrap→relay→strict-decode→unwrap on deployed wasm; `/poc/handshake` re-checked green |
 | `5f26db9` | **#15 Part B (I-4b.2 gate)** native combiner harness `sign_relay_deployed_e2e.rs` | **deployed DO co-signs over the LIVE relay → BSV-valid 2-of-2 sig** (combiner received party-0 partial from DO `03cc87ed…`, combined → 70-byte DER under joint pubkey, **no sats**). Local pure-crypto control also PASS |
+| `4937955` | **#17 CF Container P2** — full native `bsv-mpc-service` on CF Containers (root `Dockerfile` + `poc/cf-container-p2/`) | **deployed proof:** `bsv-mpc-service-container.dev-a3e.workers.dev/health` → real KSS JSON (`version 0.1.0`, `data_dir=/data`); ADR-018 native half confirmed end-to-end. Build needs libssl (native-tls); CF=amd64 |
 
 **Deployed worker:** `https://bsv-mpc-kss.dev-a3e.workers.dev`.
-**Container probe:** `https://bsv-mpc-container-probe.dev-a3e.workers.dev`.
+**Deployed native service (CF Container):** `https://bsv-mpc-service-container.dev-a3e.workers.dev`.
+**Container probe (P1):** `https://bsv-mpc-container-probe.dev-a3e.workers.dev`.
 
 ---
 
@@ -95,11 +97,14 @@ cggmp24 fork change required**; the DO ships/needs only `Presignature` (which IS
    **REMAINING:** the production path is the `/poc/sign-relay` route; folding it
    into an authed, wake-on-HTTP production endpoint couples to the proxy
    `bridge.rs` migration (#12) and I-5.
-3. **CF Container P2** (task #17). Swap the probe image for the full
-   `bsv-mpc-service` build (Dockerfile at workspace root, `cargo build --release
-   -p bsv-mpc-service`; heavy ~5-15min compile; needs `git` + network for the
-   cggmp21 patch; `.dockerignore` must exclude `target/`/`.git`/`node_modules`).
-   Platform already de-risked by P1. See `docs/CF-CONTAINER-PROBE.md`.
+3. ~~**CF Container P2** (task #17)~~ **✅ DONE (`4937955`).** Full native
+   `bsv-mpc-service` deployed + `/health`-proven on CF Containers
+   (`bsv-mpc-service-container.dev-a3e.workers.dev`). Root `Dockerfile` +
+   `poc/cf-container-p2/`. ADR-018 native half confirmed. See
+   `docs/CF-CONTAINER-PROBE.md` (P2/P3). **REMAINING:** this is a bare
+   `/health`-reachable service; wiring it as the actual presig-gen driver
+   (running 2-party presig gen with the proxy + POSTing to the DO's
+   `/ceremony/ingest-presig`) couples to #12 + provisioning automation.
 4. **Proxy `bridge.rs` migration** (task #12, I-4c, OQ-I1). Swap HTTP for native
    `MessageBoxClient` + the `bsv-mpc-service` handler pattern; proxy issues its
    partial + **combines**. Author the missing presign/ECDH relay handlers.
@@ -158,10 +163,11 @@ cggmp24 fork change required**; the DO ships/needs only `Presignature` (which IS
   orchestrate research, then VERIFY agent output.
 
 ---
-**Last commit:** `5f26db9` (#15 I-4b.2 — deployed DO co-signs over the live
-relay → BSV-valid 2-of-2, no sats). **Next pickup:** CF Container P2 (#17, the
-heavy native presig-gen home) **or** the proxy `bridge.rs` HTTP→relay migration
-(#12, makes the proxy the real combiner). Then close the #5 security must-fixes
-(handler authz + auth-session-isolate) and land I-5 (#16, real-sats TXID) — the
-hybrid sign path is now end-to-end proven; I-5 just swaps test key shares for a
-funded DKG joint key and broadcasts. The crypto + relay transport are locked.
+**Last commit:** `4937955` (#17 CF Container P2 — full native `bsv-mpc-service`
+deployed + `/health`-proven on CF Containers). **Next pickup:** the proxy
+`bridge.rs` HTTP→relay migration (#12, makes the proxy the real combiner over
+MessageBox; author the missing presign/ECDH relay handlers). Then close the #5
+security must-fixes (handler authz + auth-session-isolate) and land I-5 (#16,
+real-sats TXID). The hybrid sign path + relay transport + both deployment homes
+(wasm DO + native Container) are all proven end-to-end; I-5 swaps test key
+shares for a funded DKG joint key and broadcasts. Crypto + transport are locked.
