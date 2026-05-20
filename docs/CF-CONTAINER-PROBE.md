@@ -39,8 +39,14 @@
   `[[containers]]`. `wrangler deploy` → curl the Worker URL → routes to container
   → `/health` 200. Validates: account plan, deploy pipeline, Rust-in-CF-Container,
   DO→container reachability.
-- [ ] **P2 — full service.** Swap the image to build + run `bsv-mpc-service`
-  (workspace build w/ cggmp24 git deps + bsv-rs). Curl its `/health`.
+- [ ] **P2 — full service.** Swap the image to build + run `bsv-mpc-service`.
+  Approach: Dockerfile at the **workspace root** (build context = whole repo),
+  `cargo build --release -p bsv-mpc-service` (fetches the cggmp21 git patch +
+  bsv-rs from crates.io — needs network + `git` in the build image; ~heavy/slow
+  ~5-15min compile). `.dockerignore` MUST exclude `target/`, `.git`,
+  `**/node_modules`. Set the container `defaultPort` to the service's bind port
+  (`bsv-mpc-service` main.rs reads `MPC_*` env; ensure it binds `0.0.0.0:$PORT`).
+  Reuse the `poc-cf-container` worker proxy shape. Curl its `/health`.
 - [ ] **P3 — decision.** Record findings in DECISIONS.md (confirm/adjust ADR-018);
   if viable, this becomes the home for DKG + presig generation.
 
