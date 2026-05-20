@@ -175,3 +175,21 @@
 **Rationale:** Relative parent paths (`../`) break in git worktrees (resolve to wrong directory) and CI (fork not present). Submodule ensures the fork is always available at a predictable path regardless of checkout location. `git clone --recurse-submodules` handles initial setup.
 
 **Date:** 2026-03-22 | **Status:** Accepted
+
+---
+
+## ADR-018: Hybrid CF cosigner — light-wasm DO hot path + native Container for heavy MPC
+
+**Decision:** The deployed Cloudflare cosigner is **split by compute weight**, not crammed into wasm:
+- **Durable Object (wasm)** owns durable `share_A` (DO SQLite, eviction-proven), per-agent isolation, relay routing/wake, and the **light online operations** that fit the wasm CPU budget — partial ECDH and **1-round presigned signing** (~ms field math).
+- **Native Rust on a Cloudflare Container** (the existing `bsv-mpc-service`) runs the **heavy** CGGMP'24 work — DKG and presignature generation — feeding presignatures into the DO's pool.
+
+**Rationale:** Empirically measured on the deployed worker (Phase I probe `/poc/dkg-bench`, commit `4b30c84`): a wasm isolate **cannot** do DKG keygen+auxinfo within the ~30s CF CPU ceiling (Blum prime gen alone ~16s; full 2-party DKG died ~35s). Presignature generation has the same heavy Paillier+ZK shape and will not fit either. Forcing the audited cggmp24 math through `num-bigint`-on-wasm is the wrong tool. The DO is, however, proven god-tier at durable share custody + routing, and **online signing with a presignature is light** (a few scalar ops) and fits wasm. So: heavy crypto → native (audited, full speed, reuses proven `bsv-mpc-service`); durable custody + the ~ms hot path → the wasm DO. Stays 100% on Cloudflare (Workers + DO + Containers). Also note: `Date.now()` is frozen during synchronous wasm compute in CF Workers (Spectre mitigation) — wasm benchmarking must use external wall-clock.
+
+**Implications:**
+- **Keystone work:** implement **1-round presigned online signing** in `bsv-mpc-core` (currently `sign()` always runs the heavy 4-round path) — the speed unlock AND what makes the wasm DO viable as a signer.
+- DKG-on-worker is shelved; DKG runs natively (off-worker / container). The I-4b.1 `/ceremony/seed-primes` endpoint remains for any off-path native DKG use but is off the worker hot path.
+- Presignature provisioning: the native container generates presigs and stocks them into the DO's `mpc_presignatures` pool; the worker consumes one per signature.
+- The I-4b.2 cosigner-loop proof pivots from DKG-over-relay to **sign-over-relay**.
+
+**Date:** 2026-05-20 | **Status:** Accepted
