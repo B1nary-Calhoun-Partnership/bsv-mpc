@@ -71,6 +71,7 @@ impl DurableObject for CosignerSessionDo {
         match path.as_str() {
             "/poc/identity" => self.handle_identity().await,
             "/poc/persist" => self.handle_persist().await,
+            "/poc/share-roundtrip" => self.handle_share_roundtrip().await,
             "/poc/handshake" => self.handle_handshake().await,
             other => Response::error(format!("unknown POC route: {other}"), 404),
         }
@@ -181,6 +182,67 @@ impl CosignerSessionDo {
 #[derive(serde::Deserialize)]
 struct ShareRow {
     ciphertext: String,
+}
+
+impl CosignerSessionDo {
+    /// `GET /poc/share-roundtrip` — I-4a fund-safety proof for REAL shares.
+    /// Stores a deterministic [`EncryptedShare`] via [`DoSqlStorage`] (the
+    /// production storage layer), reads it back, and asserts byte-identical
+    /// round-trip. Across a forced eviction the row persists while
+    /// `instance_constructed_at_ms` advances — proving a real encrypted share
+    /// survives hibernation on the deployed worker (not just the I-3b stub blob).
+    async fn handle_share_roundtrip(&self) -> Result<Response> {
+        use bsv_mpc_core::types::{EncryptedShare, SessionId, ShareIndex, ThresholdConfig};
+
+        let identity = self.identity_hex()?;
+        let store = crate::do_storage::DoSqlStorage::new(&self.state);
+        store.ensure_schema()?;
+
+        // Deterministic stand-in for a DKG-produced encrypted share: fixed
+        // bytes so a post-eviction reload is byte-identical (the durability
+        // proof). Real shares are AES-256-GCM ciphertext from bsv-mpc-core.
+        let share = EncryptedShare {
+            nonce: vec![0xAB; 12],
+            ciphertext: vec![0xCD; 48],
+            session_id: SessionId::from_str_hash(&format!("i4a-{identity}")),
+            share_index: ShareIndex(0),
+            config: ThresholdConfig {
+                threshold: 2,
+                parties: 2,
+            },
+            joint_pubkey_compressed: vec![0x02; 33],
+        };
+
+        let already_existed = store.get_share(&identity)?.is_some();
+        if !already_existed {
+            store.store_share(&identity, &share)?;
+        }
+
+        let reloaded = store
+            .get_share(&identity)?
+            .ok_or_else(|| Error::RustError("share missing after store".into()))?;
+        let want = serde_json::to_string(&share)
+            .map_err(|e| Error::RustError(format!("serialize want: {e}")))?;
+        let got = serde_json::to_string(&reloaded)
+            .map_err(|e| Error::RustError(format!("serialize got: {e}")))?;
+        let reload_matches = want == got;
+        let meta = store.get_share_metadata(&identity)?;
+
+        Response::from_json(&serde_json::json!({
+            "route": "poc/share-roundtrip",
+            "client_identity": identity,
+            "already_existed": already_existed,
+            "reload_matches": reload_matches,
+            "share_index": reloaded.share_index.0,
+            "session_id": reloaded.session_id.hex(),
+            "threshold": reloaded.config.threshold,
+            "parties": reloaded.config.parties,
+            "metadata_present": meta.is_some(),
+            "share_count": store.share_count()?,
+            "instance_constructed_at_ms": self.instance_constructed_at_ms,
+            "do_name": POC_DO_NAME,
+        }))
+    }
 }
 
 // ============================================================================

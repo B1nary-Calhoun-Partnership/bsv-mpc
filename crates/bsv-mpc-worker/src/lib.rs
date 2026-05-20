@@ -50,6 +50,7 @@
 
 mod api;
 pub mod auth;
+mod do_storage;
 mod poc;
 mod storage;
 
@@ -178,6 +179,10 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             poc::forward_to_cosigner_do(req, &ctx.env).await
         })
         .post_async("/poc/persist", |req, ctx| async move {
+            poc::forward_to_cosigner_do(req, &ctx.env).await
+        })
+        // I-4a: DO-SQLite real-EncryptedShare round-trip (fund-safety store).
+        .get_async("/poc/share-roundtrip", |req, ctx| async move {
             poc::forward_to_cosigner_do(req, &ctx.env).await
         })
         // I-3b2: relay-handshake-from-DO — outbound Socket.IO + BRC-103 +

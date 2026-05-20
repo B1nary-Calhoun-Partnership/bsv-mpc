@@ -1,0 +1,338 @@
+//! Phase I Step 4 (I-4a) — Durable-Object-SQLite-backed MPC storage.
+//!
+//! The **fund-safety** store: replaces the process-global in-memory
+//! [`crate::storage`] `static STORAGE` with a per-DO co-located SQLite
+//! database (`state.storage().sql()`), so an (encrypted) `share_A` survives
+//! isolate hibernation / eviction. An in-memory share is lost on eviction →
+//! the 2-of-2 joint key can never sign again → funds permanently locked. DO
+//! SQLite is strongly consistent, single-writer, co-located (zero-latency on
+//! the signing hot path), and per-agent isolated.
+//!
+//! Mirrors the [`crate::storage::ShareStorage`] method surface so the KSS
+//! handlers (I-4a.2) can swap the backend with no logic change.
+//!
+//! ## Schema (3 tables)
+//!
+//! - `mpc_shares(agent_id PK, share_json, created_at, updated_at)` — the whole
+//!   [`EncryptedShare`] is stored as **JSON TEXT** (not per-column). TEXT (not
+//!   BLOB) is deliberate: a BLOB column comes back from the DO SQLite cursor as
+//!   a JS byte-array that serde won't map into `Vec<u8>` without `serde_bytes`;
+//!   TEXT deserializes cleanly into `String` (the I-3b POC lesson). The share
+//!   is already AES-256-GCM ciphertext, so the JSON holds ciphertext only.
+//! - `mpc_protocol_state(session_id PK, state_hex, updated_at)` — multi-round
+//!   coordinator transcript bytes as hex TEXT (belt-and-suspenders persistence;
+//!   the live coordinator is pinned in the DO isolate for the short ceremony).
+//! - `mpc_presignatures(id PK, agent_id, session_id, data_hex, created_at)` — FIFO
+//!   per agent, ordered by `created_at` (ms) then `id`.
+
+use bsv_mpc_core::types::EncryptedShare;
+use serde::Deserialize;
+use worker::{Date, Error, Result, SqlStorage, State};
+
+use crate::storage::ShareMetadata;
+
+/// DO-SQLite-backed storage, scoped to one Durable Object's co-located SQLite.
+/// Cheap to construct (borrows `&State`); each method opens a fresh
+/// `sql()` handle, matching the I-3b POC pattern.
+pub struct DoSqlStorage<'a> {
+    state: &'a State,
+}
+
+/// `SELECT share_json` row.
+#[derive(Deserialize)]
+struct ShareJsonRow {
+    share_json: String,
+}
+
+/// `SELECT share_json, created_at, updated_at` row (for metadata).
+#[derive(Deserialize)]
+struct ShareMetaRow {
+    share_json: String,
+    created_at: String,
+    updated_at: String,
+}
+
+/// `SELECT state_hex` row.
+#[derive(Deserialize)]
+struct StateRow {
+    state_hex: String,
+}
+
+/// `SELECT id, data_hex` row (oldest presignature).
+#[derive(Deserialize)]
+struct PresigRow {
+    id: String,
+    data_hex: String,
+}
+
+/// `SELECT COUNT(*) as n` row.
+#[derive(Deserialize)]
+struct CountRow {
+    n: i64,
+}
+
+#[allow(dead_code)] // full storage surface; some methods land consumers in I-4a.2
+impl<'a> DoSqlStorage<'a> {
+    /// Wrap a Durable Object's `State`. Call [`ensure_schema`] once per
+    /// request before other operations (idempotent).
+    pub fn new(state: &'a State) -> Self {
+        Self { state }
+    }
+
+    fn sql(&self) -> SqlStorage {
+        self.state.storage().sql()
+    }
+
+    fn now_ms() -> i64 {
+        Date::now().as_millis() as i64
+    }
+
+    /// Create all three tables if absent (idempotent).
+    pub fn ensure_schema(&self) -> Result<()> {
+        let sql = self.sql();
+        sql.exec(
+            "CREATE TABLE IF NOT EXISTS mpc_shares (\
+               agent_id TEXT PRIMARY KEY, \
+               share_json TEXT NOT NULL, \
+               created_at TEXT NOT NULL, \
+               updated_at TEXT NOT NULL\
+             )",
+            None,
+        )?;
+        sql.exec(
+            "CREATE TABLE IF NOT EXISTS mpc_protocol_state (\
+               session_id TEXT PRIMARY KEY, \
+               state_hex TEXT NOT NULL, \
+               updated_at TEXT NOT NULL\
+             )",
+            None,
+        )?;
+        sql.exec(
+            "CREATE TABLE IF NOT EXISTS mpc_presignatures (\
+               id TEXT PRIMARY KEY, \
+               agent_id TEXT NOT NULL, \
+               session_id TEXT NOT NULL, \
+               data_hex TEXT NOT NULL, \
+               created_at INTEGER NOT NULL\
+             )",
+            None,
+        )?;
+        Ok(())
+    }
+
+    // ── Share CRUD ──────────────────────────────────────────────────────
+
+    /// Store (upsert) an encrypted key share for an agent. Used on DKG
+    /// completion and key refresh.
+    pub fn store_share(&self, agent_id: &str, share: &EncryptedShare) -> Result<()> {
+        let json = serde_json::to_string(share)
+            .map_err(|e| Error::RustError(format!("serialize EncryptedShare: {e}")))?;
+        let now = Self::now_ms().to_string();
+        self.sql().exec(
+            "INSERT INTO mpc_shares (agent_id, share_json, created_at, updated_at) \
+             VALUES (?, ?, ?, ?) \
+             ON CONFLICT(agent_id) DO UPDATE SET \
+               share_json = excluded.share_json, updated_at = excluded.updated_at",
+            vec![agent_id.into(), json.into(), now.clone().into(), now.into()],
+        )?;
+        Ok(())
+    }
+
+    /// Retrieve an encrypted key share. `None` if DKG has not run for `agent_id`.
+    pub fn get_share(&self, agent_id: &str) -> Result<Option<EncryptedShare>> {
+        let rows: Vec<ShareJsonRow> = self
+            .sql()
+            .exec(
+                "SELECT share_json FROM mpc_shares WHERE agent_id = ?",
+                vec![agent_id.into()],
+            )?
+            .to_array()?;
+        match rows.into_iter().next() {
+            Some(r) => {
+                let share: EncryptedShare = serde_json::from_str(&r.share_json)
+                    .map_err(|e| Error::RustError(format!("deserialize EncryptedShare: {e}")))?;
+                Ok(Some(share))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Delete an agent's share + cascade its mpc_presignatures. Returns whether a
+    /// share row existed.
+    pub fn delete_share(&self, agent_id: &str) -> Result<bool> {
+        let existed = self.get_share(agent_id)?.is_some();
+        self.sql().exec(
+            "DELETE FROM mpc_shares WHERE agent_id = ?",
+            vec![agent_id.into()],
+        )?;
+        self.sql().exec(
+            "DELETE FROM mpc_presignatures WHERE agent_id = ?",
+            vec![agent_id.into()],
+        )?;
+        Ok(existed)
+    }
+
+    /// List all agent IDs with a stored share, sorted.
+    pub fn list_agents(&self) -> Result<Vec<String>> {
+        #[derive(Deserialize)]
+        struct AgentRow {
+            agent_id: String,
+        }
+        let rows: Vec<AgentRow> = self
+            .sql()
+            .exec(
+                "SELECT agent_id FROM mpc_shares ORDER BY agent_id ASC",
+                None,
+            )?
+            .to_array()?;
+        Ok(rows.into_iter().map(|r| r.agent_id).collect())
+    }
+
+    /// Count stored mpc_shares.
+    pub fn share_count(&self) -> Result<usize> {
+        let rows: Vec<CountRow> = self
+            .sql()
+            .exec("SELECT COUNT(*) AS n FROM mpc_shares", None)?
+            .to_array()?;
+        Ok(rows.first().map(|r| r.n as usize).unwrap_or(0))
+    }
+
+    /// Share metadata (no secret data). Presignature count is included.
+    pub fn get_share_metadata(&self, agent_id: &str) -> Result<Option<ShareMetadata>> {
+        let rows: Vec<ShareMetaRow> = self
+            .sql()
+            .exec(
+                "SELECT share_json, created_at, updated_at FROM mpc_shares WHERE agent_id = ?",
+                vec![agent_id.into()],
+            )?
+            .to_array()?;
+        let Some(row) = rows.into_iter().next() else {
+            return Ok(None);
+        };
+        let share: EncryptedShare = serde_json::from_str(&row.share_json)
+            .map_err(|e| Error::RustError(format!("deserialize EncryptedShare: {e}")))?;
+        let presignature_count = self.presignature_count(agent_id)?;
+        Ok(Some(ShareMetadata {
+            agent_id: agent_id.to_string(),
+            session_id: share.session_id.hex(),
+            share_index: share.share_index.0,
+            threshold: share.config.threshold,
+            parties: share.config.parties,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+            presignature_count,
+        }))
+    }
+
+    // ── Protocol state ──────────────────────────────────────────────────
+
+    /// Persist intermediate coordinator transcript bytes, keyed by session.
+    pub fn store_protocol_state(&self, session_id: &str, state: &[u8]) -> Result<()> {
+        let hex = hex::encode(state);
+        let now = Self::now_ms().to_string();
+        self.sql().exec(
+            "INSERT INTO mpc_protocol_state (session_id, state_hex, updated_at) \
+             VALUES (?, ?, ?) \
+             ON CONFLICT(session_id) DO UPDATE SET \
+               state_hex = excluded.state_hex, updated_at = excluded.updated_at",
+            vec![session_id.into(), hex.into(), now.into()],
+        )?;
+        Ok(())
+    }
+
+    /// Retrieve protocol state bytes.
+    pub fn get_protocol_state(&self, session_id: &str) -> Result<Option<Vec<u8>>> {
+        let rows: Vec<StateRow> = self
+            .sql()
+            .exec(
+                "SELECT state_hex FROM mpc_protocol_state WHERE session_id = ?",
+                vec![session_id.into()],
+            )?
+            .to_array()?;
+        match rows.into_iter().next() {
+            Some(r) => {
+                let bytes = hex::decode(&r.state_hex)
+                    .map_err(|e| Error::RustError(format!("decode mpc_protocol_state hex: {e}")))?;
+                Ok(Some(bytes))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Delete protocol state after completion or error.
+    pub fn delete_protocol_state(&self, session_id: &str) -> Result<()> {
+        self.sql().exec(
+            "DELETE FROM mpc_protocol_state WHERE session_id = ?",
+            vec![session_id.into()],
+        )?;
+        Ok(())
+    }
+
+    // ── Presignatures (FIFO per agent) ──────────────────────────────────
+
+    /// Store a completed presignature.
+    pub fn store_presignature(
+        &self,
+        agent_id: &str,
+        session_id: &str,
+        presig_id: &str,
+        data: &[u8],
+    ) -> Result<()> {
+        let hex = hex::encode(data);
+        self.sql().exec(
+            "INSERT INTO mpc_presignatures (id, agent_id, session_id, data_hex, created_at) \
+             VALUES (?, ?, ?, ?, ?)",
+            vec![
+                presig_id.into(),
+                agent_id.into(),
+                session_id.into(),
+                hex.into(),
+                Self::now_ms().into(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Consume (remove + return) the oldest presignature for an agent.
+    pub fn consume_presignature(&self, agent_id: &str) -> Result<Option<Vec<u8>>> {
+        let rows: Vec<PresigRow> = self
+            .sql()
+            .exec(
+                "SELECT id, data_hex FROM mpc_presignatures WHERE agent_id = ? \
+                 ORDER BY created_at ASC, id ASC LIMIT 1",
+                vec![agent_id.into()],
+            )?
+            .to_array()?;
+        let Some(row) = rows.into_iter().next() else {
+            return Ok(None);
+        };
+        self.sql().exec(
+            "DELETE FROM mpc_presignatures WHERE id = ?",
+            vec![row.id.into()],
+        )?;
+        let bytes = hex::decode(&row.data_hex)
+            .map_err(|e| Error::RustError(format!("decode presignature hex: {e}")))?;
+        Ok(Some(bytes))
+    }
+
+    /// Count available mpc_presignatures for an agent.
+    pub fn presignature_count(&self, agent_id: &str) -> Result<u64> {
+        let rows: Vec<CountRow> = self
+            .sql()
+            .exec(
+                "SELECT COUNT(*) AS n FROM mpc_presignatures WHERE agent_id = ?",
+                vec![agent_id.into()],
+            )?
+            .to_array()?;
+        Ok(rows.first().map(|r| r.n as u64).unwrap_or(0))
+    }
+
+    /// Count mpc_presignatures across all agents.
+    pub fn total_presignature_count(&self) -> Result<u64> {
+        let rows: Vec<CountRow> = self
+            .sql()
+            .exec("SELECT COUNT(*) AS n FROM mpc_presignatures", None)?
+            .to_array()?;
+        Ok(rows.first().map(|r| r.n as u64).unwrap_or(0))
+    }
+}
