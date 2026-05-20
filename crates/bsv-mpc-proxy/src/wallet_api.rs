@@ -1009,6 +1009,46 @@ pub async fn get_public_key(
 /// 2. Otherwise, run the full 4-round interactive protocol with the KSS.
 /// 3. Return the DER-encoded ECDSA signature.
 ///
+/// Sign a sighash through the **ADR-018 relay combiner** — the deployed
+/// cosigner (`share_A`) issues its partial over the MessageBox relay and this
+/// proxy (`share_B`) combines it into a final ECDSA signature, over the authed
+/// production `/sign-relay` route.
+///
+/// Consumes one raw presig box from the proxy pool (`take_raw`); relay mode
+/// requires the pool to be stocked with `Presignature_B`s correlated (FIFO) with
+/// the cosigner DO's `Presignature_A` pool (provisioning automation, #4). Only
+/// base-key signing is supported here — BRC-42 HD-derived (`hmac_offset`)
+/// signing stays on the legacy 4-round HTTP path (handoff §3).
+async fn relay_sign(
+    state: &AppState,
+    sighash: &[u8; 32],
+) -> std::result::Result<bsv_mpc_core::types::SigningResult, String> {
+    let raw = {
+        let mut mgr = state.presign_manager.write().await;
+        mgr.take_raw()
+    }
+    .ok_or_else(|| {
+        "relay sign: presignature pool empty — provisioning is not keeping up".to_string()
+    })?;
+
+    let trigger = crate::relay_sign::DoTrigger {
+        url: format!("{}/sign-relay", state.bridge.kss_url()),
+        // Production: the DO consumes its correlated Presignature_A from the
+        // pool; the proxy never re-sends a presignature on the wire.
+        presig_a_json: vec![],
+        do_index: state.bridge.cosigner_index(),
+        agent_id: Some(state.bridge.agent_id().to_string()),
+        // Filled by sign_over_relay from the proxy's BRC-31 session.
+        auth_headers: vec![],
+    };
+
+    state
+        .bridge
+        .sign_over_relay(sighash, raw, trigger, std::time::Duration::from_secs(60))
+        .await
+        .map_err(|e| format!("relay sign failed: {e}"))
+}
+
 /// Presignature signing takes ~50-100ms. Full protocol takes ~300-500ms.
 /// Library-callable version of `create_signature`. Accepts parsed state and request body directly.
 pub async fn create_signature_impl(state: &AppState, body: Value) -> Value {
@@ -1088,16 +1128,27 @@ pub async fn create_signature_impl(state: &AppState, body: Value) -> Value {
         None
     };
 
-    // Try to get a presignature from the pool for single-round signing
-    let presig = {
-        let mut mgr = state.presign_manager.write().await;
-        mgr.take()
-    };
-
-    // Sign via MPC bridge (2PC with KSS)
-    let signing_result = match state.bridge.sign(&msg_hash, presig, hmac_offset).await {
-        Ok(result) => result,
-        Err(e) => return json!({ "error": format!("MPC signing failed: {}", e) }),
+    // ADR-018 relay mode: route base-key signing through the deployed cosigner
+    // over the relay. HD-derived (hmac_offset) signing stays on the 4-round HTTP
+    // path (handoff §3 — the offset is baked into a presig at generation time).
+    let signing_result = if state.config.relay_sign && hmac_offset.is_none() {
+        match relay_sign(state, &msg_hash).await {
+            Ok(result) => result,
+            Err(e) => return json!({ "error": format!("MPC signing failed: {}", e) }),
+        }
+    } else {
+        // Legacy HTTP path. In relay mode, never consume a relay-correlated
+        // presig here (it would desync the proxy/DO pools); pass None.
+        let presig = if state.config.relay_sign {
+            None
+        } else {
+            let mut mgr = state.presign_manager.write().await;
+            mgr.take()
+        };
+        match state.bridge.sign(&msg_hash, presig, hmac_offset).await {
+            Ok(result) => result,
+            Err(e) => return json!({ "error": format!("MPC signing failed: {}", e) }),
+        }
     };
 
     // Return DER-encoded signature as hex
@@ -1394,20 +1445,25 @@ pub async fn create_action_impl(state: &AppState, body: Value) -> Value {
             sighash_type,
         });
 
-        // Try presignature pool for single-round signing
-        let presig = {
-            let mut mgr = state.presign_manager.write().await;
-            mgr.take()
-        };
-
-        // MPC sign via bridge (2PC with KSS).
-        // Currently all tracked UTXOs are locked to the root key, so offset=None.
-        // When inputs locked to BRC-42 derived keys are supported (e.g., from
-        // internalizeAction with derivation metadata), compute the offset via
-        // compute_signing_hmac_offset() and use the derived pubkey for subscript.
-        let signing_result = match state.bridge.sign(&sighash, presig, None).await {
-            Ok(result) => result,
-            Err(e) => return json!({"error": format!("signing input {} failed: {}", i, e)}),
+        // MPC sign via bridge. All tracked UTXOs are locked to the root key, so
+        // offset=None → relay mode is eligible. In relay mode, the deployed
+        // cosigner co-signs over the relay; otherwise the legacy 4-round HTTP
+        // path runs. (BRC-42-derived-key inputs would compute an offset and stay
+        // on the HTTP path; not yet supported here.)
+        let signing_result = if state.config.relay_sign {
+            match relay_sign(state, &sighash).await {
+                Ok(result) => result,
+                Err(e) => return json!({"error": format!("signing input {} failed: {}", i, e)}),
+            }
+        } else {
+            let presig = {
+                let mut mgr = state.presign_manager.write().await;
+                mgr.take()
+            };
+            match state.bridge.sign(&sighash, presig, None).await {
+                Ok(result) => result,
+                Err(e) => return json!({"error": format!("signing input {} failed: {}", i, e)}),
+            }
         };
 
         // Build checksig format: DER signature + sighash type byte (0x41)

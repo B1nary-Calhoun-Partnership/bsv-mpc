@@ -102,6 +102,14 @@ pub struct ProxyConfig {
     /// proxy combines the deployed DO's partial over the relay, this is the
     /// `message-box-server` it dials. Default: the live Calhoun relay.
     pub relay_url: String,
+
+    /// Route `createSignature` / `createAction` signing through the ADR-018
+    /// **relay combiner** (the deployed cosigner over the MessageBox relay)
+    /// instead of the legacy 4-round HTTP `bridge.rs::sign`. Default `false`
+    /// (legacy path) until provisioning automation keeps the proxy + DO pools
+    /// stocked with correlated pairs; flipped on once relay-mode is the default
+    /// and the HTTP path is retired (OQ-I1). Env: `MPC_RELAY_SIGN=1`.
+    pub relay_sign: bool,
 }
 
 impl ProxyConfig {
@@ -160,6 +168,8 @@ impl ProxyConfig {
 
             relay_url: std::env::var("MPC_RELAY_URL")
                 .unwrap_or_else(|_| "https://rust-message-box.dev-a3e.workers.dev".into()),
+
+            relay_sign: std::env::var("MPC_RELAY_SIGN").as_deref() == Ok("1"),
         })
     }
 }

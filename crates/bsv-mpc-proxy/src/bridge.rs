@@ -1303,6 +1303,23 @@ impl MpcBridge {
         &self.agent_id
     }
 
+    /// The cosigner (KSS / deployed DO) party's signing-time index — the `from`
+    /// index its relay partial carries. For the 2-party setup this is the
+    /// participant that is not this proxy's own share index.
+    pub fn cosigner_index(&self) -> u16 {
+        let me = self.share.share_index.0;
+        self.participants
+            .iter()
+            .copied()
+            .find(|&p| p != me)
+            .unwrap_or(0)
+    }
+
+    /// Whether relay-mode signing is enabled (config `MPC_RELAY_SIGN`).
+    pub fn relay_url(&self) -> &str {
+        &self.relay_url
+    }
+
     /// Create a bridge with a known joint key for testing.
     /// No KSS connection is established — only `joint_public_key()` and local
     /// derivation methods are usable. Partial ECDH (requiring KSS) will fail.
@@ -1505,6 +1522,7 @@ mod tests {
             threshold_configs: vec!["2-of-2".to_string()],
             min_balance_sats: None,
             relay_url: "https://rust-message-box.dev-a3e.workers.dev".into(),
+            relay_sign: false,
         };
 
         let bridge = MpcBridge::new(&config).await.unwrap();
@@ -1536,6 +1554,7 @@ mod tests {
             threshold_configs: vec!["2-of-2".to_string()],
             min_balance_sats: None,
             relay_url: "https://rust-message-box.dev-a3e.workers.dev".into(),
+            relay_sign: false,
         };
 
         let result = MpcBridge::new(&config).await;
@@ -1585,6 +1604,7 @@ mod tests {
             threshold_configs: vec!["2-of-2".to_string()],
             min_balance_sats: None,
             relay_url: "https://rust-message-box.dev-a3e.workers.dev".into(),
+            relay_sign: false,
         };
 
         let bridge = MpcBridge::new(&config).await.unwrap();

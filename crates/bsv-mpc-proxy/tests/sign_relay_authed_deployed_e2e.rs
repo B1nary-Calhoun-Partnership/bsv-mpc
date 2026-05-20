@@ -84,7 +84,10 @@ fn run_dkg_2of2() -> (JointPublicKey, EncryptedShare, EncryptedShare, SessionId)
     panic!("DKG did not complete");
 }
 
-fn gen_presig_pair(share0: EncryptedShare, share1: EncryptedShare) -> (Vec<u8>, PresignBox) {
+fn gen_presig_pair(
+    share0: EncryptedShare,
+    share1: EncryptedShare,
+) -> (Vec<u8>, bsv_mpc_core::types::Presignature, PresignBox) {
     let session = SessionId::from_str_hash("authed-presig");
     let participants = vec![0u16, 1u16];
     let mut m0 = PresigningManager::new(session, share0, participants.clone(), 2);
@@ -123,8 +126,8 @@ fn gen_presig_pair(share0: EncryptedShare, share1: EncryptedShare) -> (Vec<u8>, 
         )>()
         .expect("box0 downcast");
     let presig_a_json = serde_json::to_vec(&presig_a).expect("serialize Presignature_A");
-    let (_w1, box1) = m1.take_raw().expect("m1 take_raw");
-    (presig_a_json, box1)
+    let (presig_b, box1) = m1.take_raw().expect("m1 take_raw");
+    (presig_a_json, presig_b, box1)
 }
 
 fn assert_bsv_valid(joint: &JointPublicKey, sighash: &[u8; 32], sig: &SigningResult) {
@@ -143,7 +146,12 @@ fn assert_bsv_valid(joint: &JointPublicKey, sighash: &[u8; 32], sig: &SigningRes
     );
 }
 
-fn proxy_config(share_path: String, worker_url: &str, relay_url: &str) -> ProxyConfig {
+fn proxy_config(
+    share_path: String,
+    worker_url: &str,
+    relay_url: &str,
+    relay_sign: bool,
+) -> ProxyConfig {
     ProxyConfig {
         port: 3322,
         kss_url: worker_url.to_string(),
@@ -157,6 +165,7 @@ fn proxy_config(share_path: String, worker_url: &str, relay_url: &str) -> ProxyC
         threshold_configs: vec!["2-of-2".to_string()],
         min_balance_sats: None,
         relay_url: relay_url.to_string(),
+        relay_sign,
     }
 }
 
@@ -178,7 +187,7 @@ async fn proxy_cosigns_through_authed_sign_relay() {
     let (joint, share0, share1, dkg_session) = run_dkg_2of2();
     let joint_hex = hex::encode(&joint.compressed);
     eprintln!("✔ joint pubkey = {joint_hex}");
-    let (presig_a_json, box_b) = gen_presig_pair(share0, share1.clone());
+    let (presig_a_json, _presig_b, box_b) = gen_presig_pair(share0, share1.clone());
 
     // ── 2. Real MpcBridge from share_B → stable identity + BRC-31 handshake. ──
     let dkg_result = DkgResult {
@@ -195,6 +204,7 @@ async fn proxy_cosigns_through_authed_sign_relay() {
         share_path.to_string_lossy().to_string(),
         &worker_url,
         &relay_url,
+        false,
     );
     let bridge = MpcBridge::new(&config)
         .await
@@ -251,5 +261,111 @@ async fn proxy_cosigns_through_authed_sign_relay() {
     eprintln!();
     eprintln!("╔══════════════════════════════════════════════════════════════╗");
     eprintln!("║  #6/#5-step-4 GATE PASS — authed /sign-relay co-sign + 401     ║");
+    eprintln!("╚══════════════════════════════════════════════════════════════╝");
+}
+
+/// **#3 gate** — `createSignature` (the wallet_api BRC-100 entry) routes through
+/// the relay combiner when `relay_sign` is on. Enters `create_signature_impl`
+/// with a base-key request (no `protocolID` → `hmac_offset = None`), so the
+/// signature is over the **root joint key** — exactly what the relay path
+/// produces. Proves the dispatch + pool `take_raw` + trigger construction wiring
+/// end-to-end against the deployed cosigner. No sats.
+///
+/// ```bash
+/// SIGN_RELAY_AUTHED_E2E=1 cargo test -p bsv-mpc-proxy \
+///   --test sign_relay_authed_deployed_e2e create_signature_routes_through_relay \
+///   --release -- --nocapture --test-threads=1
+/// ```
+#[tokio::test]
+async fn create_signature_routes_through_relay() {
+    use bsv::primitives::ec::Signature as BsvSignature;
+    use bsv_mpc_proxy::presign_manager::PresignManager;
+    use bsv_mpc_proxy::server::ProxyBuilder;
+
+    if !opt_in() {
+        eprintln!("SIGN_RELAY_AUTHED_E2E=1 not set — skipping #3 createSignature-over-relay gate.");
+        return;
+    }
+    let _ = tracing_subscriber::fmt::try_init();
+    let worker_url =
+        std::env::var("DEPLOYED_WORKER_URL").unwrap_or_else(|_| DEFAULT_WORKER.to_string());
+    let relay_url =
+        std::env::var("MESSAGEBOX_RELAY_URL").unwrap_or_else(|_| DEFAULT_RELAY.to_string());
+
+    // 1. DKG + correlated pair; seed proxy pool with box_B + Presignature_B.
+    let (joint, share0, share1, dkg_session) = run_dkg_2of2();
+    let joint_arr = {
+        let mut a = [0u8; 33];
+        a.copy_from_slice(&joint.compressed);
+        a
+    };
+    let joint_pub = PublicKey::from_bytes(&joint_arr).expect("joint pubkey");
+    let (presig_a_json, presig_b, box_b) = gen_presig_pair(share0, share1.clone());
+
+    // 2. Real bridge from share_B (stable identity + BRC-31 handshake), relay on.
+    let dkg_result = DkgResult {
+        joint_key: joint.clone(),
+        share: share1,
+        session_id: dkg_session,
+    };
+    let dir = std::env::temp_dir();
+    let share_path = dir.join(format!("relay_csig_share_{}.json", std::process::id()));
+    tokio::fs::write(&share_path, serde_json::to_vec(&dkg_result).unwrap())
+        .await
+        .expect("write share file");
+    let config = proxy_config(
+        share_path.to_string_lossy().to_string(),
+        &worker_url,
+        &relay_url,
+        true, // relay_sign ON — route createSignature through the combiner
+    );
+    let bridge = MpcBridge::new(&config)
+        .await
+        .expect("MpcBridge::new (handshake)");
+
+    // 3. Provision Presignature_A → DO pool; seed the proxy pool with box_B.
+    bridge
+        .provision_presig_to_do(&presig_a_json, "relay-csig", "relay-csig-1")
+        .await
+        .expect("provision presig to DO pool");
+    let mut mgr = PresignManager::new(4);
+    mgr.add(presig_b, box_b);
+
+    let state = ProxyBuilder::new(config)
+        .with_bridge(bridge)
+        .with_presign_manager(mgr)
+        .build()
+        .await
+        .expect("build AppState");
+
+    // 4. Drive the BRC-100 entry. No protocolID → base (root) key; hashToDirectlySign.
+    let sighash = deterministic_sighash(b"createSignature over relay v1");
+    let resp = bsv_mpc_proxy::wallet_api::create_signature_impl(
+        &state,
+        serde_json::json!({
+            "data": hex::encode(sighash),
+            "hashToDirectlySign": true,
+        }),
+    )
+    .await;
+    let sig_hex = resp
+        .get("signature")
+        .and_then(|v| v.as_str())
+        .unwrap_or_else(|| panic!("createSignature returned no signature: {resp}"));
+    let der = hex::decode(sig_hex).expect("sig hex");
+    let sig = BsvSignature::from_der(&der).expect("DER signature");
+    assert!(
+        joint_pub.verify(&sighash, &sig),
+        "createSignature-over-relay signature MUST verify under the joint root key"
+    );
+    eprintln!(
+        "✔ createSignature routed through relay → root-key sig verifies (DER {} bytes)",
+        der.len()
+    );
+
+    let _ = tokio::fs::remove_file(&share_path).await;
+    eprintln!();
+    eprintln!("╔══════════════════════════════════════════════════════════════╗");
+    eprintln!("║  #3 GATE PASS — createSignature dispatches through the relay   ║");
     eprintln!("╚══════════════════════════════════════════════════════════════╝");
 }

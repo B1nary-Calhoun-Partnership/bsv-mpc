@@ -342,6 +342,7 @@ async fn setup() -> TestEnv {
         threshold_configs: vec!["2-of-2".to_string()],
         min_balance_sats: None,
         relay_url: "https://rust-message-box.dev-a3e.workers.dev".into(),
+        relay_sign: false,
     };
 
     tokio::spawn(async move {
