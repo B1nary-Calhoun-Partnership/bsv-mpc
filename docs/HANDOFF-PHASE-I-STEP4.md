@@ -228,7 +228,23 @@ end-to-end on real Cloudflare + real mainnet.
     `bsv_rs::wallet::substrates::HttpWalletJson` (default `localhost:3321`) pointed
     at the proxy (`localhost:3322`) → `create_action(CreateActionArgs)`. That IS an
     unmodified BRC-100 client — no bsv-worm, no hand-rolled JSON, Path-A.
-- **Provisioning automation (#4) — REMAINING, the last piece before the gate.**
+- ✅ **#6 GATE MET** — `1c3b4de`. A canonical BRC-100 `createAction` (built from
+  the SDK `CreateActionArgs` type, exact wire bytes) drives the **running** proxy
+  in relay mode → proxy selects the funded joint UTXO → **deployed CF cosigner**
+  co-signs the input over the **authed relay** → proxy combines, **pre-flight
+  verifies** (low-s + ECDSA under the joint key, fail-closed), broadcasts.
+  **REAL-SATS TXID
+  [`6085f497…f23b`](https://whatsonchain.com/tx/6085f497bead622daac769f73c471f5adc26bb1b2334a22140664feb51f3f23b)**
+  (joint `1Ffq2xnVoM6k3RDeWtUthSkaReLebwwDPe`; confirmed on WoC).
+  `createaction_relay_mainnet_e2e.rs`, `E2E_MAINNET=1`. Added `pub
+  build_router(state)`; pre-flight verify in `create_action_impl`.
+  - **Wire-format finding:** real BRC-100 wallet servers (`bsv-wallet-cli`
+    `McCreateActionRes`) return `txid` as a **hex string** — the proxy matches.
+    The SDK's *client* `CreateActionResult.txid` is `[u8;32]` (array) and is NOT
+    wire-compatible, so `HttpWalletJson` can't parse a real wallet's response; the
+    gate sends canonical `CreateActionArgs` and parses the canonical hex `txid`,
+    as any real BRC-100 client does. (Possible SDK follow-up, out of scope here.)
+- **Provisioning automation (#4) — REMAINING; now the only Phase I-6 item left.**
   Native Container (`bsv-mpc-service`, holds share_A, has `/presign/*`) runs
   presig gen with the proxy (`bridge.presign_raw()` targets the **container** in
   relay mode → proxy pool gets box_B), then ships its `Presignature_A` to the DO
