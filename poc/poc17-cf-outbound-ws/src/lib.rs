@@ -696,6 +696,12 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         // Empirical bar: two curls return the SAME client_identity AND
         // the SAME server_identity (relay-side stability).
         .get_async("/relay-via-do/handshake", forward_to_session_do)
+        // H-3.5c gate: canonical envelope round-trip driven entirely
+        // inside the DO. Mirrors H-3.4 /envelope-roundtrip but with
+        // stable secret-based identity instead of `PrivateKey::random()`.
+        // Empirical bar: sendMessageAck.messageId byte-equals our sent
+        // messageId; status: "success".
+        .get_async("/relay-via-do/echo", forward_to_session_do)
         .run(req, env)
         .await
 }
