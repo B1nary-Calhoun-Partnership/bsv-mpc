@@ -58,6 +58,7 @@ cggmp24 fork change required**; the DO ships/needs only `Presignature` (which IS
 | `b29e699` | **#12 proxy relay combiner** — `relay_sign::combine_sign_over_relay` + `MpcBridge::sign_over_relay` (proxy = combiner over MessageBox) | **deployed proof:** proxy combiner + deployed DO co-sign over the live relay → **BSV-valid 70-byte DER** under joint pubkey `0305e6df…` (`relay_combine_deployed_e2e.rs`, `RELAY_COMBINE_E2E=1`, no sats). 145 proxy unit tests green |
 | `a518a3a` | **#5 authz steps 1-2** — caller-identity threading + owner-identity (`mpc_shares.owner_identity`); sign/ecdh/presign reject 403 unless caller==DKG-time owner (§08.1) | **39 worker unit tests** (owner ok / stranger 403 / unauth-with-owner 403 / no-owner allowed; owner round-trip + preserve-on-refresh); design `docs/AUTHZ-DESIGN.md` spec-checked §07/§08 |
 | `c4cc9fa` | **#5 authz step 3** — durable DO-SQLite auth sessions (`AuthSessionStore` trait + `mpc_auth_sessions`); BRC-31 auth moved INTO the pinned DO; entrypoint = thin forwarder | **deployed proof:** `/poc/auth-session-roundtrip` session survives **+143s isolate eviction byte-identical** (`instance_constructed_at_ms` advanced); `POST /sign/init` no-auth → **401**; `/poc/handshake` regression-free; 40 worker unit tests. Auth-session-isolate FIXED |
+| `61430a3` | **🔒 #16 / I-5 MERGE GATE** — `i5_real_sats_deployed_e2e.rs`: proxy (share_B) + **deployed DO** (share_A partial over relay) co-sign a **REAL mainnet TX** | **REAL-SATS TXID [`d9119190…081580`](https://whatsonchain.com/tx/d9119190bc73b63bc1a84b3418df3f849d74f55dec84d879fac6fbcaaa081580)** — joint `03c7f1dc…` / `1ChPKQy1…`; pre-flight verify PASS before broadcast; GorillaPool `SEEN_ON_NETWORK`; confirmed on WhatsOnChain |
 
 **Deployed worker:** `https://bsv-mpc-kss.dev-a3e.workers.dev`.
 **Deployed native service (CF Container):** `https://bsv-mpc-service-container.dev-a3e.workers.dev`.
@@ -135,10 +136,12 @@ cggmp24 fork change required**; the DO ships/needs only `Presignature` (which IS
    - Remaining #5 hardening: at-rest encryption of primes/session blobs;
      blast-radius doc; rate limiting. §08.12 BRC-52 cert verifier + §09 policy =
      richer follow-on (own issue).
-6. **I-5 merge gate** (task #16). Real-sats mainnet TXID: proxy (share_B) + the
-   **deployed** worker (share_A) co-sign over the relay; broadcast; shape-match
-   G-5d (`442bd391…`). Wallet `localhost:3321` (Origin `http://admin.com`),
-   `E2E_MAINNET=1`. Cite the TXID in the commit.
+6. ~~**I-5 merge gate** (task #16)~~ **✅ DONE (`61430a3`).** Real-sats mainnet
+   TXID **[`d9119190…081580`](https://whatsonchain.com/tx/d9119190bc73b63bc1a84b3418df3f849d74f55dec84d879fac6fbcaaa081580)**:
+   proxy (share_B) + the **deployed** worker (share_A partial over the relay)
+   co-signed; pre-flight verify gated the broadcast; GorillaPool
+   `SEEN_ON_NETWORK`; confirmed on WhatsOnChain. `i5_real_sats_deployed_e2e.rs`
+   (`E2E_MAINNET=1`). **The Phase I deployed-cosigner merge gate is satisfied.**
 
 ---
 
@@ -187,13 +190,25 @@ cggmp24 fork change required**; the DO ships/needs only `Presignature` (which IS
   orchestrate research, then VERIFY agent output.
 
 ---
-**Last commit:** `c4cc9fa` (#5 step 3 — durable DO-SQLite auth sessions,
-deployed eviction-proven; auth-session-isolate FIXED). The two CORE #5 security
-must-fixes (handler authz + auth-session-isolate) are now both closed +
-deployed-proven. **Next pickup:** **I-5 (#16)** real-sats TXID — the hybrid sign
-path + proxy combiner + both deployment homes + auth baseline are all proven;
-fold in #5 step 4 (authed `/sign-relay` + stable proxy key from the share file)
-as part of the I-5 integration. I-5:
+**Last commit:** `61430a3` (**🔒 I-5 MERGE GATE — real-sats mainnet TXID
+[`d9119190…`](https://whatsonchain.com/tx/d9119190bc73b63bc1a84b3418df3f849d74f55dec84d879fac6fbcaaa081580)**;
+deployed DO + proxy co-signed a real mainnet TX over the relay). **The Phase I
+deployed-cosigner merge gate is SATISFIED.** Everything ADR-018 is proven
+end-to-end on real Cloudflare + real mainnet.
+
+**Remaining (hardening + productionization, not merge-gate blockers):**
+- **#5 step 4** — authed production `/sign-relay` (requester==owner) + stable
+  proxy key (derive `BridgeAuth` from the share file). The I-5 baseline used the
+  unauthed `/poc/sign-relay`; production must gate per §07.6.
+- **createAction-over-relay + provisioning automation** — route the proxy's
+  `createSignature`/`createAction` through the relay combiner + retire the HTTP
+  `bridge.rs::sign`; native Container generates correlated presig pairs →
+  DO pool (`/ceremony/ingest-presig`) + proxy pool.
+- **#5 hardening** — at-rest encryption of primes/session blobs, blast-radius
+  doc, rate limiting; §08.12 BRC-52 cert verifier + §09 policy (own issue).
+- **Phase J/K** — CHIP discovery + cross-stack joint TX with Binary.
+
+(historical I-5 plan, now done):
 swap the e2e's test key shares for a funded DKG joint key (fund the joint
 address via wallet `localhost:3321`, Origin `http://admin.com`, `E2E_MAINNET=1`),
 proxy + deployed DO co-sign over the relay, broadcast, cite the TXID.
