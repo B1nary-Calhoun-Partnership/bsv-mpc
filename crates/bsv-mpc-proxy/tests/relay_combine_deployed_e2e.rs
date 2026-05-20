@@ -182,6 +182,8 @@ To run: RELAY_COMBINE_E2E=1 cargo test -p bsv-mpc-proxy \\
             url: format!("{worker_url}/poc/sign-relay"),
             presig_a_json,
             do_index: 0,
+            agent_id: None,
+            auth_headers: vec![],
         },
         Duration::from_secs(40),
     )

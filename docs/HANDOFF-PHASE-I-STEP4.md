@@ -197,13 +197,21 @@ deployed-cosigner merge gate is SATISFIED.** Everything ADR-018 is proven
 end-to-end on real Cloudflare + real mainnet.
 
 **Remaining (hardening + productionization, not merge-gate blockers):**
-- **#5 step 4** — authed production `/sign-relay` (requester==owner). ✅ **Stable
-  proxy key DONE:** `BridgeAuth::from_share_seed` derives the proxy's long-lived
-  BRC-31 / relay identity deterministically (HMAC-SHA256, domain
-  `"bsv-mpc proxy auth identity v1"`) from the secret share material, so the
-  proxy keeps the same `owner_identity` across restarts (§07.4 / OQ-A2; 2 unit
-  tests: determinism + per-share distinctness). The I-5 baseline used the
-  unauthed `/poc/sign-relay`; production must still gate per §07.6.
+- ✅ **#5 step 4 DONE** — authed production `/sign-relay`. (1) Stable proxy key:
+  `BridgeAuth::from_share_seed` derives the proxy's long-lived BRC-31 / relay
+  identity deterministically (HMAC-SHA256, domain `"bsv-mpc proxy auth identity
+  v1"`) from the secret share material, so the proxy keeps the same
+  `owner_identity` across restarts (§07.4 / OQ-A2). (2) `/sign-relay` is now a
+  BRC-31-gated production route (`is_authed_path`) with owner-authz (§08.1) that
+  **consumes** a pooled presig (provisioned via authed `/ceremony/ingest-presig`)
+  rather than taking it in the body — `/poc/sign-relay` retained as the
+  unauthed test sibling (§07.6). `MpcBridge::sign_over_relay` auto-attaches BRC-31
+  headers; `MpcBridge::provision_presig_to_do` ships `Presignature_A` authed.
+  **Deployed proof** (`sign_relay_authed_deployed_e2e.rs`, `SIGN_RELAY_AUTHED_E2E=1`,
+  worker version `801f92e6`): real bridge (stable identity) → authed provision →
+  authed `/sign-relay` → DO consumes pooled presig → relay → proxy combines →
+  **BSV-valid 2-of-2 sig (71-byte DER)**; unauthed `/sign-relay` → **401**. No
+  sats. 147 proxy + 40 worker unit tests green.
 - **createAction-over-relay + provisioning automation** — route the proxy's
   `createSignature`/`createAction` through the relay combiner + retire the HTTP
   `bridge.rs::sign`; native Container generates correlated presig pairs →

@@ -141,6 +141,12 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         .post_async("/ceremony/ingest-presig", |req, ctx| async move {
             poc::forward_to_cosigner_do(req, &ctx.env).await
         })
+        // #6/#5 step 4: production relay sign — BRC-31 + owner-authz gated; the
+        // DO issues its partial from a pooled presig and relays it (§07.6
+        // production sibling of `/poc/sign-relay`).
+        .post_async("/sign-relay", |req, ctx| async move {
+            poc::forward_to_cosigner_do(req, &ctx.env).await
+        })
         // ── Read-only endpoints (no auth required) ──────────────────
         .get_async("/health", |req, ctx| async move {
             poc::forward_to_cosigner_do(req, &ctx.env).await

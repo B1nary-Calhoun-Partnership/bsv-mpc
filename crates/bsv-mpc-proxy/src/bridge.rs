@@ -375,14 +375,13 @@ impl BridgeAuth {
         Ok(())
     }
 
-    /// Add BRC-104 auth headers to a request builder.
+    /// Compute the BRC-104 auth headers (name, value) for a fresh request.
     ///
-    /// Generates a fresh per-request nonce, signs it with BRC-42 derived key,
-    /// and adds all required BRC-104 headers.
-    fn add_auth_headers(
-        &self,
-        builder: reqwest::RequestBuilder,
-    ) -> std::result::Result<reqwest::RequestBuilder, MpcError> {
+    /// Generates a fresh per-request nonce, signs it with the BRC-42 derived
+    /// key, and returns all required BRC-104 headers as owned pairs — usable
+    /// both for a `reqwest` builder ([`add_auth_headers`]) and for the relay
+    /// trigger (which carries them through [`crate::relay_sign::DoTrigger`]).
+    fn auth_header_pairs(&self) -> std::result::Result<Vec<(&'static str, String)>, MpcError> {
         let server_session_nonce = self
             .server_session_nonce
             .as_ref()
@@ -418,13 +417,26 @@ impl BridgeAuth {
             .map_err(|e| MpcError::Protocol(format!("ECDSA signing: {e}")))?;
         let sig_hex = hex_encode(&signature.to_der());
 
-        Ok(builder
-            .header(auth_headers::VERSION, "0.1")
-            .header(auth_headers::IDENTITY_KEY, self.identity_hex())
-            .header(auth_headers::MESSAGE_TYPE, "general")
-            .header(auth_headers::NONCE, &request_nonce)
-            .header(auth_headers::YOUR_NONCE, server_session_nonce)
-            .header(auth_headers::SIGNATURE, sig_hex))
+        Ok(vec![
+            (auth_headers::VERSION, "0.1".to_string()),
+            (auth_headers::IDENTITY_KEY, self.identity_hex()),
+            (auth_headers::MESSAGE_TYPE, "general".to_string()),
+            (auth_headers::NONCE, request_nonce),
+            (auth_headers::YOUR_NONCE, server_session_nonce.clone()),
+            (auth_headers::SIGNATURE, sig_hex),
+        ])
+    }
+
+    /// Add BRC-104 auth headers to a request builder.
+    fn add_auth_headers(
+        &self,
+        builder: reqwest::RequestBuilder,
+    ) -> std::result::Result<reqwest::RequestBuilder, MpcError> {
+        let mut builder = builder;
+        for (name, value) in self.auth_header_pairs()? {
+            builder = builder.header(name, value);
+        }
+        Ok(builder)
     }
 }
 
@@ -1174,7 +1186,7 @@ impl MpcBridge {
         &self,
         sighash: &[u8; 32],
         my_presig_box: Box<dyn std::any::Any + Send>,
-        trigger: crate::relay_sign::DoTrigger,
+        mut trigger: crate::relay_sign::DoTrigger,
         recv_timeout: std::time::Duration,
     ) -> bsv_mpc_core::error::Result<SigningResult> {
         let identity_priv = {
@@ -1182,6 +1194,17 @@ impl MpcBridge {
                 .auth
                 .lock()
                 .map_err(|_| MpcError::Protocol("auth mutex poisoned".into()))?;
+            // Production: gate the authed `/sign-relay` with BRC-31 headers
+            // signed by the proxy's stable owner identity. When the caller
+            // already supplied headers (or the trigger is the unauthed POC
+            // route), leave them untouched.
+            if trigger.auth_headers.is_empty() && auth.is_authenticated() {
+                trigger.auth_headers = auth
+                    .auth_header_pairs()?
+                    .into_iter()
+                    .map(|(k, v)| (k.to_string(), v))
+                    .collect();
+            }
             auth.auth_key.clone()
         };
         crate::relay_sign::combine_sign_over_relay(
@@ -1198,6 +1221,53 @@ impl MpcBridge {
             recv_timeout,
         )
         .await
+    }
+
+    /// **#14/#6 provisioning** — POST a serialized `Presignature_A` into the
+    /// deployed DO's presignature pool via the authed `/ceremony/ingest-presig`
+    /// route, so a subsequent authed `/sign-relay` can consume it (the DO never
+    /// receives `PresignaturePublicData`; only the serializable `Presignature`).
+    ///
+    /// The proxy must hold a live BRC-31 session with the KSS (established in
+    /// [`MpcBridge::new`]); the request is signed with the proxy's stable owner
+    /// identity. The correlated `Presignature_B` stays in the proxy's own pool.
+    pub async fn provision_presig_to_do(
+        &self,
+        presig_a_json: &[u8],
+        session_id: &str,
+        presig_id: &str,
+    ) -> bsv_mpc_core::error::Result<()> {
+        let url = format!("{}/ceremony/ingest-presig", self.kss_url);
+        let body = serde_json::json!({
+            "session_id": session_id,
+            "presig_id": presig_id,
+            "presignature_hex": hex_encode(presig_a_json),
+        });
+        let mut builder = self.client.post(&url).json(&body);
+        {
+            let auth = self
+                .auth
+                .lock()
+                .map_err(|_| MpcError::Protocol("auth mutex poisoned".into()))?;
+            if !auth.is_authenticated() {
+                return Err(MpcError::Protocol(
+                    "proxy not authenticated with KSS — cannot provision presig".into(),
+                ));
+            }
+            builder = auth.add_auth_headers(builder)?;
+        }
+        let resp = builder
+            .send()
+            .await
+            .map_err(|e| MpcError::Protocol(format!("ingest-presig request: {e}")))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let txt = resp.text().await.unwrap_or_default();
+            return Err(MpcError::Protocol(format!(
+                "ingest-presig returned {status}: {txt}"
+            )));
+        }
+        Ok(())
     }
 
     /// Get the root BSV PublicKey.

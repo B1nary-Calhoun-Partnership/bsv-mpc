@@ -371,6 +371,8 @@ To run (BURNS REAL SATS): E2E_MAINNET=1 cargo test -p bsv-mpc-proxy \\
             url: format!("{worker_url}/poc/sign-relay"),
             presig_a_json,
             do_index: 0,
+            agent_id: None,
+            auth_headers: vec![],
         },
         Duration::from_secs(60),
     )

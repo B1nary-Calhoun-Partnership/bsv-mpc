@@ -348,7 +348,7 @@ const AUTH_IDENTITY_HEADER: &str = "x-bsv-auth-identity-key";
 
 /// The authenticated caller's BRC-31 identity (hex), or `None` when absent
 /// (unauthenticated dev mode).
-fn caller_identity(req: &Request) -> Option<String> {
+pub(crate) fn caller_identity(req: &Request) -> Option<String> {
     req.headers()
         .get(AUTH_IDENTITY_HEADER)
         .ok()
@@ -362,7 +362,7 @@ fn caller_identity(req: &Request) -> Option<String> {
 /// where the entrypoint BRC-31 gate still applies), or `Ok(Some(403))` to
 /// return when the caller is not the owner — checked BEFORE any share material
 /// is used.
-fn authz_owner_or_reject(
+pub(crate) fn authz_owner_or_reject(
     caller: Option<&str>,
     store: &dyn MpcStore,
     agent_id: &str,

@@ -27,15 +27,25 @@ use bsv_mpc_messagebox::MessageBoxClient;
 /// How the proxy reaches the DO to make it issue + relay its partial.
 pub struct DoTrigger {
     /// The DO's sign-relay endpoint (the deployed `/poc/sign-relay`, or the
-    /// production authed route once it lands).
+    /// production authed `/sign-relay`).
     pub url: String,
-    /// Serialized cggmp24 `Presignature_A` (party `do_index`'s presignature),
-    /// already provisioned to the DO's pool (#14). Posted here so the proof is
-    /// self-contained; production reads it from the DO pool.
+    /// **POC mode only**: serialized cggmp24 `Presignature_A` (party
+    /// `do_index`'s presignature), posted in the trigger body so the POC proof
+    /// is self-contained. **Production** leaves this empty — the authed
+    /// `/sign-relay` consumes the presignature from the DO's provisioned pool
+    /// (#14), so `PresignaturePublicData` never crosses the boundary and the
+    /// presig is never re-sent on the wire.
     pub presig_a_json: Vec<u8>,
     /// The DO party's signing-time index — the `from` index its partial carries
     /// (the combiner keys partials by this).
     pub do_index: u16,
+    /// **Production mode**: the share's `agent_id` (joint pubkey hex) so the DO
+    /// can enforce owner-authz (§08.1) on the relay sign trigger. `None` for the
+    /// unauthed POC route.
+    pub agent_id: Option<String>,
+    /// **Production mode**: BRC-31 auth headers (name, value) for the authed
+    /// `/sign-relay` route. Empty for the unauthed POC route.
+    pub auth_headers: Vec<(String, String)>,
 }
 
 /// The combiner's signing-time index = position of its share index within
@@ -97,19 +107,32 @@ pub async fn combine_sign_over_relay(
     coord.sign_with_presignature(sighash, my_presig_box)?;
 
     // 3. Trigger the DO to issue + relay its partial to us.
+    //    Production: presig is consumed from the DO pool (no `presignature_hex`
+    //    in the body), `agent_id` carries the share key for owner-authz, and
+    //    BRC-31 auth headers gate the route. POC: presig in body, no auth.
     let http = reqwest::Client::new();
-    let resp = http
+    let mut trigger_body = serde_json::json!({
+        "sighash_hex": hex::encode(sighash),
+        "recipient_pub_hex": combiner_pub,
+        "from_index": trigger.do_index,
+        "to_index": my_index,
+        "joint_pubkey_hex": hex::encode(&joint_key.compressed),
+        "session_id_hex": session_id.hex(),
+    });
+    if !trigger.presig_a_json.is_empty() {
+        trigger_body["presignature_hex"] = serde_json::json!(hex::encode(&trigger.presig_a_json));
+    }
+    if let Some(ref agent_id) = trigger.agent_id {
+        trigger_body["agent_id"] = serde_json::json!(agent_id);
+    }
+    let mut builder = http
         .post(&trigger.url)
         .header("content-type", "application/json")
-        .json(&serde_json::json!({
-            "presignature_hex": hex::encode(&trigger.presig_a_json),
-            "sighash_hex": hex::encode(sighash),
-            "recipient_pub_hex": combiner_pub,
-            "from_index": trigger.do_index,
-            "to_index": my_index,
-            "joint_pubkey_hex": hex::encode(&joint_key.compressed),
-            "session_id_hex": session_id.hex(),
-        }))
+        .json(&trigger_body);
+    for (name, value) in &trigger.auth_headers {
+        builder = builder.header(name, value);
+    }
+    let resp = builder
         .send()
         .await
         .map_err(|e| MpcError::Protocol(format!("trigger DO sign-relay: {e}")))?;

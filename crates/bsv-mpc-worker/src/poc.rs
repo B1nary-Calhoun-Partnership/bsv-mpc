@@ -59,6 +59,7 @@ fn is_authed_path(path: &str) -> bool {
             | "/ecdh"
             | "/ceremony/seed-primes"
             | "/ceremony/ingest-presig"
+            | "/sign-relay"
     ) || path.starts_with("/shares/")
 }
 
@@ -115,6 +116,9 @@ impl DurableObject for CosignerSessionDo {
             "/poc/issue-partial" => self.handle_issue_partial(req).await,
             "/poc/presig-pool" => self.handle_presig_pool(req).await,
             "/poc/sign-relay" => self.handle_sign_relay(req).await,
+            // §07.6 production sibling of `/poc/sign-relay`: BRC-31-gated (above)
+            // + owner-authz, consuming a provisioned presig from the DO pool.
+            "/sign-relay" => self.handle_prod_sign_relay(req).await,
             "/poc/handshake" => self.handle_handshake().await,
             // ── KSS routes (I-4a.2: storage-backed by this DO's SQLite) ──
             // Auth is enforced at the Worker entrypoint before forwarding.
@@ -1136,6 +1140,258 @@ impl CosignerSessionDo {
             "instance_constructed_at_ms": self.instance_constructed_at_ms,
         }))
     }
+
+    /// `POST /sign-relay` — the **production**, BRC-31-gated sibling of
+    /// `/poc/sign-relay` (§07.6: no endpoint trusted by location; `/poc/*` are
+    /// test-only). Differs from the POC route in three ways:
+    ///
+    /// 1. **Owner-authz** — only the share's DKG-time `owner_identity` (§08.1)
+    ///    may trigger the DO to issue + relay its partial. The caller identity
+    ///    is the BRC-31 identity verified at dispatch (`is_authed_path`).
+    /// 2. **Presig from the pool** — the presignature is *consumed* from the
+    ///    DO's provisioned pool (#14 `/ceremony/ingest-presig`), never accepted
+    ///    in the request body. `PresignaturePublicData` never crosses the
+    ///    boundary; only the serializable `Presignature` is shipped/stored.
+    /// 3. **External combiner only** — `recipient_pub_hex` (the proxy combiner)
+    ///    is required; there is no self-addressed round-trip.
+    ///
+    /// Request body: `{ agent_id (joint pubkey hex, the share key),
+    /// recipient_pub_hex (combiner identity), sighash_hex,
+    /// from_index?, to_index?, joint_pubkey_hex?, session_id_hex? }`.
+    async fn handle_prod_sign_relay(&self, mut req: Request) -> Result<Response> {
+        use bsv::auth::transports::socketio::build_envelope_payload;
+        use bsv::auth::transports::socketio::codec::{EngineIoPacket, SocketIoPacket};
+        use bsv::auth::{
+            install_app_event_listener, run_dispatch, Peer, PeerOptions, SocketIoFrameSource,
+            SocketIoSink, SocketIoTransport,
+        };
+        use bsv::primitives::ec::PublicKey;
+        use bsv::wallet::ProtoWallet;
+        use bsv_mpc_core::envelope::{wrap_round_message, WrapParams};
+        use bsv_mpc_core::types::{RoundMessage, SessionId, ShareIndex};
+        use bsv_mpc_messagebox::transport_wasm::{polling_handshake, WsHandle};
+        use bsv_mpc_messagebox::types::BOX_SIGN;
+        use bsv_mpc_messagebox::wire::wrap_envelope_to_body;
+        use futures::future::{select, Either};
+        use futures::StreamExt;
+        use serde_json::json;
+        use std::time::Duration;
+        use wasm_bindgen_futures::spawn_local;
+
+        #[derive(serde::Deserialize)]
+        struct ProdSignRelayRequest {
+            agent_id: String,
+            recipient_pub_hex: String,
+            sighash_hex: String,
+            #[serde(default)]
+            from_index: Option<u16>,
+            #[serde(default)]
+            to_index: Option<u16>,
+            #[serde(default)]
+            joint_pubkey_hex: Option<String>,
+            #[serde(default)]
+            session_id_hex: Option<String>,
+        }
+
+        // ── 0. Owner-authz (BEFORE any share/presig material is touched) ────
+        // The caller identity is the BRC-31 identity verified at dispatch.
+        let caller = crate::api::caller_identity(&req);
+        let body: ProdSignRelayRequest = req.json().await?;
+        let store = self.kss_store()?;
+        if let Some(resp) =
+            crate::api::authz_owner_or_reject(caller.as_deref(), &store, &body.agent_id)?
+        {
+            return Ok(resp);
+        }
+
+        // ── 1. Decode inputs ────────────────────────────────────────────
+        let sighash_bytes = hex::decode(&body.sighash_hex)
+            .map_err(|e| Error::RustError(format!("sighash_hex: {e}")))?;
+        if sighash_bytes.len() != 32 {
+            return Response::error("sighash must be 32 bytes", 400);
+        }
+        let mut sighash = [0u8; 32];
+        sighash.copy_from_slice(&sighash_bytes);
+
+        let from_index = body.from_index.unwrap_or(0);
+        let to_index = body.to_index.unwrap_or(1);
+
+        let joint_pubkey = match &body.joint_pubkey_hex {
+            Some(h) => {
+                let b = hex::decode(h)
+                    .map_err(|e| Error::RustError(format!("joint_pubkey_hex: {e}")))?;
+                if b.len() != 33 {
+                    return Response::error("joint_pubkey_hex must be 33 bytes", 400);
+                }
+                let mut a = [0u8; 33];
+                a.copy_from_slice(&b);
+                a
+            }
+            None => [0u8; 33],
+        };
+
+        let session_id = match &body.session_id_hex {
+            Some(h) => {
+                let b =
+                    hex::decode(h).map_err(|e| Error::RustError(format!("session_id_hex: {e}")))?;
+                if b.len() != 32 {
+                    return Response::error("session_id_hex must be 32 bytes", 400);
+                }
+                let mut a = [0u8; 32];
+                a.copy_from_slice(&b);
+                SessionId(a)
+            }
+            None => SessionId::from_str_hash("mpc-sign-relay"),
+        };
+
+        // ── 2. Identity (reloaded every wake) ───────────────────────────
+        let priv_hex = self.env.secret("SERVER_PRIVATE_KEY")?.to_string();
+        let client_priv = PrivateKey::from_hex(&priv_hex)
+            .map_err(|e| Error::RustError(format!("SERVER_PRIVATE_KEY parse: {e:?}")))?;
+        let client_pub_hex = client_priv.public_key().to_hex();
+        let recipient_pub = PublicKey::from_hex(&body.recipient_pub_hex)
+            .map_err(|e| Error::RustError(format!("recipient_pub_hex: {e:?}")))?;
+
+        // ── 3. Consume a provisioned presignature from the DO pool ──────
+        // The pool is keyed by the DO's own identity (#14). The matching
+        // Presignature_B is held by the combiner; only Presignature_A ships.
+        let pool_agent = client_pub_hex.clone();
+        let consumed = match store.consume_presignature(&pool_agent)? {
+            Some(p) => p,
+            None => {
+                return Response::error(
+                    "no presignature available in pool — provision via /ceremony/ingest-presig",
+                    409,
+                )
+            }
+        };
+        let partial_json = bsv_mpc_core::signing::issue_partial_signature_json(&consumed, &sighash)
+            .map_err(|e| Error::RustError(format!("issue_partial: {e}")))?;
+
+        // ── 4. Wrap the partial as a canonical §05 MessageEnvelope ───────
+        let round_msg = RoundMessage {
+            session_id,
+            round: 1,
+            from: ShareIndex(from_index),
+            to: Some(ShareIndex(to_index)),
+            payload: partial_json.clone(),
+        };
+        let params = WrapParams {
+            to_party: to_index,
+            joint_pubkey,
+            phase: "sign".to_string(),
+            execution_id_prefix: [0u8; 8],
+            correlation_id: Some(session_id.hex()),
+            traceparent: None,
+        };
+        let envelope = wrap_round_message(&round_msg, params, &recipient_pub, &client_priv)
+            .map_err(|e| Error::RustError(format!("wrap_round_message: {e}")))?;
+        let envelope_body = wrap_envelope_to_body(&envelope);
+
+        // ── 5. Dial the relay + send to the combiner on box mpc-sign ─────
+        let t0 = Date::now().as_millis();
+        let relay = self
+            .env
+            .var("RELAY_URL")
+            .map(|v| v.to_string())
+            .unwrap_or_else(|_| DEFAULT_RELAY_URL.to_string());
+
+        let handshake = polling_handshake(&relay).await?;
+        let mut ws = WsHandle::open_and_upgrade(&relay, &handshake.sid)
+            .await
+            .map_err(Error::RustError)?;
+        let sink = ws.sender();
+
+        sink.send_socketio(&SocketIoPacket::Connect {
+            nsp: "/".to_string(),
+            data: None,
+        })
+        .map_err(Error::RustError)?;
+        loop {
+            match ws.recv_engineio().await.map_err(Error::RustError)? {
+                EngineIoPacket::Ping(payload) => {
+                    let _ = sink.send_engineio(&EngineIoPacket::Pong(payload));
+                }
+                EngineIoPacket::Message(payload) => {
+                    if let Ok(SocketIoPacket::Connect { .. }) = SocketIoPacket::decode(&payload) {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let transport = SocketIoTransport::new(sink.clone());
+        let callback = transport.callback_handle();
+        let dispatch_sink = sink.clone();
+        let wallet = ProtoWallet::new(Some(client_priv));
+        let peer = Peer::new(PeerOptions {
+            wallet,
+            transport,
+            certificates_to_request: None,
+            session_manager: None,
+            auto_persist_last_session: true,
+            originator: Some("prod-sign-relay".to_string()),
+        });
+        peer.start();
+        let (mut events, _cb_id) = install_app_event_listener(&peer).await;
+        spawn_local(run_dispatch(ws, dispatch_sink, callback));
+
+        // Join our own {id}-mpc-sign room (drives the BRC-103 handshake).
+        let own_room = format!("{client_pub_hex}-{BOX_SIGN}");
+        peer.to_peer(
+            &build_envelope_payload("joinRoom", &json!(own_room)),
+            None,
+            Some(20_000),
+        )
+        .await
+        .map_err(|e| Error::RustError(format!("to_peer(joinRoom): {e:?}")))?;
+        let handshake_rtt_ms = Date::now().as_millis() - t0;
+
+        // Server identity = sender of the first inbound General.
+        let server_identity =
+            match select(events.next(), worker::Delay::from(Duration::from_secs(8))).await {
+                Either::Left((Some(ev), _)) => Some(ev.sender.to_hex()),
+                _ => None,
+            };
+
+        let now_ms = Date::now().as_millis();
+        let message_id = format!("prod-{now_ms}");
+        let mut sent = false;
+        if let Some(server_id) = server_identity.as_deref() {
+            let send_payload = build_envelope_payload(
+                "sendMessage",
+                &json!({
+                    "messageBox": BOX_SIGN,
+                    "message": {
+                        "messageId": message_id,
+                        "recipient": body.recipient_pub_hex,
+                        "body": envelope_body,
+                    }
+                }),
+            );
+            sent = peer
+                .to_peer(&send_payload, Some(server_id), Some(20_000))
+                .await
+                .is_ok();
+        }
+
+        Response::from_json(&serde_json::json!({
+            "route": "sign-relay",
+            "client_identity": client_pub_hex,
+            "recipient": body.recipient_pub_hex,
+            "owner": caller,
+            "server_identity": server_identity,
+            "partial_hex": hex::encode(&partial_json),
+            "envelope_len": envelope.encode_canonical().len(),
+            "message_box": BOX_SIGN,
+            "message_id": message_id,
+            "sent": sent,
+            "handshake_rtt_ms": handshake_rtt_ms,
+            "relay": relay,
+            "instance_constructed_at_ms": self.instance_constructed_at_ms,
+        }))
+    }
 }
 
 /// Native stub — the relay-handshake POC is wasm32-only (the Socket.IO +
@@ -1149,6 +1405,10 @@ impl CosignerSessionDo {
 
     async fn handle_sign_relay(&self, _req: Request) -> Result<Response> {
         Response::error("/poc/sign-relay is wasm32-only (deployed CF Worker)", 501)
+    }
+
+    async fn handle_prod_sign_relay(&self, _req: Request) -> Result<Response> {
+        Response::error("/sign-relay is wasm32-only (deployed CF Worker)", 501)
     }
 }
 
