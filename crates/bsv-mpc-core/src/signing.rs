@@ -7,13 +7,17 @@
 //!
 //! ## Two Signing Modes
 //!
-//! ### 1. With Presignature (1 round) — future
+//! ### 1. With Presignature (1 round) — implemented
 //!
 //! If a presignature is available from the offline phase, online signing requires
-//! only **1 round** of communication. This path requires the
-//! `insecure-assume-preimage-known` feature on cggmp24 (because BSV sighashes
-//! are pre-hashed). Currently not implemented in the coordinator — use the full
-//! protocol path instead.
+//! only **1 round**: each party issues a partial signature locally
+//! ([`SigningCoordinator::sign_with_presignature`]), broadcasts it once, and
+//! [`process_round`](SigningCoordinator::process_round) combines them. Just field
+//! math — no Paillier/ZK rounds — so it fits the CF Worker wasm budget (ADR-018).
+//! Uses the `insecure-assume-preimage-known` cggmp24 feature (BSV sighashes are
+//! pre-hashed). **Base key only** — BRC-42 HD-derived signing (an `hmac_offset`)
+//! must use the 4-round path, since the offset is baked into a presignature at
+//! generation time.
 //!
 //! ### 2. Without Presignature (4 rounds) — implemented
 //!
@@ -38,7 +42,7 @@
 use std::collections::VecDeque;
 
 use cggmp24::security_level::SecurityLevel128;
-use cggmp24::signing::PrehashedDataToSign;
+use cggmp24::signing::{PartialSignature, PrehashedDataToSign, PresignaturePublicData};
 use cggmp24::supported_curves::Secp256k1;
 use cggmp24::ExecutionId;
 use generic_ec::Scalar;
@@ -98,6 +102,9 @@ enum SigningMode {
     NotStarted,
     /// Running the full 4-round SM-based signing protocol.
     FullProtocol,
+    /// Running the 1-round presigned online path (exchange + combine partial
+    /// signatures). Base-key only — BRC-42 offsets use `FullProtocol`.
+    Presigned,
     /// Signing is complete.
     Complete,
 }
@@ -172,6 +179,14 @@ pub struct SigningCoordinator {
     /// The message hash being signed (captured in `init_round`, used by
     /// `assemble_signing_result` to build the SigningResult).
     message_hash: Option<[u8; 32]>,
+
+    /// Presigned-path state: the shared public data (commitments) needed by
+    /// `PartialSignature::combine`, captured from the consumed presignature.
+    presig_public_data: Option<PresignaturePublicData<Secp256k1>>,
+    /// Presigned-path state: partial signatures collected so far, keyed by
+    /// signing-time index (position in `participants`) so `combine` receives
+    /// them in commitment order.
+    partial_sigs: std::collections::BTreeMap<u16, PartialSignature<Secp256k1>>,
 }
 
 // SAFETY: `SigningCoordinator` is structurally `!Send` because the
@@ -222,6 +237,8 @@ impl SigningCoordinator {
             wire_buffer: VecDeque::new(),
             next_msg_id: 0,
             message_hash: None,
+            presig_public_data: None,
+            partial_sigs: std::collections::BTreeMap::new(),
         }
     }
 
@@ -242,9 +259,81 @@ impl SigningCoordinator {
         _presignature: Option<Presignature>,
         hmac_offset: Option<[u8; 32]>,
     ) -> Result<Vec<RoundMessage>> {
-        // TODO: When cggmp24 `insecure-assume-preimage-known` feature is enabled,
-        // implement the presigned path here using issue_partial_signature + combine.
+        // Presigned 1-round path is exposed separately via
+        // [`sign_with_presignature`] (it needs the raw cggmp24 presignature,
+        // not the metadata-only `types::Presignature`). `sign` always runs the
+        // 4-round path, which is also the BRC-42-offset (derived-key) path.
         self.init_round(message_hash, hmac_offset)
+    }
+
+    /// **1-round presigned online signing** (the fast path, ADR-018).
+    ///
+    /// Given a presignature produced earlier by a [`PresigningManager`] (its
+    /// raw cggmp24 output, obtained from
+    /// [`PresigningManager::take_raw`](crate::presigning::PresigningManager::take_raw)),
+    /// this party issues its partial signature locally and emits it in a single
+    /// broadcast round. Once every participant's partial has arrived,
+    /// [`process_round`](Self::process_round) combines them into the final
+    /// ECDSA signature — no Paillier/ZK rounds, just field math (fits the CF
+    /// Worker wasm budget; the heavy presig generation runs natively per
+    /// ADR-018).
+    ///
+    /// **Base key only.** Presignatures bake the key in at generation time and
+    /// `issue_partial_signature`/`combine` take no additive shift, so BRC-42
+    /// HD-derived signing (`hmac_offset`) must use the 4-round [`sign`](Self::sign)
+    /// path. Callers with a non-`None` offset must not use this method.
+    ///
+    /// # Arguments
+    /// * `message_hash` — the 32-byte SHA-256d BSV sighash.
+    /// * `presignature_raw` — the boxed `(Presignature, PresignaturePublicData)`
+    ///   from `PresigningManager::take_raw` (downcast internally).
+    pub fn sign_with_presignature(
+        &mut self,
+        message_hash: &[u8; 32],
+        presignature_raw: Box<dyn std::any::Any + Send>,
+    ) -> Result<Vec<RoundMessage>> {
+        if self.mode != SigningMode::NotStarted {
+            return Err(MpcError::Signing(
+                "sign_with_presignature() called but signing already started".into(),
+            ));
+        }
+
+        let (presig, public_data) = *presignature_raw
+            .downcast::<crate::presigning::PresignOutput>()
+            .map_err(|_| {
+                MpcError::Signing(
+                    "presignature_raw is not the expected cggmp24 presignature type".into(),
+                )
+            })?;
+
+        let my_signing_index = self.signing_index()?;
+
+        // BSV sighashes are prehashed; the `insecure-assume-preimage-known`
+        // cggmp24 feature (enabled) lets us treat the scalar as a DataToSign.
+        let scalar = Scalar::<Secp256k1>::from_be_bytes_mod_order(*message_hash);
+        let data_to_sign =
+            PrehashedDataToSign::from_scalar(scalar).insecure_assume_preimage_known();
+
+        // Issue this party's partial signature (consumes the presignature).
+        let my_partial = presig.issue_partial_signature(data_to_sign);
+
+        self.message_hash = Some(*message_hash);
+        self.presig_public_data = Some(public_data);
+        self.partial_sigs.insert(my_signing_index, my_partial);
+        self.mode = SigningMode::Presigned;
+        self.current_round = 1;
+
+        // Broadcast our partial signature. `from` is the signing-time index so
+        // the receiver keys it into commitment order for `combine`.
+        let payload = serde_json::to_vec(&my_partial)
+            .map_err(|e| MpcError::Signing(format!("serialize partial signature: {e}")))?;
+        Ok(vec![RoundMessage {
+            session_id: self.session_id,
+            round: 1,
+            from: ShareIndex(my_signing_index),
+            to: None,
+            payload,
+        }])
     }
 
     /// Start the signing protocol (Round 1).
@@ -347,6 +436,7 @@ impl SigningCoordinator {
                     "process_round() called after signing completed".into(),
                 ));
             }
+            SigningMode::Presigned => return self.process_presigned_round(messages),
             SigningMode::FullProtocol => {}
         }
 
@@ -365,6 +455,52 @@ impl SigningCoordinator {
                 self.assemble_signing_result(signature)
             }
         }
+    }
+
+    /// Process inbound partial signatures for the presigned 1-round path.
+    /// Collects each participant's `PartialSignature`; once all have arrived,
+    /// combines them (in commitment order) into the final ECDSA signature.
+    fn process_presigned_round(
+        &mut self,
+        messages: Vec<RoundMessage>,
+    ) -> Result<SigningRoundResult> {
+        for msg in &messages {
+            let partial: PartialSignature<Secp256k1> = serde_json::from_slice(&msg.payload)
+                .map_err(|e| MpcError::Signing(format!("deserialize partial signature: {e}")))?;
+            self.partial_sigs.insert(msg.from.0, partial);
+        }
+
+        // Still waiting for the rest of the participants' partials.
+        if self.partial_sigs.len() < self.participants.len() {
+            self.current_round += 1;
+            return Ok(SigningRoundResult::NextRound(vec![]));
+        }
+
+        let public_data = self
+            .presig_public_data
+            .as_ref()
+            .ok_or_else(|| MpcError::Signing("presignature public data missing".into()))?;
+        let message_hash = self
+            .message_hash
+            .ok_or_else(|| MpcError::Signing("message hash not set (internal error)".into()))?;
+        let scalar = Scalar::<Secp256k1>::from_be_bytes_mod_order(message_hash);
+        let data_to_sign =
+            PrehashedDataToSign::from_scalar(scalar).insecure_assume_preimage_known();
+
+        // BTreeMap iterates by key (signing-time index) → commitment order,
+        // which `PartialSignature::combine` requires.
+        let partials: Vec<PartialSignature<Secp256k1>> =
+            self.partial_sigs.values().copied().collect();
+
+        let sig =
+            PartialSignature::combine(&partials, public_data, data_to_sign).ok_or_else(|| {
+                MpcError::Signing(
+                    "partial-signature combine failed (malformed or cheating party)".into(),
+                )
+            })?;
+
+        self.mode = SigningMode::Complete;
+        self.assemble_signing_result(sig)
     }
 
     /// Get the current round number (0 = not started).
@@ -1288,5 +1424,97 @@ mod tests {
 
         let valid = bsv_pubkey.verify(&message_hash, &bsv_sig);
         assert!(valid, "BSV SDK presigned verification must pass");
+    }
+
+    /// The keystone (ADR-018): drive the **1-round presigned** path through the
+    /// `SigningCoordinator` API end-to-end — both parties issue a partial via
+    /// `sign_with_presignature`, exchange one round, and `process_round`
+    /// combines into a valid ECDSA signature that the BSV SDK verifies.
+    #[tokio::test]
+    async fn coordinator_presigned_1round_sign() {
+        let n: u16 = 2;
+        let t: u16 = 2;
+        let config = ThresholdConfig::new(t, n).unwrap();
+        let key_shares = dkg_key_shares(n, t);
+        let participants: Vec<u16> = vec![0, 1];
+
+        // Presignatures via the sim → Vec<(Presignature, PresignaturePublicData)>.
+        let mut rng = rand::rngs::OsRng;
+        let eid_bytes: [u8; 32] = rand::Rng::gen(&mut rng);
+        let eid_presign = ExecutionId::new(&eid_bytes);
+        let presigs = round_based::sim::run_with_setup(
+            participants.iter().map(|i| &key_shares[usize::from(*i)]),
+            |i, party, share| {
+                let party = buffer_outgoing(party);
+                let mut party_rng = rand::rngs::OsRng;
+                let participants = participants.clone();
+                async move {
+                    cggmp24::signing(eid_presign, i, &participants, share)
+                        .generate_presignature(&mut party_rng, party)
+                        .await
+                }
+            },
+        )
+        .unwrap()
+        .expect_ok()
+        .into_vec();
+        assert_eq!(presigs.len(), 2);
+
+        // Build the two coordinators.
+        let session = SessionId::from_str_hash("presigned-coord-test");
+        let share0 = key_share_to_encrypted(&key_shares[0], 0, config);
+        let share1 = key_share_to_encrypted(&key_shares[1], 1, config);
+        let mut coord0 = SigningCoordinator::new(session, share0, config, participants.clone());
+        let mut coord1 = SigningCoordinator::new(session, share1, config, participants);
+
+        let message_hash: [u8; 32] = {
+            let mut h = sha2::Sha256::new();
+            h.update(b"presigned coordinator message");
+            let mut b = [0u8; 32];
+            b.copy_from_slice(&h.finalize());
+            b
+        };
+
+        let mut it = presigs.into_iter();
+        let presig0 = it.next().unwrap();
+        let presig1 = it.next().unwrap();
+
+        // 1 round: each party issues its partial signature.
+        let out0 = coord0
+            .sign_with_presignature(&message_hash, Box::new(presig0))
+            .expect("coord0 issue partial");
+        let out1 = coord1
+            .sign_with_presignature(&message_hash, Box::new(presig1))
+            .expect("coord1 issue partial");
+        assert_eq!(out0.len(), 1, "exactly one broadcast partial");
+        assert_eq!(out1.len(), 1);
+
+        // Exchange the partials; each side then combines → Complete.
+        let r0 = coord0.process_round(out1).expect("coord0 combine");
+        let r1 = coord1.process_round(out0).expect("coord1 combine");
+        let sig0 = match r0 {
+            SigningRoundResult::Complete(r) => r,
+            _ => panic!("coord0 did not complete in 1 round"),
+        };
+        let sig1 = match r1 {
+            SigningRoundResult::Complete(r) => r,
+            _ => panic!("coord1 did not complete in 1 round"),
+        };
+        assert_eq!(sig0.r, sig1.r, "both parties agree on r");
+        assert_eq!(sig0.s, sig1.s, "both parties agree on s");
+
+        // The combined signature must verify under the joint public key.
+        let pubkey_bytes = key_shares[0].core.shared_public_key.to_bytes(true);
+        let bsv_pubkey =
+            bsv::PublicKey::from_bytes(&pubkey_bytes).expect("BSV SDK accepts joint pubkey");
+        let mut sig_bytes = [0u8; 64];
+        sig_bytes[..32].copy_from_slice(&sig0.r);
+        sig_bytes[32..].copy_from_slice(&sig0.s);
+        let bsv_sig =
+            bsv::Signature::from_compact(&sig_bytes).expect("BSV SDK accepts combined signature");
+        assert!(
+            bsv_pubkey.verify(&message_hash, &bsv_sig),
+            "BSV SDK must verify the 1-round presigned signature"
+        );
     }
 }

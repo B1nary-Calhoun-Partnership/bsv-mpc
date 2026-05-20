@@ -83,7 +83,7 @@ use crate::types::{EncryptedShare, Presignature, RoundMessage, SessionId};
 /// tuple on success, `SigningError` on failure. The output is type-erased
 /// into `Box<dyn Any + Send>` when stored in the manager's `raw_pool`
 /// because `PresignaturePublicData` doesn't implement `Serialize`.
-type PresignOutput = (
+pub(crate) type PresignOutput = (
     cggmp24::Presignature<Secp256k1>,
     PresignaturePublicData<Secp256k1>,
 );
