@@ -51,6 +51,7 @@ cggmp24 fork change required**; the DO ships/needs only `Presignature` (which IS
 | `a8e8805` | `signing::issue_partial_signature_json` (DO light op) | `hybrid_do_issues_proxy_combines` (DO issues from JSON presig, proxy combines, BSV verify) |
 | `a60155b` | `/poc/issue-partial` deployed | **deployed-wasm partial byte-identical to native** |
 | `f94eadd`/`5ee6547` | CF Container probe P1 | **native Rust on CF Container reachable** (~1.75s cold/~130ms warm) |
+| `d6ccf57` | **#14 presig provisioning** — `/ceremony/ingest-presig` (authed, stores under the DO's own identity) + `/poc/presig-pool` | **deployed proof:** pool store→consume **byte-identical** (`round_trip_matches=true`, count 1→0), partial from the *consumed* presig byte-identical to native fixture (`…d2c14a`) |
 
 **Deployed worker:** `https://bsv-mpc-kss.dev-a3e.workers.dev`.
 **Container probe:** `https://bsv-mpc-container-probe.dev-a3e.workers.dev`.
@@ -74,12 +75,15 @@ cggmp24 fork change required**; the DO ships/needs only `Presignature` (which IS
 
 ## 4. Remaining roadmap (integration → merge gate)
 
-1. **Presig provisioning** (task #14). Native container runs 2-party presig gen
-   with the proxy (`bsv-mpc-service` already drives presig over the relay), then
-   ships `Presignature_A` (JSON) into the DO `mpc_presignatures` pool. Add a DO
-   ingest route (authed, mirror `/ceremony/seed-primes`) using
-   `DoSqlStorage::store_presignature`; DO `consume`s one per signature.
-   `PresignaturePublicData` stays native (never shipped).
+1. ~~**Presig provisioning** (task #14)~~ **✅ DONE (`d6ccf57`).** Authed
+   `/ceremony/ingest-presig` stores `Presignature_A` (JSON) into the DO
+   `mpc_presignatures` pool under the DO's **own** identity (handler authz);
+   `/poc/presig-pool` proves provision→consume→light-sign byte-identical on the
+   deployed worker. `PresignaturePublicData` stays native (never shipped).
+   **REMAINING here:** the native container half — `bsv-mpc-service` must
+   actually POST to `/ceremony/ingest-presig` after each presig gen (couples to
+   the proxy `bridge.rs` migration, #12). The DO `consume` is wired into the
+   sign loop in step 2.
 2. **Worker relay sign loop** (task #15, I-4b.2 revised). DO: wake-on-HTTP → dial
    relay (I-3b2 proven) → pop a presig → `issue_partial_signature_json` → send
    the partial over the relay. Wire: `wire::wrap_envelope_to_body` /
@@ -147,6 +151,10 @@ cggmp24 fork change required**; the DO ships/needs only `Presignature` (which IS
   orchestrate research, then VERIFY agent output.
 
 ---
-**Last commit:** `df71796`. **Next pickup:** presig provisioning (#14) — or CF
-Container P2 (#17) if continuing the container track. The crypto is locked; build
-the integration on top.
+**Last commit:** `d6ccf57` (#14 presig provisioning, deployed-proven). **Next
+pickup:** the worker relay sign loop (#15) — DO wake-on-HTTP → dial relay
+(I-3b2 proven) → `consume_presignature` → `issue_partial_signature_json` → send
+the partial over the relay (`wire::wrap_envelope_to_body`, box `mpc-sign`, room
+`{id}-mpc-sign`). The DO consume side is in place; #15 wires it to the relay.
+Alternatively CF Container P2 (#17) on the container track. The crypto is
+locked; build the integration on top.
