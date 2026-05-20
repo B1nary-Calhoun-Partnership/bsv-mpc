@@ -517,6 +517,9 @@ pub struct MpcBridge {
     /// BRC-31 Authrite client for authenticated KSS communication.
     /// Arc<Mutex> for sharing across spawn_blocking closures.
     auth: Arc<Mutex<BridgeAuth>>,
+
+    /// MessageBox relay URL for the ADR-018 relay sign path (#12).
+    relay_url: String,
 }
 
 impl MpcBridge {
@@ -672,6 +675,7 @@ impl MpcBridge {
             participants,
             agent_id,
             auth: Arc::new(Mutex::new(bridge_auth)),
+            relay_url: config.relay_url.clone(),
         })
     }
 
@@ -1113,6 +1117,46 @@ impl MpcBridge {
         }
     }
 
+    /// **ADR-018 relay sign (#12)** — combine the deployed DO's partial over
+    /// the MessageBox relay into a final signature, with this proxy as the
+    /// combiner.
+    ///
+    /// The proxy holds `share_B` + `my_presig_box` (its own `(Presignature,
+    /// PresignaturePublicData)` from the presign pool, correlated with the DO's
+    /// `Presignature_A` at generation). It dials the relay with its local auth
+    /// identity, triggers the DO to issue + relay party-`trigger.do_index`'s
+    /// partial, and combines. Delegates to the deployed-proven
+    /// [`crate::relay_sign::combine_sign_over_relay`].
+    pub async fn sign_over_relay(
+        &self,
+        sighash: &[u8; 32],
+        my_presig_box: Box<dyn std::any::Any + Send>,
+        trigger: crate::relay_sign::DoTrigger,
+        recv_timeout: std::time::Duration,
+    ) -> bsv_mpc_core::error::Result<SigningResult> {
+        let identity_priv = {
+            let auth = self
+                .auth
+                .lock()
+                .map_err(|_| MpcError::Protocol("auth mutex poisoned".into()))?;
+            auth.auth_key.clone()
+        };
+        crate::relay_sign::combine_sign_over_relay(
+            &self.relay_url,
+            identity_priv,
+            self.share.clone(),
+            self.participants.clone(),
+            self.share.config,
+            self.session_id,
+            sighash,
+            my_presig_box,
+            &self.joint_key,
+            trigger,
+            recv_timeout,
+        )
+        .await
+    }
+
     /// Get the root BSV PublicKey.
     pub fn root_pub(&self) -> &PublicKey {
         &self.root_pub
@@ -1171,6 +1215,7 @@ impl MpcBridge {
             participants: vec![0, 1],
             agent_id,
             auth: Arc::new(Mutex::new(BridgeAuth::new().expect("test auth key"))),
+            relay_url: "https://rust-message-box.dev-a3e.workers.dev".into(),
         }
     }
 }
@@ -1341,6 +1386,7 @@ mod tests {
             arc_api_key: "test_key".into(),
             threshold_configs: vec!["2-of-2".to_string()],
             min_balance_sats: None,
+            relay_url: "https://rust-message-box.dev-a3e.workers.dev".into(),
         };
 
         let bridge = MpcBridge::new(&config).await.unwrap();
@@ -1371,6 +1417,7 @@ mod tests {
             arc_api_key: "test_key".into(),
             threshold_configs: vec!["2-of-2".to_string()],
             min_balance_sats: None,
+            relay_url: "https://rust-message-box.dev-a3e.workers.dev".into(),
         };
 
         let result = MpcBridge::new(&config).await;
@@ -1419,6 +1466,7 @@ mod tests {
             arc_api_key: "test_key".into(),
             threshold_configs: vec!["2-of-2".to_string()],
             min_balance_sats: None,
+            relay_url: "https://rust-message-box.dev-a3e.workers.dev".into(),
         };
 
         let bridge = MpcBridge::new(&config).await.unwrap();

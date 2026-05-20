@@ -8,6 +8,7 @@ description = "BRC-100 compatible MPC signing proxy — drop-in replacement for 
 
 [dependencies]
 bsv-mpc-core = { path = "../bsv-mpc-core" }
+bsv-mpc-messagebox = { path = "../bsv-mpc-messagebox" }
 bsv.workspace = true
 axum.workspace = true
 tokio.workspace = true
@@ -25,3 +26,8 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 chrono.workspace = true
 anyhow.workspace = true
+
+[dev-dependencies]
+# #12 relay-combiner deployed e2e: generate a real DKG + correlated presig pair
+# (bsv-mpc-core public API) and serialize Presignature_A (needs the cggmp24 type).
+cggmp24.workspace = true

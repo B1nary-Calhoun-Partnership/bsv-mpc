@@ -97,6 +97,11 @@ pub struct ProxyConfig {
     /// will participate in DKG. Advertised via `GET /capabilities`. `None`
     /// means no minimum.
     pub min_balance_sats: Option<u64>,
+
+    /// MessageBox relay URL for the ADR-018 relay sign path (#12). When the
+    /// proxy combines the deployed DO's partial over the relay, this is the
+    /// `message-box-server` it dials. Default: the live Calhoun relay.
+    pub relay_url: String,
 }
 
 impl ProxyConfig {
@@ -152,6 +157,9 @@ impl ProxyConfig {
                 ),
                 Err(_) => None,
             },
+
+            relay_url: std::env::var("MPC_RELAY_URL")
+                .unwrap_or_else(|_| "https://rust-message-box.dev-a3e.workers.dev".into()),
         })
     }
 }

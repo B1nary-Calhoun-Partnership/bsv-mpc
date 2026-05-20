@@ -341,6 +341,7 @@ async fn setup() -> TestEnv {
         arc_api_key: "<REDACTED-ARC-API-KEY>".into(),
         threshold_configs: vec!["2-of-2".to_string()],
         min_balance_sats: None,
+        relay_url: "https://rust-message-box.dev-a3e.workers.dev".into(),
     };
 
     tokio::spawn(async move {
