@@ -212,10 +212,31 @@ end-to-end on real Cloudflare + real mainnet.
   authed `/sign-relay` → DO consumes pooled presig → relay → proxy combines →
   **BSV-valid 2-of-2 sig (71-byte DER)**; unauthed `/sign-relay` → **401**. No
   sats. 147 proxy + 40 worker unit tests green.
-- **createAction-over-relay + provisioning automation** — route the proxy's
-  `createSignature`/`createAction` through the relay combiner + retire the HTTP
-  `bridge.rs::sign`; native Container generates correlated presig pairs →
-  DO pool (`/ceremony/ingest-presig`) + proxy pool.
+- ✅ **createAction-over-relay wiring DONE** — `1b5c7ab` (pool refactor) +
+  `dd8383c` (wiring). (1) `PresignManager` now holds the full
+  `(Presignature, PresignaturePublicData)` box (`take_raw`) the combiner needs,
+  not just the serializable `Presignature` (the box is `Send`-not-`Sync`, so it's
+  `Mutex`-shimmed for `AppState: Sync`). (2) `MPC_RELAY_SIGN=1` routes base-key
+  `createSignature` (hmac_offset=None) and `createAction` through the relay
+  combiner (`relay_sign()` → `sign_over_relay`); HD-derived signing stays on the
+  4-round HTTP path. Default off. **Deployed proof**
+  (`create_signature_routes_through_relay`): base-key createSignature via the
+  wallet_api entry in relay mode → deployed DO co-signs over the relay →
+  root-key sig verifies (71-byte DER). No sats.
+  - **Gate driver settled (user-confirmed):** the #6 mainnet gate drives the
+    *running* proxy via the canonical SDK BRC-100 client
+    `bsv_rs::wallet::substrates::HttpWalletJson` (default `localhost:3321`) pointed
+    at the proxy (`localhost:3322`) → `create_action(CreateActionArgs)`. That IS an
+    unmodified BRC-100 client — no bsv-worm, no hand-rolled JSON, Path-A.
+- **Provisioning automation (#4) — REMAINING, the last piece before the gate.**
+  Native Container (`bsv-mpc-service`, holds share_A, has `/presign/*`) runs
+  presig gen with the proxy (`bridge.presign_raw()` targets the **container** in
+  relay mode → proxy pool gets box_B), then ships its `Presignature_A` to the DO
+  worker via authed `/ceremony/ingest-presig`; both pools consume FIFO in
+  lockstep. Note: the DO needs only the *presignature* for the light sign
+  (`issue_partial`), not share_A itself — so the container is the share_A holder
+  for presig gen. Needs: container BRC-31 client + extract `Presignature_A` from
+  the completed session + background replenishment loop.
 - **#5 hardening** — at-rest encryption of primes/session blobs, blast-radius
   doc, rate limiting; §08.12 BRC-52 cert verifier + §09 policy (own issue).
 - **Phase J/K** — CHIP discovery + cross-stack joint TX with Binary.
