@@ -44,6 +44,24 @@ pub const POC_DO_NAME: &str = "cosigner-poc-2";
 #[cfg(target_arch = "wasm32")]
 pub const DEFAULT_RELAY_URL: &str = "https://rust-message-box.dev-a3e.workers.dev";
 
+/// Whether a path requires BRC-31 auth (verified in the DO, #5 step 3). Mirrors
+/// MPC-Spec §07.5/§07.6: all KSS ceremony + ceremony-admin + share-metadata
+/// routes gate; `/health` and the `/poc/*` deterministic-proof routes are open.
+fn is_authed_path(path: &str) -> bool {
+    matches!(
+        path,
+        "/dkg/init"
+            | "/dkg/round"
+            | "/sign/init"
+            | "/sign/round"
+            | "/presign/init"
+            | "/presign/round"
+            | "/ecdh"
+            | "/ceremony/seed-primes"
+            | "/ceremony/ingest-presig"
+    ) || path.starts_with("/shares/")
+}
+
 /// Per-identity cosigner Durable Object. Holds its key-share in DO SQLite
 /// (durable across hibernation); `instance_constructed_at_ms` is in-memory
 /// telemetry that advances whenever the isolate is evicted + reconstructed.
@@ -68,11 +86,31 @@ impl DurableObject for CosignerSessionDo {
 
     async fn fetch(&self, req: Request) -> Result<Response> {
         let path = req.path();
+
+        // BRC-31 handshake — handled IN the DO so the session is written to the
+        // pinned DO's SQLite (durable across isolate churn; #5 step 3 / §07.7).
+        if path == "/.well-known/auth" {
+            let config = crate::auth::AuthConfig::from_env(&self.env)?;
+            let store = self.kss_store()?;
+            return crate::auth::handle_initial_request(req, &config, &store).await;
+        }
+        // Authed KSS routes: verify BRC-31 against the durable DO-SQLite session
+        // store BEFORE dispatch (§07.5/§07.6 — no endpoint trusted by location;
+        // auth runs in the pinned DO, #5 step 3). /poc/* + /health stay open.
+        if is_authed_path(&path) {
+            let config = crate::auth::AuthConfig::from_env(&self.env)?;
+            let store = self.kss_store()?;
+            if let Err(resp) = crate::auth::verify_or_allow(&req, &config, &store) {
+                return Ok(resp);
+            }
+        }
+
         match path.as_str() {
             // ── POC routes (substrate proofs) ──────────────────────────
             "/poc/identity" => self.handle_identity().await,
             "/poc/persist" => self.handle_persist().await,
             "/poc/share-roundtrip" => self.handle_share_roundtrip().await,
+            "/poc/auth-session-roundtrip" => self.handle_auth_session_roundtrip().await,
             "/poc/dkg-bench" => self.handle_dkg_bench(req).await,
             "/poc/issue-partial" => self.handle_issue_partial(req).await,
             "/poc/presig-pool" => self.handle_presig_pool(req).await,
@@ -287,6 +325,59 @@ impl CosignerSessionDo {
             "parties": reloaded.config.parties,
             "metadata_present": meta.is_some(),
             "share_count": store.share_count()?,
+            "instance_constructed_at_ms": self.instance_constructed_at_ms,
+            "do_name": POC_DO_NAME,
+        }))
+    }
+
+    /// `GET /poc/auth-session-roundtrip` — #5 step 3 proof: a BRC-31 auth
+    /// session persisted to DO SQLite survives isolate eviction. Idempotently
+    /// upserts a deterministic session via the durable store, reads it back, and
+    /// asserts a byte-identical round-trip. Two curls across a ~90s idle gap
+    /// prove eviction (`instance_constructed_at_ms` advances) while the session
+    /// row stays byte-stable — the same pattern that satisfied the I-4a
+    /// fund-safety gate, here for the auth-session-isolate fix: the handshake
+    /// write + the request read hit the SAME durable store regardless of which
+    /// entrypoint isolate served them.
+    async fn handle_auth_session_roundtrip(&self) -> Result<Response> {
+        use crate::auth::{AuthSession, AuthSessionStore};
+
+        let identity = self.identity_hex()?;
+        let store = self.kss_store()?;
+
+        // Deterministic session keyed off this DO's identity → a post-eviction
+        // reload is byte-identical (the durability proof).
+        let server_nonce = format!("poc-auth-{identity}");
+        let session = AuthSession {
+            server_nonce: server_nonce.clone(),
+            peer_identity_key: "02poc0000000000000000000000000000000000000000000000000000000000"
+                .into(),
+            peer_nonce: "poc-peer-nonce".into(),
+            created_at: 1_700_000_000_000,
+        };
+        let already_existed = AuthSessionStore::get_session(&store, &server_nonce)
+            .map_err(Error::RustError)?
+            .is_some();
+        AuthSessionStore::put_session(&store, session.clone()).map_err(Error::RustError)?;
+
+        let reloaded = AuthSessionStore::get_session(&store, &server_nonce)
+            .map_err(Error::RustError)?
+            .ok_or_else(|| Error::RustError("auth session missing after put".into()))?;
+        let reload_matches = reloaded.peer_identity_key == session.peer_identity_key
+            && reloaded.peer_nonce == session.peer_nonce
+            && reloaded.created_at == session.created_at;
+        let missing_is_none = AuthSessionStore::get_session(&store, "poc-no-such-nonce")
+            .map_err(Error::RustError)?
+            .is_none();
+
+        Response::from_json(&serde_json::json!({
+            "route": "poc/auth-session-roundtrip",
+            "client_identity": identity,
+            "server_nonce": server_nonce,
+            "already_existed": already_existed,
+            "reload_matches": reload_matches,
+            "missing_is_none": missing_is_none,
+            "reloaded_created_at": reloaded.created_at,
             "instance_constructed_at_ms": self.instance_constructed_at_ms,
             "do_name": POC_DO_NAME,
         }))

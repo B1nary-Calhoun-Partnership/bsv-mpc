@@ -155,15 +155,47 @@ impl AuthenticatedIdentity {
 /// looked up during authenticated request verification.
 #[derive(Clone)]
 #[allow(dead_code)] // peer_nonce used by sign_response_headers (not yet wired into handlers)
-struct AuthSession {
+pub struct AuthSession {
     /// Server's nonce for this session (base64-encoded, used as lookup key).
-    server_nonce: String,
+    pub server_nonce: String,
     /// Client's identity key (66-char hex compressed pubkey).
-    peer_identity_key: String,
+    pub peer_identity_key: String,
     /// Client's initial nonce from handshake (base64-encoded).
-    peer_nonce: String,
+    pub peer_nonce: String,
     /// Session creation time (ms since epoch).
-    created_at: u64,
+    pub created_at: u64,
+}
+
+/// Storage backend for BRC-31 auth sessions (§07.7 — caching allowed, TTL ≤ 1h).
+///
+/// Two impls: [`StaticSessionStore`] (process-global in-memory — native tests +
+/// non-DO contexts) and `DoSqlStorage` (durable DO SQLite — the deployed
+/// worker). The deployed worker MUST use the durable store: CF runs many
+/// entrypoint isolates, so an in-memory session written during the handshake is
+/// invisible to a follow-up request that lands on a different isolate
+/// (`SessionNotFound`). Backing sessions with the per-identity DO's SQLite +
+/// running auth INSIDE the pinned DO makes the handshake-write and request-read
+/// hit the same store. (#5 / auth-session-isolate.)
+pub trait AuthSessionStore {
+    /// Persist (upsert) a session, keyed by `server_nonce`.
+    fn put_session(&self, session: AuthSession) -> std::result::Result<(), String>;
+    /// Look up a session by `server_nonce`.
+    fn get_session(&self, server_nonce: &str) -> std::result::Result<Option<AuthSession>, String>;
+}
+
+/// Process-global in-memory session store (per-isolate). Used by native unit
+/// tests and any non-DO context. NOT durable across CF isolate churn — the
+/// deployed worker uses the DO-SQLite store instead.
+pub struct StaticSessionStore;
+
+impl AuthSessionStore for StaticSessionStore {
+    fn put_session(&self, session: AuthSession) -> std::result::Result<(), String> {
+        store_session(session);
+        Ok(())
+    }
+    fn get_session(&self, server_nonce: &str) -> std::result::Result<Option<AuthSession>, String> {
+        Ok(get_session(server_nonce))
+    }
 }
 
 /// Errors that can occur during BRC-31 authentication.
@@ -332,6 +364,7 @@ fn auth_error_response(err: &AuthError) -> Response {
 pub fn verify_or_allow(
     req: &Request,
     config: &AuthConfig,
+    store: &dyn AuthSessionStore,
 ) -> std::result::Result<AuthenticatedIdentity, Response> {
     if !has_auth_headers(req) {
         if config.allow_unauthenticated {
@@ -341,7 +374,7 @@ pub fn verify_or_allow(
         return Err(auth_error_response(&err));
     }
 
-    verify_request(req, config).map_err(|e| auth_error_response(&e))
+    verify_request(req, config, store).map_err(|e| auth_error_response(&e))
 }
 
 /// Verify BRC-31 Authrite authentication on an incoming request.
@@ -357,6 +390,7 @@ pub fn verify_or_allow(
 pub fn verify_request(
     req: &Request,
     config: &AuthConfig,
+    store: &dyn AuthSessionStore,
 ) -> std::result::Result<AuthenticatedIdentity, AuthError> {
     // 1. Extract BRC-104 auth headers
     let peer_identity_key = get_header(req, headers::IDENTITY_KEY)?;
@@ -365,7 +399,10 @@ pub fn verify_request(
     let your_nonce = get_header(req, headers::YOUR_NONCE)?;
 
     // 2. Look up session by your_nonce (which is our server_nonce)
-    let session = get_session(&your_nonce).ok_or(AuthError::SessionNotFound)?;
+    let session = store
+        .get_session(&your_nonce)
+        .map_err(AuthError::VerificationError)?
+        .ok_or(AuthError::SessionNotFound)?;
 
     // 3. Check session TTL
     let now = current_time_ms();
@@ -441,6 +478,7 @@ pub fn verify_request(
 pub async fn handle_initial_request(
     req: Request,
     config: &AuthConfig,
+    store: &dyn AuthSessionStore,
 ) -> std::result::Result<Response, worker::Error> {
     // Extract peer info from BRC-104 headers
     let peer_identity_key = req
@@ -476,7 +514,9 @@ pub async fn handle_initial_request(
         peer_nonce: initial_nonce.clone(),
         created_at: current_time_ms(),
     };
-    store_session(session);
+    store
+        .put_session(session)
+        .map_err(|e| Error::from(format!("persist auth session: {e}")))?;
 
     // Create response body
     let response_body = HandshakeResponse {};
@@ -850,6 +890,25 @@ mod tests {
     fn test_session_not_found() {
         let retrieved = get_session("nonexistent-nonce");
         assert!(retrieved.is_none());
+    }
+
+    #[test]
+    fn test_static_session_store_trait_round_trip() {
+        // The AuthSessionStore trait (the abstraction the durable DO-SQLite
+        // store also implements) round-trips a session via the static backend.
+        let store = StaticSessionStore;
+        store
+            .put_session(AuthSession {
+                server_nonce: "trait-store-nonce".into(),
+                peer_identity_key: "02feedface".into(),
+                peer_nonce: "peer-9".into(),
+                created_at: 4242,
+            })
+            .unwrap();
+        let got = store.get_session("trait-store-nonce").unwrap().unwrap();
+        assert_eq!(got.peer_identity_key, "02feedface");
+        assert_eq!(got.created_at, 4242);
+        assert!(store.get_session("missing").unwrap().is_none());
     }
 
     // ── Nonce Generation ────────────────────────────────────────────────

@@ -133,7 +133,68 @@ impl<'a> DoSqlStorage<'a> {
              )",
             None,
         )?;
+        // Durable BRC-31 auth sessions (#5 step 3 / §07.7). Co-located in the
+        // per-identity DO's SQLite so the handshake-write + request-read survive
+        // CF isolate churn (the auth-session-isolate fix).
+        sql.exec(
+            "CREATE TABLE IF NOT EXISTS mpc_auth_sessions (\
+               server_nonce TEXT PRIMARY KEY, \
+               peer_identity_key TEXT NOT NULL, \
+               peer_nonce TEXT NOT NULL, \
+               created_at INTEGER NOT NULL\
+             )",
+            None,
+        )?;
         Ok(())
+    }
+
+    // ── BRC-31 auth sessions (#5 step 3 / §07.7) ─────────────────────────
+
+    /// Persist (upsert) a BRC-31 auth session, keyed by `server_nonce`.
+    pub fn put_auth_session(
+        &self,
+        server_nonce: &str,
+        peer_identity_key: &str,
+        peer_nonce: &str,
+        created_at: u64,
+    ) -> Result<()> {
+        self.sql().exec(
+            "INSERT INTO mpc_auth_sessions \
+               (server_nonce, peer_identity_key, peer_nonce, created_at) \
+             VALUES (?, ?, ?, ?) \
+             ON CONFLICT(server_nonce) DO UPDATE SET \
+               peer_identity_key = excluded.peer_identity_key, \
+               peer_nonce = excluded.peer_nonce, created_at = excluded.created_at",
+            vec![
+                server_nonce.into(),
+                peer_identity_key.into(),
+                peer_nonce.into(),
+                (created_at as i64).into(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Look up a BRC-31 auth session by `server_nonce`.
+    pub fn get_auth_session(&self, server_nonce: &str) -> Result<Option<(String, String, u64)>> {
+        #[derive(Deserialize)]
+        struct SessionRow {
+            peer_identity_key: String,
+            peer_nonce: String,
+            created_at: i64,
+        }
+        let rows: Vec<SessionRow> = self
+            .sql()
+            .exec(
+                "SELECT peer_identity_key, peer_nonce, created_at \
+                 FROM mpc_auth_sessions WHERE server_nonce = ?",
+                vec![server_nonce.into()],
+            )?
+            .to_array()?;
+        Ok(rows
+            .into_iter()
+            .next()
+            .map(|r| (r.peer_identity_key, r.peer_nonce, r.created_at as u64)))
     }
 
     // ── Pregenerated Paillier primes (I-4b: seeded off-worker) ───────────
@@ -472,5 +533,34 @@ impl MpcStore for DoSqlStorage<'_> {
     }
     fn total_presignature_count(&self) -> std::result::Result<u64, String> {
         DoSqlStorage::total_presignature_count(self).map_err(|e| e.to_string())
+    }
+}
+
+/// Durable BRC-31 session store (§07.7) backed by this DO's SQLite.
+impl crate::auth::AuthSessionStore for DoSqlStorage<'_> {
+    fn put_session(&self, session: crate::auth::AuthSession) -> std::result::Result<(), String> {
+        self.put_auth_session(
+            &session.server_nonce,
+            &session.peer_identity_key,
+            &session.peer_nonce,
+            session.created_at,
+        )
+        .map_err(|e| e.to_string())
+    }
+    fn get_session(
+        &self,
+        server_nonce: &str,
+    ) -> std::result::Result<Option<crate::auth::AuthSession>, String> {
+        Ok(self
+            .get_auth_session(server_nonce)
+            .map_err(|e| e.to_string())?
+            .map(
+                |(peer_identity_key, peer_nonce, created_at)| crate::auth::AuthSession {
+                    server_nonce: server_nonce.to_string(),
+                    peer_identity_key,
+                    peer_nonce,
+                    created_at,
+                },
+            ))
     }
 }

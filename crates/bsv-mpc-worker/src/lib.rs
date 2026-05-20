@@ -98,81 +98,47 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
 
     let router = Router::new();
 
+    // I-4a.2 + #5 step 3: the Worker entrypoint is a thin forwarder. ALL
+    // auth (the BRC-31 `/.well-known/auth` handshake AND per-request
+    // verification) now runs INSIDE the per-identity `CosignerSessionDo`,
+    // backed by its durable SQLite session store — so the handshake-write and
+    // the request-read hit the same store regardless of which entrypoint
+    // isolate served them (the auth-session-isolate fix). The DO's `fetch`
+    // gates authed paths (`is_authed_path`) before dispatching; `/health` and
+    // the `/poc/*` deterministic-proof routes stay open per §07.6.
     router
-        // ── BRC-31 Authrite handshake ────────────────────────────────
+        // ── BRC-31 Authrite handshake (verified + stored in the DO) ────
         .post_async("/.well-known/auth", |req, ctx| async move {
-            let config = auth::AuthConfig::from_env(&ctx.env)?;
-            auth::handle_initial_request(req, &config).await
+            poc::forward_to_cosigner_do(req, &ctx.env).await
         })
-        // ── KSS protocol endpoints (BRC-31 protected) ──────────────────
-        // I-4a.2: auth is verified at the entrypoint, then the request is
-        // forwarded to the per-cosigner CosignerSessionDo, where the handler
-        // runs over DO-SQLite storage (durable shares) + the DO isolate's
-        // pinned live coordinators. The handler bodies live in `api.rs`; the
-        // DO's `fetch` dispatches by path.
+        // ── KSS protocol endpoints (BRC-31 gated inside the DO) ────────
         .post_async("/dkg/init", |req, ctx| async move {
-            let config = auth::AuthConfig::from_env(&ctx.env)?;
-            if let Err(resp) = auth::verify_or_allow(&req, &config) {
-                return Ok(resp);
-            }
             poc::forward_to_cosigner_do(req, &ctx.env).await
         })
         .post_async("/dkg/round", |req, ctx| async move {
-            let config = auth::AuthConfig::from_env(&ctx.env)?;
-            if let Err(resp) = auth::verify_or_allow(&req, &config) {
-                return Ok(resp);
-            }
             poc::forward_to_cosigner_do(req, &ctx.env).await
         })
         .post_async("/sign/init", |req, ctx| async move {
-            let config = auth::AuthConfig::from_env(&ctx.env)?;
-            if let Err(resp) = auth::verify_or_allow(&req, &config) {
-                return Ok(resp);
-            }
             poc::forward_to_cosigner_do(req, &ctx.env).await
         })
         .post_async("/sign/round", |req, ctx| async move {
-            let config = auth::AuthConfig::from_env(&ctx.env)?;
-            if let Err(resp) = auth::verify_or_allow(&req, &config) {
-                return Ok(resp);
-            }
             poc::forward_to_cosigner_do(req, &ctx.env).await
         })
         .post_async("/presign/init", |req, ctx| async move {
-            let config = auth::AuthConfig::from_env(&ctx.env)?;
-            if let Err(resp) = auth::verify_or_allow(&req, &config) {
-                return Ok(resp);
-            }
             poc::forward_to_cosigner_do(req, &ctx.env).await
         })
         .post_async("/presign/round", |req, ctx| async move {
-            let config = auth::AuthConfig::from_env(&ctx.env)?;
-            if let Err(resp) = auth::verify_or_allow(&req, &config) {
-                return Ok(resp);
-            }
             poc::forward_to_cosigner_do(req, &ctx.env).await
         })
         .post_async("/ecdh", |req, ctx| async move {
-            let config = auth::AuthConfig::from_env(&ctx.env)?;
-            if let Err(resp) = auth::verify_or_allow(&req, &config) {
-                return Ok(resp);
-            }
             poc::forward_to_cosigner_do(req, &ctx.env).await
         })
         // I-4b.1: seed off-worker-generated Paillier primes for DKG (auth'd).
         .post_async("/ceremony/seed-primes", |req, ctx| async move {
-            let config = auth::AuthConfig::from_env(&ctx.env)?;
-            if let Err(resp) = auth::verify_or_allow(&req, &config) {
-                return Ok(resp);
-            }
             poc::forward_to_cosigner_do(req, &ctx.env).await
         })
         // #14: ingest a native-generated presignature into the DO pool (auth'd).
         .post_async("/ceremony/ingest-presig", |req, ctx| async move {
-            let config = auth::AuthConfig::from_env(&ctx.env)?;
-            if let Err(resp) = auth::verify_or_allow(&req, &config) {
-                return Ok(resp);
-            }
             poc::forward_to_cosigner_do(req, &ctx.env).await
         })
         // ── Read-only endpoints (no auth required) ──────────────────
@@ -180,12 +146,6 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             poc::forward_to_cosigner_do(req, &ctx.env).await
         })
         .get_async("/shares/:agent_id", |req, ctx| async move {
-            // Share metadata requires auth in production. The DO parses the
-            // agent_id from the request path.
-            let config = auth::AuthConfig::from_env(&ctx.env)?;
-            if let Err(resp) = auth::verify_or_allow(&req, &config) {
-                return Ok(resp);
-            }
             poc::forward_to_cosigner_do(req, &ctx.env).await
         })
         // ── Phase I-3b POC: DO SQLite persistence + hibernation ─────
@@ -201,6 +161,10 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         })
         // I-4a: DO-SQLite real-EncryptedShare round-trip (fund-safety store).
         .get_async("/poc/share-roundtrip", |req, ctx| async move {
+            poc::forward_to_cosigner_do(req, &ctx.env).await
+        })
+        // #5 step 3: DO-SQLite auth-session round-trip (auth-session-isolate fix).
+        .get_async("/poc/auth-session-roundtrip", |req, ctx| async move {
             poc::forward_to_cosigner_do(req, &ctx.env).await
         })
         // I-4b probe: full 2-party DKG in one wasm isolate, timed (CF CPU fit).
