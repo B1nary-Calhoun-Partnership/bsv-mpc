@@ -49,6 +49,7 @@
 
 use crate::config::ProxyConfig;
 use bsv::primitives::ec::{PrivateKey, PublicKey};
+use bsv_mpc_core::brc31_client::{self, Brc31Client};
 use bsv_mpc_core::ecdh;
 use bsv_mpc_core::error::MpcError;
 use bsv_mpc_core::hd::{compute_invoice, derive_child_pubkey};
@@ -198,27 +199,15 @@ fn hex_decode(hex: &str) -> std::result::Result<Vec<u8>, MpcError> {
 // Uses a local auth key (not the MPC share) for signing auth messages.
 // Session is established via handshake on first KSS request.
 
-/// BRC-104 header names (must match bsv-mpc-worker/src/auth.rs).
-mod auth_headers {
-    pub const VERSION: &str = "x-bsv-auth-version";
-    pub const IDENTITY_KEY: &str = "x-bsv-auth-identity-key";
-    pub const NONCE: &str = "x-bsv-auth-nonce";
-    pub const INITIAL_NONCE: &str = "x-bsv-auth-initial-nonce";
-    pub const YOUR_NONCE: &str = "x-bsv-auth-your-nonce";
-    pub const SIGNATURE: &str = "x-bsv-auth-signature";
-    pub const MESSAGE_TYPE: &str = "x-bsv-auth-message-type";
-}
-
-/// Client-side BRC-31 session state for proxy → KSS authentication.
+/// Client-side BRC-31 session for proxy → KSS authentication.
+///
+/// Thin proxy-side wrapper over the reusable, transport-agnostic
+/// [`bsv_mpc_core::brc31_client::Brc31Client`] (shared with the native
+/// cosigner/container). This wrapper owns the `reqwest` handshake round-trip and
+/// the proxy's stable-identity derivation; the crypto + header construction live
+/// in core.
 struct BridgeAuth {
-    /// Proxy's auth identity key (NOT the MPC share — a separate local key).
-    auth_key: PrivateKey,
-    /// KSS server's identity key (learned during handshake).
-    server_identity_key: Option<String>,
-    /// Our session nonce (sent in the initial handshake).
-    our_nonce: Option<String>,
-    /// KSS server's session nonce (received in handshake response).
-    server_session_nonce: Option<String>,
+    client: Brc31Client,
 }
 
 impl BridgeAuth {
@@ -236,10 +225,7 @@ impl BridgeAuth {
         let auth_key = PrivateKey::from_bytes(&key_bytes)
             .map_err(|e| MpcError::Protocol(format!("invalid auth key bytes: {e}")))?;
         Ok(Self {
-            auth_key,
-            server_identity_key: None,
-            our_nonce: None,
-            server_session_nonce: None,
+            client: Brc31Client::new(auth_key),
         })
     }
 
@@ -268,10 +254,7 @@ impl BridgeAuth {
             let bytes: [u8; 32] = mac.finalize().into_bytes().into();
             if let Ok(auth_key) = PrivateKey::from_bytes(&bytes) {
                 return Ok(Self {
-                    auth_key,
-                    server_identity_key: None,
-                    our_nonce: None,
-                    server_session_nonce: None,
+                    client: Brc31Client::new(auth_key),
                 });
             }
         }
@@ -282,57 +265,39 @@ impl BridgeAuth {
 
     /// Whether the handshake has been completed.
     fn is_authenticated(&self) -> bool {
-        self.server_session_nonce.is_some()
+        self.client.is_authenticated()
     }
 
-    /// Our identity key as hex (for BRC-104 headers).
+    /// The auth/relay identity key (§07.4 — one key for BRC-31 + envelope sigs).
+    fn auth_key(&self) -> &PrivateKey {
+        self.client.auth_key()
+    }
+
+    /// Our identity key as compressed hex (the BRC-104 identity / owner id).
+    #[cfg(test)]
     fn identity_hex(&self) -> String {
-        self.auth_key.public_key().to_hex()
+        self.client.identity_hex()
     }
 
-    /// Generate a fresh per-request nonce (32 bytes, base64).
-    fn generate_nonce() -> std::result::Result<String, MpcError> {
-        use rand::RngCore;
-        let mut bytes = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut bytes);
-        Ok(base64::Engine::encode(
-            &base64::engine::general_purpose::STANDARD,
-            bytes,
-        ))
-    }
-
-    /// Perform the BRC-31 handshake with the KSS.
-    ///
-    /// Sends an InitialRequest and processes the InitialResponse.
+    /// Perform the BRC-31 handshake with the KSS (the `reqwest` round-trip; the
+    /// header crypto is the core [`Brc31Client`]).
     async fn handshake(
         &mut self,
         client: &reqwest::Client,
         kss_url: &str,
     ) -> std::result::Result<(), MpcError> {
-        let our_nonce = Self::generate_nonce()?;
-        let identity = self.identity_hex();
-
-        let handshake_url = format!("{}/.well-known/auth", kss_url);
-
-        tracing::debug!(
-            url = %handshake_url,
-            identity = %identity,
-            "BRC-31: initiating handshake with KSS"
-        );
-
-        let resp = client
+        let handshake_url = format!("{kss_url}/.well-known/auth");
+        let mut req = client
             .post(&handshake_url)
-            .header(auth_headers::VERSION, "0.1")
-            .header(auth_headers::IDENTITY_KEY, &identity)
-            .header(auth_headers::MESSAGE_TYPE, "initialRequest")
-            .header(auth_headers::NONCE, &our_nonce)
-            .header(auth_headers::INITIAL_NONCE, &our_nonce)
             .header("content-type", "application/json")
-            .body("{}")
+            .body("{}");
+        for (name, value) in self.client.initial_request_headers() {
+            req = req.header(name, value);
+        }
+        let resp = req
             .send()
             .await
             .map_err(|e| MpcError::Protocol(format!("BRC-31 handshake failed: {e}")))?;
-
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
@@ -341,90 +306,29 @@ impl BridgeAuth {
             )));
         }
 
-        // Extract server info from BRC-104 response headers
-        let server_identity = resp
-            .headers()
-            .get(auth_headers::IDENTITY_KEY)
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string())
-            .ok_or_else(|| {
-                MpcError::Protocol("BRC-31: missing server identity in handshake response".into())
-            })?;
+        let header = |name: &str| {
+            resp.headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string())
+        };
+        let server_identity = header(brc31_client::headers::IDENTITY_KEY).ok_or_else(|| {
+            MpcError::Protocol("BRC-31: missing server identity in handshake response".into())
+        })?;
+        let server_nonce = header(brc31_client::headers::NONCE).ok_or_else(|| {
+            MpcError::Protocol("BRC-31: missing server nonce in handshake response".into())
+        })?;
 
-        let server_nonce = resp
-            .headers()
-            .get(auth_headers::NONCE)
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string())
-            .ok_or_else(|| {
-                MpcError::Protocol("BRC-31: missing server nonce in handshake response".into())
-            })?;
-
-        // Optionally verify the server's signature (skipped for alpha)
-        // In production: verify using derive_child_pubkey(server_pub, shared_secret, invoice)
-
-        tracing::info!(
-            server_identity = %server_identity,
-            "BRC-31: handshake complete with KSS"
-        );
-
-        self.server_identity_key = Some(server_identity);
-        self.our_nonce = Some(our_nonce);
-        self.server_session_nonce = Some(server_nonce);
-
+        tracing::info!(server_identity = %server_identity, "BRC-31: handshake complete with KSS");
+        self.client
+            .complete_handshake(server_identity, server_nonce);
         Ok(())
     }
 
-    /// Compute the BRC-104 auth headers (name, value) for a fresh request.
-    ///
-    /// Generates a fresh per-request nonce, signs it with the BRC-42 derived
-    /// key, and returns all required BRC-104 headers as owned pairs — usable
-    /// both for a `reqwest` builder ([`add_auth_headers`]) and for the relay
-    /// trigger (which carries them through [`crate::relay_sign::DoTrigger`]).
+    /// BRC-104 auth headers (name, value) for a fresh request — owned pairs,
+    /// usable for a `reqwest` builder and for the relay trigger.
     fn auth_header_pairs(&self) -> std::result::Result<Vec<(&'static str, String)>, MpcError> {
-        let server_session_nonce = self
-            .server_session_nonce
-            .as_ref()
-            .ok_or_else(|| MpcError::Protocol("BRC-31: not authenticated (no session)".into()))?;
-
-        let server_identity = self.server_identity_key.as_ref().ok_or_else(|| {
-            MpcError::Protocol("BRC-31: not authenticated (no server identity)".into())
-        })?;
-
-        // Generate fresh per-request nonce
-        let request_nonce = Self::generate_nonce()?;
-
-        // BRC-42 key derivation for signing
-        let server_pub = PublicKey::from_hex(server_identity)
-            .map_err(|e| MpcError::Protocol(format!("invalid server pubkey: {e}")))?;
-
-        let key_id = format!("{} {}", request_nonce, server_session_nonce);
-        let invoice = compute_invoice(2, "auth message signature", &key_id)?;
-
-        // Derive signing key: auth_priv + HMAC(ECDH(server_pub, auth_priv), invoice)
-        let signing_key = self
-            .auth_key
-            .derive_child(&server_pub, &invoice)
-            .map_err(|e| MpcError::Protocol(format!("BRC-42 key derivation: {e}")))?;
-
-        // Sign SHA-256(nonce) — matches server's compute_signing_hash()
-        let msg_hash: [u8; 32] = {
-            use sha2::Digest;
-            sha2::Sha256::digest(request_nonce.as_bytes()).into()
-        };
-        let signature = signing_key
-            .sign(&msg_hash)
-            .map_err(|e| MpcError::Protocol(format!("ECDSA signing: {e}")))?;
-        let sig_hex = hex_encode(&signature.to_der());
-
-        Ok(vec![
-            (auth_headers::VERSION, "0.1".to_string()),
-            (auth_headers::IDENTITY_KEY, self.identity_hex()),
-            (auth_headers::MESSAGE_TYPE, "general".to_string()),
-            (auth_headers::NONCE, request_nonce),
-            (auth_headers::YOUR_NONCE, server_session_nonce.clone()),
-            (auth_headers::SIGNATURE, sig_hex),
-        ])
+        self.client.request_headers()
     }
 
     /// Add BRC-104 auth headers to a request builder.
@@ -1210,7 +1114,7 @@ impl MpcBridge {
                     .map(|(k, v)| (k.to_string(), v))
                     .collect();
             }
-            auth.auth_key.clone()
+            auth.auth_key().clone()
         };
         crate::relay_sign::combine_sign_over_relay(
             &self.relay_url,
