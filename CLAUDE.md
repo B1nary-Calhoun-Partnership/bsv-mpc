@@ -101,7 +101,7 @@ BRC-100 compatible signing proxy. Drop-in replacement for bsv-wallet-cli at loca
 Cloudflare Worker Key Share Service (Rust -> WASM). Holds share_A.
 - `lib.rs` — CF Worker router with all 8 endpoints.
 - `api.rs` — All 8 handlers call bsv-mpc-core coordinators (DKG, signing, presigning, ECDH). 12 request/response types.
-- `storage.rs` — ShareStorage struct + ShareMetadata. 3-table DO SQLite schema with working methods.
+- `storage.rs` — ShareStorage struct + ShareMetadata. **In-memory** (global `Mutex<InnerStorage>` of HashMap/VecDeque) for dev/test — lost on Worker restart. DO SQLite persistence is a Phase I deliverable (#4) and a **fund-safety gate**: no deployed worker may hold a funded `share_A` on in-memory storage (ephemeral keys = lost funds).
 - `auth.rs` — BRC-31 Authrite implementation including `verify_agent_authorization()`.
 
 #### bsv-mpc-service (~1.2K LOC, 5 files)
@@ -224,7 +224,7 @@ All 16 POCs PASSED. POCs 1-15 ran in M0 (Mar 2026) and de-risked the cryptograph
 | KSS handlers (worker + service) | **Complete** | All protocol handlers call bsv-mpc-core coordinators |
 | BRC-31 auth (worker) | **Complete** | Authrite implementation in auth.rs |
 | CHIP tokens + discovery | **Complete** | chip.rs + discovery.rs |
-| KSS storage (worker) | **Complete** | DO SQLite schema + methods working |
+| KSS storage (worker) | **In-memory (dev)** | HashMap/VecDeque behind a global Mutex; lost on Worker restart. DO SQLite persistence = Phase I (#4) fund-safety gate. |
 | KSS storage (service) | **In-memory** | HashMap/VecDeque working. SQLite not yet wired. |
 | Overlay proof publication | **TODO** | publish_proof, query_proofs, count_proofs_by_node |
 
