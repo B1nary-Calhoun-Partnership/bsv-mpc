@@ -42,31 +42,27 @@
 //! and is consumed by the caller, not by this crate.
 
 // Target-agnostic modules — compile on BOTH native and wasm32.
-pub mod engineio;
 pub mod error;
 pub mod types;
 pub mod wire;
 
-// Transport substrate (Phase H Step 4 — Socket.IO + BRC-103).
-// `transport_socketio` is target-agnostic: the `SocketIoTransport` impl
-// of `bsv::auth::Transport`, the `run_dispatch` inbound loop, and the
-// app-event envelope helpers. It `use`-aliases the WS substrate per
-// target — `transport_wasm` (`web_sys::WebSocket` + `worker::Fetch`) on
-// wasm32, `transport_native` (`tokio-tungstenite` + `reqwest`) on native
-// — both mirroring the same `WsHandle`/`WsSender` method surface.
+// WS transport substrate (Phase H Step 4 — Socket.IO + BRC-103). The
+// protocol logic (codec, `SocketIoTransport`, `run_dispatch`, app-event
+// envelope helpers) lives upstream in bsv-rs 0.3.10's `socketio`
+// feature; these modules supply only the per-target WS plumbing that
+// implements the upstream `SocketIoSink` / `SocketIoFrameSource` traits
+// — `transport_wasm` (`web_sys::WebSocket` + `worker::Fetch`) on wasm32,
+// `transport_native` (`tokio-tungstenite` + `reqwest`) on native.
 #[cfg(not(target_arch = "wasm32"))]
 pub mod transport_native;
-pub mod transport_socketio;
 #[cfg(target_arch = "wasm32")]
 pub mod transport_wasm;
 
-// Native-only modules — the existing raw-WS + BRC-104
-// SimplifiedFetchTransport path. These pull `tokio` / `reqwest` /
-// `tokio-tungstenite`, none of which compile to
-// `wasm32-unknown-unknown`. H-4.3 adds the wasm32 transport modules
-// (`transport_wasm`, `transport_socketio`); H-4.4 unifies the native
-// path onto the same Socket.IO + BRC-103 wire and lets `client` /
-// `auth` compile on both targets. Until then, these stay native-gated.
+// Native-only modules — the raw-WS + BRC-104 SimplifiedFetchTransport
+// path. These pull `tokio` / `reqwest` / `tokio-tungstenite`, none of
+// which compile to `wasm32-unknown-unknown`. H-4.4b replaces `ws.rs`
+// with a `subscribe.rs` driving the upstream Socket.IO + BRC-103
+// transport over `transport_native`.
 #[cfg(not(target_arch = "wasm32"))]
 pub mod auth;
 #[cfg(not(target_arch = "wasm32"))]

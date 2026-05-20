@@ -1,13 +1,21 @@
-//! wasm32 transport substrate — `worker::Fetch` (Engine.IO polling
-//! handshake) + `web_sys::WebSocket` (WS upgrade phase).
+//! wasm32 WS substrate for the upstream Socket.IO + BRC-103 transport —
+//! `worker::Fetch` (Engine.IO polling handshake) + `web_sys::WebSocket`
+//! (WS upgrade phase).
 //!
-//! Graduated from `poc/poc17-cf-outbound-ws/src/transport_wasm.rs`
-//! (Phase H Step 3 POC) into this crate as Phase H Step 4 sub-gate
-//! H-4.3. The whole module is `#[cfg(target_arch = "wasm32")]`-gated at
-//! the crate root (`lib.rs`); the native counterpart is
-//! [`crate::transport_native`], which mirrors this method surface with
-//! `tokio-tungstenite` + `reqwest`. Both share
-//! [`crate::engineio::codec`] byte-for-byte.
+//! Provides the wasm32 implementations of the bsv-rs `socketio`
+//! substrate traits:
+//!
+//! - [`WsSender`] implements [`bsv::auth::SocketIoSink`] (outbound).
+//! - [`WsHandle`] implements [`bsv::auth::SocketIoFrameSource`] (inbound)
+//!   and owns the Engine.IO 4 handshake/upgrade dance.
+//!
+//! Plugged into the upstream `bsv::auth::SocketIoTransport<WsSender>` +
+//! `bsv::auth::run_dispatch`, so all Socket.IO / BRC-103 protocol logic
+//! lives in bsv-rs 0.3.10; this module is purely the wasm32 transport
+//! plumbing. The native counterpart is [`crate::transport_native`].
+//!
+//! The whole module is `#[cfg(target_arch = "wasm32")]`-gated at the
+//! crate root (`lib.rs`).
 //!
 //! Both phases of the Engine.IO 4 client lifecycle live here:
 //!   1. [`polling_handshake`] GETs `<relay>/socket.io/?EIO=4&transport=
@@ -17,7 +25,7 @@
 //!      `wss://<relay>/socket.io/?EIO=4&transport=websocket&sid=<sid>`
 //!      and runs the `2probe`→`3probe`→`5` upgrade dance.
 
-use crate::engineio::codec::EngineIoPacket;
+use bsv::auth::transports::socketio::codec::EngineIoPacket;
 use serde::{Deserialize, Serialize};
 use worker::{Error, Fetch, Method, Request, RequestInit, Result};
 
@@ -38,40 +46,17 @@ pub struct EngineIoHandshake {
     #[serde(rename = "pingTimeout")]
     pub ping_timeout: u64,
     /// Max payload size the server will accept on a single packet, in
-    /// bytes. The Calhoun relay sets this to 1_000_000 (1 MB) per the
-    /// live handshake observed during H-3 prep.
+    /// bytes. The Calhoun relay sets this to 1_000_000 (1 MB).
     #[serde(default, rename = "maxPayload")]
     pub max_payload: Option<u64>,
 }
 
 /// Initiate an Engine.IO 4 polling handshake against `<relay>/socket.io/`
-/// and return the parsed `Open` payload.
-///
-/// This is the FIRST half of the Engine.IO 4 client lifecycle. The
-/// returned `sid` feeds into the subsequent WS upgrade phase
-/// ([`WsHandle::open_and_upgrade`]).
-///
-/// # Wire shape (per the canonical Engine.IO 4 spec, verified live)
-///
-/// Request:
-/// ```text
-/// GET https://<relay>/socket.io/?EIO=4&transport=polling&t=<cache-buster>
-/// ```
-///
-/// Response:
-/// ```text
-/// 200 OK
-/// Content-Type: text/plain; charset=UTF-8
-/// 0{"sid":"...","upgrades":["websocket"],"pingInterval":25000,"pingTimeout":20000,"maxPayload":1000000}
-/// ```
-///
-/// The leading `0` is the Engine.IO `Open` packet type code; the rest
-/// is the handshake JSON. Decode is delegated to
-/// [`EngineIoPacket::decode`] from the shared codec.
+/// and return the parsed `Open` payload. The returned `sid` feeds the
+/// subsequent WS upgrade phase ([`WsHandle::open_and_upgrade`]).
 pub async fn polling_handshake(relay_url: &str) -> Result<EngineIoHandshake> {
     let base = relay_url.trim_end_matches('/');
-    // The `t` query-param is a per-request cache-buster per Engine.IO 4
-    // spec — CF / Cloudflare caches may otherwise dedupe handshake GETs.
+    // Per-request cache-buster per Engine.IO 4 spec.
     let t = js_sys::Date::now() as u64;
     let url = format!("{base}/socket.io/?EIO=4&transport=polling&t={t}");
 
@@ -116,7 +101,6 @@ pub async fn polling_handshake(relay_url: &str) -> Result<EngineIoHandshake> {
 // ============================================================================
 //
 // The Engine.IO 4 upgrade dance from a CLIENT perspective:
-//
 //   1. Open `wss://<relay>/socket.io/?EIO=4&transport=websocket&sid=<sid>`
 //   2. Wait for `onopen`.
 //   3. Send `2probe` (Engine.IO Ping packet, payload = "probe").
@@ -126,7 +110,8 @@ pub async fn polling_handshake(relay_url: &str) -> Result<EngineIoHandshake> {
 
 mod ws_upgrade {
     use super::*;
-    use crate::engineio::codec::{EngineIoPacket, SocketIoPacket};
+    use bsv::auth::transports::socketio::codec::{EngineIoPacket, SocketIoPacket};
+    use bsv::auth::{SocketIoFrameSource, SocketIoSink};
     use futures::channel::{mpsc, oneshot};
     use futures::StreamExt;
     use std::cell::RefCell;
@@ -145,14 +130,12 @@ mod ws_upgrade {
 
     /// Long-lived WebSocket handle held after the Engine.IO 4 upgrade
     /// completes. Inbound text frames flow through an unbounded mpsc
-    /// channel; outbound is via [`WsHandle::send_text`] (or the
-    /// higher-level [`WsHandle::send_engineio`]/[`WsHandle::send_socketio`]
-    /// helpers).
+    /// channel ([`SocketIoFrameSource::recv_engineio`]); outbound is via
+    /// the cloneable [`WsSender`] ([`SocketIoSink`]).
     ///
     /// **Lifetime**: the underlying `web_sys::WebSocket` is closed when
     /// `WsHandle` drops. Closures are held in the struct so they survive
-    /// across calls; dropping `WsHandle` drops the closures too, which
-    /// releases the JS-side function references.
+    /// across calls; dropping `WsHandle` drops the closures too.
     pub struct WsHandle {
         ws: WebSocket,
         msg_rx: mpsc::UnboundedReceiver<std::result::Result<String, String>>,
@@ -160,45 +143,56 @@ mod ws_upgrade {
         probe_round_trip_ms: f64,
         // Held to keep the JS-side callback alive for the lifetime of
         // the handle. Drop order matters: closures must drop BEFORE the
-        // WebSocket (otherwise JS-side handlers fire on a dropped Rust
-        // closure and panic). Rust drops fields in declaration order,
-        // so these come AFTER `ws`. Reversing order would be unsound.
+        // WebSocket. Rust drops fields in declaration order, so these
+        // come AFTER `ws`.
         _on_msg: Closure<dyn FnMut(MessageEvent)>,
         _on_err: Closure<dyn FnMut(Event)>,
         _on_close: Closure<dyn FnMut(CloseEvent)>,
     }
 
-    /// Send-only half of a [`WsHandle`]. Returned by [`WsHandle::sender`]
-    /// when a caller needs outbound access independent of the inbound
-    /// `mpsc` receiver (e.g. `SocketIoTransport` whose background
-    /// dispatch task owns the receiver and whose `Transport::send` impl
-    /// runs from a different scope).
-    ///
-    /// Holds a `Clone` of the underlying `web_sys::WebSocket` JS handle.
-    /// Cloning a `web_sys::WebSocket` is a refcount bump on the JS side
-    /// — every clone references the same socket.
+    /// Send-only half of a [`WsHandle`]. Holds a `Clone` of the
+    /// underlying `web_sys::WebSocket` JS handle (a refcount bump). Backs
+    /// an upstream `bsv::auth::SocketIoTransport` via [`SocketIoSink`].
     #[derive(Clone)]
     pub struct WsSender {
         ws: WebSocket,
     }
 
+    // SAFETY: wasm32 is single-threaded by construction — the CF Worker
+    // isolate (and `workerd` in local `wrangler dev`) provably never
+    // spawns OS threads, so the `!Send + !Sync` `web_sys::WebSocket` +
+    // `Closure`s held here can never be concurrently accessed across
+    // threads. The `Send + Sync` bound on `bsv::auth::SocketIoSink` (and
+    // `Send` on `SocketIoFrameSource`) is required so the upstream
+    // `Peer`/`run_dispatch` can hold/drive them across boxed
+    // `Send + 'static` futures, but on `wasm32-unknown-unknown` that
+    // cross-thread guarantee is vacuously satisfied. Same precedent as
+    // Phase G §2.5 / commit `a9a7e18`. On native the equivalents are
+    // genuinely `Send + Sync` (see `crate::transport_native`), so this
+    // shield is wasm32-only.
+    unsafe impl Send for WsSender {}
+    unsafe impl Sync for WsSender {}
+    unsafe impl Send for WsHandle {}
+    unsafe impl Sync for WsHandle {}
+
     impl WsSender {
-        /// Send a raw text frame. Equivalent to [`WsHandle::send_text`].
-        pub fn send_text(&self, s: &str) -> std::result::Result<(), String> {
+        /// Send a raw text frame.
+        fn send_text(&self, s: &str) -> std::result::Result<(), String> {
             self.ws
                 .send_with_str(s)
                 .map_err(|e| format!("ws send_with_str: {e:?}"))
         }
+    }
 
-        /// Send an [`EngineIoPacket`]; the codec encodes the wire form.
-        pub fn send_engineio(&self, pkt: &EngineIoPacket) -> std::result::Result<(), String> {
-            self.send_text(&pkt.encode())
+    impl SocketIoSink for WsSender {
+        fn send_socketio(&self, pkt: &SocketIoPacket) -> std::result::Result<(), String> {
+            self.send_text(&EngineIoPacket::Message(pkt.encode()).encode())
         }
 
-        /// Send a [`SocketIoPacket`] wrapped in Engine.IO `Message(4)`.
-        pub fn send_socketio(&self, pkt: &SocketIoPacket) -> std::result::Result<(), String> {
-            let wrapped = EngineIoPacket::Message(pkt.encode());
-            self.send_engineio(&wrapped)
+        /// Override the trait default so we can emit non-`Message`
+        /// Engine.IO packets directly (e.g. `Pong` heartbeat replies).
+        fn send_engineio(&self, pkt: &EngineIoPacket) -> std::result::Result<(), String> {
+            self.send_text(&pkt.encode())
         }
     }
 
@@ -206,7 +200,7 @@ mod ws_upgrade {
         /// Open a WebSocket against `<relay>/socket.io/?...&transport=
         /// websocket&sid=<sid>` and complete the Engine.IO 4 upgrade
         /// dance (`2probe` → `3probe` → `5` Upgrade). Returns the live
-        /// handle ready for `emit`/`recv` operations.
+        /// handle ready for `recv_engineio` + a [`WsSender`].
         pub async fn open_and_upgrade(
             relay_url: &str,
             sid: &str,
@@ -253,7 +247,6 @@ mod ws_upgrade {
             let msg_tx_for_err = msg_tx.clone();
             let on_err: Closure<dyn FnMut(Event)> = Closure::new(move |e: Event| {
                 let err = format!("ws onerror: {e:?}");
-                // Surface the error on whichever channel is still listening.
                 if let Some(t) = open_tx_for_err.borrow_mut().take() {
                     let _ = t.send(Err(err.clone()));
                 }
@@ -272,13 +265,11 @@ mod ws_upgrade {
             ws.set_onclose(Some(on_close.as_ref().unchecked_ref()));
 
             // Drop the strong refs to msg_tx so the mpsc closes when all
-            // closures drop. (Otherwise `msg_rx.next()` would never see
-            // a None — it'd hang forever on a dropped WS.)
+            // closures drop.
             drop(msg_tx);
 
             let t_probe_start = js_sys::Date::now();
 
-            // Await the onopen event.
             open_rx
                 .await
                 .map_err(|_| "ws open channel dropped".to_string())??;
@@ -289,9 +280,6 @@ mod ws_upgrade {
                 .map_err(|e| format!("ws send 2probe: {e:?}"))?;
 
             let mut msg_rx_drain = msg_rx;
-            // Await the server's `3probe` reply. We pull from the
-            // persistent mpsc; any frames the server sent in the same
-            // window stay queued for subsequent recv calls.
             let pong_text = msg_rx_drain
                 .next()
                 .await
@@ -326,78 +314,37 @@ mod ws_upgrade {
             self.probe_round_trip_ms
         }
 
-        /// Send a raw text frame. Lower-level than `send_engineio` /
-        /// `send_socketio`; useful for probe/upgrade-style packets.
-        pub fn send_text(&self, s: &str) -> std::result::Result<(), String> {
-            self.ws
-                .send_with_str(s)
-                .map_err(|e| format!("ws send_with_str: {e:?}"))
-        }
-
-        /// Send an [`EngineIoPacket`] (the codec encodes the wire form).
-        pub fn send_engineio(&self, pkt: &EngineIoPacket) -> std::result::Result<(), String> {
-            self.send_text(&pkt.encode())
-        }
-
-        /// Send a [`SocketIoPacket`] wrapped in Engine.IO `Message(4)`.
-        pub fn send_socketio(&self, pkt: &SocketIoPacket) -> std::result::Result<(), String> {
-            let wrapped = EngineIoPacket::Message(pkt.encode());
-            self.send_engineio(&wrapped)
-        }
-
-        /// Return a cheap, cloneable [`WsSender`] that can be handed to
-        /// callers (e.g. `SocketIoTransport`) which only need outbound
-        /// access. The underlying `web_sys::WebSocket` is a JS-handle and
-        /// `Clone` is a refcount bump on the JS side — sends from any
-        /// clone reach the same socket. The owning [`WsHandle`] retains
-        /// the closures + the inbound `mpsc` receiver and remains the
-        /// sole owner of teardown (its `Drop` impl detaches the JS
-        /// callbacks and closes the connection).
+        /// Return a cheap, cloneable [`WsSender`] for outbound access.
+        /// The owning [`WsHandle`] retains the closures + the inbound
+        /// `mpsc` receiver and remains the sole owner of teardown.
         pub fn sender(&self) -> WsSender {
             WsSender {
                 ws: self.ws.clone(),
             }
         }
 
-        /// Receive the next inbound text frame. Returns `Ok(None)` if
-        /// the channel has closed (WS dropped).
-        pub async fn recv_text(&mut self) -> Option<std::result::Result<String, String>> {
+        /// Receive the next inbound text frame. Returns `None` if the
+        /// channel has closed (WS dropped).
+        async fn recv_text(&mut self) -> Option<std::result::Result<String, String>> {
             self.msg_rx.next().await
         }
+    }
 
-        /// Convenience: receive the next inbound frame and decode as an
-        /// Engine.IO packet via the shared codec.
-        pub async fn recv_engineio(&mut self) -> std::result::Result<EngineIoPacket, String> {
+    #[async_trait::async_trait]
+    impl SocketIoFrameSource for WsHandle {
+        async fn recv_engineio(&mut self) -> std::result::Result<EngineIoPacket, String> {
             let text = self
                 .recv_text()
                 .await
                 .ok_or_else(|| "ws closed".to_string())??;
             EngineIoPacket::decode(&text).map_err(|e| format!("decode engineio: {e}"))
         }
-
-        /// Convenience: receive an inbound frame and decode through both
-        /// the Engine.IO and Socket.IO layers, returning the inner
-        /// Socket.IO packet.
-        ///
-        /// Returns `Err` if the inbound packet is NOT an Engine.IO
-        /// `Message(...)` carrying a Socket.IO payload. Other Engine.IO
-        /// types (Ping/Pong/etc) surface via [`Self::recv_engineio`] instead.
-        pub async fn recv_socketio(&mut self) -> std::result::Result<SocketIoPacket, String> {
-            let eio = self.recv_engineio().await?;
-            match eio {
-                EngineIoPacket::Message(payload) => {
-                    SocketIoPacket::decode(&payload).map_err(|e| format!("decode socketio: {e}"))
-                }
-                other => Err(format!("expected Engine.IO Message, got {other:?}")),
-            }
-        }
     }
 
     impl Drop for WsHandle {
         fn drop(&mut self) {
-            // Detach JS-side handlers BEFORE the closures drop (which
-            // happens automatically after this fn returns). Otherwise a
-            // late-firing event would call into a dropped Rust closure.
+            // Detach JS-side handlers BEFORE the closures drop. Otherwise
+            // a late-firing event would call into a dropped Rust closure.
             self.ws.set_onmessage(None);
             self.ws.set_onerror(None);
             self.ws.set_onclose(None);
