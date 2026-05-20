@@ -56,15 +56,37 @@ struct PersistedBrc103Session {
 
 /// The Durable Object class. One instance per cosigner identity (per
 /// audit §11.1).
+///
+/// `instance_constructed_at_ms` is captured in `new()` and surfaced via
+/// every JSON response. It is **in-memory only** — DO eviction
+/// (hibernation) drops the entire instance, so a fresh `new()` runs on
+/// the next fetch and the value advances. This is the load-bearing
+/// proof of hibernation for the H-3.5e merge gate: a pre- vs
+/// post-hibernation curl pair MUST show DIFFERENT
+/// `instance_constructed_at_ms` values (i.e. the isolate was actually
+/// evicted) while ALL OTHER FIELDS (do_id, client_identity,
+/// server_identity, persisted_session.last_known_peer_identity_hex)
+/// stay byte-identical.
 #[durable_object]
 pub struct EngineIoSessionDo {
     state: State,
     env: Env,
+    instance_constructed_at_ms: u64,
 }
 
 impl DurableObject for EngineIoSessionDo {
     fn new(state: State, env: Env) -> Self {
-        Self { state, env }
+        let instance_constructed_at_ms = js_sys::Date::now() as u64;
+        console_log!(
+            "EngineIoSessionDo: new isolate constructed at {} ms (do_id={})",
+            instance_constructed_at_ms,
+            state.id().to_string()
+        );
+        Self {
+            state,
+            env,
+            instance_constructed_at_ms,
+        }
     }
 
     async fn fetch(&self, req: Request) -> Result<Response> {
@@ -132,6 +154,7 @@ impl EngineIoSessionDo {
             "socketio_status": "do_identity",
             "do_id": self.state.id().to_string(),
             "do_name": "cosigner-test-1",
+            "instance_constructed_at_ms": self.instance_constructed_at_ms,
             "client_identity": client_pub_hex,
             "persisted_session": persisted,
             "gate": "H-3.5d",
@@ -151,6 +174,7 @@ impl EngineIoSessionDo {
             "socketio_status": "brc103_authenticated",
             "do_id": self.state.id().to_string(),
             "do_name": "cosigner-test-1",
+            "instance_constructed_at_ms": self.instance_constructed_at_ms,
             "relay": session.relay,
             "engineio_sid": session.engineio_sid,
             "client_identity": session.client_pub_hex,
@@ -248,6 +272,7 @@ impl EngineIoSessionDo {
             "socketio_status": "envelope_roundtripped",
             "do_id": self.state.id().to_string(),
             "do_name": "cosigner-test-1",
+            "instance_constructed_at_ms": self.instance_constructed_at_ms,
             "relay": session.relay,
             "engineio_sid": session.engineio_sid,
             "client_identity": session.client_pub_hex,
