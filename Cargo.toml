@@ -42,7 +42,7 @@ round-based = { version = "0.4.1", features = ["sim", "state-machine"] }
 generic-ec = { version = "0.5", features = ["curve-secp256k1", "serde"] }
 
 # BSV SDK
-bsv = { package = "bsv-rs", version = "0.3.9", features = ["transaction", "wallet"] }
+bsv = { package = "bsv-rs", version = "0.3.10", features = ["transaction", "wallet"] }
 
 # HTTP + async
 axum = { version = "0.8" }
@@ -91,7 +91,7 @@ generic-ec = { version = "0.5", features = ["curve-secp256k1", "serde"] }
 generic-ec-zkp = { version = "0.5", features = ["alloc"] }
 
 # BSV
-bsv = { package = "bsv-rs", version = "0.3.9", features = ["transaction", "wallet"] }
+bsv = { package = "bsv-rs", version = "0.3.10", features = ["transaction", "wallet"] }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }

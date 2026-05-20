@@ -70,8 +70,8 @@ chrono.workspace = true
 # + the `wasm` feature stay scoped to the wasm32 build — the workspace
 # `bsv` dep doesn't set default-features, so inheriting it would ignore
 # our override (cargo warns + may hard-error in future). Pinned to the
-# same 0.3.9 the workspace uses.
-bsv = { package = "bsv-rs", version = "0.3.9", default-features = false, features = ["auth", "wallet", "transaction", "wasm"] }
+# same 0.3.10 the workspace uses.
+bsv = { package = "bsv-rs", version = "0.3.10", default-features = false, features = ["auth", "wallet", "transaction", "wasm"] }
 worker = "0.7"
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
