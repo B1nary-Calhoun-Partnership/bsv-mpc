@@ -74,12 +74,12 @@ jobs:
         run: cargo build -p bsv-mpc-core --target wasm32-unknown-unknown
       - name: wasm32 build (bsv-mpc-worker)
         run: cargo build -p bsv-mpc-worker --target wasm32-unknown-unknown
-      # Phase H Step 3 gate H-3.1: the new poc17-cf-outbound-ws crate
-      # (pure-Rust Engine.IO + Socket.IO client + BRC-103 transport via
-      # vendored Calhoun codec) builds clean on wasm32-unknown-unknown.
-      # Per `docs/PHASE-H-AUDIT.md` §6.2 (revised in §2.5b + §11.2).
-      - name: wasm32 build (poc17-cf-outbound-ws — Phase H Step 3 H-3.1)
-        run: cargo build -p poc17-cf-outbound-ws --target wasm32-unknown-unknown
+      # Phase H Step 4: the Socket.IO + BRC-103 transport substrate that
+      # poc17 proved (Step 3) has graduated into bsv-mpc-messagebox — its
+      # transport_wasm + the upstream bsv-rs `socketio` consumption build
+      # clean on wasm32-unknown-unknown. (poc17 deleted in H-4.6.)
+      - name: wasm32 build (bsv-mpc-messagebox — Phase H Step 4 transport)
+        run: cargo build -p bsv-mpc-messagebox --target wasm32-unknown-unknown
       # Phase G Step 5b: drive a 2-of-2 DKG end-to-end via the inline
       # `DkgCoordinator` on wasm32-unknown-unknown. Proves the *runtime*
       # (not just the build) of the inline rewrite — i.e. the SM driver
