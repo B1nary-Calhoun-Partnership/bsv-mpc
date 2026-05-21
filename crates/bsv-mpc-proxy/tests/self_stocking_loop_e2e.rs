@@ -125,10 +125,27 @@ async fn full_self_stocking_loop() {
     };
 
     // ── 1. Distributed DKG over HTTP (proxy party 1 ↔ service party 0). ──
+    // When MPC_PROXY_IDENTITY_KEY is set, the cosigner enforces BRC-31 (§07.6),
+    // so DKG must be AUTHED — and the same identity becomes the share's owner
+    // (§08.1), which the bridge (which also reads MPC_PROXY_IDENTITY_KEY) then
+    // matches for presig. Otherwise the dev (unauthed) path.
     let config = ThresholdConfig::new(2, 2).unwrap();
-    let dkg = run_dkg_over_http(&svc_url, config)
-        .await
-        .expect("distributed DKG");
+    let dkg = match std::env::var("MPC_PROXY_IDENTITY_KEY").ok() {
+        Some(hex_key) if !hex_key.trim().is_empty() => {
+            let bytes: [u8; 32] = hex::decode(hex_key.trim())
+                .expect("MPC_PROXY_IDENTITY_KEY hex")
+                .try_into()
+                .expect("MPC_PROXY_IDENTITY_KEY 32 bytes");
+            let auth_key = PrivateKey::from_bytes(&bytes).expect("MPC_PROXY_IDENTITY_KEY key");
+            eprintln!("→ authed DKG (enforced cosigner)");
+            bsv_mpc_proxy::bridge::run_dkg_over_http_authed(&svc_url, config, auth_key)
+                .await
+                .expect("authed distributed DKG")
+        }
+        _ => run_dkg_over_http(&svc_url, config)
+            .await
+            .expect("distributed DKG"),
+    };
     let joint_hex = hex::encode(&dkg.joint_key.compressed);
     eprintln!("✔ DKG complete — joint {joint_hex}");
 
