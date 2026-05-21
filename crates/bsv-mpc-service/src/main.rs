@@ -112,6 +112,9 @@ async fn main() -> anyhow::Result<()> {
         storage: RwLock::new(storage),
         started_at: chrono::Utc::now(),
         provision,
+        // §07.6: enforce BRC-31 owner-authz when MPC_SERVER_PRIVATE_KEY is set;
+        // dev mode (allow-unauthenticated) otherwise.
+        auth: bsv_mpc_service::AuthState::from_env(),
     });
 
     let app = bsv_mpc_service::build_router(state);

@@ -85,6 +85,10 @@ pub struct SqliteShareStorage {
 /// A stored encrypted share with metadata.
 struct StoredShare {
     share: EncryptedShare,
+    /// The authorized owner's BRC-31 identity (§08.1 — the DKG-time identity
+    /// key). Empty string when DKG ran unauthenticated (dev mode); a non-empty
+    /// value gates `/sign`, `/presign`, `/ecdh` to that identity alone.
+    owner_identity: String,
     created_at: String,
     updated_at: String,
 }
@@ -165,18 +169,56 @@ impl SqliteShareStorage {
 
     // ── Share CRUD ────────────────────────────────────────────────────
 
-    /// Store an encrypted key share for an agent (upsert).
+    /// Store an encrypted key share for an agent (upsert), without binding an
+    /// owner. Equivalent to `store_share_with_owner(agent_id, share, "")`.
     pub fn store_share(&mut self, agent_id: &str, share: &EncryptedShare) -> anyhow::Result<()> {
+        self.store_share_with_owner(agent_id, share, "")
+    }
+
+    /// Store an encrypted key share recording its authorized `owner_identity`
+    /// (§08.1 — the DKG-time BRC-31 identity). Mirrors the worker DO's
+    /// `store_share_with_owner`: on upsert, an empty `owner_identity` PRESERVES
+    /// the existing owner (so a key-refresh that doesn't re-authenticate the
+    /// owner won't silently drop it); a non-empty value replaces it.
+    pub fn store_share_with_owner(
+        &mut self,
+        agent_id: &str,
+        share: &EncryptedShare,
+        owner_identity: &str,
+    ) -> anyhow::Result<()> {
         let now = chrono::Utc::now().to_rfc3339();
-        self.shares.insert(
-            agent_id.to_string(),
-            StoredShare {
-                share: share.clone(),
-                created_at: now.clone(),
-                updated_at: now,
-            },
-        );
+        match self.shares.get_mut(agent_id) {
+            Some(existing) => {
+                existing.share = share.clone();
+                existing.updated_at = now;
+                if !owner_identity.is_empty() {
+                    existing.owner_identity = owner_identity.to_string();
+                }
+            }
+            None => {
+                self.shares.insert(
+                    agent_id.to_string(),
+                    StoredShare {
+                        share: share.clone(),
+                        owner_identity: owner_identity.to_string(),
+                        created_at: now.clone(),
+                        updated_at: now,
+                    },
+                );
+            }
+        }
         Ok(())
+    }
+
+    /// Read the share's authorized owner identity (hex), if recorded + non-empty.
+    /// `None` means "no owner bound" (dev/legacy share) — the §07 entrypoint
+    /// auth gate still applies, but no per-identity owner check is enforced.
+    pub fn get_share_owner(&self, agent_id: &str) -> anyhow::Result<Option<String>> {
+        Ok(self
+            .shares
+            .get(agent_id)
+            .map(|s| s.owner_identity.clone())
+            .filter(|o| !o.is_empty()))
     }
 
     /// Retrieve an encrypted key share for an agent.
@@ -359,5 +401,61 @@ impl SqliteShareStorage {
         _older_than: chrono::Duration,
     ) -> anyhow::Result<u64> {
         Ok(0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bsv_mpc_core::types::{SessionId, ShareIndex, ThresholdConfig};
+
+    fn dummy_share() -> EncryptedShare {
+        EncryptedShare {
+            nonce: vec![0u8; 12],
+            ciphertext: vec![1u8; 32],
+            session_id: SessionId::from_str_hash("test-session"),
+            share_index: ShareIndex(0),
+            config: ThresholdConfig::new(2, 2).unwrap(),
+            joint_pubkey_compressed: vec![],
+        }
+    }
+
+    #[test]
+    fn owner_binding_round_trips_and_empty_preserves() {
+        let mut s = SqliteShareStorage::open("/tmp/test-owner-store").unwrap();
+        let share = dummy_share();
+
+        // No owner bound by default (store_share ⇒ empty owner).
+        s.store_share("agentA", &share).unwrap();
+        assert_eq!(s.get_share_owner("agentA").unwrap(), None);
+
+        // Binding an owner records it.
+        s.store_share_with_owner("agentA", &share, "02owner")
+            .unwrap();
+        assert_eq!(
+            s.get_share_owner("agentA").unwrap().as_deref(),
+            Some("02owner")
+        );
+
+        // A later upsert with an EMPTY owner must PRESERVE the existing owner
+        // (mirrors the worker DO — a key-refresh that doesn't re-auth the owner
+        // must not silently drop ownership).
+        s.store_share_with_owner("agentA", &share, "").unwrap();
+        assert_eq!(
+            s.get_share_owner("agentA").unwrap().as_deref(),
+            Some("02owner"),
+            "empty owner on upsert must preserve the bound owner"
+        );
+
+        // A non-empty owner replaces it.
+        s.store_share_with_owner("agentA", &share, "02newowner")
+            .unwrap();
+        assert_eq!(
+            s.get_share_owner("agentA").unwrap().as_deref(),
+            Some("02newowner")
+        );
+
+        // Unknown agent ⇒ None.
+        assert_eq!(s.get_share_owner("ghost").unwrap(), None);
     }
 }

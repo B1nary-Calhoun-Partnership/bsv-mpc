@@ -42,6 +42,7 @@ async fn proxy_and_service_distributed_dkg_over_http() {
         storage: RwLock::new(storage),
         started_at: chrono::Utc::now(),
         provision: None, // DKG only — no presig shipping in this gate
+        auth: bsv_mpc_service::AuthState::dev(),
     });
     let app = build_router(state);
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))

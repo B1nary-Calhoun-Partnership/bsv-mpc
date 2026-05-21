@@ -306,6 +306,7 @@ async fn setup() -> TestEnv {
         storage: RwLock::new(kss_storage),
         started_at: chrono::Utc::now(),
         provision: None,
+        auth: bsv_mpc_service::AuthState::dev(),
     });
 
     let kss_router = bsv_mpc_service::build_router(kss_state);

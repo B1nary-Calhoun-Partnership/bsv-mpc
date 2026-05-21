@@ -461,10 +461,11 @@ fn bundle_messages(messages: &[RoundMessage]) -> std::result::Result<RoundMessag
 // DKG over HTTP (proxy = party 1, holds share_B)
 // ============================================================================
 
-/// POST a JSON body to an (unauthenticated) KSS endpoint and deserialize the
-/// response. Used by [`run_dkg_over_http`]; the heavy-compute cosigner
-/// (`bsv-mpc-service` / CF Container) does not BRC-31-gate `/dkg/*` (the funded
-/// signing boundary is the DO's `/sign-relay`, which IS gated).
+/// POST a JSON body to a KSS endpoint **without** BRC-31 auth and deserialize
+/// the response. Used by [`run_dkg_over_http`] (the unauthenticated variant —
+/// dev / non-enforced cosigners). When the cosigner runs with auth ENFORCED
+/// (§07.6), use [`run_dkg_over_http_authed`], which signs each request so the
+/// cosigner records the caller as the share's `owner_identity` (§08.1).
 fn http_post_json<Req: Serialize, Resp: serde::de::DeserializeOwned>(
     handle: &tokio::runtime::Handle,
     client: &reqwest::Client,
@@ -504,6 +505,40 @@ pub async fn run_dkg_over_http(
     kss_url: &str,
     config: ThresholdConfig,
 ) -> bsv_mpc_core::error::Result<DkgResult> {
+    run_dkg_over_http_inner(kss_url, config, None).await
+}
+
+/// Authenticated variant of [`run_dkg_over_http`]: performs the BRC-31 handshake
+/// with the cosigner using `auth_key` (§07.4 long-lived identity) and signs
+/// every `/dkg/*` request, so a cosigner running with auth ENFORCED (§07.6)
+/// accepts the ceremony and records this identity as the share's
+/// `owner_identity` (§08.1). Subsequent `/sign`, `/presign`, `/ecdh` must then
+/// authenticate as the SAME identity.
+pub async fn run_dkg_over_http_authed(
+    kss_url: &str,
+    config: ThresholdConfig,
+    auth_key: PrivateKey,
+) -> bsv_mpc_core::error::Result<DkgResult> {
+    // Handshake up front (async) so the in-loop authed POSTs have a session.
+    let handshake_client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| MpcError::Protocol(format!("failed to create HTTP client: {e}")))?;
+    let mut auth = BridgeAuth {
+        client: Brc31Client::new(auth_key),
+    };
+    auth.handshake(&handshake_client, kss_url).await?;
+    run_dkg_over_http_inner(kss_url, config, Some(Arc::new(Mutex::new(auth)))).await
+}
+
+/// Shared DKG-over-HTTP driver. When `auth` is `Some`, every `/dkg/*` request is
+/// BRC-31-signed (the cosigner records the owner); when `None`, requests are
+/// unauthenticated (dev / non-enforced cosigners).
+async fn run_dkg_over_http_inner(
+    kss_url: &str,
+    config: ThresholdConfig,
+    auth: Option<Arc<Mutex<BridgeAuth>>>,
+) -> bsv_mpc_core::error::Result<DkgResult> {
     use bsv_mpc_core::dkg::{DkgCoordinator, DkgRoundResult};
 
     let kss_url = kss_url.to_string();
@@ -522,20 +557,20 @@ pub async fn run_dkg_over_http(
     let handle = tokio::runtime::Handle::current();
 
     tokio::task::spawn_blocking(move || {
+        let init_url = format!("{kss_url}/dkg/init");
+        let init_req = DkgInitRequest {
+            agent_id: String::new(),
+            config,
+            label: Some("proxy-dkg-over-http".into()),
+        };
         // Start the cosigner's DKG session FIRST (party 0). The cosigner picks
         // the session id; the proxy MUST adopt it so both derive the SAME
         // canonical cggmp24 ExecutionId (eid = f(session_id)) — a mismatch makes
         // keygen fail to complete.
-        let init_resp: DkgInitResponse = http_post_json(
-            &handle,
-            &client,
-            &format!("{kss_url}/dkg/init"),
-            &DkgInitRequest {
-                agent_id: String::new(),
-                config,
-                label: Some("proxy-dkg-over-http".into()),
-            },
-        )?;
+        let init_resp: DkgInitResponse = match &auth {
+            Some(a) => kss_post(&handle, &client, &init_url, &init_req, a)?,
+            None => http_post_json(&handle, &client, &init_url, &init_req)?,
+        };
         let session_id = SessionId::from_str_hash(&init_resp.session_id);
 
         let mut dkg = DkgCoordinator::new(session_id, config, ShareIndex(1));
@@ -546,15 +581,14 @@ pub async fn run_dkg_over_http(
         let mut proxy_bundle = bundle_messages(&proxy_r1)?;
 
         loop {
-            let round_resp: DkgRoundResponse = http_post_json(
-                &handle,
-                &client,
-                &round_url,
-                &DkgRoundRequest {
-                    session_id: init_resp.session_id.clone(),
-                    round_message: proxy_bundle,
-                },
-            )?;
+            let round_req = DkgRoundRequest {
+                session_id: init_resp.session_id.clone(),
+                round_message: proxy_bundle,
+            };
+            let round_resp: DkgRoundResponse = match &auth {
+                Some(a) => kss_post(&handle, &client, &round_url, &round_req, a)?,
+                None => http_post_json(&handle, &client, &round_url, &round_req)?,
+            };
 
             match dkg.process_round(vec![kss_msg])? {
                 DkgRoundResult::NextRound(next) => {

@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 
 use axum::{
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
     Json,
 };
@@ -36,10 +36,19 @@ use crate::AppState;
 // Same pattern as bsv-mpc-worker: coordinators contain threads and channels,
 // so they're kept alive in memory between requests.
 
+/// A live DKG ceremony plus the authenticated identity that initiated it. The
+/// `owner_identity` (§08.1) is captured at `/dkg/init` from the verified caller
+/// and recorded against the share at DKG-complete, so later `/sign`, `/presign`,
+/// `/ecdh` can be gated to that identity.
+struct DkgSession {
+    coordinator: DkgCoordinator,
+    owner_identity: String,
+}
+
 /// Wrapper to hold live coordinator sessions.
 /// In production, these could be stored in AppState or use a session manager.
 struct CoordinatorStore {
-    dkg: HashMap<String, DkgCoordinator>,
+    dkg: HashMap<String, DkgSession>,
     signing: HashMap<String, SigningCoordinator>,
     presigning: HashMap<String, PresigningManager>,
     /// presign_session_id → joint-key `agent_id`, so on completion we ship
@@ -227,6 +236,27 @@ fn err_response(
     (status, Json(serde_json::json!({"error": msg.to_string()})))
 }
 
+/// §08.1 owner-authz: reject (403) unless the authenticated `caller` is the
+/// share's recorded owner. Returns `None` when authorized (no bound owner, or
+/// caller == owner). The storage lock is read here so the decision is made on
+/// the live owner binding before any share material is touched.
+fn authz_owner(
+    state: &AppState,
+    caller: &crate::auth::CallerIdentity,
+    agent_id: &str,
+) -> Option<(StatusCode, Json<serde_json::Value>)> {
+    let owner = match state.storage.read() {
+        Ok(storage) => storage.get_share_owner(agent_id).ok().flatten(),
+        Err(e) => {
+            return Some(err_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("owner lookup failed: {e}"),
+            ))
+        }
+    };
+    crate::auth::authz_owner_or_reject(caller.as_opt(), owner.as_deref())
+}
+
 /// Bundle multiple outgoing RoundMessages into a single transport RoundMessage.
 fn bundle_outgoing_messages(messages: &[RoundMessage]) -> Result<RoundMessage, String> {
     if messages.is_empty() {
@@ -259,9 +289,17 @@ fn bundle_outgoing_messages(messages: &[RoundMessage]) -> Result<RoundMessage, S
 /// `POST /dkg/init` — Start a Distributed Key Generation ceremony.
 pub async fn handle_dkg_init(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(body): Json<DkgInitRequest>,
 ) -> impl IntoResponse {
-    // TODO: Verify BRC-31 auth
+    // §07: authenticate the caller (or allow in dev mode). The verified identity
+    // becomes the share's owner at DKG-complete (§08.1).
+    let caller = match crate::auth::verify_or_allow(&headers, &state.auth) {
+        Ok(id) => id,
+        Err(resp) => return resp,
+    };
+    let owner_identity = caller.identity_key.clone();
+
     let config = match ThresholdConfig::new(body.config.threshold, body.config.parties) {
         Ok(c) => c,
         Err(e) => return err_response(StatusCode::BAD_REQUEST, e),
@@ -286,10 +324,15 @@ pub async fn handle_dkg_init(
     };
 
     if let Ok(mut store) = COORDINATOR_STORE.lock() {
-        store.dkg.insert(session_id_str.clone(), coordinator);
+        store.dkg.insert(
+            session_id_str.clone(),
+            DkgSession {
+                coordinator,
+                owner_identity,
+            },
+        );
     }
 
-    let _ = state; // AppState available for future use
     (
         StatusCode::OK,
         Json(
@@ -318,8 +361,8 @@ pub async fn handle_dkg_round(
             Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e),
         };
 
-        let coordinator = match store.dkg.get_mut(&body.session_id) {
-            Some(c) => c,
+        let session = match store.dkg.get_mut(&body.session_id) {
+            Some(s) => s,
             None => {
                 return err_response(
                     StatusCode::NOT_FOUND,
@@ -328,7 +371,7 @@ pub async fn handle_dkg_round(
             }
         };
 
-        match coordinator.process_round(incoming) {
+        match session.coordinator.process_round(incoming) {
             Ok(r) => r,
             Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e),
         }
@@ -359,8 +402,20 @@ pub async fn handle_dkg_round(
             // (matches the worker DO's keying). Keying by session_id.hex() would
             // make the share unfindable for the subsequent presign ceremony.
             let agent_id = hex::encode(&dkg_result.joint_key.compressed);
+            // Recover the DKG-time owner identity captured at /dkg/init (§08.1)
+            // and bind it to the share — empty in dev mode (no owner enforced).
+            let owner_identity = COORDINATOR_STORE
+                .lock()
+                .ok()
+                .and_then(|s| {
+                    s.dkg
+                        .get(&body.session_id)
+                        .map(|d| d.owner_identity.clone())
+                })
+                .unwrap_or_default();
             if let Ok(mut storage) = state.storage.write() {
-                let _ = storage.store_share(&agent_id, &dkg_result.share);
+                let _ =
+                    storage.store_share_with_owner(&agent_id, &dkg_result.share, &owner_identity);
             }
             // Clean up coordinator
             if let Ok(mut store) = COORDINATOR_STORE.lock() {
@@ -385,8 +440,19 @@ pub async fn handle_dkg_round(
 /// `POST /sign/init` — Start a threshold signing ceremony.
 pub async fn handle_sign_init(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(body): Json<SignInitRequest>,
 ) -> impl IntoResponse {
+    // §07/§08.1: authenticate, then enforce that the caller owns the share —
+    // BEFORE any share material is loaded or used.
+    let caller = match crate::auth::verify_or_allow(&headers, &state.auth) {
+        Ok(id) => id,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = authz_owner(&state, &caller, &body.agent_id) {
+        return resp;
+    }
+
     let share = match state.storage.read() {
         Ok(storage) => match storage.get_share(&body.agent_id) {
             Ok(Some(s)) => s,
@@ -558,8 +624,18 @@ pub async fn handle_sign_round(
 /// `POST /presign/init` — Start a presigning batch.
 pub async fn handle_presign_init(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(body): Json<PresignInitRequest>,
 ) -> impl IntoResponse {
+    // §07/§08.1: authenticate + owner-gate before loading the share.
+    let caller = match crate::auth::verify_or_allow(&headers, &state.auth) {
+        Ok(id) => id,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = authz_owner(&state, &caller, &body.agent_id) {
+        return resp;
+    }
+
     if body.count == 0 || body.count > 100 {
         return err_response(StatusCode::BAD_REQUEST, "count must be between 1 and 100");
     }
@@ -745,9 +821,19 @@ pub async fn handle_presign_round(
 /// Returns `counterparty_pub * share_scalar` for the specified agent's share.
 pub async fn handle_ecdh(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(body): Json<EcdhRequest>,
 ) -> impl IntoResponse {
-    // TODO: Verify BRC-31 auth and agent authorization
+    // §07/§08.1: authenticate + owner-gate before the share's scalar is used to
+    // compute a partial ECDH point (which would otherwise leak share_A material
+    // to any caller).
+    let caller = match crate::auth::verify_or_allow(&headers, &state.auth) {
+        Ok(id) => id,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = authz_owner(&state, &caller, &body.agent_id) {
+        return resp;
+    }
 
     // Parse counterparty public key
     let cp_bytes = match hex::decode(&body.counterparty_pub) {
@@ -870,24 +956,28 @@ pub async fn handle_get_share_metadata(
     }
 }
 
-/// `POST /.well-known/auth` — BRC-31 Authrite handshake (stub).
+/// `POST /.well-known/auth` — BRC-31 Authrite handshake (§07).
+///
+/// In enforced mode (server key configured) this issues a signed InitialResponse
+/// and stores the session for subsequent request verification. In dev mode it
+/// returns a benign stub (auth is not enforced), preserving prior behavior.
 pub async fn handle_authrite(
-    State(_state): State<Arc<AppState>>,
-    Json(body): Json<serde_json::Value>,
-) -> impl IntoResponse {
-    let _client_key = body
-        .get("identityKey")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let _client_nonce = body.get("nonce").and_then(|v| v.as_str()).unwrap_or("");
-
-    // TODO: Implement full BRC-31 handshake
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "identityKey": "000000000000000000000000000000000000000000000000000000000000000000",
-            "nonce": "development-stub-nonce",
-            "certificates": []
-        })),
-    )
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    match crate::auth::handshake(&headers, &state.auth) {
+        Ok((resp_headers, body)) => {
+            let mut hm = HeaderMap::new();
+            for (name, value) in resp_headers {
+                if let (Ok(n), Ok(v)) = (
+                    axum::http::HeaderName::from_bytes(name.as_bytes()),
+                    axum::http::HeaderValue::from_str(&value),
+                ) {
+                    hm.insert(n, v);
+                }
+            }
+            (StatusCode::OK, hm, Json(body)).into_response()
+        }
+        Err(rejection) => rejection.into_response(),
+    }
 }

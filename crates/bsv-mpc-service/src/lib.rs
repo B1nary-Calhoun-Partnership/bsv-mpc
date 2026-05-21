@@ -3,6 +3,7 @@
 //! Exposes the service's handlers, storage, and router construction
 //! so they can be used from integration tests and embedded deployments.
 
+pub mod auth;
 pub mod dkg_handler;
 pub mod handlers;
 pub mod messagebox;
@@ -10,6 +11,7 @@ pub mod provision;
 pub mod signing_handler;
 pub mod storage;
 
+pub use auth::AuthState;
 pub use dkg_handler::DkgHandler;
 pub use messagebox::{HandlerFuture, MessageBoxListener, OutgoingRoundMessage};
 pub use signing_handler::SigningHandler;
@@ -44,6 +46,10 @@ pub struct AppState {
     pub started_at: chrono::DateTime<chrono::Utc>,
     /// Presignature provisioning to the cosigner DO (`None` = disabled).
     pub provision: Option<ProvisionConfig>,
+    /// BRC-31 server auth config + live session store (§07/§08.1). Built via
+    /// [`AuthState::from_env`] in production (enforced when
+    /// `MPC_SERVER_PRIVATE_KEY` is set), or [`AuthState::dev`] in dev/tests.
+    pub auth: AuthState,
 }
 
 /// Build the Axum router with all KSS endpoints.
