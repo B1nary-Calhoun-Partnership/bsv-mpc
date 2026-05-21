@@ -90,23 +90,25 @@ impl DurableObject for CosignerSessionDo {
     async fn fetch(&self, req: Request) -> Result<Response> {
         let path = req.path();
 
-        // BRC-31 handshake — handled IN the DO so the session is written to the
-        // pinned DO's SQLite (durable across isolate churn; #5 step 3 / §07.7).
-        if path == "/.well-known/auth" {
-            let config = crate::auth::AuthConfig::from_env(&self.env)?;
+        // Canonical BRC-31 auth runs INSIDE the DO so the session is written to
+        // the pinned DO's SQLite (durable across isolate churn; #5 / §07.7), now
+        // on the canonical wire (#8 leg 2). Both the handshake
+        // (`/.well-known/auth`) and the per-request verify on authed routes go
+        // through `process_request_auth`, which delegates to the canonical
+        // `bsv-middleware-cloudflare` middleware backed by `DoSqlStorage`. The
+        // returned `request` is the body-bearing original for the handler
+        // (whose `x-bsv-auth-identity-key` header == the verified caller).
+        // `/health` and the `/poc/*` deterministic-proof routes stay open
+        // (§07.6).
+        let req = if path == "/.well-known/auth" || is_authed_path(&path) {
             let store = self.kss_store()?;
-            return crate::auth::handle_initial_request(req, &config, &store).await;
-        }
-        // Authed KSS routes: verify BRC-31 against the durable DO-SQLite session
-        // store BEFORE dispatch (§07.5/§07.6 — no endpoint trusted by location;
-        // auth runs in the pinned DO, #5 step 3). /poc/* + /health stay open.
-        if is_authed_path(&path) {
-            let config = crate::auth::AuthConfig::from_env(&self.env)?;
-            let store = self.kss_store()?;
-            if let Err(resp) = crate::auth::verify_or_allow(&req, &config, &store) {
-                return Ok(resp);
+            match crate::auth::process_request_auth(req, &store, &self.env).await? {
+                crate::auth::AuthOutcome::Respond(resp) => return Ok(resp),
+                crate::auth::AuthOutcome::Proceed { request, .. } => request,
             }
-        }
+        } else {
+            req
+        };
 
         match path.as_str() {
             // ── POC routes (substrate proofs) ──────────────────────────

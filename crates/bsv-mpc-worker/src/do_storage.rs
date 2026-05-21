@@ -145,6 +145,35 @@ impl<'a> DoSqlStorage<'a> {
              )",
             None,
         )?;
+        // Canonical BRC-31 sessions (#8 leg 2): full `StoredSession` as JSON.
+        // Separate from the legacy `mpc_auth_sessions` (3-tuple) table so the new
+        // canonical-wire path and the `/poc/auth-session-roundtrip` legacy route
+        // never collide. Co-located in this DO's SQLite (isolate-stable).
+        sql.exec(
+            "CREATE TABLE IF NOT EXISTS mpc_canonical_sessions (\
+               session_nonce TEXT PRIMARY KEY, \
+               identity_key TEXT NOT NULL, \
+               last_update INTEGER NOT NULL, \
+               session_json TEXT NOT NULL\
+             )",
+            None,
+        )?;
+        // §07.1 replay defense (#8 leg 2): per-session consumed request-nonces.
+        // The canonical `process_auth_with_storage` verifies the signature but
+        // does NOT track per-request nonce reuse; this table is the consumed set
+        // checked AFTER signature verification (so a forged nonce can't poison
+        // it). Bounded by a TTL sweep on insert (mirrors the service's approach).
+        // PK is the (session_nonce, request_nonce) pair so the same fresh nonce
+        // is rejected on its second use within one session.
+        sql.exec(
+            "CREATE TABLE IF NOT EXISTS mpc_consumed_nonces (\
+               session_nonce TEXT NOT NULL, \
+               request_nonce TEXT NOT NULL, \
+               seen_at INTEGER NOT NULL, \
+               PRIMARY KEY (session_nonce, request_nonce)\
+             )",
+            None,
+        )?;
         // Durable custody of a cosigner's KEK-WRAPPED share (#9): a separate
         // table from `mpc_shares` (which holds THIS DO's own DKG shares) so the
         // two never collide. `share_json` here is the SEALED EncryptedShare
@@ -281,6 +310,125 @@ impl<'a> DoSqlStorage<'a> {
             .into_iter()
             .next()
             .map(|r| (r.peer_identity_key, r.peer_nonce, r.created_at as u64)))
+    }
+
+    // ── Canonical BRC-31 session storage (#8 leg 2) ─────────────────────
+    //
+    // The middleware's `SessionStorage` trait persists the full canonical
+    // `StoredSession` (it carries flags the legacy 3-tuple doesn't:
+    // is_authenticated, certificates_*, created_at, last_update). It's stored as
+    // JSON TEXT in its own table so the canonical handshake-write and the
+    // canonical request-read hit the SAME co-located DO SQLite (the
+    // auth-session-isolate fix) — and never collide with the legacy
+    // `mpc_auth_sessions` table that the `/poc/auth-session-roundtrip` route
+    // exercises. Keyed by `session_nonce`; a secondary lookup by identity scans
+    // for the most recently updated row (the trait's `get_session_by_identity`).
+
+    /// Upsert a canonical [`StoredSession`] (JSON), keyed by its server nonce.
+    pub fn put_canonical_session(
+        &self,
+        session_nonce: &str,
+        identity_key: &str,
+        last_update: u64,
+        session_json: &str,
+    ) -> Result<()> {
+        self.sql().exec(
+            "INSERT INTO mpc_canonical_sessions \
+               (session_nonce, identity_key, last_update, session_json) \
+             VALUES (?, ?, ?, ?) \
+             ON CONFLICT(session_nonce) DO UPDATE SET \
+               identity_key = excluded.identity_key, \
+               last_update = excluded.last_update, \
+               session_json = excluded.session_json",
+            vec![
+                session_nonce.into(),
+                identity_key.into(),
+                (last_update as i64).into(),
+                session_json.into(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Read a canonical session JSON by its server nonce.
+    pub fn get_canonical_session(&self, session_nonce: &str) -> Result<Option<String>> {
+        #[derive(Deserialize)]
+        struct Row {
+            session_json: String,
+        }
+        let rows: Vec<Row> = self
+            .sql()
+            .exec(
+                "SELECT session_json FROM mpc_canonical_sessions WHERE session_nonce = ?",
+                vec![session_nonce.into()],
+            )?
+            .to_array()?;
+        Ok(rows.into_iter().next().map(|r| r.session_json))
+    }
+
+    /// Read the most-recently-updated canonical session JSON for an identity key.
+    pub fn get_canonical_session_by_identity(&self, identity_key: &str) -> Result<Option<String>> {
+        #[derive(Deserialize)]
+        struct Row {
+            session_json: String,
+        }
+        let rows: Vec<Row> = self
+            .sql()
+            .exec(
+                "SELECT session_json FROM mpc_canonical_sessions \
+                 WHERE identity_key = ? ORDER BY last_update DESC LIMIT 1",
+                vec![identity_key.into()],
+            )?
+            .to_array()?;
+        Ok(rows.into_iter().next().map(|r| r.session_json))
+    }
+
+    // ── §07.1 replay defense (#8 leg 2) ──────────────────────────────────
+
+    /// Atomically record that `request_nonce` was consumed on the session keyed
+    /// by `session_nonce`. Returns `true` if it was fresh (accept), `false` if
+    /// already seen (replay → reject). Sweeps entries older than `ttl_ms` first
+    /// so the consumed set stays bounded under the session TTL window. The DO is
+    /// a single writer per request turn, so the SELECT-then-INSERT is atomic.
+    pub fn consume_request_nonce(
+        &self,
+        session_nonce: &str,
+        request_nonce: &str,
+        now_ms: u64,
+        ttl_ms: u64,
+    ) -> Result<bool> {
+        let sql = self.sql();
+        // TTL sweep (bound the set).
+        let cutoff = (now_ms.saturating_sub(ttl_ms)) as i64;
+        sql.exec(
+            "DELETE FROM mpc_consumed_nonces WHERE seen_at < ?",
+            vec![cutoff.into()],
+        )?;
+        // Already consumed on this session?
+        #[derive(Deserialize)]
+        struct CntRow {
+            n: i64,
+        }
+        let rows: Vec<CntRow> = sql
+            .exec(
+                "SELECT COUNT(*) AS n FROM mpc_consumed_nonces \
+                 WHERE session_nonce = ? AND request_nonce = ?",
+                vec![session_nonce.into(), request_nonce.into()],
+            )?
+            .to_array()?;
+        if rows.first().map(|r| r.n).unwrap_or(0) > 0 {
+            return Ok(false); // replay
+        }
+        sql.exec(
+            "INSERT INTO mpc_consumed_nonces (session_nonce, request_nonce, seen_at) \
+             VALUES (?, ?, ?)",
+            vec![
+                session_nonce.into(),
+                request_nonce.into(),
+                (now_ms as i64).into(),
+            ],
+        )?;
+        Ok(true)
     }
 
     // ── Pregenerated Paillier primes (I-4b: seeded off-worker) ───────────
@@ -671,5 +819,89 @@ impl crate::auth::AuthSessionStore for DoSqlStorage<'_> {
                     created_at,
                 },
             ))
+    }
+}
+
+/// Canonical BRC-31 session store (#8 leg 2): backs the
+/// `bsv_middleware_cloudflare::SessionStorage` trait with THIS DO's co-located
+/// SQLite. The middleware's `process_auth_with_storage` reads/writes the full
+/// canonical [`StoredSession`] here, so the handshake-write and the per-request
+/// read survive CF isolate churn — the auth-session-isolate fix, now on the
+/// canonical wire. Sessions live in DO-SQLite (NOT KV) by design.
+#[async_trait::async_trait(?Send)]
+impl bsv_middleware_cloudflare::SessionStorage for DoSqlStorage<'_> {
+    async fn get_session(
+        &self,
+        session_nonce: &str,
+    ) -> bsv_middleware_cloudflare::Result<Option<bsv_middleware_cloudflare::types::StoredSession>>
+    {
+        let json = self
+            .get_canonical_session(session_nonce)
+            .map_err(|e| middleware_storage_err(&e))?;
+        decode_stored_session(json)
+    }
+
+    async fn get_session_by_identity(
+        &self,
+        identity_key_hex: &str,
+    ) -> bsv_middleware_cloudflare::Result<Option<bsv_middleware_cloudflare::types::StoredSession>>
+    {
+        let json = self
+            .get_canonical_session_by_identity(identity_key_hex)
+            .map_err(|e| middleware_storage_err(&e))?;
+        decode_stored_session(json)
+    }
+
+    async fn save_session(
+        &self,
+        session: &bsv_middleware_cloudflare::types::StoredSession,
+    ) -> bsv_middleware_cloudflare::Result<()> {
+        self.upsert_canonical(session)
+    }
+
+    async fn update_session(
+        &self,
+        session: &bsv_middleware_cloudflare::types::StoredSession,
+    ) -> bsv_middleware_cloudflare::Result<()> {
+        self.upsert_canonical(session)
+    }
+}
+
+impl DoSqlStorage<'_> {
+    /// Shared upsert for `save_session`/`update_session` (same durable row).
+    fn upsert_canonical(
+        &self,
+        session: &bsv_middleware_cloudflare::types::StoredSession,
+    ) -> bsv_middleware_cloudflare::Result<()> {
+        let json = serde_json::to_string(session).map_err(|e| {
+            bsv_middleware_cloudflare::AuthCloudflareError::SerializationError(e.to_string())
+        })?;
+        self.put_canonical_session(
+            &session.session_nonce,
+            &session.peer_identity_key,
+            session.last_update,
+            &json,
+        )
+        .map_err(|e| middleware_storage_err(&e))
+    }
+}
+
+/// Map a `worker::Error` from the DO-SQLite layer into the middleware's error.
+fn middleware_storage_err(e: &Error) -> bsv_middleware_cloudflare::AuthCloudflareError {
+    bsv_middleware_cloudflare::AuthCloudflareError::KvError(e.to_string())
+}
+
+/// Deserialize a stored canonical session JSON (if present).
+fn decode_stored_session(
+    json: Option<String>,
+) -> bsv_middleware_cloudflare::Result<Option<bsv_middleware_cloudflare::types::StoredSession>> {
+    match json {
+        Some(s) => {
+            let session = serde_json::from_str(&s).map_err(|e| {
+                bsv_middleware_cloudflare::AuthCloudflareError::SerializationError(e.to_string())
+            })?;
+            Ok(Some(session))
+        }
+        None => Ok(None),
     }
 }

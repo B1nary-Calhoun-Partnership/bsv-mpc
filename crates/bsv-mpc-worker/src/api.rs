@@ -341,9 +341,11 @@ fn unbundle_incoming_message(msg: &RoundMessage) -> std::result::Result<Vec<Roun
 // ── Authorization helpers (#5 / §08.1) ─────────────────────────────────────
 
 /// BRC-31 identity-key header (MUST match `auth.rs` `headers::IDENTITY_KEY`).
-/// Verified at the Worker entrypoint by `verify_or_allow` before the request is
-/// forwarded to this DO, so by the time a handler reads it the value is the
-/// authenticated caller (the DO is only reachable via the entrypoint binding).
+/// Verified inside the DO by `auth::process_request_auth` (canonical BRC-31,
+/// #8 leg 2) BEFORE dispatch: the canonical signature is checked over
+/// `(method, path, headers, body)` and the header identity is bound to the
+/// established session, so by the time a handler reads this header the value is
+/// the authenticated caller.
 const AUTH_IDENTITY_HEADER: &str = "x-bsv-auth-identity-key";
 
 /// The authenticated caller's BRC-31 identity (hex), or `None` when absent

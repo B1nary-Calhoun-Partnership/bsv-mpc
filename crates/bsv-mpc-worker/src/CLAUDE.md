@@ -21,7 +21,7 @@ This crate implements the remote Key Share Service (KSS) as a Cloudflare Worker 
 ### Entry Point (`lib.rs`)
 
 - `MpcStorage` — Durable Object struct (stub). Holds `State` and `Env`, returns JSON status on fetch. Required by wrangler for `MPC_STORAGE` binding.
-- `fetch()` — `#[event(fetch)]` handler. Routes via `worker::Router` to 10 endpoints plus CORS preflight. Each protected endpoint loads `AuthConfig::from_env()` and calls `auth::verify_or_allow()` before delegating to the handler.
+- `fetch()` — `#[event(fetch)]` handler. A thin forwarder: routes via `worker::Router` and forwards every route to the per-identity `CosignerSessionDo` (`poc::forward_to_cosigner_do`). Auth runs INSIDE that DO: `CosignerSessionDo::fetch` calls `auth::process_request_auth()` (canonical BRC-31, #8 leg 2) for the handshake + every authed route before delegating to the handler.
 
 ### Request/Response Types (`api.rs`)
 
@@ -77,30 +77,49 @@ Each protocol round may produce multiple wire messages (broadcast + p2p). For HT
 - `unbundle_incoming_message(msg) -> Vec<RoundMessage>` — Recovers individual messages. Handles both bundled (JSON array) and single-message formats.
 - `generate_session_id(prefix) -> String` — Creates unique session IDs using `getrandom` + SHA-256. Format: `{prefix}-{32 hex chars}`.
 
-### Authentication (`auth.rs`)
+### Authentication (`auth.rs`) — CANONICAL BRC-31 wire (#8 leg 2)
 
-Full BRC-31 Authrite implementation ported from `bsv-auth-cloudflare`.
+The worker DO verifies the **canonical BRC-31 wire** via the
+`bsv-middleware-cloudflare` server middleware (we maintain it; consumed via a
+pinned git rev). This replaced the old custom "sign `SHA-256(nonce)`" profile:
+the leg-1 proxy now emits canonical-wire requests, so the DO must verify the
+canonical wire to match. The proven wire is exactly what
+`bsv-mpc-core/tests/conformance_07_brc31_auth.rs` produces.
 
-**Configuration:**
-- `AuthConfig` — Loaded from CF Worker env via `from_env()`. Reads `SERVER_PRIVATE_KEY` secret. Falls back to `allow_unauthenticated` mode if not set (development).
-- `headers` module — 7 BRC-104 header constants (`x-bsv-auth-*`).
+**Where auth runs:** INSIDE the per-identity `CosignerSessionDo` (NOT the
+entrypoint), backed by that DO's co-located SQLite session store. The
+handshake-write and the per-request read hit the same store regardless of which
+entrypoint isolate served them (the auth-session-isolate fix, #5). Sessions stay
+in DO-SQLite (NOT KV).
 
-**Core functions (all implemented):**
-- `verify_or_allow(req, config) -> Result<AuthenticatedIdentity, Response>` — Main entry point called by each protected endpoint. Returns identity if authenticated, or allows through in dev mode.
-- `verify_request(req, config) -> Result<AuthenticatedIdentity, AuthError>` — Full BRC-31 verification: extract BRC-104 headers, lookup session by `your_nonce`, check TTL, verify identity matches session, derive BRC-42 verification key via ECDH, verify ECDSA signature.
-- `handle_initial_request(req, config) -> Result<Response>` — BRC-31 handshake (`POST /.well-known/auth`). Extracts peer identity/nonce, generates server nonce, stores session, signs response with BRC-42 derived key, returns BRC-104 headers.
-- `sign_response_headers(body, req_nonce, ...) -> Vec<(String, String)>` — Generates BRC-104 auth headers for signed responses.
-- `verify_agent_authorization(auth, agent_id) -> Result<(), AuthError>` — Ensures authenticated identity matches `agent_id` in request body. Dev mode (empty identity_key) allows all.
-- `handle_cors_preflight() -> Result<Response>` — Returns 204 with CORS headers allowing BRC-104 auth headers.
+**Core functions:**
+- `process_request_auth(req, storage, env) -> Result<AuthOutcome>` — the single
+  DO-side entry for BOTH the handshake (`/.well-known/auth`) and the per-request
+  verify on authed routes. Clones the request (so the handler keeps the
+  body-bearing original), runs the canonical
+  `process_auth_with_storage(req, &DoSqlStorage, &options)`, returns
+  `AuthOutcome::Respond(resp)` (handshake / auth error) or
+  `AuthOutcome::Proceed { caller, request }`. On `Authenticated` it enforces (a)
+  §07 identity binding (the `x-bsv-auth-identity-key` header == the
+  session-bound identity → else 403) and (b) §07.1 replay (a reused
+  `(your_nonce, nonce)` pair → 401).
+- `auth_options(env)` — builds `AuthMiddlewareOptions`: `SERVER_PRIVATE_KEY` set
+  ⇒ enforced; unset ⇒ `allow_unauthenticated` (dev mode).
+- `verify_agent_authorization(caller, agent_id) -> Result<(), String>` — compat
+  helper; dev mode (no caller) allows all. The live owner-authz path is
+  `api::authz_owner_or_reject` (checks the share's bound `owner_identity` BEFORE
+  share material loads).
+- `handle_cors_preflight()` — delegates to the middleware (canonical header set).
+- `headers` module — 8 BRC-104 header constants (`x-bsv-auth-*`).
 
-**Session management:**
-- `AuthSession` — Server-side session state: `server_nonce`, `peer_identity_key`, `peer_nonce`, `created_at`.
-- `AUTH_SESSIONS` — In-memory `LazyLock<Mutex<HashMap>>`, keyed by `server_nonce`.
-- `store_session()`, `get_session()`, `session_count()` — CRUD on session storage.
+**Session storage (canonical):** `DoSqlStorage` implements
+`bsv_middleware_cloudflare::SessionStorage` (async, `?Send`) over its
+`mpc_canonical_sessions` table (full `StoredSession` as JSON). §07.1 replay uses
+`mpc_consumed_nonces` (TTL-swept, PK = `(session_nonce, request_nonce)`).
 
-**Types:**
-- `AuthenticatedIdentity` — Verified BRC-31 identity: `identity_key` (33-byte hex pubkey), `nonce`, `established_at`.
-- `AuthError` — 6 variants: `NotAuthenticated`, `InvalidSignature(String)`, `SessionExpired`, `SessionNotFound`, `IdentityMismatch`, `VerificationError(String)`. Each maps to HTTP status (401/403/500).
+**Legacy (compat only):** `AuthSession` + `AuthSessionStore` + the
+`mpc_auth_sessions` table are retained ONLY for the `/poc/auth-session-roundtrip`
+deterministic-proof route; the canonical path never touches them.
 
 ### Storage (`storage.rs`)
 

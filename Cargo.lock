@@ -197,6 +197,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "bsv-middleware-cloudflare"
+version = "0.2.0"
+source = "git+https://github.com/Calhooon/bsv-middleware-cloudflare?rev=96efe6f608a03f4934dc78384f425b4fc1698146#96efe6f608a03f4934dc78384f425b4fc1698146"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "bsv-rs",
+ "console_error_panic_hook",
+ "futures",
+ "getrandom 0.2.17",
+ "hex",
+ "js-sys",
+ "rand 0.8.5",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "worker",
+]
+
+[[package]]
 name = "bsv-middleware-rs"
 version = "0.2.0"
 source = "git+https://github.com/Calhooon/bsv-middleware-rs?rev=61e1f4948d150dfb217ea5fdd22ad73c2b267bc7#61e1f4948d150dfb217ea5fdd22ad73c2b267bc7"
@@ -384,7 +406,10 @@ dependencies = [
 name = "bsv-mpc-worker"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "base64 0.22.1",
+ "bsv-middleware-cloudflare",
+ "bsv-middleware-rs",
  "bsv-mpc-core",
  "bsv-mpc-messagebox",
  "bsv-rs",
@@ -593,6 +618,16 @@ checksum = "773f3b9af64447d2ce9850330c473515014aa235e6a783b02db81ff39e4a3dad"
 dependencies = [
  "crypto-common",
  "inout",
+]
+
+[[package]]
+name = "console_error_panic_hook"
+version = "0.1.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a06aeb73f470f66dcdbf7223caeebb85984942f22f1adb2a088cf9668146bbbc"
+dependencies = [
+ "cfg-if",
+ "wasm-bindgen",
 ]
 
 [[package]]

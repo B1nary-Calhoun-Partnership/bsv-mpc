@@ -18,6 +18,15 @@ base64.workspace = true
 worker = "0.8"
 getrandom = { version = "0.2", features = ["js"] }
 rand = { workspace = true }
+# Canonical BRC-31 CF Worker server middleware (we maintain it). Consumed
+# as-is via the pinned git rev. Exposes the pluggable-`SessionStorage`
+# `process_auth_with_storage` + `sign_json_response` (#8 leg 2): the worker DO
+# verifies the CANONICAL BRC-31 wire (same wire the leg-1 proxy now emits)
+# instead of the old custom "sign SHA-256(nonce)" profile. Target-agnostic so
+# `cargo clippy --all-targets` (host) checks the DO auth path too — the crate
+# itself is portable (worker 0.8 + js-sys bindings build on the host).
+bsv-middleware-cloudflare = { git = "https://github.com/Calhooon/bsv-middleware-cloudflare", rev = "96efe6f608a03f4934dc78384f425b4fc1698146" }
+async-trait = "0.1"
 
 # Native target — `cargo clippy --workspace --all-targets` compiles the worker
 # for the host; only the non-wasm32 code paths are checked. Uses the workspace
@@ -36,6 +45,18 @@ bsv = { package = "bsv-rs", version = "0.3.11", default-features = false, featur
 bsv-mpc-messagebox = { path = "../bsv-mpc-messagebox" }
 futures.workspace = true
 wasm-bindgen-futures = "0.4"
+
+# Dev-only (native `cargo test` build): the worker's canonical-verify unit test
+# (auth.rs) constructs a `bsv::auth::Peer`-signed General message the same way
+# `conformance_07_brc31_auth.rs` does, then asserts the worker's canonical
+# verification accepts it (and rejects a stranger / tampered payload). Needs the
+# `auth` feature on bsv (the native dep above is feature-light) and the public
+# canonical BRC-104 `build_request_payload` from bsv-middleware-rs (the
+# cloudflare crate keeps its identical copy private). Same pinned rev as
+# bsv-mpc-core, so no duplicate source.
+[dev-dependencies]
+bsv = { package = "bsv-rs", version = "0.3.11", features = ["transaction", "wallet", "auth"] }
+bsv-middleware-rs = { git = "https://github.com/Calhooon/bsv-middleware-rs", rev = "61e1f4948d150dfb217ea5fdd22ad73c2b267bc7" }
 
 [lib]
 crate-type = ["cdylib"]
