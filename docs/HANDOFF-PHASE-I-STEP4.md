@@ -244,7 +244,28 @@ end-to-end on real Cloudflare + real mainnet.
     wire-compatible, so `HttpWalletJson` can't parse a real wallet's response; the
     gate sends canonical `CreateActionArgs` and parses the canonical hex `txid`,
     as any real BRC-100 client does. (Possible SDK follow-up, out of scope here.)
-- **Provisioning automation (#4) — REMAINING; now the only Phase I-6 item left.**
+- **Provisioning automation (#4) — IN PROGRESS (4a/4b/4c done + deployed-proven):**
+  - ✅ **4a** `c9fe733` — `bsv_mpc_core::presigning::serialize_party_presignature`
+    (extract+serialize the cggmp24 presig from a `take_raw` box). GATE: helper-
+    serialized `Presignature_A` drives a BSV-valid 2-of-2 sig. All 4 e2e harnesses
+    DRY-refactored onto it.
+  - ✅ **4b** `c085427` — reusable transport-agnostic `bsv_mpc_core::brc31_client::Brc31Client`
+    (extracted from the proxy's `BridgeAuth`; wasm-safe, byte-identical). Proxy
+    delegates to it; re-proven against the LIVE worker (sign_relay_authed).
+  - ✅ **4c** `f312a23` — `bsv-mpc-service` `ProvisionConfig::ship_presignature`:
+    on presig completion the native cosigner ships `Presignature_A` to the DO
+    pool via authed `/ceremony/ingest-presig` (FIFO-lockstep, fail-closed; off
+    unless `MPC_WORKER_URL`+`MPC_SERVICE_AUTH_KEY`). DEPLOYED proof
+    (`provision_via_service_deployed_e2e`): service stocks the LIVE DO pool →
+    proxy combiner consumes via authed `/sign-relay` → BSV-valid. No sats.
+  - **REMAINING 4d/4e (full deployed self-stocking loop):** (i) **proxy-side
+    DKG-over-HTTP driver** so the container obtains `share_A` (today the proxy
+    loads its share from a file — no DKG driver exists); (ii) proxy
+    `presign_raw`/`background_replenish` targets the **container** (`MPC_PRESIGN_URL`)
+    in relay mode; (iii) **CF Container redeploy** of `bsv-mpc-service` with the
+    shipping logic; (iv) proxy↔container presig over HTTP → DO pool, then
+    `createAction` → **real-sats mainnet TXID** as the capstone (user: full CF
+    Container redeploy + real sats OK).
   Native Container (`bsv-mpc-service`, holds share_A, has `/presign/*`) runs
   presig gen with the proxy (`bridge.presign_raw()` targets the **container** in
   relay mode → proxy pool gets box_B), then ships its `Presignature_A` to the DO
