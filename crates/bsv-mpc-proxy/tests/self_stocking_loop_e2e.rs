@@ -85,31 +85,43 @@ async fn full_self_stocking_loop() {
     let relay_url =
         std::env::var("MESSAGEBOX_RELAY_URL").unwrap_or_else(|_| DEFAULT_RELAY.to_string());
 
-    // ── Start the in-process cosigner with provisioning → deployed DO. ──
+    // The cosigner (party 0, share_A): either the DEPLOYED CF Container
+    // (`DEPLOYED_CONTAINER_URL` — the 4e fully-deployed proof) or an in-process
+    // instance (local proof). The deployed container has `MPC_WORKER_URL` baked,
+    // so it self-ships `Presignature_A` to the deployed DO.
     let data_dir = std::env::temp_dir().join(format!("selfstock_svc_{}", std::process::id()));
     std::fs::create_dir_all(&data_dir).unwrap();
-    let storage = SqliteShareStorage::open(data_dir.to_str().unwrap()).unwrap();
-    let state = Arc::new(AppState {
-        data_dir: data_dir.to_string_lossy().to_string(),
-        storage: RwLock::new(storage),
-        started_at: chrono::Utc::now(),
-        provision: Some(ProvisionConfig {
-            worker_url: worker_url.clone(),
-            auth: tokio::sync::Mutex::new(Brc31Client::new(fresh_priv())),
-            http: reqwest::Client::new(),
-        }),
-    });
-    let app = build_router(state);
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-        .await
-        .unwrap();
-    let svc_url = format!("http://{}", listener.local_addr().unwrap());
-    let server = tokio::spawn(async move {
-        axum::serve(listener, app.into_make_service())
-            .await
-            .unwrap();
-    });
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    let (svc_url, server) = match std::env::var("DEPLOYED_CONTAINER_URL") {
+        Ok(url) => {
+            eprintln!("✔ using DEPLOYED CF Container cosigner: {url}");
+            (url, None)
+        }
+        Err(_) => {
+            let storage = SqliteShareStorage::open(data_dir.to_str().unwrap()).unwrap();
+            let state = Arc::new(AppState {
+                data_dir: data_dir.to_string_lossy().to_string(),
+                storage: RwLock::new(storage),
+                started_at: chrono::Utc::now(),
+                provision: Some(ProvisionConfig {
+                    worker_url: worker_url.clone(),
+                    auth: tokio::sync::Mutex::new(Brc31Client::new(fresh_priv())),
+                    http: reqwest::Client::new(),
+                }),
+            });
+            let app = build_router(state);
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let handle = tokio::spawn(async move {
+                axum::serve(listener, app.into_make_service())
+                    .await
+                    .unwrap();
+            });
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            (url, Some(handle))
+        }
+    };
 
     // ── 1. Distributed DKG over HTTP (proxy party 1 ↔ service party 0). ──
     let config = ThresholdConfig::new(2, 2).unwrap();
@@ -163,7 +175,9 @@ async fn full_self_stocking_loop() {
         .expect("proxy combines the self-provisioned presig over the relay");
     assert_bsv_valid(&dkg.joint_key, &sighash, &sig);
 
-    server.abort();
+    if let Some(s) = server {
+        s.abort();
+    }
     let _ = std::fs::remove_dir_all(&data_dir);
 
     eprintln!(

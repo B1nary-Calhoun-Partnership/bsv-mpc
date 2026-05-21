@@ -11,7 +11,11 @@
       "class_name": "BsvMpcServiceContainer",
       "image": "../../Dockerfile",
       "image_build_context": "../../",
-      "max_instances": 1
+      "max_instances": 1,
+      // #4e: DKG/presig generate Paillier safe-primes inline (CPU + memory
+      // heavy); the default "dev" instance (256 MiB) OOMs. "standard" gives
+      // more memory + vCPU for the off-hot-path ceremonies.
+      "instance_type": "standard"
     }
   ],
   "durable_objects": {

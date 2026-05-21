@@ -507,8 +507,16 @@ pub async fn run_dkg_over_http(
     use bsv_mpc_core::dkg::{DkgCoordinator, DkgRoundResult};
 
     let kss_url = kss_url.to_string();
+    // DKG is a one-time, off-hot-path ceremony; a remote cosigner on a
+    // constrained instance generates Paillier primes inline (tens of seconds to
+    // minutes), so allow a generous per-round budget. Overridable via
+    // `MPC_DKG_TIMEOUT_SECS`.
+    let dkg_timeout = std::env::var("MPC_DKG_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(600);
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(180))
+        .timeout(std::time::Duration::from_secs(dkg_timeout))
         .build()
         .map_err(|e| MpcError::Protocol(format!("failed to create HTTP client: {e}")))?;
     let handle = tokio::runtime::Handle::current();
