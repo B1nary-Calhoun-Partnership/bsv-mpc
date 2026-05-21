@@ -126,10 +126,20 @@ Worker DO `9f2075e1` (segregated pool + authed /sign-relay). CF Container
   ephemeral-compute cosigners (`MPC-Spec 1c7682e`); **§18.9 presig-invalidation
   primitive** `delete_presignatures_for_agent` across all pools (`7eb0bc2`,
   unit-proven).
-- **Open tickets (nothing forgotten):** **#10** wire multi-round `/refresh` +
-  rotation-on-commit; **#11** §06/§09/§18 conformance harnesses (§06 deferred on
-  Ishaan's byte-lock); **#8** body-binding; **MPC-Spec #37** rust-mpc
-  `build_invoice_number` validation.
+- **#12 audit residual:** concurrency-stress PROVEN (`880eff6` —
+  `concurrency_stress_e2e`: 3 parallel ceremonies, distinct keys, owner-gated,
+  no corruption/deadlock); replay gap (§07.1 per-request nonce not consumed)
+  documented + folded into #8. Closed #12.
+- **Issue hygiene:** closed done issues #6/#7/#9/#12; stale auth-TODOs cleared;
+  CLAUDE.md version + status table refreshed (`b12c75f`).
+- **Open tickets (nothing forgotten):** **#10** distributed-refresh (SCOPE-
+  CORRECTED — multi-round PSS + atomic commit + §18 wire spec + Binary coord;
+  fund-critical, not rushed); **#11** §06/§09/§18 conformance (§06 deferred on
+  Ishaan); **#8** auth-hardening cycle (body-binding + replay-nonce, dedicated);
+  **#13** OQ-I1 (blocks on relay HD-key); **#5/#2** umbrellas; **MPC-Spec #37**
+  rust-mpc invoice validation. The clean SOLO-buildable high-value backlog is
+  now exhausted — remaining work is blocked (Ishaan), cross-impl/spec-first
+  (#10), or a dedicated auth-substrate cycle (#8).
 
 ## In-flight / next steps (priority order)
 0. ✅ **#7 finding #1 DEPLOYED enforcement — DONE.** Proxy multi-server BRC-31
