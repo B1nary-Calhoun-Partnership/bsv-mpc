@@ -20,8 +20,8 @@
   changes. (Spec-relevant *additions* assessed below.)
 
 ## Deployed infra (Calhoun dev-a3e CF account)
-- Worker (DO, share_A presig pool + light sign): `https://bsv-mpc-kss.dev-a3e.workers.dev` (version `801f92e6` — has authed `/sign-relay`).
-- Native cosigner (CF Container, share_A heavy DKG/presig): `https://bsv-mpc-service-container.dev-a3e.workers.dev` (version `f445893e`, **instance_type `standard-1`**; `MPC_WORKER_URL` baked. **BRC-31 ENFORCED** — `MPC_SERVER_PRIVATE_KEY` wired via Worker secret → container `envVars`; unauthed→401 live).
+- Worker (DO, presig pool + light sign + #9 custody store): `https://bsv-mpc-kss.dev-a3e.workers.dev` (version `ff080f61` — authed `/sign-relay`, orphan-cleanup, `/custody/{put,get}-share`).
+- Native cosigner (CF Container, share_A heavy DKG/presig): `https://bsv-mpc-service-container.dev-a3e.workers.dev` (version `89e52beb`, **instance_type `standard-1`**; `MPC_WORKER_URL` baked. **BRC-31 ENFORCED** — `MPC_SERVER_PRIVATE_KEY` via Worker secret → container `envVars`; unauthed→401 live. **#9 durable custody auto-enabled** — persists KEK-sealed share_A to the worker DO).
 - Relay: `https://rust-message-box.dev-a3e.workers.dev`.
 
 ## Commits this session (all on `main`, all gated)
@@ -110,8 +110,10 @@ Worker DO `9f2075e1` (segregated pool + authed /sign-relay). CF Container
   lazily recovers on cold-cache miss before the owner check. **Restart-survival
   PROVEN** against the deployed worker (`custody_restart_survival_e2e`): drop
   service A → fresh B recovers `share_A` → valid partial; stranger→403,
-  unauthed→401. Worker deployed `ff080f61`; container redeploy (custody
-  auto-enables) in progress.
+  unauthed→401. **DEPLOYED + CLOSED:** worker `ff080f61` (custody endpoints),
+  container `89e52beb` (custody auto-enabled). Deployed self-stocking with
+  custody ON → authed DKG completes (DKG-complete custody-put succeeded
+  fail-closed) → presig→ship→relay-sign → BSV-valid 2-of-2 (467s).
 
 ## In-flight / next steps (priority order)
 0. ✅ **#7 finding #1 DEPLOYED enforcement — DONE.** Proxy multi-server BRC-31
