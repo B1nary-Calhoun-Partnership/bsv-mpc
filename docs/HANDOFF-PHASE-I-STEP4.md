@@ -258,14 +258,20 @@ end-to-end on real Cloudflare + real mainnet.
     unless `MPC_WORKER_URL`+`MPC_SERVICE_AUTH_KEY`). DEPLOYED proof
     (`provision_via_service_deployed_e2e`): service stocks the LIVE DO pool →
     proxy combiner consumes via authed `/sign-relay` → BSV-valid. No sats.
-  - **REMAINING 4d/4e (full deployed self-stocking loop):** (i) **proxy-side
-    DKG-over-HTTP driver** so the container obtains `share_A` (today the proxy
-    loads its share from a file — no DKG driver exists); (ii) proxy
-    `presign_raw`/`background_replenish` targets the **container** (`MPC_PRESIGN_URL`)
-    in relay mode; (iii) **CF Container redeploy** of `bsv-mpc-service` with the
-    shipping logic; (iv) proxy↔container presig over HTTP → DO pool, then
-    `createAction` → **real-sats mainnet TXID** as the capstone (user: full CF
-    Container redeploy + real sats OK).
+  - ✅ **4d** `9dbfc7e` + `b0dc1f3` — proxy-side **distributed DKG-over-HTTP**
+    driver (`run_dkg_over_http`, party 1, no trusted dealer) + `presign_url`
+    split (presig/DKG → native cosigner; sign → wasm DO over relay). Fixed two
+    execution-id mismatches (DKG adopts the cosigner's session id; service
+    `/presign/init` reconstructs the SessionId via `from_hex`, not re-hash) and
+    the service's DKG-complete share keying (by joint key, not session hash).
+  - ✅ **FULL SELF-STOCKING LOOP PROVEN** (`self_stocking_loop_e2e`, no sats):
+    DKG-over-HTTP (proxy↔in-process service) → presig-over-HTTP (service
+    **auto-ships** `Presignature_A` to the **deployed** DO pool) → proxy triggers
+    the authed `/sign-relay` → DO consumes the self-provisioned presig → proxy
+    combines → **BSV-valid 2-of-2**. Nothing hand-stitched.
+  - **REMAINING 4e:** CF-Container redeploy of `bsv-mpc-service` with the
+    shipping logic (`1cbf4e8` bakes `MPC_WORKER_URL`, ephemeral auth) + run the
+    loop entirely on deployed infra; real-sats `createAction` capstone.
   Native Container (`bsv-mpc-service`, holds share_A, has `/presign/*`) runs
   presig gen with the proxy (`bridge.presign_raw()` targets the **container** in
   relay mode → proxy pool gets box_B), then ships its `Presignature_A` to the DO
