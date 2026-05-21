@@ -115,6 +115,22 @@ Worker DO `9f2075e1` (segregated pool + authed /sign-relay). CF Container
   custody ON → authed DKG completes (DKG-complete custody-put succeeded
   fail-closed) → presig→ship→relay-sign → BSV-valid 2-of-2 (467s).
 
+## Hardening + follow-ons (this segment)
+- **#8 hardening:** deploy smoke-test (`b28a856`, live: worker+container healthy +
+  unauthed→401 on all funded-boundary/custody routes); round-handler
+  defense-in-depth BRC-31 auth on the service (`6ec6890`, proven). **Body-binding
+  (`SHA-256(nonce‖body)`) — DESIGNED + fully specced in #8**, scheduled as a
+  dedicated cycle (breaking auth-substrate change; §07 permits the nonce profile;
+  TLS-covered — not rushed).
+- **#9 follow-ons:** MPC-Spec **§16.6.4** mandates durable encrypted custody for
+  ephemeral-compute cosigners (`MPC-Spec 1c7682e`); **§18.9 presig-invalidation
+  primitive** `delete_presignatures_for_agent` across all pools (`7eb0bc2`,
+  unit-proven).
+- **Open tickets (nothing forgotten):** **#10** wire multi-round `/refresh` +
+  rotation-on-commit; **#11** §06/§09/§18 conformance harnesses (§06 deferred on
+  Ishaan's byte-lock); **#8** body-binding; **MPC-Spec #37** rust-mpc
+  `build_invoice_number` validation.
+
 ## In-flight / next steps (priority order)
 0. ✅ **#7 finding #1 DEPLOYED enforcement — DONE.** Proxy multi-server BRC-31
    (`presign_auth` session vs `presign_url`, `MPC_PROXY_IDENTITY_KEY` pre-DKG
