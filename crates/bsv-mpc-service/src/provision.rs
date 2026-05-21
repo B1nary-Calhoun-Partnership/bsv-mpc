@@ -20,6 +20,7 @@ impl ProvisionConfig {
     /// without its DO `Presignature_A`).
     pub async fn ship_presignature(
         &self,
+        agent_id: &str,
         presig_json: &[u8],
         session_id: &str,
         presig_id: &str,
@@ -58,6 +59,7 @@ impl ProvisionConfig {
             .http
             .post(format!("{}/ceremony/ingest-presig", self.worker_url))
             .json(&serde_json::json!({
+                "agent_id": agent_id,
                 "session_id": session_id,
                 "presig_id": presig_id,
                 "presignature_hex": hex::encode(presig_json),

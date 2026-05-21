@@ -164,7 +164,7 @@ async fn service_provisions_do_pool_proxy_combines() {
         auth: tokio::sync::Mutex::new(Brc31Client::new(fresh_priv())),
         http: reqwest::Client::new(),
     };
-    prov.ship_presignature(&presig_a_json, "prov-svc", "prov-svc-1")
+    prov.ship_presignature(&joint_hex, &presig_a_json, "prov-svc", "prov-svc-1")
         .await
         .expect("service ships Presignature_A to the deployed DO pool");
     eprintln!("✔ service provisioned Presignature_A → DO pool (authed /ceremony/ingest-presig)");

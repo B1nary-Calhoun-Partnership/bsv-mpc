@@ -148,20 +148,37 @@ pub async fn combine_sign_over_relay(
     }
 
     // 4. Receive the DO's partial over the relay; combine.
-    let decoded = tokio::time::timeout(recv_timeout, sub.next())
-        .await
-        .map_err(|_| MpcError::Protocol("timed out awaiting DO partial over relay".into()))?
-        .ok_or_else(|| MpcError::Protocol("relay subscription closed before partial".into()))?
-        .map_err(proto)?;
+    //
+    //    The `mpc-sign` box is SHARED across signs (and across signers), and the
+    //    relay backfills recent messages — so a fresh subscription can surface a
+    //    STALE partial from a prior sign or another joint key. Combining that
+    //    with this sign's presignature fails ("malformed or cheating party").
+    //    Filter to THIS sign: accept only a partial from the DO party that
+    //    carries this sign's unique `session_id` (the combiner picks a fresh id
+    //    per sign, sends it in the trigger, and the DO echoes it in the §05
+    //    envelope). Drain everything else until the matching partial or timeout.
+    let deadline = tokio::time::Instant::now() + recv_timeout;
+    let round_msg = loop {
+        let remaining = deadline
+            .checked_duration_since(tokio::time::Instant::now())
+            .ok_or_else(|| MpcError::Protocol("timed out awaiting DO partial over relay".into()))?;
+        let decoded = tokio::time::timeout(remaining, sub.next())
+            .await
+            .map_err(|_| MpcError::Protocol("timed out awaiting DO partial over relay".into()))?
+            .ok_or_else(|| MpcError::Protocol("relay subscription closed before partial".into()))?
+            .map_err(proto)?;
+        let rm = decoded.round_msg;
+        if rm.from == ShareIndex(trigger.do_index) && rm.session_id == session_id {
+            break rm;
+        }
+        tracing::debug!(
+            from = rm.from.0,
+            stale_session = %rm.session_id.hex(),
+            "relay: skipping unrelated/stale partial (not this sign's session)"
+        );
+    };
 
-    if decoded.round_msg.from != ShareIndex(trigger.do_index) {
-        return Err(MpcError::Signing(format!(
-            "expected partial from DO party {}, got party {}",
-            trigger.do_index, decoded.round_msg.from.0
-        )));
-    }
-
-    let result = coord.process_round(vec![decoded.round_msg])?;
+    let result = coord.process_round(vec![round_msg])?;
     sub.shutdown().await;
     match result {
         SigningRoundResult::Complete(sig) => Ok(sig),

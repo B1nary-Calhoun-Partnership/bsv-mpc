@@ -572,21 +572,26 @@ impl CosignerSessionDo {
     /// is NOT shipped — only the combiner (native proxy) needs it (ADR-018).
     ///
     /// Auth is enforced at the Worker entrypoint before forwarding. The presig
-    /// is stored under **this DO's own cosigner identity** (derived from
-    /// `SERVER_PRIVATE_KEY`), never a client-supplied agent_id — the requester
-    /// cannot stock another agent's pool (handler-level authz, #5). The blob is
-    /// stored opaque (validated at consumption time by `issue_partial_signature_json`,
-    /// mirroring the seed-primes precedent).
+    /// pool is **segregated by the joint key (`agent_id`)** so presigs for one
+    /// joint key can never be consumed by a sign for another (the #7 finding-5
+    /// cross-contamination fix). Owner-authz gates it: only the share's
+    /// DKG-time owner (§08.1) may stock its pool — a requester cannot poison
+    /// another joint key's pool. The blob is stored opaque (validated at
+    /// consumption time by `issue_partial_signature_json`).
     async fn handle_ingest_presig(&self, mut req: Request) -> Result<Response> {
         #[derive(serde::Deserialize)]
         struct IngestPresigRequest {
+            /// Joint pubkey hex — the pool key (segregation).
+            agent_id: String,
             session_id: String,
             presig_id: String,
             presignature_hex: String,
         }
+        // Caller identity (verified BRC-31) — read before consuming the body.
+        let caller = crate::api::caller_identity(&req);
         let body: IngestPresigRequest = req.json().await?;
-        if body.session_id.is_empty() || body.presig_id.is_empty() {
-            return Response::error("session_id and presig_id are required", 400);
+        if body.agent_id.is_empty() || body.session_id.is_empty() || body.presig_id.is_empty() {
+            return Response::error("agent_id, session_id and presig_id are required", 400);
         }
         let presig_bytes = hex::decode(&body.presignature_hex)
             .map_err(|e| Error::RustError(format!("presignature_hex: {e}")))?;
@@ -594,14 +599,24 @@ impl CosignerSessionDo {
             return Response::error("presignature_hex is empty", 400);
         }
 
-        let agent_id = self.identity_hex()?;
         let store = self.kss_store()?;
-        store.store_presignature(&agent_id, &body.session_id, &body.presig_id, &presig_bytes)?;
-        let pool_count = store.presignature_count(&agent_id)?;
+        // Only the joint key's owner may stock its pool (§08.1).
+        if let Some(resp) =
+            crate::api::authz_owner_or_reject(caller.as_deref(), &store, &body.agent_id)?
+        {
+            return Ok(resp);
+        }
+        store.store_presignature(
+            &body.agent_id,
+            &body.session_id,
+            &body.presig_id,
+            &presig_bytes,
+        )?;
+        let pool_count = store.presignature_count(&body.agent_id)?;
 
         Response::from_json(&serde_json::json!({
             "route": "ceremony/ingest-presig",
-            "agent_id": agent_id,
+            "agent_id": body.agent_id,
             "session_id": body.session_id,
             "presig_id": body.presig_id,
             "presig_len": presig_bytes.len(),
@@ -1252,11 +1267,12 @@ impl CosignerSessionDo {
         let recipient_pub = PublicKey::from_hex(&body.recipient_pub_hex)
             .map_err(|e| Error::RustError(format!("recipient_pub_hex: {e:?}")))?;
 
-        // ── 3. Consume a provisioned presignature from the DO pool ──────
-        // The pool is keyed by the DO's own identity (#14). The matching
-        // Presignature_B is held by the combiner; only Presignature_A ships.
-        let pool_agent = client_pub_hex.clone();
-        let consumed = match store.consume_presignature(&pool_agent)? {
+        // ── 3. Consume a provisioned presignature from THIS joint key's pool ──
+        // The pool is segregated by the joint key (`agent_id`), so a sign for
+        // this joint key only ever consumes its own correlated presignatures —
+        // never a leftover from another joint key/run (#7 finding 5). The
+        // matching Presignature_B is held by the combiner; only A ships.
+        let consumed = match store.consume_presignature(&body.agent_id)? {
             Some(p) => p,
             None => {
                 return Response::error(

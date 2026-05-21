@@ -207,7 +207,12 @@ async fn proxy_cosigns_through_authed_sign_relay() {
 
     // ── 3. Provision Presignature_A into the DO pool over authed ingest. ──
     bridge
-        .provision_presig_to_do(&presig_a_json, "authed-relay", "authed-presig-1")
+        .provision_presig_to_do(
+            &joint_hex,
+            &presig_a_json,
+            "authed-relay",
+            "authed-presig-1",
+        )
         .await
         .expect("provision presig to DO pool (authed)");
     eprintln!("✔ Presignature_A provisioned to DO pool (authed /ceremony/ingest-presig)");
@@ -319,7 +324,12 @@ async fn create_signature_routes_through_relay() {
 
     // 3. Provision Presignature_A → DO pool; seed the proxy pool with box_B.
     bridge
-        .provision_presig_to_do(&presig_a_json, "relay-csig", "relay-csig-1")
+        .provision_presig_to_do(
+            &hex::encode(&joint.compressed),
+            &presig_a_json,
+            "relay-csig",
+            "relay-csig-1",
+        )
         .await
         .expect("provision presig to DO pool");
     let mut mgr = PresignManager::new(4);

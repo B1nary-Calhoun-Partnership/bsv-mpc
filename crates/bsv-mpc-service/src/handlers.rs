@@ -42,6 +42,9 @@ struct CoordinatorStore {
     dkg: HashMap<String, DkgCoordinator>,
     signing: HashMap<String, SigningCoordinator>,
     presigning: HashMap<String, PresigningManager>,
+    /// presign_session_id → joint-key `agent_id`, so on completion we ship
+    /// `Presignature_A` to the DO pool keyed by the right joint key (#7).
+    presign_agent: HashMap<String, String>,
 }
 
 static COORDINATOR_STORE: std::sync::LazyLock<Mutex<CoordinatorStore>> =
@@ -50,6 +53,7 @@ static COORDINATOR_STORE: std::sync::LazyLock<Mutex<CoordinatorStore>> =
             dkg: HashMap::new(),
             signing: HashMap::new(),
             presigning: HashMap::new(),
+            presign_agent: HashMap::new(),
         })
     });
 
@@ -595,6 +599,11 @@ pub async fn handle_presign_init(
 
     if let Ok(mut store) = COORDINATOR_STORE.lock() {
         store.presigning.insert(presign_session_id.clone(), manager);
+        // Remember the joint key so on completion we ship Presignature_A to the
+        // DO pool keyed by it (#7 pool segregation).
+        store
+            .presign_agent
+            .insert(presign_session_id.clone(), body.agent_id.clone());
     }
 
     (
@@ -657,9 +666,9 @@ pub async fn handle_presign_round(
             ),
         ),
         PresigningRoundResult::Complete => {
-            // Extract this party's Presignature_A (drop the std lock before any
-            // await), then remove the spent session.
-            let extracted = {
+            // Extract this party's Presignature_A + the joint key it belongs to
+            // (drop the std lock before any await), then remove the spent session.
+            let (extracted, agent_id) = {
                 let mut store = match COORDINATOR_STORE.lock() {
                     Ok(s) => s,
                     Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e),
@@ -669,11 +678,21 @@ pub async fn handle_presign_round(
                     .get_mut(&body.presign_session_id)
                     .and_then(|m| m.take_raw());
                 store.presigning.remove(&body.presign_session_id);
-                taken
+                let agent = store.presign_agent.remove(&body.presign_session_id);
+                (taken, agent)
             };
 
             // Provision to the cosigner DO (only when configured).
             if let Some(prov) = &state.provision {
+                let agent_id = match agent_id {
+                    Some(a) => a,
+                    None => {
+                        return err_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "presign session has no recorded joint key (agent_id)".to_string(),
+                        )
+                    }
+                };
                 let (meta, raw) = match extracted {
                     Some(pair) => pair,
                     None => {
@@ -694,7 +713,7 @@ pub async fn handle_presign_round(
                     }
                 };
                 if let Err(e) = prov
-                    .ship_presignature(&presig_json, &meta.session_id.hex(), &meta.id)
+                    .ship_presignature(&agent_id, &presig_json, &meta.session_id.hex(), &meta.id)
                     .await
                 {
                     return err_response(

@@ -1280,13 +1280,23 @@ impl MpcBridge {
             }
             auth.auth_key().clone()
         };
+        // Fresh, unique session id PER SIGN — it correlates this sign's §05
+        // relay envelope so the combiner can filter out stale/other partials on
+        // the shared `mpc-sign` box (the crypto is presig-based + session-
+        // agnostic, so a per-sign id is purely a routing/correlation label).
+        let sign_session = {
+            use rand::RngCore;
+            let mut seed = [0u8; 16];
+            rand::rngs::OsRng.fill_bytes(&mut seed);
+            SessionId::from_str_hash(&format!("relay-sign-{}", hex_encode(&seed)))
+        };
         crate::relay_sign::combine_sign_over_relay(
             &self.relay_url,
             identity_priv,
             self.share.clone(),
             self.participants.clone(),
             self.share.config,
-            self.session_id,
+            sign_session,
             sighash,
             my_presig_box,
             &self.joint_key,
@@ -1306,12 +1316,16 @@ impl MpcBridge {
     /// identity. The correlated `Presignature_B` stays in the proxy's own pool.
     pub async fn provision_presig_to_do(
         &self,
+        agent_id: &str,
         presig_a_json: &[u8],
         session_id: &str,
         presig_id: &str,
     ) -> bsv_mpc_core::error::Result<()> {
         let url = format!("{}/ceremony/ingest-presig", self.kss_url);
+        // `agent_id` (joint key) keys the DO pool — it must match the joint key
+        // the subsequent `/sign-relay` consumes from (#7 finding 5 segregation).
         let body = serde_json::json!({
+            "agent_id": agent_id,
             "session_id": session_id,
             "presig_id": presig_id,
             "presignature_hex": hex_encode(presig_a_json),

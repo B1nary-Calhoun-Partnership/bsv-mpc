@@ -251,7 +251,12 @@ To run (BURNS REAL SATS): E2E_MAINNET=1 cargo test -p bsv-mpc-proxy \\
 
     // Provision Presignature_A → DO pool (authed); seed proxy pool with box_B.
     bridge
-        .provision_presig_to_do(&presig_a_json, "ca-gate", "ca-gate-1")
+        .provision_presig_to_do(
+            &hex::encode(joint_arr),
+            &presig_a_json,
+            "ca-gate",
+            "ca-gate-1",
+        )
         .await
         .expect("provision presig to DO pool");
     let mut mgr = PresignManager::new(4);

@@ -446,15 +446,23 @@ impl<'a> DoSqlStorage<'a> {
         data: &[u8],
     ) -> Result<()> {
         let hex = hex::encode(data);
+        // The PK `id` is SERVER-generated (caller `presig_id` + a monotonic
+        // sequence) so a caller reusing a `presig_id` can never collide on the
+        // primary key (which previously 500'd the INSERT). `presig_id` stays in
+        // the row id for traceability; uniqueness comes from the sequence.
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let now = Self::now_ms();
+        let row_id = format!("{presig_id}:{now}:{seq}");
         self.sql().exec(
             "INSERT INTO mpc_presignatures (id, agent_id, session_id, data_hex, created_at) \
              VALUES (?, ?, ?, ?, ?)",
             vec![
-                presig_id.into(),
+                row_id.into(),
                 agent_id.into(),
                 session_id.into(),
                 hex.into(),
-                Self::now_ms().into(),
+                now.into(),
             ],
         )?;
         Ok(())
