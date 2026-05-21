@@ -392,8 +392,16 @@ pub async fn handle_dkg_init(
 /// `POST /dkg/round` — Process a DKG round message.
 pub async fn handle_dkg_round(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(body): Json<DkgRoundRequest>,
 ) -> impl IntoResponse {
+    // §07.6 defense-in-depth: require a valid BRC-31 session to advance a
+    // ceremony (the session id is server-generated + unguessable, but we don't
+    // trust that alone). Headers-only — no per-share owner-authz here (the
+    // ceremony was owner-bound at /dkg/init). Dev mode allows.
+    if let Err(resp) = crate::auth::verify_or_allow(&headers, &state.auth) {
+        return resp;
+    }
     // Pass the bundled message directly — the SM thread handles unbundling
     // JSON array payloads internally (same pattern as signing).
     let incoming = vec![body.round_message];
@@ -608,9 +616,14 @@ pub async fn handle_sign_init(
 
 /// `POST /sign/round` — Process a signing round message.
 pub async fn handle_sign_round(
-    State(_state): State<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(body): Json<SignRoundRequest>,
 ) -> impl IntoResponse {
+    // §07.6 defense-in-depth: require a valid BRC-31 session (dev mode allows).
+    if let Err(resp) = crate::auth::verify_or_allow(&headers, &state.auth) {
+        return resp;
+    }
     // Pass the bundled message directly to the coordinator — the SM thread
     // handles unbundling JSON array payloads internally via VecDeque buffer.
     let incoming = vec![body.round_message];
@@ -772,8 +785,13 @@ pub async fn handle_presign_init(
 /// lockstep, fail-closed).
 pub async fn handle_presign_round(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(body): Json<PresignRoundRequest>,
 ) -> impl IntoResponse {
+    // §07.6 defense-in-depth: require a valid BRC-31 session (dev mode allows).
+    if let Err(resp) = crate::auth::verify_or_allow(&headers, &state.auth) {
+        return resp;
+    }
     let result = {
         let mut store = match COORDINATOR_STORE.lock() {
             Ok(s) => s,
