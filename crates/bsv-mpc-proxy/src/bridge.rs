@@ -358,18 +358,21 @@ impl BridgeAuth {
         self.client.identity_hex()
     }
 
-    /// Perform the BRC-31 handshake with the KSS (the `reqwest` round-trip; the
-    /// header crypto is the core [`Brc31Client`]).
+    /// Perform the canonical BRC-31 handshake with the KSS (the `reqwest`
+    /// round-trip; the header/body crypto is the core [`Brc31Client`]). Sends a
+    /// canonical `AuthMessage` InitialRequest body and parses the InitialResponse
+    /// identity + session nonce from the response headers.
     async fn handshake(
         &mut self,
         client: &reqwest::Client,
         kss_url: &str,
     ) -> std::result::Result<(), MpcError> {
         let handshake_url = format!("{kss_url}/.well-known/auth");
+        let init_body = self.client.initial_request_body()?;
         let mut req = client
             .post(&handshake_url)
             .header("content-type", "application/json")
-            .body("{}");
+            .body(init_body);
         for (name, value) in self.client.initial_request_headers() {
             req = req.header(name, value);
         }
@@ -399,27 +402,27 @@ impl BridgeAuth {
         })?;
 
         tracing::info!(server_identity = %server_identity, "BRC-31: handshake complete with KSS");
-        self.client
-            .complete_handshake(server_identity, server_nonce);
+        if !self
+            .client
+            .complete_handshake(server_identity, server_nonce)
+        {
+            return Err(MpcError::Protocol(
+                "BRC-31: handshake response carried an invalid server identity key".into(),
+            ));
+        }
         Ok(())
     }
 
-    /// BRC-104 auth headers (name, value) for a fresh request — owned pairs,
-    /// usable for a `reqwest` builder and for the relay trigger.
-    fn auth_header_pairs(&self) -> std::result::Result<Vec<(&'static str, String)>, MpcError> {
-        self.client.request_headers()
-    }
-
-    /// Add BRC-104 auth headers to a request builder.
-    fn add_auth_headers(
+    /// Canonical BRC-104 auth headers (name, value) for a fresh request over
+    /// `(method, path, body)` — owned pairs, usable for a `reqwest` builder and
+    /// for the relay trigger.
+    fn auth_header_pairs(
         &self,
-        builder: reqwest::RequestBuilder,
-    ) -> std::result::Result<reqwest::RequestBuilder, MpcError> {
-        let mut builder = builder;
-        for (name, value) in self.auth_header_pairs()? {
-            builder = builder.header(name, value);
-        }
-        Ok(builder)
+        method: &str,
+        path: &str,
+        body: &[u8],
+    ) -> std::result::Result<Vec<(&'static str, String)>, MpcError> {
+        self.client.request_headers(method, path, body)
     }
 }
 
@@ -429,25 +432,36 @@ impl BridgeAuth {
 
 /// POST a JSON request to the KSS and deserialize the response.
 ///
-/// Called from within `spawn_blocking` via `handle.block_on`.
-/// Adds BRC-31 Authrite headers when the bridge has an authenticated session.
+/// Called from within `spawn_blocking` via `handle.block_on`. The request body
+/// is serialized to bytes ONCE; the canonical BRC-104 signature is computed over
+/// those exact bytes + `path`; and the SAME bytes are sent via `.body(..)` (NOT
+/// `.json()`) so the server reconstructs a byte-identical payload. `path` MUST be
+/// the URL path the server sees (e.g. `/sign/init`).
 fn kss_post<Req: Serialize, Resp: serde::de::DeserializeOwned>(
     handle: &tokio::runtime::Handle,
     client: &reqwest::Client,
     url: &str,
+    path: &str,
     body: &Req,
     auth: &Mutex<BridgeAuth>,
 ) -> std::result::Result<Resp, MpcError> {
     handle.block_on(async {
-        let mut builder = client.post(url).json(body);
+        let body_bytes = serde_json::to_vec(body)
+            .map_err(|e| MpcError::Serialization(format!("serialize request to {url}: {e}")))?;
+        let mut builder = client
+            .post(url)
+            .header("content-type", "application/json")
+            .body(body_bytes.clone());
 
-        // Add BRC-31 auth headers if authenticated
+        // Add canonical BRC-31 auth headers if authenticated.
         {
             let auth_guard = auth
                 .lock()
                 .map_err(|e| MpcError::Protocol(format!("auth lock poisoned: {e}")))?;
             if auth_guard.is_authenticated() {
-                builder = auth_guard.add_auth_headers(builder)?;
+                for (name, value) in auth_guard.auth_header_pairs("POST", path, &body_bytes)? {
+                    builder = builder.header(name, value);
+                }
             }
         }
 
@@ -612,7 +626,7 @@ async fn run_dkg_over_http_inner(
         // canonical cggmp24 ExecutionId (eid = f(session_id)) — a mismatch makes
         // keygen fail to complete.
         let init_resp: DkgInitResponse = match &auth {
-            Some(a) => kss_post(&handle, &client, &init_url, &init_req, a)?,
+            Some(a) => kss_post(&handle, &client, &init_url, "/dkg/init", &init_req, a)?,
             None => http_post_json(&handle, &client, &init_url, &init_req)?,
         };
         let session_id = SessionId::from_str_hash(&init_resp.session_id);
@@ -630,7 +644,7 @@ async fn run_dkg_over_http_inner(
                 round_message: proxy_bundle,
             };
             let round_resp: DkgRoundResponse = match &auth {
-                Some(a) => kss_post(&handle, &client, &round_url, &round_req, a)?,
+                Some(a) => kss_post(&handle, &client, &round_url, "/dkg/round", &round_req, a)?,
                 None => http_post_json(&handle, &client, &round_url, &round_req)?,
             };
 
@@ -988,6 +1002,7 @@ impl MpcBridge {
                 &handle,
                 &client,
                 &sign_init_url,
+                "/sign/init",
                 &SignInitRequest {
                     agent_id,
                     session_id: session_id.hex(),
@@ -1020,6 +1035,7 @@ impl MpcBridge {
                     &handle,
                     &client,
                     &sign_round_url,
+                    "/sign/round",
                     &SignRoundRequest {
                         signing_session_id: signing_session_id.clone(),
                         round_message: proxy_bundle,
@@ -1105,6 +1121,7 @@ impl MpcBridge {
                 &handle,
                 &client,
                 &presign_init_url,
+                "/presign/init",
                 &PresignInitRequest {
                     agent_id,
                     session_id: session_id.hex(),
@@ -1133,6 +1150,7 @@ impl MpcBridge {
                     &handle,
                     &client,
                     &presign_round_url,
+                    "/presign/round",
                     &PresignRoundRequest {
                         presign_session_id: presign_session_id.clone(),
                         round_messages: proxy_wire_msgs,
@@ -1230,17 +1248,25 @@ impl MpcBridge {
             agent_id: self.agent_id.clone(),
             counterparty_pub: hex_encode(&counterparty_pub.to_compressed()),
         };
+        // Serialize once; sign over + send the exact bytes (canonical BRC-104).
+        let body_bytes = serde_json::to_vec(&req)
+            .map_err(|e| MpcError::Serialization(format!("serialize /ecdh request: {e}")))?;
+        let mut builder = self
+            .client
+            .post(&url)
+            .header("content-type", "application/json")
+            .body(body_bytes.clone());
 
-        let mut builder = self.client.post(&url).json(&req);
-
-        // Add BRC-31 auth headers if authenticated
+        // Add canonical BRC-31 auth headers if authenticated.
         {
             let auth_guard = self
                 .auth
                 .lock()
                 .map_err(|e| MpcError::Protocol(format!("auth lock poisoned: {e}")))?;
             if auth_guard.is_authenticated() {
-                builder = auth_guard.add_auth_headers(builder)?;
+                for (name, value) in auth_guard.auth_header_pairs("POST", "/ecdh", &body_bytes)? {
+                    builder = builder.header(name, value);
+                }
             }
         }
 
@@ -1389,7 +1415,7 @@ impl MpcBridge {
         &self,
         sighash: &[u8; 32],
         my_presig_box: Box<dyn std::any::Any + Send>,
-        mut trigger: crate::relay_sign::DoTrigger,
+        trigger: crate::relay_sign::DoTrigger,
         recv_timeout: std::time::Duration,
     ) -> bsv_mpc_core::error::Result<SigningResult> {
         let identity_priv = {
@@ -1397,19 +1423,16 @@ impl MpcBridge {
                 .auth
                 .lock()
                 .map_err(|_| MpcError::Protocol("auth mutex poisoned".into()))?;
-            // Production: gate the authed `/sign-relay` with BRC-31 headers
-            // signed by the proxy's stable owner identity. When the caller
-            // already supplied headers (or the trigger is the unauthed POC
-            // route), leave them untouched.
-            if trigger.auth_headers.is_empty() && auth.is_authenticated() {
-                trigger.auth_headers = auth
-                    .auth_header_pairs()?
-                    .into_iter()
-                    .map(|(k, v)| (k.to_string(), v))
-                    .collect();
-            }
             auth.auth_key().clone()
         };
+        // The DO `/sign-relay` trigger is the WORKER leg (legacy BRC-31 wire) and
+        // is exercised only by deployed, env-gated e2e. Its canonical-wire
+        // migration is a separate (worker-side) change. The bridge no longer
+        // pre-injects its (now canonical) per-request auth headers here, because
+        // canonical headers must be signed over the EXACT trigger body — which is
+        // serialized inside `combine_sign_over_relay`, after this point — and
+        // because the unchanged worker still verifies the legacy profile. Callers
+        // that already populated `trigger.auth_headers` are left untouched.
         // Fresh, unique session id PER SIGN — it correlates this sign's §05
         // relay envelope so the combiner can filter out stale/other partials on
         // the shared `mpc-sign` box (the crypto is presig-based + session-
@@ -1451,7 +1474,8 @@ impl MpcBridge {
         session_id: &str,
         presig_id: &str,
     ) -> bsv_mpc_core::error::Result<()> {
-        let url = format!("{}/ceremony/ingest-presig", self.kss_url);
+        let path = "/ceremony/ingest-presig";
+        let url = format!("{}{path}", self.kss_url);
         // `agent_id` (joint key) keys the DO pool — it must match the joint key
         // the subsequent `/sign-relay` consumes from (#7 finding 5 segregation).
         let body = serde_json::json!({
@@ -1460,7 +1484,14 @@ impl MpcBridge {
             "presig_id": presig_id,
             "presignature_hex": hex_encode(presig_a_json),
         });
-        let mut builder = self.client.post(&url).json(&body);
+        // Serialize once; sign over + send the exact bytes (canonical BRC-104).
+        let body_bytes = serde_json::to_vec(&body)
+            .map_err(|e| MpcError::Serialization(format!("serialize ingest-presig: {e}")))?;
+        let mut builder = self
+            .client
+            .post(&url)
+            .header("content-type", "application/json")
+            .body(body_bytes.clone());
         {
             let auth = self
                 .auth
@@ -1471,7 +1502,9 @@ impl MpcBridge {
                     "proxy not authenticated with KSS — cannot provision presig".into(),
                 ));
             }
-            builder = auth.add_auth_headers(builder)?;
+            for (name, value) in auth.auth_header_pairs("POST", path, &body_bytes)? {
+                builder = builder.header(name, value);
+            }
         }
         let resp = builder
             .send()

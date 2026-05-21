@@ -45,6 +45,11 @@
 //! management. The transport layer (how round messages are delivered between
 //! parties) is handled by `bsv-mpc-worker` and `bsv-mpc-service`.
 
+// Canonical BRC-31 client. NATIVE-ONLY: it depends on `bsv-middleware-rs`
+// (canonical BRC-104 wire helpers), which is a non-wasm dependency. The worker
+// (wasm32) is a BRC-31 *server* and never constructs this client, so gating the
+// module off wasm keeps the worker's wasm graph unchanged.
+#[cfg(not(target_arch = "wasm32"))]
 pub mod brc31_client;
 pub mod canonical;
 pub mod custody;

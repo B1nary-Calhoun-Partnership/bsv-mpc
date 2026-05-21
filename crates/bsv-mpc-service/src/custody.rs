@@ -23,11 +23,13 @@ impl CustodyConfig {
         if auth.is_authenticated() {
             return Ok(());
         }
+        let init_body = auth
+            .initial_request_body()
+            .map_err(|e| anyhow::anyhow!("BRC-31 InitialRequest body: {e}"))?;
         let mut req = self
             .http
             .post(format!("{}/.well-known/auth", self.worker_url))
-            .header("content-type", "application/json")
-            .body("{}");
+            .body(init_body);
         for (name, value) in auth.initial_request_headers() {
             req = req.header(name, value);
         }
@@ -45,7 +47,9 @@ impl CustodyConfig {
             .ok_or_else(|| anyhow::anyhow!("handshake response missing server identity"))?;
         let server_nonce = header(headers::NONCE)
             .ok_or_else(|| anyhow::anyhow!("handshake response missing server nonce"))?;
-        auth.complete_handshake(server_identity, server_nonce);
+        if !auth.complete_handshake(server_identity, server_nonce) {
+            anyhow::bail!("handshake response carried an invalid server identity key");
+        }
         Ok(())
     }
 
@@ -63,12 +67,18 @@ impl CustodyConfig {
             .map_err(|e| anyhow::anyhow!("seal share for custody: {e}"))?;
         let mut auth = self.auth.lock().await;
         self.ensure_handshake(&mut auth).await?;
+        // Serialize the body ONCE; sign over the exact bytes; send those exact
+        // bytes (NOT `.json()`, which would re-serialize and could diverge).
+        let path = "/custody/put-share";
+        let body =
+            serde_json::to_vec(&serde_json::json!({ "agent_id": agent_id, "share": sealed }))?;
         let mut req = self
             .http
-            .post(format!("{}/custody/put-share", self.worker_url))
-            .json(&serde_json::json!({ "agent_id": agent_id, "share": sealed }));
+            .post(format!("{}{path}", self.worker_url))
+            .header("content-type", "application/json")
+            .body(body.clone());
         for (name, value) in auth
-            .request_headers()
+            .request_headers("POST", path, &body)
             .map_err(|e| anyhow::anyhow!("auth headers: {e}"))?
         {
             req = req.header(name, value);
@@ -91,12 +101,15 @@ impl CustodyConfig {
     ) -> anyhow::Result<Option<(EncryptedShare, String)>> {
         let mut auth = self.auth.lock().await;
         self.ensure_handshake(&mut auth).await?;
+        let path = "/custody/get-share";
+        let body = serde_json::to_vec(&serde_json::json!({ "agent_id": agent_id }))?;
         let mut req = self
             .http
-            .post(format!("{}/custody/get-share", self.worker_url))
-            .json(&serde_json::json!({ "agent_id": agent_id }));
+            .post(format!("{}{path}", self.worker_url))
+            .header("content-type", "application/json")
+            .body(body.clone());
         for (name, value) in auth
-            .request_headers()
+            .request_headers("POST", path, &body)
             .map_err(|e| anyhow::anyhow!("auth headers: {e}"))?
         {
             req = req.header(name, value);

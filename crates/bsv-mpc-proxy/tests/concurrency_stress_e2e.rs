@@ -49,10 +49,11 @@ fn owner_seed(i: u8) -> u8 {
 async fn handshake(svc_url: &str, k: PrivateKey) -> Brc31Client {
     let http = reqwest::Client::new();
     let mut brc = Brc31Client::new(k);
+    let init_body = brc.initial_request_body().unwrap();
     let mut req = http
         .post(format!("{svc_url}/.well-known/auth"))
         .header("content-type", "application/json")
-        .body("{}");
+        .body(init_body);
     for (n, v) in brc.initial_request_headers() {
         req = req.header(n, v);
     }
@@ -63,10 +64,10 @@ async fn handshake(svc_url: &str, k: PrivateKey) -> Brc31Client {
             .and_then(|v| v.to_str().ok())
             .map(str::to_string)
     };
-    brc.complete_handshake(
+    assert!(brc.complete_handshake(
         h(headers::IDENTITY_KEY).unwrap(),
         h(headers::NONCE).unwrap(),
-    );
+    ));
     brc
 }
 
@@ -74,12 +75,15 @@ async fn authed_ecdh_status(svc_url: &str, agent_id: &str, k: PrivateKey) -> u16
     let brc = handshake(svc_url, k).await;
     let http = reqwest::Client::new();
     let cp = key_from(0x7c).public_key().to_hex();
+    let body = serde_json::to_vec(&serde_json::json!({
+        "agent_id": agent_id, "counterparty_pub": cp,
+    }))
+    .unwrap();
     let mut req = http
         .post(format!("{svc_url}/ecdh"))
-        .json(&serde_json::json!({
-            "agent_id": agent_id, "counterparty_pub": cp,
-        }));
-    for (n, v) in brc.request_headers().unwrap() {
+        .header("content-type", "application/json")
+        .body(body.clone());
+    for (n, v) in brc.request_headers("POST", "/ecdh", &body).unwrap() {
         req = req.header(n, v);
     }
     req.send().await.expect("/ecdh").status().as_u16()

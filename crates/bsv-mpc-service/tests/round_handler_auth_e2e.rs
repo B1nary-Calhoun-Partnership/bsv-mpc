@@ -22,10 +22,11 @@ fn key_from(byte: u8) -> PrivateKey {
 async fn handshake(svc_url: &str, k: PrivateKey) -> Brc31Client {
     let http = reqwest::Client::new();
     let mut brc = Brc31Client::new(k);
+    let init_body = brc.initial_request_body().unwrap();
     let mut req = http
         .post(format!("{svc_url}/.well-known/auth"))
         .header("content-type", "application/json")
-        .body("{}");
+        .body(init_body);
     for (n, v) in brc.initial_request_headers() {
         req = req.header(n, v);
     }
@@ -36,10 +37,10 @@ async fn handshake(svc_url: &str, k: PrivateKey) -> Brc31Client {
             .and_then(|v| v.to_str().ok())
             .map(str::to_string)
     };
-    brc.complete_handshake(
+    assert!(brc.complete_handshake(
         h(headers::IDENTITY_KEY).unwrap(),
         h(headers::NONCE).unwrap(),
-    );
+    ));
     brc
 }
 
@@ -77,12 +78,15 @@ async fn dkg_round_requires_brc31_session_when_enforced() {
         payload: b"irrelevant".to_vec(),
     };
     let body = serde_json::json!({ "session_id": "no-such-session", "round_message": msg });
+    // Canonical wire: sign over + send the EXACT body bytes (not `.json()`).
+    let body_bytes = serde_json::to_vec(&body).unwrap();
     let http = reqwest::Client::new();
 
     // Unauthed → 401 (gated at the round handler).
     let unauthed = http
         .post(format!("{url}/dkg/round"))
-        .json(&body)
+        .header("content-type", "application/json")
+        .body(body_bytes.clone())
         .send()
         .await
         .unwrap();
@@ -94,8 +98,14 @@ async fn dkg_round_requires_brc31_session_when_enforced() {
 
     // Authed session (unknown ceremony) → PAST auth → 404, not 401.
     let brc = handshake(&url, key_from(0x42)).await;
-    let mut req = http.post(format!("{url}/dkg/round")).json(&body);
-    for (n, v) in brc.request_headers().unwrap() {
+    let mut req = http
+        .post(format!("{url}/dkg/round"))
+        .header("content-type", "application/json")
+        .body(body_bytes.clone());
+    for (n, v) in brc
+        .request_headers("POST", "/dkg/round", &body_bytes)
+        .unwrap()
+    {
         req = req.header(n, v);
     }
     let authed = req.send().await.unwrap();

@@ -48,10 +48,11 @@ fn key_from(byte: u8) -> PrivateKey {
 async fn handshake(svc_url: &str, auth_key: PrivateKey) -> Brc31Client {
     let http = reqwest::Client::new();
     let mut brc = Brc31Client::new(auth_key);
+    let init_body = brc.initial_request_body().expect("initial request body");
     let mut req = http
         .post(format!("{svc_url}/.well-known/auth"))
         .header("content-type", "application/json")
-        .body("{}");
+        .body(init_body);
     for (name, value) in brc.initial_request_headers() {
         req = req.header(name, value);
     }
@@ -69,7 +70,7 @@ async fn handshake(svc_url: &str, auth_key: PrivateKey) -> Brc31Client {
     };
     let server_identity = h(headers::IDENTITY_KEY).expect("server identity in handshake");
     let server_nonce = h(headers::NONCE).expect("server nonce in handshake");
-    brc.complete_handshake(server_identity, server_nonce);
+    assert!(brc.complete_handshake(server_identity, server_nonce));
     brc
 }
 
@@ -81,14 +82,20 @@ async fn post_ecdh(
     brc: Option<&Brc31Client>,
 ) -> reqwest::Response {
     let http = reqwest::Client::new();
+    let body = serde_json::to_vec(&serde_json::json!({
+        "agent_id": agent_id,
+        "counterparty_pub": counterparty_pub,
+    }))
+    .unwrap();
     let mut req = http
         .post(format!("{svc_url}/ecdh"))
-        .json(&serde_json::json!({
-            "agent_id": agent_id,
-            "counterparty_pub": counterparty_pub,
-        }));
+        .header("content-type", "application/json")
+        .body(body.clone());
     if let Some(brc) = brc {
-        for (name, value) in brc.request_headers().expect("authed headers") {
+        for (name, value) in brc
+            .request_headers("POST", "/ecdh", &body)
+            .expect("authed headers")
+        {
             req = req.header(name, value);
         }
     }
@@ -103,8 +110,15 @@ async fn post_authed(
     brc: &Brc31Client,
 ) -> reqwest::Response {
     let http = reqwest::Client::new();
-    let mut req = http.post(format!("{svc_url}{path}")).json(&body);
-    for (name, value) in brc.request_headers().expect("authed headers") {
+    let body_bytes = serde_json::to_vec(&body).unwrap();
+    let mut req = http
+        .post(format!("{svc_url}{path}"))
+        .header("content-type", "application/json")
+        .body(body_bytes.clone());
+    for (name, value) in brc
+        .request_headers("POST", path, &body_bytes)
+        .expect("authed headers")
+    {
         req = req.header(name, value);
     }
     req.send().await.expect("authed request")

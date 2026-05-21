@@ -12,7 +12,10 @@ cggmp24-keygen.workspace = true
 round-based.workspace = true
 generic-ec.workspace = true
 generic-ec-zkp.workspace = true
-bsv.workspace = true
+# `auth` (additive over the workspace transaction+wallet features) is required by
+# the canonical BRC-31 client (`brc31_client.rs`): it signs a General message via
+# `bsv::auth::AuthMessage` + `ProtoWallet`, exactly as `bsv_rs::auth::Peer` does.
+bsv = { package = "bsv-rs", version = "0.3.11", features = ["transaction", "wallet", "auth"] }
 serde.workspace = true
 serde_json.workspace = true
 hex.workspace = true
@@ -25,6 +28,16 @@ glass_pumpkin.workspace = true
 thiserror.workspace = true
 chrono.workspace = true
 tracing.workspace = true
+
+# Canonical BRC-104 wire helpers (`build_request_payload` / `filter_signable_headers`)
+# used by the canonical BRC-31 client (`brc31_client.rs`). Pinned to the FIXED
+# canonical server verifier rev (public Calhooon repo). NATIVE-ONLY: the worker
+# (wasm32) does not use `brc31_client`, and pulling this in would add a second
+# `getrandom` (0.4) into the wasm graph that the worker doesn't configure. Gated
+# off wasm keeps the worker's wasm build byte-for-byte unchanged. The module is
+# `#[cfg(not(target_arch = "wasm32"))]` in lib.rs to match.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+bsv-middleware-rs = { git = "https://github.com/Calhooon/bsv-middleware-rs", rev = "61e1f4948d150dfb217ea5fdd22ad73c2b267bc7" }
 
 [dev-dependencies]
 # tokio is used ONLY for `#[tokio::test]` in the in-file unit tests (dkg.rs,
@@ -39,12 +52,6 @@ tokio = { version = "1", default-features = false, features = ["rt", "macros"] }
 tempfile.workspace = true
 futures.workspace = true
 pin-project.workspace = true
-# §07 BRC-31 conformance harness (tests/conformance_07_brc31_auth.rs). Pins the
-# FIXED canonical server verifier (public Calhooon repo, fix branch) via git rev
-# — CI-safe (public), reproducible. Swap to a crates.io version after the fix is
-# published (post Phase C real-sats). Pulls bsv-rs `auth` (additive) into the
-# dev/test graph only; no http/socketio/reqwest. See bsv-mpc #8.
-bsv-middleware-rs = { git = "https://github.com/Calhooon/bsv-middleware-rs", rev = "61e1f4948d150dfb217ea5fdd22ad73c2b267bc7" }
 round-based = { workspace = true, features = ["sim"] }
 cggmp24 = { git = "https://github.com/LFDT-Lockness/cggmp21", features = ["curve-secp256k1", "hd-wallet", "hd-slip10", "spof"] }
 

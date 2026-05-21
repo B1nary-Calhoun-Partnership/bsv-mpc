@@ -79,10 +79,11 @@ async fn spawn_enforced_service(
 async fn handshake(svc_url: &str, auth_key: PrivateKey) -> Brc31Client {
     let http = reqwest::Client::new();
     let mut brc = Brc31Client::new(auth_key);
+    let init_body = brc.initial_request_body().expect("initial request body");
     let mut req = http
         .post(format!("{svc_url}/.well-known/auth"))
         .header("content-type", "application/json")
-        .body("{}");
+        .body(init_body);
     for (name, value) in brc.initial_request_headers() {
         req = req.header(name, value);
     }
@@ -95,7 +96,7 @@ async fn handshake(svc_url: &str, auth_key: PrivateKey) -> Brc31Client {
     };
     let server_identity = h(headers::IDENTITY_KEY).expect("server identity");
     let server_nonce = h(headers::NONCE).expect("server nonce");
-    brc.complete_handshake(server_identity, server_nonce);
+    assert!(brc.complete_handshake(server_identity, server_nonce));
     brc
 }
 
@@ -179,12 +180,18 @@ async fn proxy_presigns_against_enforced_cosigner() {
 
     // Stranger (valid session, wrong identity) → 403.
     let stranger = handshake(&container_url, key_from(0x42)).await;
+    let stranger_body = serde_json::to_vec(&serde_json::json!({
+        "agent_id": joint_hex, "session_id": dkg.session_id.hex(), "count": 1
+    }))
+    .unwrap();
     let mut req = reqwest::Client::new()
         .post(format!("{container_url}/presign/init"))
-        .json(&serde_json::json!({
-            "agent_id": joint_hex, "session_id": dkg.session_id.hex(), "count": 1
-        }));
-    for (name, value) in stranger.request_headers().unwrap() {
+        .header("content-type", "application/json")
+        .body(stranger_body.clone());
+    for (name, value) in stranger
+        .request_headers("POST", "/presign/init", &stranger_body)
+        .unwrap()
+    {
         req = req.header(name, value);
     }
     let stranger_resp = req.send().await.unwrap();

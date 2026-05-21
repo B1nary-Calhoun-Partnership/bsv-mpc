@@ -356,8 +356,10 @@ name = "bsv-mpc-service"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "base64 0.22.1",
+ "bsv-middleware-rs",
  "bsv-mpc-core",
  "bsv-mpc-messagebox",
  "bsv-rs",

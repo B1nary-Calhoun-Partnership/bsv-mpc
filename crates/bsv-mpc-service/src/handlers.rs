@@ -17,6 +17,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use axum::{
+    body::Bytes,
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
@@ -236,6 +237,21 @@ fn err_response(
     (status, Json(serde_json::json!({"error": msg.to_string()})))
 }
 
+/// Deserialize the raw request body into the typed request `T`. The handlers now
+/// take the body as `Bytes` (not `Json<T>`) so the SAME exact bytes that were
+/// canonical-BRC-104-signed by the client are both auth-verified and parsed —
+/// `Json` would have consumed/re-buffered the body before auth could see it.
+fn parse_body<T: serde::de::DeserializeOwned>(
+    body: &Bytes,
+) -> Result<T, (StatusCode, Json<serde_json::Value>)> {
+    serde_json::from_slice(body).map_err(|e| {
+        err_response(
+            StatusCode::BAD_REQUEST,
+            format!("invalid request body: {e}"),
+        )
+    })
+}
+
 /// §08.1 owner-authz: reject (403) unless the authenticated `caller` is the
 /// share's recorded owner. Returns `None` when authorized (no bound owner, or
 /// caller == owner). The storage lock is read here so the decision is made on
@@ -333,12 +349,17 @@ fn bundle_outgoing_messages(messages: &[RoundMessage]) -> Result<RoundMessage, S
 pub async fn handle_dkg_init(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Json(body): Json<DkgInitRequest>,
+    raw: Bytes,
 ) -> impl IntoResponse {
-    // §07: authenticate the caller (or allow in dev mode). The verified identity
-    // becomes the share's owner at DKG-complete (§08.1).
-    let caller = match crate::auth::verify_or_allow(&headers, &state.auth) {
-        Ok(id) => id,
+    // §07: authenticate the caller (or allow in dev mode) over the RAW body. The
+    // verified identity becomes the share's owner at DKG-complete (§08.1).
+    let caller =
+        match crate::auth::verify_or_allow("POST", "/dkg/init", &headers, &raw, &state.auth) {
+            Ok(id) => id,
+            Err(resp) => return resp,
+        };
+    let body: DkgInitRequest = match parse_body(&raw) {
+        Ok(b) => b,
         Err(resp) => return resp,
     };
     let owner_identity = caller.identity_key.clone();
@@ -393,15 +414,21 @@ pub async fn handle_dkg_init(
 pub async fn handle_dkg_round(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Json(body): Json<DkgRoundRequest>,
+    raw: Bytes,
 ) -> impl IntoResponse {
     // §07.6 defense-in-depth: require a valid BRC-31 session to advance a
     // ceremony (the session id is server-generated + unguessable, but we don't
     // trust that alone). Headers-only — no per-share owner-authz here (the
     // ceremony was owner-bound at /dkg/init). Dev mode allows.
-    if let Err(resp) = crate::auth::verify_or_allow(&headers, &state.auth) {
+    if let Err(resp) =
+        crate::auth::verify_or_allow("POST", "/dkg/round", &headers, &raw, &state.auth)
+    {
         return resp;
     }
+    let body: DkgRoundRequest = match parse_body(&raw) {
+        Ok(b) => b,
+        Err(resp) => return resp,
+    };
     // Pass the bundled message directly — the SM thread handles unbundling
     // JSON array payloads internally (same pattern as signing).
     let incoming = vec![body.round_message];
@@ -517,13 +544,19 @@ pub async fn handle_dkg_round(
 pub async fn handle_sign_init(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Json(body): Json<SignInitRequest>,
+    raw: Bytes,
 ) -> impl IntoResponse {
-    // §07: authenticate. Then recover the share (+owner) from durable custody on
-    // a cold-cache miss (#9) BEFORE the §08.1 owner check, so post-restart the
-    // authz sees the restored owner binding — never a wide-open share.
-    let caller = match crate::auth::verify_or_allow(&headers, &state.auth) {
-        Ok(id) => id,
+    // §07: authenticate over the RAW body. Then recover the share (+owner) from
+    // durable custody on a cold-cache miss (#9) BEFORE the §08.1 owner check, so
+    // post-restart the authz sees the restored owner binding — never a wide-open
+    // share.
+    let caller =
+        match crate::auth::verify_or_allow("POST", "/sign/init", &headers, &raw, &state.auth) {
+            Ok(id) => id,
+            Err(resp) => return resp,
+        };
+    let body: SignInitRequest = match parse_body(&raw) {
+        Ok(b) => b,
         Err(resp) => return resp,
     };
     let share = match load_share_or_recover(&state, &body.agent_id).await {
@@ -618,12 +651,18 @@ pub async fn handle_sign_init(
 pub async fn handle_sign_round(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Json(body): Json<SignRoundRequest>,
+    raw: Bytes,
 ) -> impl IntoResponse {
     // §07.6 defense-in-depth: require a valid BRC-31 session (dev mode allows).
-    if let Err(resp) = crate::auth::verify_or_allow(&headers, &state.auth) {
+    if let Err(resp) =
+        crate::auth::verify_or_allow("POST", "/sign/round", &headers, &raw, &state.auth)
+    {
         return resp;
     }
+    let body: SignRoundRequest = match parse_body(&raw) {
+        Ok(b) => b,
+        Err(resp) => return resp,
+    };
     // Pass the bundled message directly to the coordinator — the SM thread
     // handles unbundling JSON array payloads internally via VecDeque buffer.
     let incoming = vec![body.round_message];
@@ -702,12 +741,17 @@ pub async fn handle_sign_round(
 pub async fn handle_presign_init(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Json(body): Json<PresignInitRequest>,
+    raw: Bytes,
 ) -> impl IntoResponse {
-    // §07: authenticate. Recover share (+owner) from durable custody on a
-    // cold-cache miss (#9) BEFORE the §08.1 owner check.
-    let caller = match crate::auth::verify_or_allow(&headers, &state.auth) {
-        Ok(id) => id,
+    // §07: authenticate over the RAW body. Recover share (+owner) from durable
+    // custody on a cold-cache miss (#9) BEFORE the §08.1 owner check.
+    let caller =
+        match crate::auth::verify_or_allow("POST", "/presign/init", &headers, &raw, &state.auth) {
+            Ok(id) => id,
+            Err(resp) => return resp,
+        };
+    let body: PresignInitRequest = match parse_body(&raw) {
+        Ok(b) => b,
         Err(resp) => return resp,
     };
 
@@ -786,12 +830,18 @@ pub async fn handle_presign_init(
 pub async fn handle_presign_round(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Json(body): Json<PresignRoundRequest>,
+    raw: Bytes,
 ) -> impl IntoResponse {
     // §07.6 defense-in-depth: require a valid BRC-31 session (dev mode allows).
-    if let Err(resp) = crate::auth::verify_or_allow(&headers, &state.auth) {
+    if let Err(resp) =
+        crate::auth::verify_or_allow("POST", "/presign/round", &headers, &raw, &state.auth)
+    {
         return resp;
     }
+    let body: PresignRoundRequest = match parse_body(&raw) {
+        Ok(b) => b,
+        Err(resp) => return resp,
+    };
     let result = {
         let mut store = match COORDINATOR_STORE.lock() {
             Ok(s) => s,
@@ -914,13 +964,17 @@ pub async fn handle_presign_round(
 pub async fn handle_ecdh(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Json(body): Json<EcdhRequest>,
+    raw: Bytes,
 ) -> impl IntoResponse {
-    // §07/§08.1: authenticate + owner-gate before the share's scalar is used to
-    // compute a partial ECDH point (which would otherwise leak share_A material
-    // to any caller).
-    let caller = match crate::auth::verify_or_allow(&headers, &state.auth) {
+    // §07/§08.1: authenticate (over the RAW body) + owner-gate before the share's
+    // scalar is used to compute a partial ECDH point (which would otherwise leak
+    // share_A material to any caller).
+    let caller = match crate::auth::verify_or_allow("POST", "/ecdh", &headers, &raw, &state.auth) {
         Ok(id) => id,
+        Err(resp) => return resp,
+    };
+    let body: EcdhRequest = match parse_body(&raw) {
+        Ok(b) => b,
         Err(resp) => return resp,
     };
     // Recover share (+owner) from durable custody on a cold-cache miss (#9)
@@ -1046,9 +1100,9 @@ pub async fn handle_get_share_metadata(
 /// returns a benign stub (auth is not enforced), preserving prior behavior.
 pub async fn handle_authrite(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    raw: Bytes,
 ) -> axum::response::Response {
-    match crate::auth::handshake(&headers, &state.auth) {
+    match crate::auth::handshake(&raw, &state.auth) {
         Ok((resp_headers, body)) => {
             let mut hm = HeaderMap::new();
             for (name, value) in resp_headers {
