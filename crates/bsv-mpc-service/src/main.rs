@@ -69,18 +69,29 @@ async fn main() -> anyhow::Result<()> {
 
     let storage = SqliteShareStorage::open(&data_dir)?;
 
-    // #4 presignature provisioning: when MPC_WORKER_URL + MPC_SERVICE_AUTH_KEY
-    // are set, ship each generated Presignature_A to the cosigner DO pool over
-    // the authed /ceremony/ingest-presig route (self-stocking cosigner).
-    let provision = match (
-        std::env::var("MPC_WORKER_URL").ok(),
-        std::env::var("MPC_SERVICE_AUTH_KEY").ok(),
-    ) {
-        (Some(worker_url), Some(auth_hex)) => {
-            let key_bytes = hex::decode(auth_hex.trim())
-                .map_err(|e| anyhow::anyhow!("MPC_SERVICE_AUTH_KEY invalid hex: {e}"))?;
-            let auth_key = bsv::primitives::ec::PrivateKey::from_bytes(&key_bytes)
-                .map_err(|e| anyhow::anyhow!("MPC_SERVICE_AUTH_KEY invalid key: {e:?}"))?;
+    // #4 presignature provisioning: when MPC_WORKER_URL is set, ship each
+    // generated Presignature_A to the cosigner DO pool over the authed
+    // /ceremony/ingest-presig route (self-stocking cosigner). The BRC-31 auth
+    // identity comes from MPC_SERVICE_AUTH_KEY if set, else an ephemeral key is
+    // generated (the DO stores presigs under its OWN identity, so the caller's
+    // identity need only be a valid session — no secret to commit).
+    let provision = match std::env::var("MPC_WORKER_URL").ok() {
+        Some(worker_url) => {
+            let auth_key = match std::env::var("MPC_SERVICE_AUTH_KEY").ok() {
+                Some(auth_hex) => {
+                    let key_bytes = hex::decode(auth_hex.trim())
+                        .map_err(|e| anyhow::anyhow!("MPC_SERVICE_AUTH_KEY invalid hex: {e}"))?;
+                    bsv::primitives::ec::PrivateKey::from_bytes(&key_bytes)
+                        .map_err(|e| anyhow::anyhow!("MPC_SERVICE_AUTH_KEY invalid key: {e:?}"))?
+                }
+                None => {
+                    let mut b = [0u8; 32];
+                    getrandom::getrandom(&mut b).map_err(|e| anyhow::anyhow!("entropy: {e}"))?;
+                    b[0] |= 0x01;
+                    bsv::primitives::ec::PrivateKey::from_bytes(&b)
+                        .map_err(|e| anyhow::anyhow!("ephemeral auth key: {e:?}"))?
+                }
+            };
             tracing::info!(%worker_url, "presignature provisioning ENABLED");
             Some(bsv_mpc_service::ProvisionConfig {
                 worker_url,
@@ -90,10 +101,8 @@ async fn main() -> anyhow::Result<()> {
                 http: reqwest::Client::new(),
             })
         }
-        _ => {
-            tracing::info!(
-                "presignature provisioning disabled (set MPC_WORKER_URL + MPC_SERVICE_AUTH_KEY)"
-            );
+        None => {
+            tracing::info!("presignature provisioning disabled (set MPC_WORKER_URL to enable)");
             None
         }
     };

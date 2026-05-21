@@ -36,4 +36,9 @@ USER app
 EXPOSE 8080
 ENV MPC_SERVICE_PORT=8080
 ENV MPC_DATA_DIR=/data
+# #4 self-stocking: ship each generated Presignature_A to the cosigner DO pool.
+# MPC_WORKER_URL is the (public) DO worker base URL — not a secret. The BRC-31
+# auth identity is ephemeral (generated at startup) unless MPC_SERVICE_AUTH_KEY
+# is provided, so no key is committed to the image.
+ENV MPC_WORKER_URL=https://bsv-mpc-kss.dev-a3e.workers.dev
 CMD ["bsv-mpc-service"]
