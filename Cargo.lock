@@ -221,7 +221,7 @@ dependencies = [
 [[package]]
 name = "bsv-middleware-rs"
 version = "0.2.0"
-source = "git+https://github.com/Calhooon/bsv-middleware-rs?rev=61e1f4948d150dfb217ea5fdd22ad73c2b267bc7#61e1f4948d150dfb217ea5fdd22ad73c2b267bc7"
+source = "git+https://github.com/Calhooon/bsv-middleware-rs?rev=57a0b8bce3e65991652f6596ec3dd2bc81ace6e1#57a0b8bce3e65991652f6596ec3dd2bc81ace6e1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",

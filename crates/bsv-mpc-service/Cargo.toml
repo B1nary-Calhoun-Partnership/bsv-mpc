@@ -16,7 +16,7 @@ bsv = { package = "bsv-rs", version = "0.3.11", features = ["transaction", "wall
 # Canonical BRC-31 server: `verify_message_signature`, `sign_message`,
 # `SessionStorage`, transport (`build_request_payload` / `filter_signable_headers`).
 # Same pinned rev as bsv-mpc-core.
-bsv-middleware-rs = { git = "https://github.com/Calhooon/bsv-middleware-rs", rev = "61e1f4948d150dfb217ea5fdd22ad73c2b267bc7" }
+bsv-middleware-rs = { git = "https://github.com/Calhooon/bsv-middleware-rs", rev = "57a0b8bce3e65991652f6596ec3dd2bc81ace6e1" }
 async-trait = "0.1"
 axum.workspace = true
 tokio.workspace = true

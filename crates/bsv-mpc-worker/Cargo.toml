@@ -56,7 +56,7 @@ wasm-bindgen-futures = "0.4"
 # bsv-mpc-core, so no duplicate source.
 [dev-dependencies]
 bsv = { package = "bsv-rs", version = "0.3.11", features = ["transaction", "wallet", "auth"] }
-bsv-middleware-rs = { git = "https://github.com/Calhooon/bsv-middleware-rs", rev = "61e1f4948d150dfb217ea5fdd22ad73c2b267bc7" }
+bsv-middleware-rs = { git = "https://github.com/Calhooon/bsv-middleware-rs", rev = "57a0b8bce3e65991652f6596ec3dd2bc81ace6e1" }
 
 [lib]
 crate-type = ["cdylib"]
