@@ -670,12 +670,24 @@ pub async fn handle_presign_init(
         Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e),
     };
 
-    // The proxy sends the canonical session_id as hex; reconstruct the SAME
-    // SessionId (NOT from_str_hash, which would re-hash the hex and yield a
-    // different cggmp24 ExecutionId → presig fails to complete). Fall back to
-    // from_str_hash for any non-hex caller.
-    let session_id = SessionId::from_hex(&body.session_id)
-        .unwrap_or_else(|_| SessionId::from_str_hash(&body.session_id));
+    // The proxy sends the canonical session_id as 64-char hex; reconstruct the
+    // SAME SessionId via from_hex. HARD-ERROR on malformed hex (#7 finding #4):
+    // the previous `from_str_hash` fallback silently RE-HASHED a corrupt hex
+    // into a *different* SessionId → a divergent cggmp24 ExecutionId → the presig
+    // would fail to complete with a confusing "malformed/cheating party" error
+    // far from the real cause. A non-hex session_id here is a caller bug; fail
+    // loudly at the boundary.
+    let session_id = match SessionId::from_hex(&body.session_id) {
+        Ok(id) => id,
+        Err(e) => {
+            return err_response(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "session_id must be the canonical 64-char hex SessionId (got malformed: {e})"
+                ),
+            )
+        }
+    };
     let participants: Vec<u16> = (0..share.config.parties).collect();
     let mut manager = PresigningManager::new(session_id, share, participants, body.count as usize);
 

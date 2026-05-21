@@ -977,9 +977,22 @@ impl CosignerSessionDo {
             .map_err(|e| Error::RustError(format!("recipient_pub_hex: {e:?}")))?;
 
         // ── 3. Pool: stock + consume, then issue this party's partial ────
-        let agent_id = client_pub_hex.clone();
+        // #7 finding #2: the POC route is a self-roundtrip test (store then
+        // immediately consume the SAME presig). Previously it keyed the pool by
+        // the server's own pubkey — a SHARED key across all POC callers — so two
+        // CONCURRENT POC calls raced the FIFO pool and could consume each other's
+        // presig. Key by a UNIQUE per-call id (random) so each store→consume is
+        // fully isolated. (Production /sign-relay consumes by joint-key +
+        // owner-authz and is unaffected.)
         let store = self.kss_store()?;
-        let presig_id = format!("poc-sign-relay-{}", Date::now().as_millis());
+        let mut rnd = [0u8; 8];
+        getrandom::getrandom(&mut rnd).map_err(|e| Error::RustError(format!("entropy: {e}")))?;
+        let presig_id = format!(
+            "poc-sign-relay-{}-{}",
+            Date::now().as_millis(),
+            hex::encode(rnd)
+        );
+        let agent_id = presig_id.clone(); // unique per-call pool slot (isolation)
         store.store_presignature(&agent_id, "poc-sign-relay", &presig_id, &presig_bytes)?;
         let consumed = store
             .consume_presignature(&agent_id)?
