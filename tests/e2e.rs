@@ -307,6 +307,7 @@ async fn setup() -> TestEnv {
         started_at: chrono::Utc::now(),
         provision: None,
         auth: bsv_mpc_service::AuthState::dev(),
+        custody: None,
     });
 
     let kss_router = bsv_mpc_service::build_router(kss_state);

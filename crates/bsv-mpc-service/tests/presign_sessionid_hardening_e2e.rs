@@ -40,6 +40,7 @@ async fn presign_init_rejects_malformed_session_id() {
         started_at: chrono::Utc::now(),
         provision: None,
         auth: AuthState::dev(), // dev mode — no owner bound, so authz allows
+        custody: None,
     });
     // Pre-store a dummy share so /presign/init reaches the session_id parse.
     let agent_id = "02".to_string() + &"ab".repeat(32); // any 66-hex agent id

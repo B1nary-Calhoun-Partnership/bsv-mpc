@@ -4,6 +4,7 @@
 //! so they can be used from integration tests and embedded deployments.
 
 pub mod auth;
+pub mod custody;
 pub mod dkg_handler;
 pub mod handlers;
 pub mod messagebox;
@@ -36,6 +37,22 @@ pub struct ProvisionConfig {
     pub http: reqwest::Client,
 }
 
+/// Optional durable share custody (#9): when set, the cosigner persists its
+/// KEK-wrapped `share_A` to the worker DO (`/custody/put-share`) at DKG-complete
+/// and lazily reloads it (`/custody/get-share`) on a cache miss after a restart
+/// — so an ephemeral-container restart can never permanently lock funds.
+pub struct CustodyConfig {
+    /// Base URL of the durable worker DO (e.g. `https://…workers.dev`).
+    pub worker_url: String,
+    /// The 32-byte KEK (derived from the cosigner's stable identity secret) that
+    /// seals `share_A` before it leaves this process. The DO never sees it.
+    pub kek: [u8; 32],
+    /// Stable BRC-31 session to the worker (the custody-record owner identity).
+    pub auth: tokio::sync::Mutex<bsv_mpc_core::brc31_client::Brc31Client>,
+    /// HTTP client for outbound custody requests.
+    pub http: reqwest::Client,
+}
+
 /// Shared application state, accessible from all request handlers.
 pub struct AppState {
     /// Path to the data directory where the SQLite database lives.
@@ -50,6 +67,8 @@ pub struct AppState {
     /// [`AuthState::from_env`] in production (enforced when
     /// `MPC_SERVER_PRIVATE_KEY` is set), or [`AuthState::dev`] in dev/tests.
     pub auth: AuthState,
+    /// Durable share custody to the worker DO (`None` = disabled / in-memory only).
+    pub custody: Option<CustodyConfig>,
 }
 
 /// Build the Axum router with all KSS endpoints.

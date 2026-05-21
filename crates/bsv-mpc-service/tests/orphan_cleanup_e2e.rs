@@ -29,6 +29,7 @@ async fn dkg_round_error_removes_orphan_coordinator() {
         started_at: chrono::Utc::now(),
         provision: None,
         auth: AuthState::dev(),
+        custody: None,
     });
     let app = build_router(state);
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))

@@ -108,6 +108,7 @@ async fn full_self_stocking_loop() {
                     http: reqwest::Client::new(),
                 }),
                 auth: bsv_mpc_service::AuthState::dev(),
+                custody: None,
             });
             let app = build_router(state);
             let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))

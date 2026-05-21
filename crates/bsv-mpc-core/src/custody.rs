@@ -16,11 +16,13 @@
 //!
 //! ```text
 //! KEK   = HMAC-SHA256(server_identity_key_bytes, "bsv-mpc share custody kek v1")
-//! blob  = AES-256-GCM_KEK( serde_json(EncryptedShare) )   // fresh 96-bit nonce
+//! blob  = AES-256-GCM_KEK( serde_json({ share, owner_identity }) )  // fresh nonce
 //! ```
 //!
-//! - The whole `EncryptedShare` (including its raw `ciphertext`) is serialized
-//!   and AEAD-sealed, so the DO sees only ciphertext + a fresh nonce.
+//! - The whole `EncryptedShare` (including its raw `ciphertext`) PLUS its
+//!   `owner_identity` (§08.1) is serialized and AEAD-sealed, so the DO sees only
+//!   ciphertext + a fresh nonce, and a restart-recovery restores the owner
+//!   binding too (not just the key material).
 //! - The KEK is derived from the container's long-lived `MPC_SERVER_PRIVATE_KEY`
 //!   (a durable secret only the container possesses). Neither the DO blob nor a
 //!   leaked container secret alone is sufficient: confidentiality rests on the
@@ -56,15 +58,34 @@ pub fn derive_custody_kek(server_key_bytes: &[u8; 32]) -> [u8; 32] {
     kek
 }
 
-/// Seal an `EncryptedShare` (whose `ciphertext` is the raw cggmp24 share) into a
-/// custody blob under the KEK. The result is itself an `EncryptedShare` whose
-/// `ciphertext` is `AES-256-GCM_KEK(serde_json(input))` — safe to hand to an
-/// untrusted durable store. Non-secret metadata (`session_id`, `share_index`,
-/// `config`, `joint_pubkey`) is copied through for keying/observability; the
-/// secret lives only inside the sealed blob.
-pub fn wrap_share_for_custody(share: &EncryptedShare, kek: &[u8; 32]) -> Result<EncryptedShare> {
-    let plaintext = serde_json::to_vec(share)
-        .map_err(|e| MpcError::Serialization(format!("custody serialize share: {e}")))?;
+/// The custody payload sealed under the KEK: the share AND its authorized
+/// `owner_identity` (§08.1). The owner MUST be sealed alongside the share so a
+/// restart-recovery restores the owner binding too — otherwise the recovered
+/// share would have no bound owner and any authenticated caller could use it,
+/// silently re-opening the owner-authz gap after every restart.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CustodyPayload {
+    share: EncryptedShare,
+    owner_identity: String,
+}
+
+/// Seal an `EncryptedShare` + its `owner_identity` into a custody blob under the
+/// KEK. The result is itself an `EncryptedShare` whose `ciphertext` is
+/// `AES-256-GCM_KEK(serde_json({share, owner}))` — safe to hand to an untrusted
+/// durable store. Non-secret metadata (`session_id`, `share_index`, `config`,
+/// `joint_pubkey`) is copied through for keying/observability; the secret + the
+/// owner live only inside the sealed blob.
+pub fn wrap_share_for_custody(
+    share: &EncryptedShare,
+    owner_identity: &str,
+    kek: &[u8; 32],
+) -> Result<EncryptedShare> {
+    let payload = CustodyPayload {
+        share: share.clone(),
+        owner_identity: owner_identity.to_string(),
+    };
+    let plaintext = serde_json::to_vec(&payload)
+        .map_err(|e| MpcError::Serialization(format!("custody serialize payload: {e}")))?;
     let mut blob = encrypt_share(&plaintext, kek)?;
     blob.session_id = share.session_id;
     blob.share_index = share.share_index;
@@ -74,12 +95,16 @@ pub fn wrap_share_for_custody(share: &EncryptedShare, kek: &[u8; 32]) -> Result<
 }
 
 /// Unseal a custody blob produced by [`wrap_share_for_custody`] back into the
-/// original in-memory `EncryptedShare` (raw `ciphertext` restored). A wrong KEK
-/// or a tampered blob fails the GCM tag and returns an error (never plaintext).
-pub fn unwrap_custody_share(blob: &EncryptedShare, kek: &[u8; 32]) -> Result<EncryptedShare> {
+/// original `(EncryptedShare, owner_identity)`. A wrong KEK or a tampered blob
+/// fails the GCM tag and returns an error (never plaintext).
+pub fn unwrap_custody_share(
+    blob: &EncryptedShare,
+    kek: &[u8; 32],
+) -> Result<(EncryptedShare, String)> {
     let plaintext = decrypt_share(blob, kek)?;
-    serde_json::from_slice(&plaintext)
-        .map_err(|e| MpcError::Serialization(format!("custody deserialize share: {e}")))
+    let payload: CustodyPayload = serde_json::from_slice(&plaintext)
+        .map_err(|e| MpcError::Serialization(format!("custody deserialize payload: {e}")))?;
+    Ok((payload.share, payload.owner_identity))
 }
 
 #[cfg(test)]
@@ -112,18 +137,23 @@ mod tests {
     }
 
     #[test]
-    fn wrap_unwrap_round_trips() {
+    fn wrap_unwrap_round_trips_share_and_owner() {
         let kek = derive_custody_kek(&[42u8; 32]);
         let original = raw_share();
-        let blob = wrap_share_for_custody(&original, &kek).unwrap();
+        let owner = "02owneridentitykeyhex";
+        let blob = wrap_share_for_custody(&original, owner, &kek).unwrap();
 
         // The durable blob is genuinely sealed — its ciphertext is NOT the raw
-        // share, and the raw share string does not appear in it.
+        // share, and neither the raw share nor the owner appears in it.
         assert_ne!(blob.ciphertext, original.ciphertext);
         assert!(!blob
             .ciphertext
             .windows(b"cggmp24".len())
             .any(|w| w == b"cggmp24"));
+        assert!(!blob
+            .ciphertext
+            .windows(owner.len())
+            .any(|w| w == owner.as_bytes()));
         // Non-secret metadata copied through for keying.
         assert_eq!(blob.session_id, original.session_id);
         assert_eq!(
@@ -131,18 +161,21 @@ mod tests {
             original.joint_pubkey_compressed
         );
 
-        let restored = unwrap_custody_share(&blob, &kek).unwrap();
+        let (restored, restored_owner) = unwrap_custody_share(&blob, &kek).unwrap();
         assert_eq!(restored.ciphertext, original.ciphertext);
         assert_eq!(restored.nonce, original.nonce);
         assert_eq!(restored.session_id, original.session_id);
         assert_eq!(restored.share_index.0, original.share_index.0);
         assert_eq!(restored.config.threshold, original.config.threshold);
+        // The owner binding (§08.1) survives the round trip — so a recovered
+        // share still gates sign/presign/ecdh to the same identity.
+        assert_eq!(restored_owner, owner);
     }
 
     #[test]
     fn wrong_kek_fails_closed() {
         let kek = derive_custody_kek(&[1u8; 32]);
-        let blob = wrap_share_for_custody(&raw_share(), &kek).unwrap();
+        let blob = wrap_share_for_custody(&raw_share(), "02owner", &kek).unwrap();
         let wrong = derive_custody_kek(&[2u8; 32]);
         assert!(
             unwrap_custody_share(&blob, &wrong).is_err(),
@@ -153,7 +186,7 @@ mod tests {
     #[test]
     fn tampered_blob_fails_closed() {
         let kek = derive_custody_kek(&[9u8; 32]);
-        let mut blob = wrap_share_for_custody(&raw_share(), &kek).unwrap();
+        let mut blob = wrap_share_for_custody(&raw_share(), "02owner", &kek).unwrap();
         // Flip a ciphertext byte → GCM tag must reject.
         blob.ciphertext[0] ^= 0xff;
         assert!(unwrap_custody_share(&blob, &kek).is_err());

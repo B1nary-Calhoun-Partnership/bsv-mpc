@@ -257,6 +257,49 @@ fn authz_owner(
     crate::auth::authz_owner_or_reject(caller.as_opt(), owner.as_deref())
 }
 
+/// Load the agent's share, recovering it from durable custody (#9) on a local
+/// cache miss (e.g. after an ephemeral-container restart). Recovery restores
+/// BOTH the share and its owner binding (§08.1) into local storage, so a
+/// subsequent [`authz_owner`] check enforces the SAME identity as before the
+/// restart (call this BEFORE the owner check on a cold cache). Hot path is a
+/// pure in-memory read; the custody round-trip only happens on a miss.
+async fn load_share_or_recover(
+    state: &AppState,
+    agent_id: &str,
+) -> Result<bsv_mpc_core::types::EncryptedShare, (StatusCode, Json<serde_json::Value>)> {
+    // 1. Local cache (hot path).
+    match state.storage.read() {
+        Ok(s) => match s.get_share(agent_id) {
+            Ok(Some(share)) => return Ok(share),
+            Ok(None) => {}
+            Err(e) => return Err(err_response(StatusCode::INTERNAL_SERVER_ERROR, e)),
+        },
+        Err(e) => return Err(err_response(StatusCode::INTERNAL_SERVER_ERROR, e)),
+    }
+    // 2. Durable custody recover (cold path: post-restart) — re-binds the owner.
+    if let Some(custody) = &state.custody {
+        match custody.get_share(agent_id).await {
+            Ok(Some((share, owner))) => {
+                if let Ok(mut s) = state.storage.write() {
+                    let _ = s.store_share_with_owner(agent_id, &share, &owner);
+                }
+                return Ok(share);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                return Err(err_response(
+                    StatusCode::BAD_GATEWAY,
+                    format!("custody recover failed: {e}"),
+                ))
+            }
+        }
+    }
+    Err(err_response(
+        StatusCode::NOT_FOUND,
+        format!("No share for agent: {agent_id}"),
+    ))
+}
+
 /// Bundle multiple outgoing RoundMessages into a single transport RoundMessage.
 fn bundle_outgoing_messages(messages: &[RoundMessage]) -> Result<RoundMessage, String> {
     if messages.is_empty() {
@@ -419,6 +462,25 @@ pub async fn handle_dkg_round(
                         .map(|d| d.owner_identity.clone())
                 })
                 .unwrap_or_default();
+            // #9: persist the KEK-wrapped share_A (+ its owner) to durable
+            // custody FIRST, fail-closed — a restart must never lose share_A →
+            // permanent fund-lock. If custody is configured but the put fails,
+            // do NOT finalize the DKG (drop the coordinator; report it) so the
+            // operator fixes durability before funding.
+            if let Some(custody) = &state.custody {
+                if let Err(e) = custody
+                    .put_share(&agent_id, &dkg_result.share, &owner_identity)
+                    .await
+                {
+                    if let Ok(mut store) = COORDINATOR_STORE.lock() {
+                        store.dkg.remove(&body.session_id);
+                    }
+                    return err_response(
+                        StatusCode::BAD_GATEWAY,
+                        format!("durable custody put failed; DKG not finalized: {e}"),
+                    );
+                }
+            }
             if let Ok(mut storage) = state.storage.write() {
                 let _ =
                     storage.store_share_with_owner(&agent_id, &dkg_result.share, &owner_identity);
@@ -449,29 +511,20 @@ pub async fn handle_sign_init(
     headers: HeaderMap,
     Json(body): Json<SignInitRequest>,
 ) -> impl IntoResponse {
-    // §07/§08.1: authenticate, then enforce that the caller owns the share —
-    // BEFORE any share material is loaded or used.
+    // §07: authenticate. Then recover the share (+owner) from durable custody on
+    // a cold-cache miss (#9) BEFORE the §08.1 owner check, so post-restart the
+    // authz sees the restored owner binding — never a wide-open share.
     let caller = match crate::auth::verify_or_allow(&headers, &state.auth) {
         Ok(id) => id,
+        Err(resp) => return resp,
+    };
+    let share = match load_share_or_recover(&state, &body.agent_id).await {
+        Ok(s) => s,
         Err(resp) => return resp,
     };
     if let Some(resp) = authz_owner(&state, &caller, &body.agent_id) {
         return resp;
     }
-
-    let share = match state.storage.read() {
-        Ok(storage) => match storage.get_share(&body.agent_id) {
-            Ok(Some(s)) => s,
-            Ok(None) => {
-                return err_response(
-                    StatusCode::NOT_FOUND,
-                    format!("No share for agent: {}", body.agent_id),
-                )
-            }
-            Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e),
-        },
-        Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e),
-    };
 
     let sighash_bytes = match hex::decode(&body.sighash) {
         Ok(b) => b,
@@ -638,32 +691,24 @@ pub async fn handle_presign_init(
     headers: HeaderMap,
     Json(body): Json<PresignInitRequest>,
 ) -> impl IntoResponse {
-    // §07/§08.1: authenticate + owner-gate before loading the share.
+    // §07: authenticate. Recover share (+owner) from durable custody on a
+    // cold-cache miss (#9) BEFORE the §08.1 owner check.
     let caller = match crate::auth::verify_or_allow(&headers, &state.auth) {
         Ok(id) => id,
         Err(resp) => return resp,
     };
-    if let Some(resp) = authz_owner(&state, &caller, &body.agent_id) {
-        return resp;
-    }
 
     if body.count == 0 || body.count > 100 {
         return err_response(StatusCode::BAD_REQUEST, "count must be between 1 and 100");
     }
 
-    let share = match state.storage.read() {
-        Ok(storage) => match storage.get_share(&body.agent_id) {
-            Ok(Some(s)) => s,
-            Ok(None) => {
-                return err_response(
-                    StatusCode::NOT_FOUND,
-                    format!("No share for agent: {}", body.agent_id),
-                )
-            }
-            Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e),
-        },
-        Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e),
+    let share = match load_share_or_recover(&state, &body.agent_id).await {
+        Ok(s) => s,
+        Err(resp) => return resp,
     };
+    if let Some(resp) = authz_owner(&state, &caller, &body.agent_id) {
+        return resp;
+    }
 
     let presign_session_id = match generate_session_id("presign") {
         Ok(id) => id,
@@ -860,6 +905,12 @@ pub async fn handle_ecdh(
         Ok(id) => id,
         Err(resp) => return resp,
     };
+    // Recover share (+owner) from durable custody on a cold-cache miss (#9)
+    // BEFORE the §08.1 owner check.
+    let share = match load_share_or_recover(&state, &body.agent_id).await {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
     if let Some(resp) = authz_owner(&state, &caller, &body.agent_id) {
         return resp;
     }
@@ -884,22 +935,7 @@ pub async fn handle_ecdh(
         }
     };
 
-    // Load the agent's share
-    let share = match state.storage.read() {
-        Ok(storage) => match storage.get_share(&body.agent_id) {
-            Ok(Some(s)) => s,
-            Ok(None) => {
-                return err_response(
-                    StatusCode::NOT_FOUND,
-                    format!("No share for agent: {}", body.agent_id),
-                )
-            }
-            Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e),
-        },
-        Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e),
-    };
-
-    // Extract scalar and compute partial ECDH
+    // Extract scalar and compute partial ECDH (share recovered/loaded above)
     let scalar = match bsv_mpc_core::ecdh::parse_share_scalar(&share.ciphertext) {
         Ok(s) => s,
         Err(e) => {

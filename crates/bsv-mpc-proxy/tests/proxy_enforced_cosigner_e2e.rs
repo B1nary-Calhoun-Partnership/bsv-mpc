@@ -61,6 +61,7 @@ async fn spawn_enforced_service(
         started_at: chrono::Utc::now(),
         provision: None,
         auth: AuthState::with_key(server_key),
+        custody: None,
     });
     let app = build_router(state);
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))

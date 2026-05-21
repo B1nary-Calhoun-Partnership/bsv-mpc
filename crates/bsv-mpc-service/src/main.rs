@@ -107,6 +107,44 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    // #9 durable share custody: when BOTH MPC_SERVER_PRIVATE_KEY (the stable
+    // custody root → KEK + the custody-record owner identity) and MPC_WORKER_URL
+    // (the durable DO) are set, persist the KEK-wrapped share_A to the DO at
+    // DKG-complete and lazily reload it after a restart — closing the
+    // ephemeral-container fund-lock. The KEK never leaves this process; the DO
+    // holds only sealed bytes.
+    let custody = match (
+        std::env::var("MPC_SERVER_PRIVATE_KEY").ok(),
+        std::env::var("MPC_WORKER_URL").ok(),
+    ) {
+        (Some(server_hex), Some(worker_url)) if !server_hex.trim().is_empty() => {
+            let key_bytes: [u8; 32] = hex::decode(server_hex.trim())
+                .map_err(|e| anyhow::anyhow!("MPC_SERVER_PRIVATE_KEY invalid hex: {e}"))?
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("MPC_SERVER_PRIVATE_KEY must be 32 bytes"))?;
+            let auth_key = bsv::primitives::ec::PrivateKey::from_bytes(&key_bytes)
+                .map_err(|e| anyhow::anyhow!("MPC_SERVER_PRIVATE_KEY invalid key: {e:?}"))?;
+            let kek = bsv_mpc_core::custody::derive_custody_kek(&key_bytes);
+            tracing::info!(%worker_url, "durable share custody ENABLED (#9)");
+            Some(bsv_mpc_service::CustodyConfig {
+                worker_url,
+                kek,
+                auth: tokio::sync::Mutex::new(bsv_mpc_core::brc31_client::Brc31Client::new(
+                    auth_key,
+                )),
+                http: reqwest::Client::new(),
+            })
+        }
+        _ => {
+            tracing::warn!(
+                "durable share custody DISABLED — share_A is in-memory only and is LOST on \
+                 restart (set MPC_SERVER_PRIVATE_KEY + MPC_WORKER_URL to enable; required \
+                 before funded use)"
+            );
+            None
+        }
+    };
+
     let state = Arc::new(AppState {
         data_dir,
         storage: RwLock::new(storage),
@@ -115,6 +153,7 @@ async fn main() -> anyhow::Result<()> {
         // §07.6: enforce BRC-31 owner-authz when MPC_SERVER_PRIVATE_KEY is set;
         // dev mode (allow-unauthenticated) otherwise.
         auth: bsv_mpc_service::AuthState::from_env(),
+        custody,
     });
 
     let app = bsv_mpc_service::build_router(state);
