@@ -361,8 +361,8 @@ pub async fn handle_dkg_round(
             Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e),
         };
 
-        let session = match store.dkg.get_mut(&body.session_id) {
-            Some(s) => s,
+        let outcome = match store.dkg.get_mut(&body.session_id) {
+            Some(s) => s.coordinator.process_round(incoming),
             None => {
                 return err_response(
                     StatusCode::NOT_FOUND,
@@ -371,9 +371,15 @@ pub async fn handle_dkg_round(
             }
         };
 
-        match session.coordinator.process_round(incoming) {
+        match outcome {
             Ok(r) => r,
-            Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e),
+            Err(e) => {
+                // Remove the orphaned coordinator: a ceremony that errors
+                // mid-round must not leave stale state that blocks a retry of
+                // the same session id or grows unbounded (#7 finding #3).
+                store.dkg.remove(&body.session_id);
+                return err_response(StatusCode::INTERNAL_SERVER_ERROR, e);
+            }
         }
     };
 
@@ -562,8 +568,8 @@ pub async fn handle_sign_round(
             Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e),
         };
 
-        let coordinator = match store.signing.get_mut(&body.signing_session_id) {
-            Some(c) => c,
+        let outcome = match store.signing.get_mut(&body.signing_session_id) {
+            Some(c) => c.process_round(incoming),
             None => {
                 return err_response(
                     StatusCode::NOT_FOUND,
@@ -572,9 +578,14 @@ pub async fn handle_sign_round(
             }
         };
 
-        match coordinator.process_round(incoming) {
+        match outcome {
             Ok(r) => r,
-            Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e),
+            Err(e) => {
+                // Remove the orphaned coordinator on a mid-ceremony error so a
+                // failed sign doesn't block retry / leak (#7 finding #3).
+                store.signing.remove(&body.signing_session_id);
+                return err_response(StatusCode::INTERNAL_SERVER_ERROR, e);
+            }
         }
     };
 
@@ -712,8 +723,8 @@ pub async fn handle_presign_round(
             Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e),
         };
 
-        let manager = match store.presigning.get_mut(&body.presign_session_id) {
-            Some(m) => m,
+        let outcome = match store.presigning.get_mut(&body.presign_session_id) {
+            Some(m) => m.process_generate_round(body.round_messages),
             None => {
                 return err_response(
                     StatusCode::NOT_FOUND,
@@ -722,9 +733,15 @@ pub async fn handle_presign_round(
             }
         };
 
-        match manager.process_generate_round(body.round_messages) {
+        match outcome {
             Ok(r) => r,
-            Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e),
+            Err(e) => {
+                // Remove the orphaned manager + its agent mapping on a
+                // mid-ceremony error (#7 finding #3).
+                store.presigning.remove(&body.presign_session_id);
+                store.presign_agent.remove(&body.presign_session_id);
+                return err_response(StatusCode::INTERNAL_SERVER_ERROR, e);
+            }
         }
     };
 

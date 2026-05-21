@@ -468,15 +468,18 @@ pub async fn handle_dkg_round(mut req: Request, store: &dyn MpcStore) -> Result<
             .get_mut(&body.session_id)
             .ok_or_else(|| Error::from(format!("DKG session not found: {}", body.session_id)))?;
 
-        let result = session
-            .coordinator
-            .process_round(incoming)
-            .map_err(|e| Error::from(e.to_string()))?;
-        (
-            result,
-            session.agent_id.clone(),
-            session.owner_identity.clone(),
-        )
+        let agent_id = session.agent_id.clone();
+        let owner_identity = session.owner_identity.clone();
+        match session.coordinator.process_round(incoming) {
+            Ok(result) => (result, agent_id, owner_identity),
+            Err(e) => {
+                // Remove the orphaned coordinator: a ceremony that errors
+                // mid-round must not leave stale state that blocks a retry of
+                // the same session id or grows unbounded (#7 finding #3).
+                sessions.remove(&body.session_id);
+                return Err(Error::from(e.to_string()));
+            }
+        }
     };
 
     match result {
@@ -612,9 +615,15 @@ pub async fn handle_sign_round(mut req: Request) -> Result<Response> {
             ))
         })?;
 
-        coordinator
-            .process_round(incoming)
-            .map_err(|e| Error::from(e.to_string()))?
+        match coordinator.process_round(incoming) {
+            Ok(r) => r,
+            Err(e) => {
+                // Remove the orphaned coordinator on a mid-ceremony error so a
+                // failed sign doesn't block retry / leak (#7 finding #3).
+                sessions.remove(&body.signing_session_id);
+                return Err(Error::from(e.to_string()));
+            }
+        }
     };
 
     match result {
@@ -727,9 +736,15 @@ pub async fn handle_presign_round(mut req: Request) -> Result<Response> {
             ))
         })?;
 
-        manager
-            .process_generate_round(body.round_messages)
-            .map_err(|e| Error::from(e.to_string()))?
+        match manager.process_generate_round(body.round_messages) {
+            Ok(r) => r,
+            Err(e) => {
+                // Remove the orphaned manager on a mid-ceremony error (#7
+                // finding #3).
+                sessions.remove(&body.presign_session_id);
+                return Err(Error::from(e.to_string()));
+            }
+        }
     };
 
     match result {
