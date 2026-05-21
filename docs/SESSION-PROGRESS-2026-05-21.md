@@ -97,6 +97,10 @@ Worker DO `9f2075e1` (segregated pool + authed /sign-relay). CF Container
    identity) + container redeployed with `MPC_SERVER_PRIVATE_KEY` (Worker
    secret → `envVars`). Live: unauthed→401; full authed self-stocking
    BSV-valid (449s). Residual hardening → #8.
+0b. ✅ **#7 finding #3 — orphaned-coordinator cleanup (task #11) DONE** (`ef9db58`).
+   Worker + service round handlers remove the live coordinator on a
+   mid-ceremony `process_round` error (was: only on completion). Proof:
+   `orphan_cleanup_e2e` (500 → retry 404). Worker change deploy-pending.
 1. **#7 audit sweep — REMAINING classes** (highest-confidence "no hidden shit"):
    concurrency (two ceremonies on the same DO/pool/relay identity), leftover/
    orphaned state (failed ceremonies → stale presigs/coordinators/sessions; TTL/
