@@ -147,6 +147,14 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         .post_async("/sign-relay", |req, ctx| async move {
             poc::forward_to_cosigner_do(req, &ctx.env).await
         })
+        // #9: durable custody of a cosigner's KEK-wrapped share_A (BRC-31 +
+        // owner-authz; the DO stores only sealed bytes).
+        .post_async("/custody/put-share", |req, ctx| async move {
+            poc::forward_to_cosigner_do(req, &ctx.env).await
+        })
+        .post_async("/custody/get-share", |req, ctx| async move {
+            poc::forward_to_cosigner_do(req, &ctx.env).await
+        })
         // ── Read-only endpoints (no auth required) ──────────────────
         .get_async("/health", |req, ctx| async move {
             poc::forward_to_cosigner_do(req, &ctx.env).await

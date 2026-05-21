@@ -60,6 +60,8 @@ fn is_authed_path(path: &str) -> bool {
             | "/ceremony/seed-primes"
             | "/ceremony/ingest-presig"
             | "/sign-relay"
+            | "/custody/put-share"
+            | "/custody/get-share"
     ) || path.starts_with("/shares/")
 }
 
@@ -136,6 +138,10 @@ impl DurableObject for CosignerSessionDo {
             "/sign/round" => crate::api::handle_sign_round(req).await,
             "/ceremony/seed-primes" => self.handle_seed_primes(req).await,
             "/ceremony/ingest-presig" => self.handle_ingest_presig(req).await,
+            // #9 durable share custody — KEK-wrapped share_A persisted by the
+            // ephemeral cosigner; owner-authz (§08.1) on top of the BRC-31 gate.
+            "/custody/put-share" => self.handle_custody_put(req).await,
+            "/custody/get-share" => self.handle_custody_get(req).await,
             "/presign/init" => {
                 let store = self.kss_store()?;
                 crate::api::handle_presign_init(req, &store).await
@@ -176,6 +182,57 @@ impl CosignerSessionDo {
         let store = crate::do_storage::DoSqlStorage::new(&self.state);
         store.ensure_schema()?;
         Ok(store)
+    }
+
+    /// `POST /custody/put-share` (#9) — durably store a cosigner's KEK-WRAPPED
+    /// share blob in this DO's SQLite. BRC-31 is verified at dispatch; here we
+    /// add owner-authz (§08.1): the first authed caller binds ownership, and
+    /// only that identity may overwrite. The blob is already AES-256-GCM sealed
+    /// under the caller's KEK — the DO never sees plaintext share material.
+    async fn handle_custody_put(&self, mut req: Request) -> Result<Response> {
+        #[derive(serde::Deserialize)]
+        struct PutReq {
+            agent_id: String,
+            share: bsv_mpc_core::types::EncryptedShare,
+        }
+        let caller = crate::api::caller_identity(&req).unwrap_or_default();
+        let body: PutReq = req.json().await?;
+        let store = self.kss_store()?;
+        if let Some(owner) = store.get_custody_owner(&body.agent_id)? {
+            if owner != caller {
+                return Response::error(
+                    format!("Forbidden: {caller} is not the custody owner for this agent"),
+                    403,
+                );
+            }
+        }
+        store.put_custody(&body.agent_id, &body.share, &caller)?;
+        Response::from_json(&serde_json::json!({
+            "stored": true,
+            "agent_id": body.agent_id,
+        }))
+    }
+
+    /// `POST /custody/get-share` (#9) — return the sealed custody blob for an
+    /// agent. Owner-authz: only the binding identity may read it back (404 if
+    /// none stored). The caller still needs its KEK to unwrap the blob.
+    async fn handle_custody_get(&self, mut req: Request) -> Result<Response> {
+        #[derive(serde::Deserialize)]
+        struct GetReq {
+            agent_id: String,
+        }
+        let caller = crate::api::caller_identity(&req);
+        let body: GetReq = req.json().await?;
+        let store = self.kss_store()?;
+        if let Some(owner) = store.get_custody_owner(&body.agent_id)? {
+            if caller.as_deref() != Some(owner.as_str()) {
+                return Response::error("Forbidden: not the custody owner for this agent", 403);
+            }
+        }
+        match store.get_custody(&body.agent_id)? {
+            Some(sealed) => Response::from_json(&serde_json::json!({ "share": sealed })),
+            None => Response::error("no custody blob stored for this agent", 404),
+        }
     }
 
     /// Ensure the `shares` table exists (idempotent). `ciphertext` is the

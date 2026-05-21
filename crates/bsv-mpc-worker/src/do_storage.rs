@@ -145,7 +145,93 @@ impl<'a> DoSqlStorage<'a> {
              )",
             None,
         )?;
+        // Durable custody of a cosigner's KEK-WRAPPED share (#9): a separate
+        // table from `mpc_shares` (which holds THIS DO's own DKG shares) so the
+        // two never collide. `share_json` here is the SEALED EncryptedShare
+        // (AES-256-GCM under the container's KEK) — the DO never sees plaintext.
+        sql.exec(
+            "CREATE TABLE IF NOT EXISTS mpc_custody (\
+               agent_id TEXT PRIMARY KEY, \
+               share_json TEXT NOT NULL, \
+               owner_identity TEXT NOT NULL DEFAULT '', \
+               created_at TEXT NOT NULL, \
+               updated_at TEXT NOT NULL\
+             )",
+            None,
+        )?;
         Ok(())
+    }
+
+    // ── Durable share custody (#9 — KEK-wrapped share_A) ─────────────────
+
+    /// Store a KEK-wrapped custody blob for `agent_id`, recording its authorized
+    /// `owner_identity` (the cosigner's stable BRC-31 identity). On upsert an
+    /// empty `owner_identity` preserves the bound owner (same semantics as
+    /// `store_share_with_owner`). The blob is an already-sealed `EncryptedShare`.
+    pub fn put_custody(
+        &self,
+        agent_id: &str,
+        sealed: &EncryptedShare,
+        owner_identity: &str,
+    ) -> Result<()> {
+        let json = serde_json::to_string(sealed)
+            .map_err(|e| Error::RustError(format!("serialize custody blob: {e}")))?;
+        let now = Self::now_ms().to_string();
+        self.sql().exec(
+            "INSERT INTO mpc_custody (agent_id, share_json, owner_identity, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?) \
+             ON CONFLICT(agent_id) DO UPDATE SET \
+               share_json = excluded.share_json, updated_at = excluded.updated_at, \
+               owner_identity = CASE WHEN excluded.owner_identity = '' \
+                 THEN mpc_custody.owner_identity ELSE excluded.owner_identity END",
+            vec![
+                agent_id.into(),
+                json.into(),
+                owner_identity.into(),
+                now.clone().into(),
+                now.into(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Read the custody blob's authorized owner identity, if recorded + non-empty.
+    pub fn get_custody_owner(&self, agent_id: &str) -> Result<Option<String>> {
+        #[derive(Deserialize)]
+        struct OwnerRow {
+            owner_identity: String,
+        }
+        let rows: Vec<OwnerRow> = self
+            .sql()
+            .exec(
+                "SELECT owner_identity FROM mpc_custody WHERE agent_id = ?",
+                vec![agent_id.into()],
+            )?
+            .to_array()?;
+        Ok(rows
+            .into_iter()
+            .next()
+            .map(|r| r.owner_identity)
+            .filter(|o| !o.is_empty()))
+    }
+
+    /// Retrieve the sealed custody blob for `agent_id`. `None` if never stored.
+    pub fn get_custody(&self, agent_id: &str) -> Result<Option<EncryptedShare>> {
+        let rows: Vec<ShareJsonRow> = self
+            .sql()
+            .exec(
+                "SELECT share_json FROM mpc_custody WHERE agent_id = ?",
+                vec![agent_id.into()],
+            )?
+            .to_array()?;
+        match rows.into_iter().next() {
+            Some(r) => {
+                let sealed: EncryptedShare = serde_json::from_str(&r.share_json)
+                    .map_err(|e| Error::RustError(format!("deserialize custody blob: {e}")))?;
+                Ok(Some(sealed))
+            }
+            None => Ok(None),
+        }
     }
 
     // ── BRC-31 auth sessions (#5 step 3 / §07.7) ─────────────────────────
