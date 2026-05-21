@@ -12,8 +12,8 @@
 - **#4 provisioning automation: COMPLETE + fully deployed.** Self-stocking loop
   (DKG→presig→ship→relay-sign) proven BSV-valid with the **deployed CF Container**
   (share_A) ↔ **deployed DO** (presig pool) ↔ proxy combiner. No trusted dealer.
-- **#7 correctness audit: logged**, 4 bugs found+fixed, finding #5 (pool
-  segregation) in progress.
+- **#7 correctness audit: logged**, 5 latent bugs fixed+proven; **finding #1
+  (service owner-authz) enforcement landed + proven in-process** (`455fc5c`).
 - **MPC-Spec: UNTOUCHED** (Path-A; verified clean tree). No canonical spec
   changes. (Spec-relevant *additions* assessed below.)
 
@@ -51,6 +51,31 @@
    `store_presignature` server-generates a collision-safe row id. **Worker
    redeployed `9f2075e1`.**
 
+### #7 finding #1 — service owner-authz (§07.6 / §08.1) — `455fc5c`
+The self-hosted `bsv-mpc-service` exposed `/dkg|/sign|/presign|/ecdh` with NO
+auth (any caller could load `share_A`). NOT fund-loss (2-of-2), but a real
+§07.6 + DoS + ECDH-partial-leak gap. **Enforcement landed + proven in-process:**
+- `bsv-mpc-service/src/auth.rs` (new) — axum port of the worker's BRC-31
+  verify + handshake, **wire-identical** to `bsv_mpc_core::brc31_client`
+  (`Brc31Client` talks to it unchanged). `AuthState` in `AppState`; dev mode
+  (no `MPC_SERVER_PRIVATE_KEY`) = `allow_unauthenticated` (existing flows
+  unaffected). Storage gains `store_share_with_owner` / `get_share_owner`
+  (empty-preserves). `/dkg/init` captures the caller → DKG-complete records
+  `owner_identity`; `/sign|/presign|/ecdh` verify + reject non-owner (403)
+  before touching share material. Proxy `run_dkg_over_http_authed` (authed DKG
+  driver) for enforced cosigners.
+- **Proof:** `service_owner_authz_e2e` (`SERVICE_AUTHZ_E2E=1`) — real
+  in-process ENFORCED service, authed DKG binds owner, `/ecdh` unauthed→401 /
+  stranger→403 / owner→200, sign+presign stranger→403. PASS (82s). No
+  regression: `dkg_over_http_local_e2e` PASS; 17 svc + 149 proxy lib tests.
+- **DEPLOYED enforcement = follow-on sub-gate** (NOT yet on the deployed
+  container): needs (a) proxy **multi-server BRC-31** — it holds ONE
+  `BridgeAuth` session with the DO (`kss_url`); `presign_raw`/`ecdh` hit the
+  container (`presign_url`) reusing it → would 401 against an enforced
+  container (DKG path already done); (b) redeploy container with
+  `MPC_SERVER_PRIVATE_KEY` + re-prove self-stocking. New code w/o the env key
+  = behavior-byte-identical (dev mode).
+
 **Regression proof (4+5):** `relay_sign_bench_e2e` (`RELAY_BENCH_E2E=1 BENCH_K=5`)
 — **5 SEQUENTIAL relay co-signs, all BSV-valid** (pre-fix, sign #2 died). Plus
 `sign_relay_authed_deployed_e2e` green on the segregated pool.
@@ -65,12 +90,17 @@ Worker DO `9f2075e1` (segregated pool + authed /sign-relay). CF Container
 `01e62ab4` (standard instance, self-stocking). Relay `rust-message-box`.
 
 ## In-flight / next steps (priority order)
+0. **#7 finding #1 DEPLOYED enforcement** (follow-on to `455fc5c`): proxy
+   multi-server BRC-31 (second `BridgeAuth` session vs `presign_url` for
+   presign + HD-key sign/ecdh; DKG already has `run_dkg_over_http_authed`),
+   then redeploy container with `MPC_SERVER_PRIVATE_KEY` + re-prove
+   self-stocking with auth enforced. Until then the deployed container is
+   dev-mode (byte-identical, unenforced).
 1. **#7 audit sweep — REMAINING classes** (highest-confidence "no hidden shit"):
    concurrency (two ceremonies on the same DO/pool/relay identity), leftover/
    orphaned state (failed ceremonies → stale presigs/coordinators/sessions; TTL/
-   cleanup), idempotency/replay beyond presig PK, owner-authz FULL coverage
-   (every funded-boundary route). Each finding → a regression test reproducing
-   the exposing condition.
+   cleanup — task #11), idempotency/replay beyond presig PK. Each finding → a
+   regression test reproducing the exposing condition.
 2. **Warm relay connection** — the ~2.3s → sub-100ms online-sign win (pool the
    BRC-103 session instead of a fresh handshake per sign).
 3. **Background Paillier prime pool** (#5 speed) — `core::paillier_pool` ready;
@@ -91,6 +121,8 @@ Worker DO `9f2075e1` (segregated pool + authed /sign-relay). CF Container
 - `provision_via_service_deployed_e2e` (`PROVISION_SVC_E2E=1`) — #4c.
 - `dkg_over_http_local_e2e` (`DKG_HTTP_E2E=1`) — #4d distributed DKG.
 - `sign_relay_authed_deployed_e2e` (`SIGN_RELAY_AUTHED_E2E=1`) — authed relay.
+- `service_owner_authz_e2e` (`SERVICE_AUTHZ_E2E=1`) — #7 finding #1; in-process
+  ENFORCED service, authed DKG → owner-gate (unauthed 401 / stranger 403 / owner 200).
 - `relay_sign_bench_e2e` (`RELAY_BENCH_E2E=1`, `BENCH_K=5`) — latency.
 - `i5_real_sats_deployed_e2e` / `relay_combine_deployed_e2e` — earlier gates.
 
