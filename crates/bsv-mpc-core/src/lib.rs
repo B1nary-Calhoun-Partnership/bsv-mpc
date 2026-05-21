@@ -47,6 +47,7 @@
 
 pub mod brc31_client;
 pub mod canonical;
+pub mod custody;
 pub mod dkg;
 pub mod ecdh;
 pub mod envelope;
