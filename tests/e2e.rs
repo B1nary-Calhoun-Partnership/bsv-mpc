@@ -305,6 +305,7 @@ async fn setup() -> TestEnv {
         data_dir: "/tmp/e2e-kss".to_string(),
         storage: RwLock::new(kss_storage),
         started_at: chrono::Utc::now(),
+        provision: None,
     });
 
     let kss_router = bsv_mpc_service::build_router(kss_state);

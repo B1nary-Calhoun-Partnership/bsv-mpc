@@ -318,6 +318,7 @@ dependencies = [
  "base64 0.22.1",
  "bsv-mpc-core",
  "bsv-mpc-messagebox",
+ "bsv-mpc-service",
  "bsv-rs",
  "cggmp24",
  "chrono",

@@ -6,6 +6,7 @@
 pub mod dkg_handler;
 pub mod handlers;
 pub mod messagebox;
+pub mod provision;
 pub mod signing_handler;
 pub mod storage;
 
@@ -21,6 +22,18 @@ use std::sync::RwLock;
 
 pub use storage::SqliteShareStorage;
 
+/// Optional presignature-provisioning config (#4): when set, the service ships
+/// each generated `Presignature_A` to the cosigner DO's pool over the authed
+/// `/ceremony/ingest-presig` route, making the deployed cosigner self-stocking.
+pub struct ProvisionConfig {
+    /// Base URL of the cosigner DO worker (e.g. `https://…workers.dev`).
+    pub worker_url: String,
+    /// The service's BRC-31 session to the worker (lazy handshake, cached).
+    pub auth: tokio::sync::Mutex<bsv_mpc_core::brc31_client::Brc31Client>,
+    /// HTTP client for outbound provisioning requests.
+    pub http: reqwest::Client,
+}
+
 /// Shared application state, accessible from all request handlers.
 pub struct AppState {
     /// Path to the data directory where the SQLite database lives.
@@ -29,6 +42,8 @@ pub struct AppState {
     pub storage: RwLock<SqliteShareStorage>,
     /// Server start time for uptime reporting.
     pub started_at: chrono::DateTime<chrono::Utc>,
+    /// Presignature provisioning to the cosigner DO (`None` = disabled).
+    pub provision: Option<ProvisionConfig>,
 }
 
 /// Build the Axum router with all KSS endpoints.

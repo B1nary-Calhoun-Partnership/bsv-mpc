@@ -602,8 +602,14 @@ pub async fn handle_presign_init(
 }
 
 /// `POST /presign/round` — Process a presigning round.
+///
+/// On completion, if provisioning is configured (#4), this party's freshly
+/// generated `Presignature_A` is shipped to the cosigner DO pool **before** the
+/// `complete: true` response is returned — so the proxy never adds its
+/// correlated `box_B` without the DO already holding `Presignature_A` (FIFO
+/// lockstep, fail-closed).
 pub async fn handle_presign_round(
-    State(_state): State<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
     Json(body): Json<PresignRoundRequest>,
 ) -> impl IntoResponse {
     let result = {
@@ -642,9 +648,54 @@ pub async fn handle_presign_round(
             ),
         ),
         PresigningRoundResult::Complete => {
-            if let Ok(mut store) = COORDINATOR_STORE.lock() {
+            // Extract this party's Presignature_A (drop the std lock before any
+            // await), then remove the spent session.
+            let extracted = {
+                let mut store = match COORDINATOR_STORE.lock() {
+                    Ok(s) => s,
+                    Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e),
+                };
+                let taken = store
+                    .presigning
+                    .get_mut(&body.presign_session_id)
+                    .and_then(|m| m.take_raw());
                 store.presigning.remove(&body.presign_session_id);
+                taken
+            };
+
+            // Provision to the cosigner DO (only when configured).
+            if let Some(prov) = &state.provision {
+                let (meta, raw) = match extracted {
+                    Some(pair) => pair,
+                    None => {
+                        return err_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "presigning completed but no presignature to provision".to_string(),
+                        )
+                    }
+                };
+                let presig_json = match bsv_mpc_core::presigning::serialize_party_presignature(raw)
+                {
+                    Ok(j) => j,
+                    Err(e) => {
+                        return err_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("serialize Presignature_A: {e}"),
+                        )
+                    }
+                };
+                if let Err(e) = prov
+                    .ship_presignature(&presig_json, &meta.session_id.hex(), &meta.id)
+                    .await
+                {
+                    return err_response(
+                        StatusCode::BAD_GATEWAY,
+                        format!("provision Presignature_A to DO failed: {e}"),
+                    );
+                }
+                tracing::info!(presig_id = %meta.id, "provisioned Presignature_A to cosigner DO");
             }
+
             (
                 StatusCode::OK,
                 Json(

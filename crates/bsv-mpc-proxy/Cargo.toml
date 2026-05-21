@@ -31,3 +31,6 @@ anyhow.workspace = true
 # #12 relay-combiner deployed e2e: generate a real DKG + correlated presig pair
 # (bsv-mpc-core public API) and serialize Presignature_A (needs the cggmp24 type).
 cggmp24.workspace = true
+# #4 provisioning e2e: exercise the native cosigner/container's
+# ProvisionConfig::ship_presignature path (ships Presignature_A to the DO).
+bsv-mpc-service = { path = "../bsv-mpc-service" }
