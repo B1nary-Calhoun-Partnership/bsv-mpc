@@ -269,9 +269,22 @@ end-to-end on real Cloudflare + real mainnet.
     **auto-ships** `Presignature_A` to the **deployed** DO pool) → proxy triggers
     the authed `/sign-relay` → DO consumes the self-provisioned presig → proxy
     combines → **BSV-valid 2-of-2**. Nothing hand-stitched.
-  - **REMAINING 4e:** CF-Container redeploy of `bsv-mpc-service` with the
-    shipping logic (`1cbf4e8` bakes `MPC_WORKER_URL`, ephemeral auth) + run the
-    loop entirely on deployed infra; real-sats `createAction` capstone.
+  - ✅ **4e DONE** `32889f7` — **FULLY-DEPLOYED self-stocking loop**: proxy ↔
+    DEPLOYED CF Container (`bsv-mpc-service`, **standard** instance — `lite`/`dev`
+    OOMs on inline Paillier prime-gen) runs distributed DKG + presig over HTTP;
+    the container AUTO-SHIPS `Presignature_A` to the deployed DO; proxy
+    sign-relays → **BSV-valid 2-of-2** (joint `03b29053…`, 402s, no sats, no
+    trusted dealer, no hand-stitching). `DEPLOYED_CONTAINER_URL` toggle on
+    `self_stocking_loop_e2e`; DKG timeout `MPC_DKG_TIMEOUT_SECS` (default 600).
+    **#4 provisioning automation COMPLETE.**
+
+  **Only #6 item left:** retire the legacy HTTP `bridge.rs::sign` path (OQ-I1)
+  once relay-mode is the default. Optional cherry: a real-sats `createAction`
+  driven entirely from a self-stocked (deployed-container-provisioned) pool — the
+  #6 createAction→mainnet gate is already met (`6085f497…`).
+  **Future hardening (#5):** deployed DKG/presig do inline prime-gen (slow on
+  constrained vCPU); a background Paillier-prime pool (core `paillier_pool`
+  exists) would make the deployed ceremony fast field-math.
   Native Container (`bsv-mpc-service`, holds share_A, has `/presign/*`) runs
   presig gen with the proxy (`bridge.presign_raw()` targets the **container** in
   relay mode → proxy pool gets box_B), then ships its `Presignature_A` to the DO
