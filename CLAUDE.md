@@ -101,7 +101,7 @@ BRC-100 compatible signing proxy. Drop-in replacement for bsv-wallet-cli at loca
 Cloudflare Worker Key Share Service (Rust -> WASM). Holds share_A.
 - `lib.rs` — CF Worker router with all 8 endpoints.
 - `api.rs` — All 8 handlers call bsv-mpc-core coordinators (DKG, signing, presigning, ECDH). 12 request/response types.
-- `storage.rs` — ShareStorage struct + ShareMetadata. **In-memory** (global `Mutex<InnerStorage>` of HashMap/VecDeque) for dev/test — lost on Worker restart. DO SQLite persistence is a Phase I deliverable (#4) and a **fund-safety gate**: no deployed worker may hold a funded `share_A` on in-memory storage (ephemeral keys = lost funds).
+- `storage.rs` — static `ShareStorage` (HashMap/VecDeque) for dev/test only. The **deployed** worker uses `do_storage.rs` (durable DO-SQLite, #4 CLOSED) for shares, presig pool, auth sessions, and #9 KEK-sealed custody — all survive Worker restart. (Ephemeral-compute cosigners MUST persist `share_A` durably; MPC-Spec §16.6.4.)
 - `auth.rs` — BRC-31 Authrite implementation including `verify_agent_authorization()`.
 
 #### bsv-mpc-service (~1.2K LOC, 5 files)
@@ -224,8 +224,10 @@ All 16 POCs PASSED. POCs 1-15 ran in M0 (Mar 2026) and de-risked the cryptograph
 | KSS handlers (worker + service) | **Complete** | All protocol handlers call bsv-mpc-core coordinators |
 | BRC-31 auth (worker) | **Complete** | Authrite implementation in auth.rs |
 | CHIP tokens + discovery | **Complete** | chip.rs + discovery.rs |
-| KSS storage (worker) | **In-memory (dev)** | HashMap/VecDeque behind a global Mutex; lost on Worker restart. DO SQLite persistence = Phase I (#4) fund-safety gate. |
-| KSS storage (service) | **In-memory** | HashMap/VecDeque working. SQLite not yet wired. |
+| KSS storage (worker) | **DO SQLite (deployed)** | `do_storage.rs` durable DO-SQLite is the deployed path (#4 CLOSED): shares (+owner_identity §08.1), presig pool, auth sessions, and #9 KEK-sealed custody all persist across restarts. The static in-mem store is dev/test only. |
+| KSS storage (service) | **In-memory + durable custody** | HashMap for shares/presigs (ephemeral); `share_A` persisted KEK-sealed to the worker DO via #9 durable custody (recovered on restart → no fund-lock). Local SQLite not yet wired. |
+| BRC-31 owner-authz (§07.6/§08.1) | **Complete + deployed** | Worker + service + deployed container enforce owner-authz on funded-boundary routes; deploy smoke-test guards it. |
+| Durable share custody (#9) | **Complete + deployed** | KEK-sealed `share_A` on the DO via authed `/custody/{put,get}-share`; fail-closed at DKG; lazy recover on restart. |
 | Overlay proof publication | **TODO** | publish_proof, query_proofs, count_proofs_by_node |
 
 ## Key Dependencies
@@ -256,7 +258,7 @@ All 16 POCs PASSED. POCs 1-15 ran in M0 (Mar 2026) and de-risked the cryptograph
 - **Share encryption**: BRC-42 HMAC-SHA256 key derivation to AES-256-GCM. Protocol ID: `[2, "mpc share"]`, key_id: session_id, counterparty: `"self"`.
 - **Protocol messages**: JSON over HTTP (proxy to KSS). Format: `{ session_id, round, from, to, payload }`.
 - **WASM target**: bsv-mpc-worker targets `wasm32-unknown-unknown`. Must use `getrandom/js` for entropy.
-- **BSV SDK**: Published crate `bsv-rs 0.3.0` from crates.io, patched to local `../bsv-rs` for development. Features: `["transaction", "wallet"]`.
+- **BSV SDK**: Published crate `bsv-rs 0.3.11` from crates.io, patched to local `../bsv-rs` for development. Features: `["transaction", "wallet"]`.
 - **Config**: All via `MPC_*` environment variables (see proxy `config.rs`).
 - **License**: MIT OR Apache-2.0 (workspace-level). deny.toml enforces copyleft=deny.
 - **Rust edition**: 2021, minimum 1.85.
@@ -352,7 +354,7 @@ See [DECISIONS.md](DECISIONS.md) for the full Architectural Decision Log (16 ADR
 - **Fee via multisig (Level 2)**: MPC nodes self-settle. Upgrade to sCrypt covenant (Level 3) for trustless enforcement.
 - **Overlay topic `tm_mpc_signing`**: Uses existing SHIP/SLAP infrastructure.
 - **Runar for covenants**: Rust-native BSV Script compiler instead of sCrypt TypeScript.
-- **BSV SDK from crates.io**: Primary dependency is `bsv-rs 0.3.0` from crates.io, with local path override for development.
+- **BSV SDK from crates.io**: Primary dependency is `bsv-rs 0.3.11` from crates.io, with local path override for development.
 
 ## Open Questions
 

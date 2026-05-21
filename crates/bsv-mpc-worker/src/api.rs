@@ -451,7 +451,8 @@ pub async fn handle_dkg_init(mut req: Request) -> Result<Response> {
 /// 4. If more rounds remain: bundle outgoing messages and return.
 /// 5. If DKG is complete: store the encrypted share, clean up, return joint public key.
 pub async fn handle_dkg_round(mut req: Request, store: &dyn MpcStore) -> Result<Response> {
-    // TODO: Verify BRC-31 auth
+    // BRC-31 is verified at the DO entrypoint (poc.rs `is_authed_path`) before
+    // dispatch — the DO is only reachable via that gate (§07.5/§07.6).
     let body: DkgRoundRequest = req.json().await?;
 
     // Unbundle the incoming message
@@ -598,7 +599,8 @@ pub async fn handle_sign_init(mut req: Request, store: &dyn MpcStore) -> Result<
 /// 4. If more rounds remain: return the next round's messages.
 /// 5. If signing is complete: clean up, return the ECDSA signature.
 pub async fn handle_sign_round(mut req: Request) -> Result<Response> {
-    // TODO: Verify BRC-31 auth
+    // BRC-31 is verified at the DO entrypoint (poc.rs `is_authed_path`) before
+    // dispatch — the DO is only reachable via that gate (§07.5/§07.6).
     let body: SignRoundRequest = req.json().await?;
 
     let incoming = unbundle_incoming_message(&body.round_message).map_err(Error::from)?;
@@ -721,7 +723,8 @@ pub async fn handle_presign_init(mut req: Request, store: &dyn MpcStore) -> Resu
 /// 4. If more rounds remain: return the next round's messages.
 /// 5. If complete: the presignature is added to the manager's pool. Clean up.
 pub async fn handle_presign_round(mut req: Request) -> Result<Response> {
-    // TODO: Verify BRC-31 auth
+    // BRC-31 is verified at the DO entrypoint (poc.rs `is_authed_path`) before
+    // dispatch — the DO is only reachable via that gate (§07.5/§07.6).
     let body: PresignRoundRequest = req.json().await?;
 
     let result = {
@@ -845,7 +848,8 @@ pub async fn handle_health(store: &dyn MpcStore) -> Result<Response> {
 /// Returns session ID, share index, threshold config, timestamps, and
 /// presignature count. Never exposes the encrypted share data itself.
 pub async fn handle_get_share_metadata(agent_id: &str, store: &dyn MpcStore) -> Result<Response> {
-    // TODO: Verify BRC-31 auth and check requester == agent_id
+    // BRC-31 verified at the DO entrypoint (`is_authed_path`); metadata is
+    // non-secret (no share material), so no per-owner gate here.
     match store.get_share_metadata(agent_id).map_err(Error::from)? {
         Some(metadata) => Response::from_json(&metadata),
         None => Response::error(format!("No share found for agent: {agent_id}"), 404),
