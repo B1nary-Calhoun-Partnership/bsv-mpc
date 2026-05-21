@@ -70,7 +70,7 @@ Core MPC protocol layer wrapping cggmp24 for threshold ECDSA on secp256k1. **All
 - `envelope.rs` — Canonical signed envelope (Phase A) — encode_strict / decode_strict, BRC-31 outer-auth wrapper.
 - `types.rs` — All 10 core types: SessionId, ShareIndex, ThresholdConfig, JointPublicKey, EncryptedShare, Presignature, ParticipationProof, RoundMessage, DkgResult, SigningResult.
 - `error.rs` — MpcError enum + From impls.
-- **`unsafe impl Send` shield** on `DkgCoordinator`/`SigningCoordinator`/`PresigningManager` (G-4e `a9a7e18`) — safe under documented serialization invariant; structural `SendShield<T>` wrapper deferred to Phase I deployment audit per `docs/PHASE-G-AUDIT.md` §2.5.
+- **`unsafe impl Send` shield** on `DkgCoordinator`/`SigningCoordinator`/`PresigningManager` (G-4e `a9a7e18`) — safe under documented serialization invariant; structural `SendShield<T>` wrapper deferred to Phase I deployment audit per `docs/archive/PHASE-G-AUDIT.md` §2.5.
 
 #### bsv-mpc-messagebox (~2.9K LOC, 8 files)
 Native Rust MessageBox transport client (Phase A-F). Conforms to the canonical TS `@bsv/message-box-client` v2.0.7 spec at `~/bsv/message-box-client/src/MessageBoxClient.ts` — implementation conforms to the canonical TS, never the inverse (Path A, per [`feedback_canonical_ts_immutable`]). Uses native `tokio-tungstenite` for WebSocket subscribe; not yet wasm32-compatible (Phase H will produce a CF-Worker-compatible parallel client crate).

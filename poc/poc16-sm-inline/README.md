@@ -1,6 +1,6 @@
 # POC 16 — Phase G inline state-machine drive + Paillier safe-prime pool
 
-> Empirical validation of `docs/PHASE-G-AUDIT.md` § 2 (inline SM rewrite)
+> Empirical validation of `docs/archive/PHASE-G-AUDIT.md` § 2 (inline SM rewrite)
 > and § 3 (Paillier safe-prime pool per MPC-Spec §06.10.1 / ADR-0041).
 > First POC commit of Phase G; lands on `main` BEFORE the implementation
 > commits (G-4) begin.
@@ -70,7 +70,7 @@ Empirical findings from this POC that informed the audit doc:
 - `src/main.rs` — runs all four runtime gates with timings.
 - `tests/poc.rs` — `#[test]` versions + the static grep check.
 
-## Design decisions inherited from `docs/PHASE-G-AUDIT.md`
+## Design decisions inherited from `docs/archive/PHASE-G-AUDIT.md`
 
 Per the audit doc's locked decisions (no re-litigation in this POC):
 
@@ -111,8 +111,8 @@ Per the audit doc's locked decisions (no re-litigation in this POC):
 
 ## References
 
-- `docs/PHASE-G-AUDIT.md` — design doc this POC validates
-- `docs/NEXT-STEPS.md` — phased v1.0 cosigner plan (5-step workflow)
+- `docs/archive/PHASE-G-AUDIT.md` — design doc this POC validates
+- `docs/archive/NEXT-STEPS.md` — phased v1.0 cosigner plan (5-step workflow)
 - `MPC-Spec/06-transport.md` §06.10.1 — Paillier safe-prime pool spec
 - `MPC-Spec/decisions/0041-network-profile-latency-budgets.md` — ADR
 - `crates/bsv-mpc-core/src/dkg.rs:759-908` — the SM thread bridge being
