@@ -350,9 +350,13 @@ pub async fn handle_dkg_round(
             )
         }
         DkgRoundResult::Complete(dkg_result) => {
-            // Store share
+            // Store share_A keyed by the JOINT KEY (agent_id) — the stable
+            // identifier that /presign/init and /sign/init look it up by
+            // (matches the worker DO's keying). Keying by session_id.hex() would
+            // make the share unfindable for the subsequent presign ceremony.
+            let agent_id = hex::encode(&dkg_result.joint_key.compressed);
             if let Ok(mut storage) = state.storage.write() {
-                let _ = storage.store_share(&dkg_result.session_id.hex(), &dkg_result.share);
+                let _ = storage.store_share(&agent_id, &dkg_result.share);
             }
             // Clean up coordinator
             if let Ok(mut store) = COORDINATOR_STORE.lock() {

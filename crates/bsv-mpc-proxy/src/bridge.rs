@@ -170,6 +170,41 @@ struct EcdhResponse {
     partial: String,
 }
 
+/// Request body for `POST /dkg/init` (matches `bsv-mpc-service`).
+#[derive(Serialize, Deserialize, Debug)]
+struct DkgInitRequest {
+    agent_id: String,
+    config: ThresholdConfig,
+    label: Option<String>,
+}
+
+/// Response from `POST /dkg/init`.
+#[derive(Serialize, Deserialize, Debug)]
+struct DkgInitResponse {
+    session_id: String,
+    round_message: RoundMessage,
+    #[allow(dead_code)]
+    total_rounds: u8,
+}
+
+/// Request body for `POST /dkg/round`.
+#[derive(Serialize, Deserialize, Debug)]
+struct DkgRoundRequest {
+    session_id: String,
+    round_message: RoundMessage,
+}
+
+/// Response from `POST /dkg/round`.
+#[derive(Serialize, Deserialize, Debug)]
+struct DkgRoundResponse {
+    #[allow(dead_code)]
+    session_id: String,
+    round_message: Option<RoundMessage>,
+    complete: bool,
+    #[allow(dead_code)]
+    joint_pubkey: Option<JointPublicKey>,
+}
+
 // ============================================================================
 // Hex utilities
 // ============================================================================
@@ -420,6 +455,117 @@ fn bundle_messages(messages: &[RoundMessage]) -> std::result::Result<RoundMessag
         to: None,
         payload: bundled_payload,
     })
+}
+
+// ============================================================================
+// DKG over HTTP (proxy = party 1, holds share_B)
+// ============================================================================
+
+/// POST a JSON body to an (unauthenticated) KSS endpoint and deserialize the
+/// response. Used by [`run_dkg_over_http`]; the heavy-compute cosigner
+/// (`bsv-mpc-service` / CF Container) does not BRC-31-gate `/dkg/*` (the funded
+/// signing boundary is the DO's `/sign-relay`, which IS gated).
+fn http_post_json<Req: Serialize, Resp: serde::de::DeserializeOwned>(
+    handle: &tokio::runtime::Handle,
+    client: &reqwest::Client,
+    url: &str,
+    body: &Req,
+) -> std::result::Result<Resp, MpcError> {
+    handle.block_on(async {
+        let resp = client
+            .post(url)
+            .json(body)
+            .send()
+            .await
+            .map_err(|e| MpcError::Protocol(format!("DKG request to {url} failed: {e}")))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body_text = resp.text().await.unwrap_or_default();
+            return Err(MpcError::Dkg(format!(
+                "KSS returned {status} from {url}: {body_text}"
+            )));
+        }
+        resp.json::<Resp>()
+            .await
+            .map_err(|e| MpcError::Protocol(format!("DKG response parse error from {url}: {e}")))
+    })
+}
+
+/// Run a 2-party CGGMP'24 DKG against a remote heavy-compute cosigner (party 0,
+/// `bsv-mpc-service` / CF Container) over HTTP, as **party 1** — producing this
+/// proxy's `share_B` + the joint key. This is real distributed DKG (no trusted
+/// dealer): neither party ever holds the other's share.
+///
+/// The cosigner stores `share_A` keyed by the joint pubkey on completion; the
+/// returned [`DkgResult`] is the proxy's `share_B`, which the caller persists to
+/// the proxy's share file. Paillier primes are generated inline natively on both
+/// sides (DKG is the heavy off-hot-path ceremony — ADR-018).
+pub async fn run_dkg_over_http(
+    kss_url: &str,
+    config: ThresholdConfig,
+) -> bsv_mpc_core::error::Result<DkgResult> {
+    use bsv_mpc_core::dkg::{DkgCoordinator, DkgRoundResult};
+
+    let kss_url = kss_url.to_string();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(180))
+        .build()
+        .map_err(|e| MpcError::Protocol(format!("failed to create HTTP client: {e}")))?;
+    let handle = tokio::runtime::Handle::current();
+
+    tokio::task::spawn_blocking(move || {
+        // Start the cosigner's DKG session FIRST (party 0). The cosigner picks
+        // the session id; the proxy MUST adopt it so both derive the SAME
+        // canonical cggmp24 ExecutionId (eid = f(session_id)) — a mismatch makes
+        // keygen fail to complete.
+        let init_resp: DkgInitResponse = http_post_json(
+            &handle,
+            &client,
+            &format!("{kss_url}/dkg/init"),
+            &DkgInitRequest {
+                agent_id: String::new(),
+                config,
+                label: Some("proxy-dkg-over-http".into()),
+            },
+        )?;
+        let session_id = SessionId::from_str_hash(&init_resp.session_id);
+
+        let mut dkg = DkgCoordinator::new(session_id, config, ShareIndex(1));
+        let proxy_r1 = dkg.init()?;
+
+        let round_url = format!("{kss_url}/dkg/round");
+        let mut kss_msg = init_resp.round_message;
+        let mut proxy_bundle = bundle_messages(&proxy_r1)?;
+
+        loop {
+            let round_resp: DkgRoundResponse = http_post_json(
+                &handle,
+                &client,
+                &round_url,
+                &DkgRoundRequest {
+                    session_id: init_resp.session_id.clone(),
+                    round_message: proxy_bundle,
+                },
+            )?;
+
+            match dkg.process_round(vec![kss_msg])? {
+                DkgRoundResult::NextRound(next) => {
+                    if round_resp.complete {
+                        return Err(MpcError::Dkg(
+                            "cosigner completed DKG but proxy has more rounds".into(),
+                        ));
+                    }
+                    kss_msg = round_resp.round_message.ok_or_else(|| {
+                        MpcError::Dkg("cosigner returned no message but DKG not complete".into())
+                    })?;
+                    proxy_bundle = bundle_messages(&next)?;
+                }
+                DkgRoundResult::Complete(result) => return Ok(result),
+            }
+        }
+    })
+    .await
+    .map_err(|e| MpcError::Dkg(format!("DKG task panicked: {e}")))?
 }
 
 // ============================================================================
