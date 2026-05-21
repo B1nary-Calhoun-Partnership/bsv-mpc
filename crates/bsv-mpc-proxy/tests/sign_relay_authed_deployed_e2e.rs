@@ -159,6 +159,7 @@ fn proxy_config(
         min_balance_sats: None,
         relay_url: relay_url.to_string(),
         relay_sign,
+        presign_url: None,
     }
 }
 

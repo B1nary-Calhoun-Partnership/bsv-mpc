@@ -344,6 +344,7 @@ async fn setup() -> TestEnv {
         min_balance_sats: None,
         relay_url: "https://rust-message-box.dev-a3e.workers.dev".into(),
         relay_sign: false,
+        presign_url: None,
     };
 
     tokio::spawn(async move {

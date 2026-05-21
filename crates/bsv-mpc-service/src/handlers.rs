@@ -579,7 +579,12 @@ pub async fn handle_presign_init(
         Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e),
     };
 
-    let session_id = SessionId::from_str_hash(&body.session_id);
+    // The proxy sends the canonical session_id as hex; reconstruct the SAME
+    // SessionId (NOT from_str_hash, which would re-hash the hex and yield a
+    // different cggmp24 ExecutionId → presig fails to complete). Fall back to
+    // from_str_hash for any non-hex caller.
+    let session_id = SessionId::from_hex(&body.session_id)
+        .unwrap_or_else(|_| SessionId::from_str_hash(&body.session_id));
     let participants: Vec<u16> = (0..share.config.parties).collect();
     let mut manager = PresigningManager::new(session_id, share, participants, body.count as usize);
 

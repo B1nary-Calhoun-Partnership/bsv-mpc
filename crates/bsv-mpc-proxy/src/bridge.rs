@@ -623,6 +623,10 @@ pub struct MpcBridge {
 
     /// MessageBox relay URL for the ADR-018 relay sign path (#12).
     relay_url: String,
+
+    /// Heavy-compute cosigner URL for DKG + presig ceremonies (ADR-018). Defaults
+    /// to `kss_url` when `MPC_PRESIGN_URL` is unset.
+    presign_url: String,
 }
 
 impl MpcBridge {
@@ -781,6 +785,10 @@ impl MpcBridge {
             agent_id,
             auth: Arc::new(Mutex::new(bridge_auth)),
             relay_url: config.relay_url.clone(),
+            presign_url: config
+                .presign_url
+                .clone()
+                .unwrap_or_else(|| config.kss_url.clone()),
         })
     }
 
@@ -932,7 +940,9 @@ impl MpcBridge {
         let share = self.share.clone();
         let session_id = self.session_id;
         let participants = self.participants.clone();
-        let kss_url = self.kss_url.clone();
+        // ADR-018: presig runs against the heavy-compute cosigner (container),
+        // not the wasm DO. Falls back to kss_url when MPC_PRESIGN_URL is unset.
+        let kss_url = self.presign_url.clone();
         let client = self.client.clone();
         let agent_id = self.agent_id.clone();
         let auth = self.auth.clone();
@@ -1401,6 +1411,7 @@ impl MpcBridge {
             agent_id,
             auth: Arc::new(Mutex::new(BridgeAuth::new().expect("test auth key"))),
             relay_url: "https://rust-message-box.dev-a3e.workers.dev".into(),
+            presign_url: "http://localhost:9999".into(),
         }
     }
 }
@@ -1573,6 +1584,7 @@ mod tests {
             min_balance_sats: None,
             relay_url: "https://rust-message-box.dev-a3e.workers.dev".into(),
             relay_sign: false,
+            presign_url: None,
         };
 
         let bridge = MpcBridge::new(&config).await.unwrap();
@@ -1605,6 +1617,7 @@ mod tests {
             min_balance_sats: None,
             relay_url: "https://rust-message-box.dev-a3e.workers.dev".into(),
             relay_sign: false,
+            presign_url: None,
         };
 
         let result = MpcBridge::new(&config).await;
@@ -1655,6 +1668,7 @@ mod tests {
             min_balance_sats: None,
             relay_url: "https://rust-message-box.dev-a3e.workers.dev".into(),
             relay_sign: false,
+            presign_url: None,
         };
 
         let bridge = MpcBridge::new(&config).await.unwrap();

@@ -195,6 +195,7 @@ async fn service_provisions_do_pool_proxy_combines() {
         min_balance_sats: None,
         relay_url,
         relay_sign: true,
+        presign_url: None,
     };
     let bridge = MpcBridge::new(&config).await.expect("bridge handshake");
 

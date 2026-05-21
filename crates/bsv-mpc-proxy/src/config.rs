@@ -110,6 +110,13 @@ pub struct ProxyConfig {
     /// stocked with correlated pairs; flipped on once relay-mode is the default
     /// and the HTTP path is retired (OQ-I1). Env: `MPC_RELAY_SIGN=1`.
     pub relay_sign: bool,
+
+    /// URL of the **heavy-compute cosigner** (`bsv-mpc-service` / CF Container,
+    /// holds `share_A`) used for the off-hot-path DKG + presignature ceremonies.
+    /// ADR-018 splits compute: presig/DKG run against this native cosigner while
+    /// online signing runs against the wasm DO (`kss_url`) over the relay. `None`
+    /// → fall back to `kss_url` (single-endpoint dev). Env: `MPC_PRESIGN_URL`.
+    pub presign_url: Option<String>,
 }
 
 impl ProxyConfig {
@@ -170,6 +177,8 @@ impl ProxyConfig {
                 .unwrap_or_else(|_| "https://rust-message-box.dev-a3e.workers.dev".into()),
 
             relay_sign: std::env::var("MPC_RELAY_SIGN").as_deref() == Ok("1"),
+
+            presign_url: std::env::var("MPC_PRESIGN_URL").ok(),
         })
     }
 }

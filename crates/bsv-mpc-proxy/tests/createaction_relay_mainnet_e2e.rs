@@ -245,6 +245,7 @@ To run (BURNS REAL SATS): E2E_MAINNET=1 cargo test -p bsv-mpc-proxy \\
         min_balance_sats: None,
         relay_url: relay_url.clone(),
         relay_sign: true,
+        presign_url: None,
     };
     let bridge = MpcBridge::new(&config).await.expect("bridge handshake");
 
