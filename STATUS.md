@@ -1,80 +1,90 @@
 # bsv-mpc — Project Status
 
 > What's done, what's open, what's next.
-> Updated: 2026-05-19
+> Updated: 2026-05-21
 
-This file is the short / scannable view. The full, authoritative
-trackers are:
+This file is the short / scannable view. The **authoritative trackers** are:
 
-- [**docs/NEXT-STEPS.md**](docs/NEXT-STEPS.md) — live phase plan (G/H/I/J/K)
-- [**docs/PHASE-G-AUDIT.md**](docs/PHASE-G-AUDIT.md) — Phase G design + merge-gate check-off
-- [**bsv-mpc#2**](https://github.com/B1nary-Calhoun-Partnership/bsv-mpc/issues/2) — v1.0 CF-native cosigner umbrella issue
-- [**MPC-Spec#36**](https://github.com/B1nary-Calhoun-Partnership/MPC-Spec/issues/36) — joint cross-stack mainnet TX (Phase K closing)
-- [**LESSONS.md**](LESSONS.md) — POC + implementation findings
+- [**docs/SESSION-PROGRESS-2026-05-21.md**](docs/SESSION-PROGRESS-2026-05-21.md) — full ledger: commits, deployed versions, bugs found+fixed, latency.
+- [**docs/HANDOFF-2026-05-21-CONTINUATION.md**](docs/HANDOFF-2026-05-21-CONTINUATION.md) — next-session plan (Calhoun-solo, non-blocked work).
+- [**LESSONS.md**](LESSONS.md) — POC + implementation findings.
+- GitHub `B1nary-Calhoun-Partnership/bsv-mpc` issues (see open-issues table below).
+
+Older phase docs (Phase A–H) are archived in [`docs/archive/`](docs/archive/).
 
 ---
 
-## Phase tracker
+## Where the project is
 
-| Phase | Scope | State | On-chain / CI artifact |
+The CF-native 2-of-2 cosigner is **built, deployed, and mainnet-proven**. A
+canonical BRC-100 `CreateActionArgs` flows proxy → deployed cosigner over an
+authed relay and lands a **real-sats mainnet TX**
+([`6085f497…`](https://whatsonchain.com/tx/6085f497bead622daac769f73c471f5adc26bb1b2334a22140664feb51f3f23b)).
+Self-stocking provisioning (DKG → presig → ship → relay-sign) runs end-to-end
+against deployed infra with no trusted dealer, and KEK-sealed durable share
+custody survives cosigner restart. MPC-Spec is canonical (Path-A); `main` is
+green at every commit (fmt, clippy `-D warnings`, native test, wasm32 build).
+
+### Deployed infra (Calhoun dev-a3e CF account)
+
+| Component | URL | Version | Notes |
 |---|---|---|---|
-| A–F | canonical envelopes + MessageBox wire + DKG via MB + Sign via MB | **CLOSED** | Phase E mainnet TXID [`82ccb15c…`](https://whatsonchain.com/tx/82ccb15c49985a32b355a618f417bb7a09ec4ee5cf34e539e9baaebb74dadc29) |
-| G | inline SM coordinator rewrite + Paillier safe-prime pool | **CLOSED 2026-05-19** | Mainnet TXID [`442bd391…`](https://whatsonchain.com/tx/442bd391cf8eda299f82dc1e4aeb1a9cb4f33610365d44c9c1c0e55d32f171b9) (G-5d) + wasm32 `tests/wasm32_dkg.rs` green (G-5b). Merge-gate commit `d9b1b27`. |
-| H | Socket.IO + BRC-103 wasm32 client + native unification + `bsv-rs` upstream `SocketIoTransport` | **STEPS 1-4 DONE**; Step 5 (real-sats) next | `bsv-rs 0.3.10` published with upstream `SocketIoTransport`; native unification on `subscribe.rs` (Socket.IO + BRC-103, raw `/ws` deleted); all `live_relay_proof` (4) + `bsv-mpc-service` e2e green; poc17 graduated (deleted H-4.6). Step 5 = fresh native real-sats mainnet TXID (G-5d shape `442bd391…`). |
-| I | wire G + H into deployed `bsv-mpc-worker` CF cosigner | blocked on H | — |
-| J | CHIP + `/capabilities` + `/health.json` (MPC-Spec §12 + §16) | blocked on I | — |
-| K | cross-stack joint mainnet TX (closes MPC-Spec #36) | blocked on J + Quaakee's rust-mpc deploy | — |
+| Worker (DO) | `bsv-mpc-kss.dev-a3e.workers.dev` | `ff080f61` | authed `/sign-relay`, orphan-cleanup, `/custody/{put,get}-share`, presig pool, DO-SQLite |
+| Container (cosigner, share_A) | `bsv-mpc-service-container.dev-a3e.workers.dev` | `89e52beb` (`standard-1`) | BRC-31 ENFORCED + #9 durable custody auto-enabled |
+| Relay | `rust-message-box.dev-a3e.workers.dev` | — | MessageBox / Socket.IO + BRC-103 |
+
+After **any** deploy, run the smoke-test:
+`DEPLOY_SMOKE=1 cargo test -p bsv-mpc-proxy --test deploy_smoke_e2e --release`
+(asserts deployed health + unauthed→401 on funded-boundary/custody routes).
 
 ---
 
-## POC validation (historical)
+## Issue tracker (B1nary-Calhoun-Partnership/bsv-mpc)
 
-All 16 POCs PASSED across the project's history. POCs 1-15 ran in M0
-(Mar 2026) and de-risked the cryptographic + wire path. POC 16
-(`poc16-sm-inline`) ran in Phase G Step 3 (2026-05-19) and proved the
-inline-SM + Paillier-pool design empirically before the production
-port. See [LESSONS.md](LESSONS.md) for the full technical writeup.
+### Closed (delivered + proven)
+
+| # | Scope | Proof |
+|---|---|---|
+| #4 | Provisioning automation (self-stocking, no dealer) | deployed self-stocking BSV-valid 2-of-2 |
+| #6 | createAction → mainnet | real-sats TXID `6085f497…` |
+| #7 | Correctness audit (5 latent bugs + findings 1–4) | each finding → regression test, deployed-proven |
+| #9 | Fund-safety: KEK-sealed durable share custody | restart-survival proven vs deployed worker |
+| #12 | Concurrency-stress | parallel ceremonies, distinct keys, no corruption |
+
+### Open
+
+| # | Scope | State / blocker |
+|---|---|---|
+| #8 | Auth-hardening cycle (body-binding + replay-nonce) | **next solo build** — breaking auth-substrate change; lockstep redeploy + re-prove all authed e2e + MPC-Spec §07. Consider migrating KSS profile to `bsv-rs::auth::Peer`. |
+| #5 | Production-hardening umbrella | smaller solo items: worker rate-limiting, `/poc/*` retirement, wrangler.toml VC, wasm latency benchmark |
+| #2 | v1.0 CF-native cosigner umbrella | tracks the above |
+| #10 | Distributed key-refresh | **blocked** — fund-critical multi-round PSS + atomic commit; needs §18 wire spec + Binary coordination |
+| #11 | §06 / §09 / §18 conformance | **blocked** — §06 on Ishaan byte-locking `06-presig-bundle-encryption.json` (MPC-Spec #9) |
+| #13 | OQ-I1: retire legacy HTTP sign path | **blocked** — needs relay-mode HD-key support (offset-baked presigs) |
+
+Related: **MPC-Spec #37** (rust-mpc `build_invoice_number` must add the §03
+invoice-number validation the canonical fix introduced).
 
 ---
 
-## What's running today
+## Conformance status (MPC-Spec, canonical)
 
-- 5-crate Cargo workspace (`bsv-mpc-core`, `bsv-mpc-proxy`,
-  `bsv-mpc-service`, `bsv-mpc-worker`, `bsv-mpc-overlay`) plus
-  `bsv-mpc-messagebox` (Phase A-F). ~22K LOC production code + ~13K
-  LOC POC code.
-- All protocol modules in `bsv-mpc-core` implemented inline (no thread
-  bridge, no spawn) and wasm32-buildable + wasm32-runtime-verified.
-- `bsv-mpc-service` runs locally with the canonical MessageBox wire,
-  signs real mainnet transactions via the live Calhoun relay.
-- CI on `B1nary-Calhoun-Partnership/bsv-mpc` `main` covers: fmt,
-  clippy `-D warnings`, native build+test (all crates, all targets),
-  wasm32 build (`bsv-mpc-core` + `bsv-mpc-worker`), and the wasm32 DKG
-  runtime test.
+| Vector | Test | State |
+|---|---|---|
+| §02 ExecutionId | `conformance_02_execution_id.rs` | PASS |
+| §03 BRC-42 invoice | `conformance_03_brc42_invoice.rs` | PASS (10 derivation + 6 validation; canonical fix `MPC-Spec 4891cbe`) |
+| §04 SessionId | `conformance_04_session_id.rs` | PASS |
+| §05 MessageEnvelope | `conformance_05_message_envelope.rs` | PASS |
+| §06 presig-bundle encryption | — | blocked on Ishaan byte-lock (#11) |
 
 ---
 
-## Known follow-ups deferred past Phase G
+## Known follow-ups deferred
 
 | Item | Source | Why deferred |
 |---|---|---|
-| Replace `unsafe impl Send` on inline coordinators with a `SendShield<T>` structural wrapper | audit §2.5 OQ6 | Sound today under documented invariant; right shape depends on Phase I DO concurrency patterns — revisit in Phase I deployment audit. |
-| Eager startup backfill of `paillier_pool` in `bsv-mpc-service` | audit OQ4 | Spec-recommended; not on the G gate path. Phase I work. |
-| SQLite persistence backend for `bsv-mpc-service` | CLAUDE.md | Currently in-memory; not load-bearing for cross-stack tests. Phase I or later. |
-| Overlay proof publication (`publish_proof`, `query_proofs`, `count_proofs_by_node`) | CLAUDE.md | Phase J adjacent. |
-
-## Upstream contributions due in Phase H
-
-Per audit §11.2 **revised** (pure Rust+WASM, leverage existing Calhoun-owned `engineio/codec.rs`; JS bundle is Plan B fallback only):
-
-| Target repo | What | When |
-|---|---|---|
-| `bsv-rs` (`~/bsv/bsv-rs/src/auth/transports/socketio/`) | new `SocketIoTransport` Rust impl of `bsv_rs::auth::Transport` over Socket.IO `authMessage` event — Rust analog of TS `@bsv/authsocket-client::SocketClientTransport` | **DONE** — PR Calhooon/bsv-rs#4 merged (`9a081dc`), published as `bsv-rs 0.3.10`; substrate-agnostic over `SocketIoSink`/`SocketIoFrameSource`, consumed by `bsv-mpc-messagebox` |
-
-## Ecosystem follow-ups (NOT Phase H gates — tracked here for visibility)
-
-| Target | What | Why |
-|---|---|---|
-| New crate `bsv-engineio-rs` (or co-located) | Extract `engineio/codec.rs` from `bsv-messagebox-cloudflare-public` + `rust-message-box` into a shared crate; refactor both servers + our new client to depend on it | Currently the codec is duplicated byte-for-byte across both Rust servers. Shared crate = DRY + canonical Rust impl of Engine.IO v4 + Socket.IO v5 wire for the BSV ecosystem. Coordination work; post-Phase-H. |
-| `rust-socketio` upstream (`1c3t3a/rust-socketio`) | wasm32-unknown-unknown target support | Plan A1 (vendor codec) gives pure Rust+WASM without needing `rust-socketio` at all, so this is no longer Phase H gating. Still worth doing as a broader-ecosystem contribution — replaces `reqwest+blocking+native-tls`, `tokio-tungstenite`, `native-tls` with wasm32-compatible alternates inside the external crate. Post-Phase-H. |
-| New crate `bsv-authsocket-rs` | Rust analog of TS `@bsv/authsocket-client` — wraps upstream `SocketIoTransport` + `Peer` for the broader BSV ecosystem | Post-Phase-H crate publication, depends on the bsv-rs upstream PR landing first. |
+| Replace `unsafe impl Send` with structural `SendShield<T>` | audit §2.5 OQ6 | Sound today under documented serialization invariant; revisit in deployment audit. |
+| Eager startup backfill of `paillier_pool` in `bsv-mpc-service` | audit OQ4 | Speed win for deployed DKG; not gate-path. Tracked in #5. |
+| SQLite persistence backend for `bsv-mpc-service` | CLAUDE.md | In-memory today; durable custody (#9) covers fund-safety. |
+| Overlay proof publication (`publish_proof`, `query_proofs`, `count_proofs_by_node`) | CLAUDE.md | Not on critical path. |
+| Warm relay connection (pool BRC-103 session) | SESSION-PROGRESS | ~2.3s → sub-100ms online-sign win; tracked in #5. |

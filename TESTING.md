@@ -11,6 +11,42 @@ Every POC produces tests that become the permanent test suite. We don't throw aw
 
 ---
 
+## Live gated E2E inventory (updated 2026-05-21)
+
+> The tables below (Levels 1–3) are the original POC-era plan. This section is
+> the **current, authoritative** list of env-var-gated end-to-end harnesses that
+> exercise the deployed CF-native cosigner. Ungated unit + integration tests run
+> on a plain `cargo test --workspace`. Each harness is gated so heavy/networked/
+> real-sats runs are opt-in. Run with:
+> `cargo test -p bsv-mpc-proxy --test <name> --release` plus the env gate.
+
+Shared deployed-infra env vars: `DEPLOYED_WORKER_URL`, `DEPLOYED_CONTAINER_URL`,
+`MESSAGEBOX_RELAY_URL`, `MPC_PROXY_IDENTITY_KEY` (owner identity for authed DKG).
+Real-sats funding via the local wallet at `localhost:3321` (Origin
+`http://admin.com`); minimize sats. Secrets live in `secrets.md` (gitignored).
+
+| Test (`crates/bsv-mpc-proxy/tests/`) | Gate env var | What it proves |
+|---|---|---|
+| `createaction_relay_mainnet_e2e` | `E2E_MAINNET=1` | #6 gate — canonical `CreateActionArgs` → relay → **real-sats mainnet TX** |
+| `i5_real_sats_deployed_e2e` | `E2E_MAINNET=1` | earlier real-sats deployed gate |
+| `self_stocking_loop_e2e` | `SELF_STOCKING_E2E=1` | #4 self-stocking (DKG→presig→ship→relay-sign); authed deployed with `DEPLOYED_CONTAINER_URL` + `MPC_PROXY_IDENTITY_KEY` |
+| `provision_via_service_deployed_e2e` | `PROVISION_SVC_E2E=1` | #4c container ships `Presignature_A` to DO pool |
+| `dkg_over_http_local_e2e` | `DKG_HTTP_E2E=1` | #4d distributed DKG-over-HTTP driver |
+| `sign_relay_authed_deployed_e2e` | `SIGN_RELAY_AUTHED_E2E=1` | authed `/sign-relay` against segregated pool |
+| `relay_combine_deployed_e2e` | `RELAY_COMBINE_E2E=1` | relay combiner over deployed infra |
+| `relay_sign_bench_e2e` | `RELAY_BENCH_E2E=1` (`BENCH_K=N`) | latency + N sequential relay co-signs (regression for relay backlog cross-contamination) |
+| `service_owner_authz_e2e` | `SERVICE_AUTHZ_E2E=1` | #7 finding #1 — in-process ENFORCED service; unauthed→401 / stranger→403 / owner→200 |
+| `proxy_enforced_cosigner_e2e` | `PROXY_ENFORCED_E2E=1` | #7 finding #1 proxy side — multi-server BRC-31 vs enforced container |
+| `custody_restart_survival_e2e` | `CUSTODY_E2E=1` | #9 — drop cosigner A → fresh B recovers KEK-sealed `share_A` → valid partial |
+| `concurrency_stress_e2e` | `CONCURRENCY_E2E=1` | #12 — K parallel ceremonies, distinct keys, owner-gated, no corruption |
+| `deploy_smoke_e2e` | `DEPLOY_SMOKE=1` | post-deploy smoke — deployed health + unauthed→401 on funded-boundary/custody routes |
+
+**After any deploy, run `deploy_smoke_e2e`.** Wire/crypto/on-chain/cross-impl
+changes must be gated by a real-mainnet e2e (cite the TXID in the commit), not
+just unit + mock tests.
+
+---
+
 ## Test Levels
 
 ### Level 1: Unit Tests (per-module, fast, no network)
