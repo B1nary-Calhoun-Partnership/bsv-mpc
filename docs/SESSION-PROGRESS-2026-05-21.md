@@ -202,3 +202,36 @@ to push. Worker deploy: `eval "$(grep '^export CLOUDFLARE' secrets.md)"` then
 `cd crates/bsv-mpc-worker && wrangler deploy`. Container deploy: use
 `CLOUDFLARE_CONTAINERS_TOKEN` as `CLOUDFLARE_API_TOKEN`, `cd poc/cf-container-p2
 && wrangler deploy`. secrets.md gitignored — redact `[a-f0-9]{16,}`.
+
+## 2026-05-21 (cont.) — Step 0 hygiene CLOSED + #8 reframed to canonical convergence + canonical-crate bug FIXED
+
+- **Step 0 hygiene — DONE + pushed (`51b0a42..420adcd`).** Green baseline (482
+  tests/50 suites, clippy `-D warnings`, wasm32 worker build); `STATUS.md`
+  refreshed; `TESTING.md` gained the live gated-e2e inventory; 12 closed Phase
+  G/H docs (+ stale `NEXT-STEPS`) archived to `docs/archive/`; stale branch
+  `feat/canonical-wire-mpc-spec-3` deleted (local+origin+pruned); deploy
+  smoke-test PASS (worker+container healthy + unauthed→401 enforcing).
+- **#8 reframed (decided + recorded):** the auth-hardening is a **convergence
+  onto the canonical BSV middleware**, not a patch to the custom "simplified"
+  profile (spec §07.2 SHOULD). Layers: clients→`bsv_rs::auth::Peer` (already
+  wasm32-proven in `bsv-mpc-messagebox`); worker→`bsv-middleware-cloudflare`
+  (canonical-correct, prod-proven); native service→`bsv-middleware-rs`. All
+  resolve `bsv-rs 0.3.11`; both middleware crates published on crates.io.
+  Earlier "Peer wasm32 = 2-3 wk port" claim was REFUTED by direct verification.
+- **🐛 FUND-CRITICAL canonical bug found + fixed.** A §07 interop probe
+  (canonical-client signature → `bsv-middleware-rs` verify) PROVED a real
+  `bsv_rs::auth::Peer` client could NOT authenticate to a `bsv-middleware-rs`
+  server. Root cause (vs `Peer` peer.rs:582-642 + `bsv-middleware-cloudflare`):
+  divergent key_id (static session nonces vs `AuthMessage::get_key_id`
+  per-message), `SecurityLevel::App` vs `Counterparty`, `for_self: true` vs
+  `None`. **Fixed in `Calhooon/bsv-middleware-rs` branch
+  `fix/brc31-general-message-canonical-wire` (`61e1f49`)** + regression test
+  `canonical_peer_client_general_message_verifies`; 15/15 green, fmt-clean,
+  runtime-proven (bsv-rs 0.3.11). Lesson: bsv-rs key derivation base64-decodes
+  keyID nonce tokens → nonces MUST be real base64.
+- **GATED next action:** publish `bsv-middleware-rs` (bug-fix bump) — outward/
+  irreversible, needs maintainer OK. Until then Phase B consumes the fix via a
+  git rev on the public Calhooon repo. Then Phase B (service/worker/client
+  migration, in-process proof) → C (lockstep redeploy + re-prove all authed e2e
+  + real-sats) → D (MPC-Spec §07.10 + THREAT-MODEL scrub + author
+  `07-brc31-auth.json` + close #8). Full detail in issue #8 comments.
