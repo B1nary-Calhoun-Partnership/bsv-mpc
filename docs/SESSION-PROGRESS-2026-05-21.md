@@ -41,28 +41,41 @@
 1. DKG execution-id mismatch (proxy must adopt cosigner session id) — `9dbfc7e`.
 2. Presig `from_str_hash(hex)` re-hash → eid mismatch; use `from_hex` — `b0dc1f3`.
 3. Service DKG share keyed by session-hash not joint key — `b0dc1f3`.
-4. **Relay backlog cross-contamination** — combiner took first party-0 partial on
-   the shared `mpc-sign` box → stale/foreign partial → combine fails. **FIX CODED
-   (uncommitted):** `bridge.rs::sign_over_relay` uses a fresh per-sign `SessionId`;
-   `relay_sign.rs::combine_sign_over_relay` filters received envelopes by
-   `from == do_index && session_id == this-sign` and drains the rest.
-5. **DO presig pool not segregated by joint key** (IN PROGRESS) —
-   `do_storage.rs` `mpc_presignatures` keyed by DO identity; `consume_presignature`
-   pulls oldest across ALL joint keys → cross-key/run contamination. Also
-   `store_presignature` uses caller `presig_id` as PK → dup-id INSERT 500s.
-   **FIX PLAN:** key ingest + consume by the **joint-key agent_id** (thread it
-   through proxy `provision_presig_to_do` + service `ProvisionConfig::ship_presignature`
-   + `handle_ingest_presig` request + `handle_prod_sign_relay` consume); make
-   `store_presignature` collision-safe. **Worker redeploy required.**
+4. ✅ **Relay backlog cross-contamination — FIXED+PROVEN** `b7db361`. Fresh
+   per-sign `SessionId` + combiner filters §05 envelopes by
+   `from==do_index && session_id==this-sign`, draining stale.
+5. ✅ **DO presig pool segregation — FIXED+PROVEN** `b7db361`. Pool keyed by
+   joint-key `agent_id` (threaded through proxy `provision_presig_to_do`, service
+   `ProvisionConfig::ship_presignature` + presign_session→agent_id map, worker
+   `handle_ingest_presig`/`handle_prod_sign_relay`), owner-authz on ingest (§08.1),
+   `store_presignature` server-generates a collision-safe row id. **Worker
+   redeployed `9f2075e1`.**
+
+**Regression proof (4+5):** `relay_sign_bench_e2e` (`RELAY_BENCH_E2E=1 BENCH_K=5`)
+— **5 SEQUENTIAL relay co-signs, all BSV-valid** (pre-fix, sign #2 died). Plus
+`sign_relay_authed_deployed_e2e` green on the segregated pool.
+
+**LATENCY (deployed DO + live relay):** DO issue-partial (wasm online-sign
+compute + HTTPS) **median 26ms** (min 22, max 92); end-to-end relay co-sign
+**median 2252ms** (per-sign BRC-103 handshake dominates — warm conn → sub-100ms);
+authed presig provision median 57ms.
+
+## Deployed versions (current)
+Worker DO `9f2075e1` (segregated pool + authed /sign-relay). CF Container
+`01e62ab4` (standard instance, self-stocking). Relay `rust-message-box`.
 
 ## In-flight / next steps (priority order)
-1. **Commit the relay-session-filter fix** (#6 bug 4) — `relay_sign.rs` + `bridge.rs`
-   coded; prove no single-sign regression (re-run `sign_relay_authed_deployed_e2e`).
-2. **Pool segregation by joint key** (#7 finding 5) — code + worker redeploy.
-3. **Re-run the latency benchmark** (`relay_sign_bench_e2e`, `RELAY_BENCH_E2E=1`)
-   — needs segregation for clean K-sign runs. Report DO issue-partial RTT + K
-   sequential relay co-sign latencies (proves bug-4 fix). First clean single-sign
-   was **~2762 ms** end-to-end (dominated by per-sign BRC-103 relay handshake).
+1. **#7 audit sweep — REMAINING classes** (highest-confidence "no hidden shit"):
+   concurrency (two ceremonies on the same DO/pool/relay identity), leftover/
+   orphaned state (failed ceremonies → stale presigs/coordinators/sessions; TTL/
+   cleanup), idempotency/replay beyond presig PK, owner-authz FULL coverage
+   (every funded-boundary route). Each finding → a regression test reproducing
+   the exposing condition.
+2. **Warm relay connection** — the ~2.3s → sub-100ms online-sign win (pool the
+   BRC-103 session instead of a fresh handshake per sign).
+3. **Background Paillier prime pool** (#5 speed) — `core::paillier_pool` ready;
+   wire into `bsv-mpc-service::handle_dkg_init` via `with_pool` + startup backfill
+   → fast deployed DKG (presig does NOT use pooled primes).
 4. **Retire legacy HTTP sign path (#6, OQ-I1)** — SAFE partial only: relay is
    default; KEEP `bridge.rs::sign` strictly as the HD-derived-key (`hmac_offset`)
    path (relay is base-key only — a full delete would BREAK HD-key createSignature).
