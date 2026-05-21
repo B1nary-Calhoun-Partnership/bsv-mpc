@@ -332,6 +332,18 @@ impl ShareStorage {
             .unwrap_or(0))
     }
 
+    /// Atomically delete ALL presignatures for an agent (§18.9 invalidation on
+    /// a share-refresh commit — no presig from the old share is consumable
+    /// against the new one). Returns the count purged.
+    pub fn delete_presignatures_for_agent(&self, agent_id: &str) -> Result<u64, String> {
+        let mut storage = STORAGE.lock().map_err(|e| format!("lock poisoned: {e}"))?;
+        Ok(storage
+            .presignatures
+            .remove(agent_id)
+            .map(|q| q.len() as u64)
+            .unwrap_or(0))
+    }
+
     /// Count total presignatures across all agents.
     pub fn total_presignature_count(&self) -> Result<u64, String> {
         let storage = STORAGE.lock().map_err(|e| format!("lock poisoned: {e}"))?;

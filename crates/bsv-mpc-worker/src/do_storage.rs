@@ -596,6 +596,21 @@ impl<'a> DoSqlStorage<'a> {
             .to_array()?;
         Ok(rows.first().map(|r| r.n as u64).unwrap_or(0))
     }
+
+    /// Atomically delete ALL pooled presignatures for an agent (§18.9
+    /// invalidation). On a share-refresh commit the cosigner MUST purge the pool
+    /// so no presig generated against the OLD share is consumable against the
+    /// new one. Single SQL DELETE → atomic within this DO. Returns the count
+    /// purged (the COUNT + DELETE run in the same DO call, so no consume can
+    /// interleave).
+    pub fn delete_presignatures_for_agent(&self, agent_id: &str) -> Result<u64> {
+        let n = self.presignature_count(agent_id)?;
+        self.sql().exec(
+            "DELETE FROM mpc_presignatures WHERE agent_id = ?",
+            vec![agent_id.into()],
+        )?;
+        Ok(n)
+    }
 }
 
 /// Bridge the inherent `worker::Result` API to the handler-facing

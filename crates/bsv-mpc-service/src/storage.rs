@@ -394,6 +394,18 @@ impl SqliteShareStorage {
             .unwrap_or(0))
     }
 
+    /// Atomically delete ALL presignatures for an agent (§18.9 invalidation).
+    /// MUST be called on a share-refresh commit (the new share invalidates every
+    /// presig generated against the old one — they MUST NOT be consumable across
+    /// the refresh boundary). Returns the number purged.
+    pub fn delete_presignatures_for_agent(&mut self, agent_id: &str) -> anyhow::Result<u64> {
+        Ok(self
+            .presignatures
+            .remove(agent_id)
+            .map(|q| q.len() as u64)
+            .unwrap_or(0))
+    }
+
     /// Clean up consumed presignatures older than the given duration.
     /// No-op for in-memory storage (consumed presignatures are already removed).
     pub fn prune_consumed_presignatures(
@@ -457,5 +469,47 @@ mod tests {
 
         // Unknown agent ⇒ None.
         assert_eq!(s.get_share_owner("ghost").unwrap(), None);
+    }
+
+    #[test]
+    fn refresh_rotation_overwrites_share_and_purges_presigs() {
+        // §18.9: a share-refresh commit rotates the share AND invalidates every
+        // presig generated against the old share (must not be consumable across
+        // the refresh boundary).
+        let mut s = SqliteShareStorage::open("/tmp/test-refresh-rotate").unwrap();
+        let old = dummy_share();
+        s.store_share_with_owner("agentR", &old, "02owner").unwrap();
+        s.store_presignature("agentR", "sess", "p1", b"presig-1")
+            .unwrap();
+        s.store_presignature("agentR", "sess", "p2", b"presig-2")
+            .unwrap();
+        assert_eq!(s.presignature_count("agentR").unwrap(), 2);
+
+        // Refresh commit: overwrite the share (new key material, same agent_id)
+        // and purge the now-invalid presigs.
+        let mut refreshed = dummy_share();
+        refreshed.ciphertext = b"refreshed-cggmp24-share".to_vec();
+        s.store_share_with_owner("agentR", &refreshed, "").unwrap(); // empty owner preserves
+        let purged = s.delete_presignatures_for_agent("agentR").unwrap();
+
+        assert_eq!(purged, 2, "both stale presigs purged");
+        assert_eq!(
+            s.presignature_count("agentR").unwrap(),
+            0,
+            "no presig consumable across the refresh boundary (§18.9)"
+        );
+        assert!(
+            s.consume_presignature("agentR").unwrap().is_none(),
+            "consume after purge yields nothing"
+        );
+        // The rotated share is in place; the owner binding survived the rotation.
+        assert_eq!(
+            s.get_share("agentR").unwrap().unwrap().ciphertext,
+            b"refreshed-cggmp24-share"
+        );
+        assert_eq!(
+            s.get_share_owner("agentR").unwrap().as_deref(),
+            Some("02owner")
+        );
     }
 }
