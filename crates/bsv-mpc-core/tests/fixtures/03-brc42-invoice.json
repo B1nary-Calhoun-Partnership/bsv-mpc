@@ -1,0 +1,299 @@
+{
+  "spec_section": "03",
+  "spec_title": "Canonical BRC-42 Invoice + HMAC",
+  "brc42_spec_source": "~/bsv/BRCs/key-derivation/0042.md",
+  "private_derivation_vectors": [
+    {
+      "name": "brc42-priv-vector-1",
+      "source": "BRC-42 spec §Test Vectors / Private Key Derivation",
+      "inputs": {
+        "senderPublicKey": "033f9160df035156f1c48e75eae99914fa1a1546bec19781e8eddb900200bff9d1",
+        "recipientPrivateKey": "6a1751169c111b4667a6539ee1be6b7cd9f6e9c8fe011a5f2fe31e03a15e0ede",
+        "invoiceNumber": "f3WCaUmnN9U="
+      },
+      "intermediate": {
+        "shared_secret_compressed_hex": "0343fcf7c987a9ce39e2258abe4af95f9d515f874e9ea4933cbbac8d9d6fff8502",
+        "hmac_offset_hex": "0bff055abfae862c9153a1f0793af22034067f384efcb06d6a413c0d5e2a8511"
+      },
+      "expected": {
+        "childPrivateKey_hex": "761656715bbfa172f8f9f58f5af95d9d0dfd69014cfdcacc9a245a10ff8893ef"
+      },
+      "computed": {
+        "childPrivateKey_hex": "761656715bbfa172f8f9f58f5af95d9d0dfd69014cfdcacc9a245a10ff8893ef"
+      },
+      "agrees_with_spec_vector": true
+    },
+    {
+      "name": "brc42-priv-vector-2",
+      "source": "BRC-42 spec §Test Vectors / Private Key Derivation",
+      "inputs": {
+        "senderPublicKey": "027775fa43959548497eb510541ac34b01d5ee9ea768de74244a4a25f7b60fae8d",
+        "recipientPrivateKey": "cab2500e206f31bc18a8af9d6f44f0b9a208c32d5cca2b22acfe9d1a213b2f36",
+        "invoiceNumber": "2Ska++APzEc="
+      },
+      "intermediate": {
+        "shared_secret_compressed_hex": "024f3e7fb39947cf5a0c677a626360c51aed9bb967c7752cfd21c7c8e208604ac4",
+        "hmac_offset_hex": "3f40647db6f01bea29f2176dee8995827778cd0a097086b408362a876cb2d481"
+      },
+      "expected": {
+        "childPrivateKey_hex": "09f2b48bd75f4da6429ac70b5dce863d5ed2b350b6f2119af5626914bdb7c276"
+      },
+      "computed": {
+        "childPrivateKey_hex": "09f2b48bd75f4da6429ac70b5dce863d5ed2b350b6f2119af5626914bdb7c276"
+      },
+      "agrees_with_spec_vector": true
+    },
+    {
+      "name": "brc42-priv-vector-3",
+      "source": "BRC-42 spec §Test Vectors / Private Key Derivation",
+      "inputs": {
+        "senderPublicKey": "0338d2e0d12ba645578b0955026ee7554889ae4c530bd7a3b6f688233d763e169f",
+        "recipientPrivateKey": "7a66d0896f2c4c2c9ac55670c71a9bc1bdbdfb4e8786ee5137cea1d0a05b6f20",
+        "invoiceNumber": "cN/yQ7+k7pg="
+      },
+      "intermediate": {
+        "shared_secret_compressed_hex": "038d8e34fb522e2875eabf507d82fe7fcaa65905e31cf66ecc2cdea87314375238",
+        "hmac_offset_hex": "f6adfd118df261b394b119cc025c267e215b10bf1d86698e2818cb88a4387c11"
+      },
+      "expected": {
+        "childPrivateKey_hex": "7114cd9afd1eade02f76703cc976c241246a2f26f5c4b7a3a0150ecc745da9f0"
+      },
+      "computed": {
+        "childPrivateKey_hex": "7114cd9afd1eade02f76703cc976c241246a2f26f5c4b7a3a0150ecc745da9f0"
+      },
+      "agrees_with_spec_vector": true
+    },
+    {
+      "name": "brc42-priv-vector-4",
+      "source": "BRC-42 spec §Test Vectors / Private Key Derivation",
+      "inputs": {
+        "senderPublicKey": "02830212a32a47e68b98d477000bde08cb916f4d44ef49d47ccd4918d9aaabe9c8",
+        "recipientPrivateKey": "6e8c3da5f2fb0306a88d6bcd427cbfba0b9c7f4c930c43122a973d620ffa3036",
+        "invoiceNumber": "m2/QAsmwaA4="
+      },
+      "intermediate": {
+        "shared_secret_compressed_hex": "02964b1ea2733950ec4094520e06b1891d42daf71a8258db909b758a8f68224b59",
+        "hmac_offset_hex": "834abd5fe71722f8454fb126cd8468f5d4ffbcce1ab3b8c39e25d37119f55f0a"
+      },
+      "expected": {
+        "childPrivateKey_hex": "f1d6fb05da1225feeddd1cf4100128afe09c3c1aadbffbd5c8bd10d329ef8f40"
+      },
+      "computed": {
+        "childPrivateKey_hex": "f1d6fb05da1225feeddd1cf4100128afe09c3c1aadbffbd5c8bd10d329ef8f40"
+      },
+      "agrees_with_spec_vector": true
+    },
+    {
+      "name": "brc42-priv-vector-5",
+      "source": "BRC-42 spec §Test Vectors / Private Key Derivation",
+      "inputs": {
+        "senderPublicKey": "03f20a7e71c4b276753969e8b7e8b67e2dbafc3958d66ecba98dedc60a6615336d",
+        "recipientPrivateKey": "e9d174eff5708a0a41b32624f9b9cc97ef08f8931ed188ee58d5390cad2bf68e",
+        "invoiceNumber": "jgpUIjWFlVQ="
+      },
+      "intermediate": {
+        "shared_secret_compressed_hex": "0228bbe77e340c55980f7a0ecf05d5f1373216956cac7ad4d37ae0006ce6f1eeba",
+        "hmac_offset_hex": "db96076349a7390537f0e11fb7c6b8c9f6cc105fa44f9685afc0ab715ba9c459"
+      },
+      "expected": {
+        "childPrivateKey_hex": "c5677c533f17c30f79a40744b18085632b262c0c13d87f3848c385f1389f79a6"
+      },
+      "computed": {
+        "childPrivateKey_hex": "c5677c533f17c30f79a40744b18085632b262c0c13d87f3848c385f1389f79a6"
+      },
+      "agrees_with_spec_vector": true
+    }
+  ],
+  "public_derivation_vectors": [
+    {
+      "name": "brc42-pub-vector-1",
+      "source": "BRC-42 spec §Test Vectors / Public Key Derivation",
+      "inputs": {
+        "senderPrivateKey": "583755110a8c059de5cd81b8a04e1be884c46083ade3f779c1e022f6f89da94c",
+        "recipientPublicKey": "02c0c1e1a1f7d247827d1bcf399f0ef2deef7695c322fd91a01a91378f101b6ffc",
+        "invoiceNumber": "IBioA4D/OaE="
+      },
+      "intermediate": {
+        "shared_secret_compressed_hex": "0230638f193e2c4151788d3cd2ad4ce5e7d63e7cc3b7db5473413e46dffbdefcf1",
+        "hmac_offset_hex": "f141a6635f191f3a6f11a4ad2d0c150dcbd3456083696f21d4d8bc4530f7a4e2"
+      },
+      "expected": {
+        "childPublicKey_hex": "03c1bf5baadee39721ae8c9882b3cf324f0bf3b9eb3fc1b8af8089ca7a7c2e669f"
+      },
+      "computed": {
+        "childPublicKey_hex": "03c1bf5baadee39721ae8c9882b3cf324f0bf3b9eb3fc1b8af8089ca7a7c2e669f"
+      },
+      "agrees_with_spec_vector": true
+    },
+    {
+      "name": "brc42-pub-vector-2",
+      "source": "BRC-42 spec §Test Vectors / Public Key Derivation",
+      "inputs": {
+        "senderPrivateKey": "2c378b43d887d72200639890c11d79e8f22728d032a5733ba3d7be623d1bb118",
+        "recipientPublicKey": "039a9da906ecb8ced5c87971e9c2e7c921e66ad450fd4fc0a7d569fdb5bede8e0f",
+        "invoiceNumber": "PWYuo9PDKvI="
+      },
+      "intermediate": {
+        "shared_secret_compressed_hex": "03c171ddb3fe26cedc7aa519516c4f6fb9d27e8be9e3f3d98dddca81ed9ed1ff59",
+        "hmac_offset_hex": "8b50d79bf795dcf45c42a8cfd8efd666e4c712423a2e026bbcc5c23b0a30f430"
+      },
+      "expected": {
+        "childPublicKey_hex": "0398cdf4b56a3b2e106224ff3be5253afd5b72de735d647831be51c713c9077848"
+      },
+      "computed": {
+        "childPublicKey_hex": "0398cdf4b56a3b2e106224ff3be5253afd5b72de735d647831be51c713c9077848"
+      },
+      "agrees_with_spec_vector": true
+    },
+    {
+      "name": "brc42-pub-vector-3",
+      "source": "BRC-42 spec §Test Vectors / Public Key Derivation",
+      "inputs": {
+        "senderPrivateKey": "d5a5f70b373ce164998dff7ecd93260d7e80356d3d10abf928fb267f0a6c7be6",
+        "recipientPublicKey": "02745623f4e5de046b6ab59ce837efa1a959a8f28286ce9154a4781ec033b85029",
+        "invoiceNumber": "X9pnS+bByrM="
+      },
+      "intermediate": {
+        "shared_secret_compressed_hex": "021fd9c71c462513e7a4025249944ca992dfeb64d8d73a348b8390c6118d4e68e7",
+        "hmac_offset_hex": "d9cbb9842677b73650a909d01ec69f02e8b43bf88d8ed2c2a7ecc113b552d32b"
+      },
+      "expected": {
+        "childPublicKey_hex": "0273eec9380c1a11c5a905e86c2d036e70cbefd8991d9a0cfca671f5e0bbea4a3c"
+      },
+      "computed": {
+        "childPublicKey_hex": "0273eec9380c1a11c5a905e86c2d036e70cbefd8991d9a0cfca671f5e0bbea4a3c"
+      },
+      "agrees_with_spec_vector": true
+    },
+    {
+      "name": "brc42-pub-vector-4",
+      "source": "BRC-42 spec §Test Vectors / Public Key Derivation",
+      "inputs": {
+        "senderPrivateKey": "46cd68165fd5d12d2d6519b02feb3f4d9c083109de1bfaa2b5c4836ba717523c",
+        "recipientPublicKey": "031e18bb0bbd3162b886007c55214c3c952bb2ae6c33dd06f57d891a60976003b1",
+        "invoiceNumber": "+ktmYRHv3uQ="
+      },
+      "intermediate": {
+        "shared_secret_compressed_hex": "026279c5f6913fc9a99cb6046a010bf8bc7762377a1f9072fb46d43c59e70a6d3f",
+        "hmac_offset_hex": "254cc0e82dccfe0e6d74c835148fd2e80ecb2ac857fd6f5f69355cad5575ed06"
+      },
+      "expected": {
+        "childPublicKey_hex": "034c5c6bf2e52e8de8b2eb75883090ed7d1db234270907f1b0d1c2de1ddee5005d"
+      },
+      "computed": {
+        "childPublicKey_hex": "034c5c6bf2e52e8de8b2eb75883090ed7d1db234270907f1b0d1c2de1ddee5005d"
+      },
+      "agrees_with_spec_vector": true
+    },
+    {
+      "name": "brc42-pub-vector-5",
+      "source": "BRC-42 spec §Test Vectors / Public Key Derivation",
+      "inputs": {
+        "senderPrivateKey": "7c98b8abd7967485cfb7437f9c56dd1e48ceb21a4085b8cdeb2a647f62012db4",
+        "recipientPublicKey": "03c8885f1e1ab4facd0f3272bb7a48b003d2e608e1619fb38b8be69336ab828f37",
+        "invoiceNumber": "PPfDTTcl1ao="
+      },
+      "intermediate": {
+        "shared_secret_compressed_hex": "02791019072ef58fbb5a3fe6ace6de23584a2a77629e9353b3c40928c6400cb680",
+        "hmac_offset_hex": "b1444294572cda1951afc14b85099086071cf320364ed392d7797318e27a49a2"
+      },
+      "expected": {
+        "childPublicKey_hex": "03304b41cfa726096ffd9d8907fe0835f888869eda9653bca34eb7bcab870d3779"
+      },
+      "computed": {
+        "childPublicKey_hex": "03304b41cfa726096ffd9d8907fe0835f888869eda9653bca34eb7bcab870d3779"
+      },
+      "agrees_with_spec_vector": true
+    }
+  ],
+  "all_private_vectors_agree": true,
+  "all_public_vectors_agree": true,
+  "stress_vectors": [
+    {
+      "name": "brc42-stress-vector-1-mixed-case-whitespace",
+      "spec_ref": "§03.5.1",
+      "inputs": {
+        "security_level": 2,
+        "protocol_id_raw": "  AUTH MESSAGE SIGNATURE  ",
+        "key_id_raw": " AbC123 ",
+        "shared_secret_hex": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+        "shared_secret_source": "secp256k1 G compressed (test-only pin)"
+      },
+      "intermediate": {
+        "normalized_protocol_id": "auth message signature",
+        "invoice_string": "2-auth message signature- AbC123 ",
+        "invoice_bytes_hex": "322d61757468206d657373616765207369676e61747572652d2041624331323320",
+        "invoice_length_bytes": 33
+      },
+      "expected": {
+        "hmac_offset_hex": "52ca69e463fa1b2abeabc7be3739aa45cd591f816fb003bb315ac487b23bdf91"
+      }
+    },
+    {
+      "name": "brc42-stress-vector-2-unicode-rejected",
+      "spec_ref": "§03.5.2",
+      "inputs": {
+        "security_level": 2,
+        "protocol_id_raw": "Café Société",
+        "key_id_raw": "Δοκιμή"
+      },
+      "expected": {
+        "rejected": true,
+        "reason": "protocol name must match /^[a-z0-9 ]+$/ after .toLowerCase().trim() (canonical @bsv SDK computeInvoiceNumber); Unicode letters are not permitted"
+      }
+    },
+    {
+      "name": "brc42-stress-vector-3-empty-key-id-rejected",
+      "spec_ref": "§03.5.3",
+      "inputs": {
+        "security_level": 2,
+        "protocol_id_raw": "test",
+        "key_id_raw": ""
+      },
+      "expected": {
+        "rejected": true,
+        "reason": "key_id length must be 1..=800 (canonical @bsv SDK computeInvoiceNumber throws when keyID.length < 1)"
+      }
+    },
+    {
+      "name": "brc42-stress-vector-4-protocol-too-short-rejected",
+      "spec_ref": "§03.2.1",
+      "inputs": {
+        "security_level": 2,
+        "protocol_id_raw": "abcd",
+        "key_id_raw": "1"
+      },
+      "expected": {
+        "rejected": true,
+        "reason": "normalized protocol name must be >= 5 chars (SDK: 'Protocol names must be 5 characters or more')"
+      }
+    },
+    {
+      "name": "brc42-stress-vector-5-consecutive-spaces-rejected",
+      "spec_ref": "§03.2.1",
+      "inputs": {
+        "security_level": 2,
+        "protocol_id_raw": "auth  message",
+        "key_id_raw": "1"
+      },
+      "expected": {
+        "rejected": true,
+        "reason": "normalized protocol name must not contain consecutive spaces (SDK: 'cannot contain multiple consecutive spaces')"
+      }
+    },
+    {
+      "name": "brc42-stress-vector-6-trailing-protocol-rejected",
+      "spec_ref": "§03.2.1",
+      "inputs": {
+        "security_level": 2,
+        "protocol_id_raw": "my cool protocol",
+        "key_id_raw": "1"
+      },
+      "expected": {
+        "rejected": true,
+        "reason": "normalized protocol name must not end with ' protocol' (SDK: 'No need to end your protocol name with \" protocol\"')"
+      }
+    }
+  ],
+  "stress_vector_notes": "Vector 1 is a valid ASCII mixed-case/whitespace canonicalization case with a test-only pinned shared_secret (secp256k1 G compressed). Vectors 2-6 are REJECTION cases (corrected 2026-05-21): they pin inputs the canonical @bsv SDK KeyDeriver.computeInvoiceNumber rejects (Unicode protocol name; empty key_id; protocol < 5 chars; consecutive spaces; trailing ' protocol'). Implementations MUST reject them per §03.2.1 BEFORE any HMAC. bsv-mpc conforms (validate_protocol_name / validate_key_id); rust-mpc build_invoice_number MUST add this validation."
+}
