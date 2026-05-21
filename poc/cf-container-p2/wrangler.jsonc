@@ -13,9 +13,9 @@
       "image_build_context": "../../",
       "max_instances": 1,
       // #4e: DKG/presig generate Paillier safe-primes inline (CPU + memory
-      // heavy); the default "dev" instance (256 MiB) OOMs. "standard" gives
+      // heavy); the default "dev" instance (256 MiB) OOMs. "standard-1" gives
       // more memory + vCPU for the off-hot-path ceremonies.
-      "instance_type": "standard"
+      "instance_type": "standard-1"
     }
   ],
   "durable_objects": {
