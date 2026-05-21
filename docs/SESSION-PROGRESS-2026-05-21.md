@@ -91,6 +91,28 @@ authed presig provision median 57ms.
 Worker DO `9f2075e1` (segregated pool + authed /sign-relay). CF Container
 `01e62ab4` (standard instance, self-stocking). Relay `rust-message-box`.
 
+## 2026-05-21 continuation — audit closure + conformance + fund-safety
+- **#7 audit: findings #1–#4 all CLOSED + deployed-proven.** #1 service+proxy+deployed
+  BRC-31 owner-authz (§07.6/§08.1); #2 `/poc/sign-relay` consume isolation;
+  #3 orphaned-coordinator cleanup; #4 `/presign/init` session-id hard-error.
+- **§03 BRC-42 conformance harness** (`ddd5b3a`) + **canonical MPC-Spec fix**
+  (`MPC-Spec 4891cbe`, Mitch-authorized): the spec's §03.5.2/§03.5.3 stress
+  vectors (unicode protocol, empty key_id) were over-permissive vs the canonical
+  @bsv SDK `computeInvoiceNumber`; corrected to rejection cases. bsv-mpc conforms
+  (10 derivation byte-for-byte + 6 validation vectors). Filed MPC-Spec #37
+  (rust-mpc `build_invoice_number` must add the same validation). Issue #8 tracks
+  the residual BRC-31-profile asterisks.
+- **#9 fund-safety — durable share custody (KEK-wrapped, all-Cloudflare).**
+  Deployed cosigner held `share_A` in-memory-only (lost on restart → fund-lock).
+  Fix: core `custody.rs` seals (share+owner) under a KEK from
+  `MPC_SERVER_PRIVATE_KEY`; worker DO `mpc_custody` table + authed
+  `/custody/{put,get}-share`; service persists at DKG-complete (fail-closed) +
+  lazily recovers on cold-cache miss before the owner check. **Restart-survival
+  PROVEN** against the deployed worker (`custody_restart_survival_e2e`): drop
+  service A → fresh B recovers `share_A` → valid partial; stranger→403,
+  unauthed→401. Worker deployed `ff080f61`; container redeploy (custody
+  auto-enables) in progress.
+
 ## In-flight / next steps (priority order)
 0. ✅ **#7 finding #1 DEPLOYED enforcement — DONE.** Proxy multi-server BRC-31
    (`presign_auth` session vs `presign_url`, `MPC_PROXY_IDENTITY_KEY` pre-DKG
