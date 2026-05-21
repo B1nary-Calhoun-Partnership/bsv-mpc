@@ -197,6 +197,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "bsv-middleware-rs"
+version = "0.2.0"
+source = "git+https://github.com/Calhooon/bsv-middleware-rs?rev=61e1f4948d150dfb217ea5fdd22ad73c2b267bc7#61e1f4948d150dfb217ea5fdd22ad73c2b267bc7"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "bsv-rs",
+ "getrandom 0.4.2",
+ "hex",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "bsv-mpc"
 version = "0.1.0"
 dependencies = [
@@ -231,6 +246,7 @@ version = "0.1.0"
 dependencies = [
  "aes-gcm",
  "base64 0.22.1",
+ "bsv-middleware-rs",
  "bsv-rs",
  "cggmp24",
  "cggmp24-keygen",

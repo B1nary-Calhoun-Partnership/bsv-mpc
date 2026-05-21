@@ -39,6 +39,12 @@ tokio = { version = "1", default-features = false, features = ["rt", "macros"] }
 tempfile.workspace = true
 futures.workspace = true
 pin-project.workspace = true
+# §07 BRC-31 conformance harness (tests/conformance_07_brc31_auth.rs). Pins the
+# FIXED canonical server verifier (public Calhooon repo, fix branch) via git rev
+# — CI-safe (public), reproducible. Swap to a crates.io version after the fix is
+# published (post Phase C real-sats). Pulls bsv-rs `auth` (additive) into the
+# dev/test graph only; no http/socketio/reqwest. See bsv-mpc #8.
+bsv-middleware-rs = { git = "https://github.com/Calhooon/bsv-middleware-rs", rev = "61e1f4948d150dfb217ea5fdd22ad73c2b267bc7" }
 round-based = { workspace = true, features = ["sim"] }
 cggmp24 = { git = "https://github.com/LFDT-Lockness/cggmp21", features = ["curve-secp256k1", "hd-wallet", "hd-slip10", "spof"] }
 
