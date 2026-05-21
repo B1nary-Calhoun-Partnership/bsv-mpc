@@ -13,13 +13,15 @@
   (DKG→presig→ship→relay-sign) proven BSV-valid with the **deployed CF Container**
   (share_A) ↔ **deployed DO** (presig pool) ↔ proxy combiner. No trusted dealer.
 - **#7 correctness audit: logged**, 5 latent bugs fixed+proven; **finding #1
-  (service owner-authz) enforcement landed + proven in-process** (`455fc5c`).
+  (service owner-authz) CLOSED on deployed infra** — enforced CF Container,
+  unauthed→401 live, full authed self-stocking BSV-valid (`455fc5c` `5d9a263`
+  `afa2939` `55200da`). Residual hardening tracked in #8.
 - **MPC-Spec: UNTOUCHED** (Path-A; verified clean tree). No canonical spec
   changes. (Spec-relevant *additions* assessed below.)
 
 ## Deployed infra (Calhoun dev-a3e CF account)
 - Worker (DO, share_A presig pool + light sign): `https://bsv-mpc-kss.dev-a3e.workers.dev` (version `801f92e6` — has authed `/sign-relay`).
-- Native cosigner (CF Container, share_A heavy DKG/presig): `https://bsv-mpc-service-container.dev-a3e.workers.dev` (image `01e62ab4`, **instance_type `standard`** — lite/dev OOM on inline Paillier prime-gen; `MPC_WORKER_URL` baked, ephemeral auth).
+- Native cosigner (CF Container, share_A heavy DKG/presig): `https://bsv-mpc-service-container.dev-a3e.workers.dev` (version `f445893e`, **instance_type `standard-1`**; `MPC_WORKER_URL` baked. **BRC-31 ENFORCED** — `MPC_SERVER_PRIVATE_KEY` wired via Worker secret → container `envVars`; unauthed→401 live).
 - Relay: `https://rust-message-box.dev-a3e.workers.dev`.
 
 ## Commits this session (all on `main`, all gated)
@@ -90,12 +92,11 @@ Worker DO `9f2075e1` (segregated pool + authed /sign-relay). CF Container
 `01e62ab4` (standard instance, self-stocking). Relay `rust-message-box`.
 
 ## In-flight / next steps (priority order)
-0. **#7 finding #1 DEPLOYED enforcement** (follow-on to `455fc5c`): proxy
-   multi-server BRC-31 (second `BridgeAuth` session vs `presign_url` for
-   presign + HD-key sign/ecdh; DKG already has `run_dkg_over_http_authed`),
-   then redeploy container with `MPC_SERVER_PRIVATE_KEY` + re-prove
-   self-stocking with auth enforced. Until then the deployed container is
-   dev-mode (byte-identical, unenforced).
+0. ✅ **#7 finding #1 DEPLOYED enforcement — DONE.** Proxy multi-server BRC-31
+   (`presign_auth` session vs `presign_url`, `MPC_PROXY_IDENTITY_KEY` pre-DKG
+   identity) + container redeployed with `MPC_SERVER_PRIVATE_KEY` (Worker
+   secret → `envVars`). Live: unauthed→401; full authed self-stocking
+   BSV-valid (449s). Residual hardening → #8.
 1. **#7 audit sweep — REMAINING classes** (highest-confidence "no hidden shit"):
    concurrency (two ceremonies on the same DO/pool/relay identity), leftover/
    orphaned state (failed ceremonies → stale presigs/coordinators/sessions; TTL/
@@ -123,6 +124,10 @@ Worker DO `9f2075e1` (segregated pool + authed /sign-relay). CF Container
 - `sign_relay_authed_deployed_e2e` (`SIGN_RELAY_AUTHED_E2E=1`) — authed relay.
 - `service_owner_authz_e2e` (`SERVICE_AUTHZ_E2E=1`) — #7 finding #1; in-process
   ENFORCED service, authed DKG → owner-gate (unauthed 401 / stranger 403 / owner 200).
+- `proxy_enforced_cosigner_e2e` (`PROXY_ENFORCED_E2E=1`) — #7 finding #1 proxy
+  side; 2 in-process ENFORCED services, proxy authed-presig vs enforced container.
+- `self_stocking_loop_e2e` w/ `MPC_PROXY_IDENTITY_KEY` + `DEPLOYED_CONTAINER_URL`
+  — full authed self-stocking vs the ENFORCED deployed container (BSV-valid).
 - `relay_sign_bench_e2e` (`RELAY_BENCH_E2E=1`, `BENCH_K=5`) — latency.
 - `i5_real_sats_deployed_e2e` / `relay_combine_deployed_e2e` — earlier gates.
 
