@@ -227,17 +227,21 @@ fn has_auth_headers(headers: &HeaderMap) -> bool {
 
 /// Verify BRC-31 auth, or allow through in dev mode.
 ///
-/// - No auth headers + dev mode ⇒ `Ok(unauthenticated)`.
-/// - No auth headers + enforced ⇒ `Err(401)`.
-/// - Auth headers present ⇒ full BRC-31 verification (401/403/500 on failure).
+/// - **Dev mode** (no server key) ⇒ always `Ok(unauthenticated)`. We have no key
+///   to verify a signature with, so ANY headers a client happens to send (e.g. a
+///   proxy that handshook against the dev stub) are ignored rather than 500'd.
+///   With no bound owner this still authorizes everyone — exactly the prior,
+///   un-enforced behavior.
+/// - **Enforced**, no auth headers ⇒ `Err(401)` (§07.6).
+/// - **Enforced**, auth headers present ⇒ full BRC-31 verification (401/403/500).
 pub fn verify_or_allow(
     headers: &HeaderMap,
     auth: &AuthState,
 ) -> Result<CallerIdentity, AuthRejection> {
+    if auth.allow_unauthenticated() {
+        return Ok(CallerIdentity::unauthenticated());
+    }
     if !has_auth_headers(headers) {
-        if auth.allow_unauthenticated() {
-            return Ok(CallerIdentity::unauthenticated());
-        }
         return Err(reject(
             StatusCode::UNAUTHORIZED,
             "Not authenticated: missing BRC-104 auth headers (§07.6)",
@@ -469,6 +473,25 @@ mod tests {
         let auth = AuthState::dev();
         assert!(auth.allow_unauthenticated());
         let id = verify_or_allow(&HeaderMap::new(), &auth).expect("dev allows no-auth");
+        assert!(id.as_opt().is_none());
+    }
+
+    #[test]
+    fn dev_mode_allows_even_with_auth_headers() {
+        // Regression: a client that handshook against the dev stub then sends
+        // BRC-104 headers must NOT 500 (no server key to verify) — dev mode
+        // ignores them and allows. This is the self-stocking dev-container path.
+        let auth = AuthState::dev();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::HeaderName::from_static(headers::IDENTITY_KEY),
+            "02abcdef".parse().unwrap(),
+        );
+        headers.insert(
+            axum::http::HeaderName::from_static(headers::SIGNATURE),
+            "deadbeef".parse().unwrap(),
+        );
+        let id = verify_or_allow(&headers, &auth).expect("dev allows even with headers");
         assert!(id.as_opt().is_none());
     }
 

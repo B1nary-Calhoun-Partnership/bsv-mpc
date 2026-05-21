@@ -234,6 +234,53 @@ fn hex_decode(hex: &str) -> std::result::Result<Vec<u8>, MpcError> {
 // Uses a local auth key (not the MPC share) for signing auth messages.
 // Session is established via handshake on first KSS request.
 
+/// Deterministically derive the proxy's 32-byte BRC-31 identity-key material
+/// from secret share material (§07.4 / OQ-A2 — stable, zero-config). Bumps a
+/// counter on the negligible chance of an out-of-range scalar (~2^-128/try).
+fn derive_proxy_identity_bytes(share_secret: &[u8]) -> std::result::Result<[u8; 32], MpcError> {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    const DOMAIN: &[u8] = b"bsv-mpc proxy auth identity v1";
+    for counter in 0u8..=u8::MAX {
+        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(DOMAIN)
+            .map_err(|e| MpcError::Protocol(format!("hmac init: {e}")))?;
+        mac.update(share_secret);
+        mac.update(&[counter]);
+        let bytes: [u8; 32] = mac.finalize().into_bytes().into();
+        // Validate the scalar is in range by attempting a key parse.
+        if PrivateKey::from_bytes(&bytes).is_ok() {
+            return Ok(bytes);
+        }
+    }
+    Err(MpcError::Protocol(
+        "could not derive a valid proxy auth key from share seed".into(),
+    ))
+}
+
+/// Resolve the proxy's long-lived BRC-31 identity-key bytes (§07.4): an
+/// operator-provided `MPC_PROXY_IDENTITY_KEY` (hex) takes precedence — required
+/// when the cosigner records the owner at DKG time (the share-derived identity
+/// does not exist until DKG completes, so a pre-DKG stable identity must be
+/// supplied to make owner-authz against an enforced container match). Falls back
+/// to the share-derived identity (stable across restarts, zero-config).
+fn resolve_proxy_identity_bytes(share_secret: &[u8]) -> std::result::Result<[u8; 32], MpcError> {
+    if let Ok(hex_key) = std::env::var("MPC_PROXY_IDENTITY_KEY") {
+        let trimmed = hex_key.trim();
+        if !trimmed.is_empty() {
+            let raw = hex_decode(trimmed)
+                .map_err(|e| MpcError::Protocol(format!("MPC_PROXY_IDENTITY_KEY hex: {e}")))?;
+            let bytes: [u8; 32] = raw.try_into().map_err(|_| {
+                MpcError::Protocol("MPC_PROXY_IDENTITY_KEY must be 32 bytes".into())
+            })?;
+            // Validate it's a usable scalar.
+            PrivateKey::from_bytes(&bytes)
+                .map_err(|e| MpcError::Protocol(format!("MPC_PROXY_IDENTITY_KEY invalid: {e}")))?;
+            return Ok(bytes);
+        }
+    }
+    derive_proxy_identity_bytes(share_secret)
+}
+
 /// Client-side BRC-31 session for proxy → KSS authentication.
 ///
 /// Thin proxy-side wrapper over the reusable, transport-agnostic
@@ -248,8 +295,9 @@ struct BridgeAuth {
 impl BridgeAuth {
     /// Create a new auth client with a random identity key (tests only).
     ///
-    /// Production uses [`BridgeAuth::from_share_seed`] so the proxy keeps a
-    /// stable owner identity across restarts.
+    /// Production resolves a stable identity via [`resolve_proxy_identity_bytes`]
+    /// (operator-provided `MPC_PROXY_IDENTITY_KEY`, else share-derived) so the
+    /// proxy keeps the same owner identity across restarts.
     #[cfg(test)]
     fn new() -> std::result::Result<Self, MpcError> {
         use rand::RngCore;
@@ -273,29 +321,25 @@ impl BridgeAuth {
     /// per-process key would orphan the share's ownership after a restart, so
     /// the key is derived from the secret share material — binding owner
     /// identity to control of `share_B` (AUTHZ-DESIGN §3c / OQ-A2: derive from
-    /// the share file, zero new config).
+    /// the share file, zero new config). Production goes through
+    /// [`resolve_proxy_identity_bytes`] + [`BridgeAuth::from_key_bytes`]; this
+    /// thin wrapper exercises the share-derived path directly in tests.
+    #[cfg(test)]
     fn from_share_seed(share_secret: &[u8]) -> std::result::Result<Self, MpcError> {
-        use hmac::{Hmac, Mac};
-        use sha2::Sha256;
-        const DOMAIN: &[u8] = b"bsv-mpc proxy auth identity v1";
-        // Reject the negligible chance of an out-of-range scalar by bumping a
-        // counter (probability ~2^-128 per try; the loop effectively never
-        // iterates).
-        for counter in 0u8..=u8::MAX {
-            let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(DOMAIN)
-                .map_err(|e| MpcError::Protocol(format!("hmac init: {e}")))?;
-            mac.update(share_secret);
-            mac.update(&[counter]);
-            let bytes: [u8; 32] = mac.finalize().into_bytes().into();
-            if let Ok(auth_key) = PrivateKey::from_bytes(&bytes) {
-                return Ok(Self {
-                    client: Brc31Client::new(auth_key),
-                });
-            }
-        }
-        Err(MpcError::Protocol(
-            "could not derive a valid proxy auth key from share seed".into(),
-        ))
+        let bytes = derive_proxy_identity_bytes(share_secret)?;
+        Self::from_key_bytes(&bytes)
+    }
+
+    /// Build a `BridgeAuth` from explicit 32-byte identity-key material. Used to
+    /// (a) honor an operator-provided stable identity (`MPC_PROXY_IDENTITY_KEY`)
+    /// and (b) construct a SECOND session (against `presign_url`) with the SAME
+    /// long-lived identity (§07.4 — one identity, per-server sessions).
+    fn from_key_bytes(bytes: &[u8; 32]) -> std::result::Result<Self, MpcError> {
+        let auth_key = PrivateKey::from_bytes(bytes)
+            .map_err(|e| MpcError::Protocol(format!("invalid auth key bytes: {e}")))?;
+        Ok(Self {
+            client: Brc31Client::new(auth_key),
+        })
     }
 
     /// Whether the handshake has been completed.
@@ -659,9 +703,17 @@ pub struct MpcBridge {
     /// Used for BRC-31 auth with the KSS.
     agent_id: String,
 
-    /// BRC-31 Authrite client for authenticated KSS communication.
+    /// BRC-31 Authrite client for authenticated KSS (DO `kss_url`) communication.
     /// Arc<Mutex> for sharing across spawn_blocking closures.
     auth: Arc<Mutex<BridgeAuth>>,
+
+    /// BRC-31 session for the heavy-compute cosigner (`presign_url`). When
+    /// `presign_url == kss_url` this is the same `Arc` as `auth`; otherwise it is
+    /// a SEPARATE session with the SAME long-lived identity (§07.4) — required
+    /// because a BRC-31 session is per-server (signature is derived against the
+    /// server's identity; the session nonce is server-issued), so presig against
+    /// an enforced container needs its own handshake.
+    presign_auth: Arc<Mutex<BridgeAuth>>,
 
     /// MessageBox relay URL for the ADR-018 relay sign path (#12).
     relay_url: String,
@@ -775,11 +827,19 @@ impl MpcBridge {
             .build()
             .map_err(|e| anyhow::anyhow!("failed to create HTTP client: {e}"))?;
 
-        // 6. Initialize BRC-31 auth client with a STABLE identity derived from
-        //    the secret share material (§07.4 long-lived identity / OQ-A2), so
-        //    the proxy keeps the same `owner_identity` across restarts.
-        let mut bridge_auth = BridgeAuth::from_share_seed(&dkg_result.share.ciphertext)
-            .map_err(|e| anyhow::anyhow!("failed to derive stable proxy auth identity: {e}"))?;
+        // 6. Resolve the proxy's STABLE long-lived BRC-31 identity (§07.4):
+        //    MPC_PROXY_IDENTITY_KEY if provided (needed to match a container's
+        //    DKG-time owner binding), else derived from the share material
+        //    (zero-config, stable across restarts).
+        let identity_bytes = resolve_proxy_identity_bytes(&dkg_result.share.ciphertext)
+            .map_err(|e| anyhow::anyhow!("failed to resolve proxy auth identity: {e}"))?;
+        let mut bridge_auth = BridgeAuth::from_key_bytes(&identity_bytes)
+            .map_err(|e| anyhow::anyhow!("failed to build proxy auth identity: {e}"))?;
+
+        let presign_url = config
+            .presign_url
+            .clone()
+            .unwrap_or_else(|| config.kss_url.clone());
 
         // 7. Check KSS health + perform BRC-31 handshake
         let health_url = format!("{}/health", config.kss_url);
@@ -814,6 +874,43 @@ impl MpcBridge {
             }
         }
 
+        // 8. Establish the presig-cosigner (`presign_url`) BRC-31 session. Same
+        //    identity, separate session when it's a different server than the DO.
+        let presign_auth = if presign_url == config.kss_url {
+            // Same server — reuse the DO session.
+            Arc::new(Mutex::new(bridge_auth))
+        } else {
+            let do_auth = Arc::new(Mutex::new(bridge_auth));
+            let mut cosigner_auth = BridgeAuth::from_key_bytes(&identity_bytes)
+                .map_err(|e| anyhow::anyhow!("failed to build cosigner auth identity: {e}"))?;
+            match cosigner_auth.handshake(&client, &presign_url).await {
+                Ok(()) => {
+                    tracing::info!(%presign_url, "BRC-31 handshake with presig cosigner succeeded")
+                }
+                Err(e) => tracing::warn!(
+                    error = %e, %presign_url,
+                    "BRC-31 handshake with presig cosigner failed — presig will be unauthenticated"
+                ),
+            }
+            // `auth` (DO) and `presign_auth` (cosigner) are distinct sessions.
+            return Ok(Self {
+                kss_url: config.kss_url.clone(),
+                share: dkg_result.share,
+                joint_key: dkg_result.joint_key,
+                root_pub,
+                share_scalar,
+                vss_points,
+                client,
+                session_id: dkg_result.session_id,
+                participants,
+                agent_id,
+                auth: do_auth,
+                presign_auth: Arc::new(Mutex::new(cosigner_auth)),
+                relay_url: config.relay_url.clone(),
+                presign_url,
+            });
+        };
+
         Ok(Self {
             kss_url: config.kss_url.clone(),
             share: dkg_result.share,
@@ -825,12 +922,10 @@ impl MpcBridge {
             session_id: dkg_result.session_id,
             participants,
             agent_id,
-            auth: Arc::new(Mutex::new(bridge_auth)),
+            auth: presign_auth.clone(),
+            presign_auth,
             relay_url: config.relay_url.clone(),
-            presign_url: config
-                .presign_url
-                .clone()
-                .unwrap_or_else(|| config.kss_url.clone()),
+            presign_url,
         })
     }
 
@@ -987,7 +1082,8 @@ impl MpcBridge {
         let kss_url = self.presign_url.clone();
         let client = self.client.clone();
         let agent_id = self.agent_id.clone();
-        let auth = self.auth.clone();
+        // The cosigner session (== the DO session when presign_url == kss_url).
+        let auth = self.presign_auth.clone();
 
         let handle = tokio::runtime::Handle::current();
 
@@ -1466,6 +1562,7 @@ impl MpcBridge {
             participants: vec![0, 1],
             agent_id,
             auth: Arc::new(Mutex::new(BridgeAuth::new().expect("test auth key"))),
+            presign_auth: Arc::new(Mutex::new(BridgeAuth::new().expect("test auth key"))),
             relay_url: "https://rust-message-box.dev-a3e.workers.dev".into(),
             presign_url: "http://localhost:9999".into(),
         }
