@@ -1286,6 +1286,105 @@ mod tests {
         panic!("signing did not complete within 20 rounds");
     }
 
+    /// **bsv-mpc#14 proof — run manually, NOT in CI (`#[ignore]`).**
+    ///
+    /// The KSS/worker signing handlers (`bsv-mpc-worker` `handle_sign_init`,
+    /// `bsv-mpc-service` `handle_sign_init`) reconstruct the proxy's canonical
+    /// wire `session_id` via `SessionId::from_hex`. The bug this proves/closes:
+    /// the old code used `from_str_hash`, which RE-HASHED the hex into a
+    /// *different* SessionId → a divergent cggmp24 `ExecutionId` → the 2PC
+    /// ceremony aborted mid-round (the masked 500 behind MPC-Spec #18).
+    ///
+    /// This drives a REAL 2-of-2 signing the way the worker DO handler does
+    /// (party-1 reconstructs the SessionId from the wire string), proving:
+    ///   1. `from_hex(S.hex())` round-trips to `S` and signing COMPLETES (valid DER);
+    ///   2. `from_str_hash(S.hex())` yields `S' != S` and signing does NOT
+    ///      complete — so the fix is load-bearing, not cosmetic.
+    ///
+    /// Run: `cargo test -p bsv-mpc-core --lib sign_sessionid_wire_roundtrip_proof -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn sign_sessionid_wire_roundtrip_proof() {
+        let config = ThresholdConfig::new(2, 2).unwrap();
+        let key_shares = dkg_key_shares(2, 2);
+        let participants = vec![0u16, 1];
+
+        // The proxy holds the canonical SessionId S and transmits S.hex() on the wire.
+        let s = SessionId::from_str_hash("worker-wire-roundtrip-proof");
+        let wire = s.hex();
+
+        // The invariant the fix relies on: from_hex inverts hex; from_str_hash does NOT.
+        assert_eq!(
+            SessionId::from_hex(&wire).unwrap(),
+            s,
+            "from_hex must round-trip the wire hex back to S"
+        );
+        assert_ne!(
+            SessionId::from_str_hash(&wire),
+            s,
+            "from_str_hash RE-HASHES the wire hex into a different SessionId (the bug)"
+        );
+
+        let msg: [u8; 32] = {
+            let mut h = sha2::Sha256::new();
+            h.update(b"worker #14 wire round-trip proof");
+            let r = h.finalize();
+            let mut b = [0u8; 32];
+            b.copy_from_slice(&r);
+            b
+        };
+
+        // Drive a full 2-party signing where party-1 (KSS/worker) reconstructs the
+        // SessionId from the wire via `reconstruct`. Returns Some(der_sig) on
+        // completion, None if it errors / desyncs (eid divergence).
+        let run = |reconstruct: fn(&str) -> SessionId| -> Option<Vec<u8>> {
+            let share0 = key_share_to_encrypted(&key_shares[0], 0, config);
+            let share1 = key_share_to_encrypted(&key_shares[1], 1, config);
+            let mut c0 = SigningCoordinator::new(s, share0, config, participants.clone());
+            let mut c1 =
+                SigningCoordinator::new(reconstruct(&wire), share1, config, participants.clone());
+            let mut o0 = c0.init_round(&msg, None).ok()?;
+            let mut o1 = c1.init_round(&msg, None).ok()?;
+            for _ in 0..20 {
+                match (c0.process_round(o1.clone()), c1.process_round(o0.clone())) {
+                    (
+                        Ok(SigningRoundResult::NextRound(a)),
+                        Ok(SigningRoundResult::NextRound(b)),
+                    ) => {
+                        o0 = a;
+                        o1 = b;
+                    }
+                    (Ok(SigningRoundResult::Complete(r0)), Ok(SigningRoundResult::Complete(_))) => {
+                        return Some(r0.signature)
+                    }
+                    _ => return None, // error or desync (the from_str_hash failure mode)
+                }
+            }
+            None
+        };
+
+        // FIXED path (what the worker now does): from_hex → signing completes.
+        let sig = run(|w| SessionId::from_hex(w).unwrap())
+            .expect("from_hex wire reconstruction MUST complete signing");
+        assert_eq!(
+            sig[0], 0x30,
+            "completed signature must be valid DER (SEQUENCE tag)"
+        );
+        eprintln!(
+            "  from_hex      → signing COMPLETED, DER sig {} bytes",
+            sig.len()
+        );
+
+        // BUGGY path (old worker code): from_str_hash → eid divergence → never completes.
+        assert!(
+            run(SessionId::from_str_hash).is_none(),
+            "from_str_hash wire reconstruction MUST fail to complete — proves the #14 fix is load-bearing"
+        );
+        eprintln!(
+            "  from_str_hash → signing did NOT complete (bug reproduced); fix is load-bearing"
+        );
+    }
+
     // ================================================================
     // Integration test: sign() convenience method
     // ================================================================
