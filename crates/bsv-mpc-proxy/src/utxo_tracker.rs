@@ -30,6 +30,14 @@ pub struct TrackedOutput {
     pub tags: Vec<String>,
     /// When the output was first tracked.
     pub created_at: DateTime<Utc>,
+    /// Full-ancestry BEEF (BRC-62) proving this output's transaction back to
+    /// confirmed ancestors, captured when the output was learned (internalized
+    /// funding tx, or the BEEF we broadcast for our own change). At spend time
+    /// the child's broadcast BEEF is assembled from its inputs' `source_beef` —
+    /// so we propagate the ancestry we already hold instead of re-fetching it
+    /// from a third-party indexer. `None` falls back to indexer lookup.
+    #[serde(default)]
+    pub source_beef: Option<Vec<u8>>,
 }
 
 impl TrackedOutput {
@@ -201,6 +209,7 @@ mod tests {
             basket: None,
             tags: vec![],
             created_at: Utc::now(),
+            source_beef: None,
         }
     }
 
@@ -220,6 +229,7 @@ mod tests {
             basket: Some(basket.to_string()),
             tags: tags.into_iter().map(String::from).collect(),
             created_at: Utc::now(),
+            source_beef: None,
         }
     }
 

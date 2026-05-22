@@ -703,6 +703,35 @@ async fn construct_beef(
     Some(beef.to_binary())
 }
 
+/// Assemble a child transaction's broadcast BEEF from the **full ancestry we
+/// already hold** — the `source_beef` of each input it spends — instead of
+/// re-fetching parent txs/proofs from a third-party indexer (WoC). Each parent
+/// `source_beef` carries its transaction plus merkle-proof ancestry back to a
+/// confirmed block; we merge them all (bsv-rs `Beef::merge_beef`) and append the
+/// child as the un-proven tip. Returns `None` if no ancestry was supplied or the
+/// merged BEEF fails validation, so the caller can fall back to indexer lookup.
+fn build_beef_from_ancestry(parent_beefs: &[Vec<u8>], child_raw: &[u8]) -> Option<Vec<u8>> {
+    if parent_beefs.is_empty() {
+        return None;
+    }
+    let mut beef = Beef::new();
+    for pb in parent_beefs {
+        match Beef::from_binary(pb) {
+            Ok(parent) => beef.merge_beef(&parent),
+            Err(e) => {
+                tracing::warn!(error = %e, "stored source_beef failed to parse; skipping ancestry merge");
+                return None;
+            }
+        }
+    }
+    beef.merge_raw_tx(child_raw.to_vec(), None);
+    if !beef.is_valid(false) {
+        tracing::warn!("child BEEF assembled from stored ancestry is invalid");
+        return None;
+    }
+    Some(beef.to_binary())
+}
+
 /// Broadcast a signed transaction using BEEF format to ARC endpoints, with WoC fallback.
 ///
 /// Broadcasting strategy:
@@ -722,21 +751,32 @@ async fn broadcast_tx(
     raw_tx_hex: &str,
     input_txids: &[String],
     arc_api_key: &str,
+    prebuilt_beef: Option<&[u8]>,
 ) -> Result<serde_json::Value, String> {
-    // Step 1: Construct BEEF for ARC compliance
-    let beef_hex = match construct_beef(client, raw_tx, input_txids).await {
-        Some(beef_bytes) => {
-            let hex = hex::encode(&beef_bytes);
+    // Step 1: Prefer the BEEF assembled from the inputs' own ancestry (the
+    // `source_beef` we already hold) — no indexer round-trip. Only when no
+    // ancestry was supplied do we fall back to building BEEF from WoC.
+    let beef_hex = match prebuilt_beef {
+        Some(b) => {
             tracing::info!(
-                beef_size = beef_bytes.len(),
-                "BEEF constructed for ARC broadcast"
+                beef_size = b.len(),
+                "Broadcasting with BEEF assembled from stored ancestry (no WoC)"
             );
-            Some(hex)
+            Some(hex::encode(b))
         }
-        None => {
-            tracing::warn!("BEEF construction failed, will fall back to WoC raw broadcast");
-            None
-        }
+        None => match construct_beef(client, raw_tx, input_txids).await {
+            Some(beef_bytes) => {
+                tracing::info!(
+                    beef_size = beef_bytes.len(),
+                    "BEEF constructed for ARC broadcast (WoC ancestry fallback)"
+                );
+                Some(hex::encode(&beef_bytes))
+            }
+            None => {
+                tracing::warn!("BEEF construction failed, will fall back to raw broadcast");
+                None
+            }
+        },
     };
 
     // Step 2: Try ARC broadcasters with BEEF.
@@ -1518,12 +1558,21 @@ pub async fn create_action_impl(state: &AppState, body: Value) -> Value {
     // TAAL without an API key. BEEF wraps parent merkle proofs so the miner
     // can verify the input chain without querying the UTXO set.
     let input_txids: Vec<String> = selected_utxos.iter().map(|u| u.txid.clone()).collect();
+    // Assemble the broadcast BEEF from the inputs' own stored ancestry (their
+    // `source_beef`) so we never re-fetch parent proofs from an indexer — the
+    // funding parent is frequently still unconfirmed at spend time.
+    let parent_beefs: Vec<Vec<u8>> = selected_utxos
+        .iter()
+        .filter_map(|u| u.source_beef.clone())
+        .collect();
+    let child_beef = build_beef_from_ancestry(&parent_beefs, &raw_tx);
     match broadcast_tx(
         &state.http_client,
         &raw_tx,
         &raw_tx_hex,
         &input_txids,
         &state.config.arc_api_key,
+        child_beef.as_deref(),
     )
     .await
     {
@@ -1564,6 +1613,9 @@ pub async fn create_action_impl(state: &AppState, body: Value) -> Value {
                     basket: Some("default".into()),
                     tags: vec![],
                     created_at: chrono::Utc::now(),
+                    // Carry this tx's full BEEF forward so a later spend of the
+                    // change output also broadcasts with complete ancestry.
+                    source_beef: child_beef.clone(),
                 })
                 .await
             {
@@ -1611,6 +1663,15 @@ pub async fn internalize_action_impl(state: &AppState, body: Value) -> Value {
     let input_bytes = match hex::decode(raw_tx_hex) {
         Ok(b) => b,
         Err(e) => return json!({"error": format!("invalid hex in tx: {}", e)}),
+    };
+
+    // When the caller hands us BEEF, it carries this tx's full merkle-proof
+    // ancestry. Retain it on each internalized output so a later spend can build
+    // its broadcast BEEF from ancestry we already hold (no indexer round-trip).
+    let source_beef: Option<Vec<u8>> = if is_beef_format(&input_bytes) {
+        Some(input_bytes.clone())
+    } else {
+        None
     };
 
     // Detect whether input is BEEF/AtomicBEEF or a raw transaction.
@@ -1700,6 +1761,7 @@ pub async fn internalize_action_impl(state: &AppState, body: Value) -> Value {
                     basket: Some(basket.to_string()),
                     tags: vec![],
                     created_at: chrono::Utc::now(),
+                    source_beef: source_beef.clone(),
                 })
                 .await
             {
@@ -1722,6 +1784,7 @@ pub async fn internalize_action_impl(state: &AppState, body: Value) -> Value {
                         basket: Some(basket.to_string()),
                         tags: vec![],
                         created_at: chrono::Utc::now(),
+                        source_beef: source_beef.clone(),
                     })
                     .await
                 {
