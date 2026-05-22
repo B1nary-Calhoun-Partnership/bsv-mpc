@@ -56,7 +56,10 @@ use bsv_mpc_core::canonical::{canonical_execution_id, ExecutionParams, PhaseTag}
 use bsv_mpc_core::envelope::WrapParams;
 use bsv_mpc_core::presig_at_rest::{derive_presig_at_rest_key, seal_presig_bytes};
 use bsv_mpc_core::presig_encryption::{encrypt_presig_share, wallet_from_identity};
-use bsv_mpc_core::presigning::{serialize_party_presignature, PresigningManager, PresigningRoundResult};
+use bsv_mpc_core::presigning::{
+    serialize_party_presig_with_public_data, serialize_party_presignature, PresigningManager,
+    PresigningRoundResult,
+};
 use bsv_mpc_core::types::{
     EncryptedShare, PolicyId, PresigBundle, RoundMessage, SessionId, ShareIndex,
 };
@@ -91,6 +94,12 @@ struct CeremonySlot {
 struct CollectionSlot {
     /// Coordinator's OWN serialized presig share, sealed at-rest (§06.17.1).
     own_presig_sealed: Vec<u8>,
+    /// Durable CBOR of the shared `PresignaturePublicData` (§06.17.1
+    /// `commitments`) — lets the coordinator reconstruct + combine after a
+    /// restart (#25a), not just from an in-memory pool.
+    public_data_cbor: Vec<u8>,
+    /// `Gamma` commitment hex (§06.17.1 `gamma_hex`).
+    gamma_hex: String,
     /// canonical `presig_id` (= presign session_id hex).
     presig_id: String,
     /// Joint pubkey (33-byte compressed) the bundle binds to. Stashed at
@@ -416,13 +425,16 @@ impl PresignHandler {
             .take_raw()
             .ok_or_else(|| anyhow::anyhow!("presign complete but pool empty (no raw presig)"))?;
         let _ = meta;
-        let serialized = serialize_party_presignature(raw)
-            .map_err(|e| anyhow::anyhow!("serialize_party_presignature: {e}"))?;
 
         if self.is_coordinator() {
-            // Coordinator keeps its OWN share (sealed at-rest, §06.17.1) and
-            // opens / advances the collection slot. The cosigner ciphertexts
-            // arrive on the return box.
+            // Coordinator keeps its OWN share (sealed at-rest, §06.17.1) + the
+            // shared public data (durable CBOR for cross-restart combine, #25a)
+            // and opens the collection slot. Cosigner ciphertexts arrive on the
+            // return box.
+            let (serialized, public_data_cbor, gamma_hex) =
+                serialize_party_presig_with_public_data(raw).map_err(|e| {
+                    anyhow::anyhow!("serialize coordinator presig + public data: {e}")
+                })?;
             let at_rest_key = derive_presig_at_rest_key(&self.inner.at_rest_root, &presig_id);
             let sealed = seal_presig_bytes(&serialized, &at_rest_key)
                 .map_err(|e| anyhow::anyhow!("seal coordinator presig: {e}"))?;
@@ -432,6 +444,8 @@ impl PresignHandler {
                 let mut col = self.inner.collections.lock().unwrap_or_else(|p| p.into_inner());
                 col.entry(session_id).or_insert_with(|| CollectionSlot {
                     own_presig_sealed: sealed,
+                    public_data_cbor,
+                    gamma_hex,
                     presig_id: presig_id.clone(),
                     joint_pubkey,
                     cosigner_shares: vec![None; n],
@@ -448,7 +462,10 @@ impl PresignHandler {
             Ok(vec![])
         } else {
             // Cosigner: BRC-2 self-encrypt the share and ship it to the
-            // coordinator on the return box (§06.16 step 3).
+            // coordinator on the return box (§06.16 step 3). It keeps no
+            // plaintext and no public data (the coordinator holds those).
+            let serialized = serialize_party_presignature(raw)
+                .map_err(|e| anyhow::anyhow!("serialize_party_presignature: {e}"))?;
             let wallet = wallet_from_identity(&self.inner.identity_priv);
             let ciphertext = encrypt_presig_share(&wallet, &presig_id, &serialized)
                 .map_err(|e| anyhow::anyhow!("encrypt_presig_share: {e}"))?;
@@ -583,8 +600,8 @@ impl PresignHandler {
                 presig_id: slot.presig_id.clone(),
                 presig_bytes: slot.own_presig_sealed.clone(),
                 cosigner_encrypted_shares,
-                gamma_hex: String::new(),
-                commitments: Vec::new(),
+                gamma_hex: slot.gamma_hex.clone(),
+                commitments: slot.public_data_cbor.clone(),
                 policy_id: self.inner.policy_id,
                 joint_pubkey: joint_pubkey.to_vec(),
                 parties_at_keygen: self.inner.parties_at_keygen.clone(),
@@ -895,6 +912,8 @@ mod tests {
                 sid,
                 CollectionSlot {
                     own_presig_sealed: sealed.clone(),
+                    public_data_cbor: b"stub-public-data-cbor".to_vec(),
+                    gamma_hex: "02deadbeef".to_string(),
                     presig_id: presig_id.clone(),
                     joint_pubkey: jpk,
                     cosigner_shares: vec![None, None],
