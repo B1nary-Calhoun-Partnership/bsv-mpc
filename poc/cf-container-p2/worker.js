@@ -7,7 +7,10 @@ import { Container, getContainer } from "@cloudflare/containers";
 
 export class BsvMpcServiceContainer extends Container {
   defaultPort = 8080;
-  sleepAfter = "5m";
+  // Longer than a full DKG/presig ceremony so a mid-sequence gap can't sleep the
+  // container and drop the in-memory COORDINATOR_STORE session state. (CF default
+  // is 10m; a multi-round Paillier DKG can exceed that on a busy/slow instance.)
+  sleepAfter = "30m";
 
   constructor(ctx, env, options) {
     super(ctx, env, options);

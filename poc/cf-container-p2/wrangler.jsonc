@@ -12,12 +12,16 @@
       "image": "../../Dockerfile",
       "image_build_context": "../../",
       "max_instances": 1,
-      // #4e: DKG/presig generate Paillier safe-primes inline (CPU + memory
-      // heavy); the default "dev" instance (256 MiB) OOMs. "standard-1" gives
-      // more memory + vCPU for the off-hot-path ceremonies.
-      "instance_type": "standard-1"
+      // #4e/#8: DKG/presig generate 2048-bit Paillier safe-primes inline — heavily
+      // CPU-bound. "standard-1" is only 1/2 vCPU, on which a single DKG round can
+      // exceed the proxy's per-request timeout (observed: >600s, deployed real-sats
+      // blocked). "standard-4" = 4 vCPU (8x) brings a round well under the budget.
+      "instance_type": "standard-4"
     }
   ],
+  // Surface the container's stdout in `wrangler tail` / Workers Logs (off by
+  // default → container logs were invisible while debugging the #8 DKG hang).
+  "observability": { "enabled": true },
   "durable_objects": {
     "bindings": [
       { "class_name": "BsvMpcServiceContainer", "name": "BSV_MPC_SERVICE" }

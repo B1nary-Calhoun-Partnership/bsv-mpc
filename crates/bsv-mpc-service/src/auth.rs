@@ -489,7 +489,10 @@ pub fn handshake(
     });
 
     // Build + sign the InitialResponse (its own signing_data + get_key_id;
-    // protocolID [App, "auth message signature"], counterparty = the client).
+    // protocolID [Counterparty, "auth message signature"], counterparty = the
+    // client). SecurityLevel::Counterparty matches the canonical @bsv TS handshake
+    // (Peer.processInitialRequest) + bsv-rs + bsv-middleware-cloudflare, so a
+    // canonical TS/cross-impl client can verify our InitialResponse signature.
     let mut resp = AuthMessage::new(MessageType::InitialResponse, server_key.clone());
     resp.nonce = Some(server_nonce.clone());
     resp.initial_nonce = Some(server_nonce.clone());
@@ -500,7 +503,7 @@ pub fn handshake(
         .create_signature(CreateSignatureArgs {
             data: Some(data),
             hash_to_directly_sign: None,
-            protocol_id: Protocol::new(SecurityLevel::App, "auth message signature"),
+            protocol_id: Protocol::new(SecurityLevel::Counterparty, "auth message signature"),
             key_id,
             counterparty: Some(Counterparty::Other(req.identity_key.clone())),
         })
