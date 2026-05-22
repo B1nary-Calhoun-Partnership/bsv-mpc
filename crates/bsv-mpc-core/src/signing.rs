@@ -1872,6 +1872,80 @@ mod tests {
         );
     }
 
+    /// §06.20 worker-self-encrypt-at-rest byte-identity gate (#25b): the
+    /// deployed worker BRC-2 self-encrypts its presig at ingest and decrypts it
+    /// at sign-time. Because `issue_partial_signature_json` is deterministic, the
+    /// partial issued via the encrypt→consume→decrypt path MUST be byte-identical
+    /// to the partial issued directly from the plaintext presig for the same
+    /// (presig, sighash). This is the hermetic mirror of the deployed worker's
+    /// `/ceremony/ingest-presig` → `/sign-relay` round-trip.
+    #[tokio::test]
+    async fn presig_decrypt_issue_partial_byte_identical_to_plaintext() {
+        let key_shares = dkg_key_shares(2, 2);
+        let participants: Vec<u16> = vec![0, 1];
+        let mut rng = rand::rngs::OsRng;
+        let eid_bytes: [u8; 32] = rand::Rng::gen(&mut rng);
+        let eid_presign = ExecutionId::new(&eid_bytes);
+        let presigs = round_based::sim::run_with_setup(
+            participants.iter().map(|i| &key_shares[usize::from(*i)]),
+            |i, party, share| {
+                let party = buffer_outgoing(party);
+                let mut party_rng = rand::rngs::OsRng;
+                let participants = participants.clone();
+                async move {
+                    cggmp24::signing(eid_presign, i, &participants, share)
+                        .generate_presignature(&mut party_rng, party)
+                        .await
+                }
+            },
+        )
+        .unwrap()
+        .expect_ok()
+        .into_vec();
+
+        let sighash: [u8; 32] = {
+            let mut h = sha2::Sha256::new();
+            h.update(b"sec06.20 byte-identity sighash");
+            let mut b = [0u8; 32];
+            b.copy_from_slice(&h.finalize());
+            b
+        };
+
+        // The worker's presig (party 1), serialized exactly as it would be at
+        // ingest (the plaintext the proxy ships, the bytes that get sealed).
+        let presig1 = presigs.into_iter().nth(1).unwrap();
+        let presig_plaintext = serde_json::to_vec(&presig1.0).expect("serialize presig");
+
+        // Plaintext path (what the worker did BEFORE §06.20).
+        let partial_plain =
+            issue_partial_signature_json(&presig_plaintext, &sighash).expect("plaintext partial");
+
+        // §06.20 path: worker self-encrypts at ingest, decrypts at sign.
+        let worker_priv = bsv::primitives::ec::PrivateKey::from_bytes(&[0x9c; 32]).unwrap();
+        let wallet = crate::presig_encryption::wallet_from_identity(&worker_priv);
+        let presig_id = "presig-byte-identity-001";
+        let ciphertext =
+            crate::presig_encryption::encrypt_presig_share(&wallet, presig_id, &presig_plaintext)
+                .expect("self-encrypt at ingest");
+        assert_ne!(
+            ciphertext, presig_plaintext,
+            "at-rest row MUST be ciphertext, not the plaintext presig"
+        );
+        let partial_via_decrypt = crate::presig_encryption::decrypt_and_issue_partial(
+            &wallet,
+            presig_id,
+            &ciphertext,
+            &sighash,
+            None,
+        )
+        .expect("§06.20 decrypt + issue partial");
+
+        assert_eq!(
+            partial_via_decrypt, partial_plain,
+            "§06.20: decrypt→issue partial MUST be byte-identical to the plaintext-issued partial"
+        );
+    }
+
     /// §06.20 + §03.8 HD path: every signer applies the SAME BRC-42 offset to
     /// its presig share at consume-time; the signature MUST verify under the
     /// HD-derived child key `joint_pub + offset·G` (and MUST NOT verify under the
