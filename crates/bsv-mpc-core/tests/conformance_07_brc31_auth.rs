@@ -17,6 +17,13 @@
 //! pure function): the consuming service tracks consumed per-request nonces.
 //! That is exercised by the service-side e2e in the Phase B migration, not here.
 
+// Native-only: this test links `bsv-middleware-rs` (the canonical server
+// verifier), which does not build for `wasm32-unknown-unknown`. Exclude the
+// whole test from wasm builds so the crate's `wasm-pack test` job (which
+// compiles every integration test in the package, not just `wasm32_dkg`) links
+// cleanly. Inverse of `wasm32_dkg.rs`'s `#![cfg(target_arch = "wasm32")]`.
+#![cfg(not(target_arch = "wasm32"))]
+
 use base64::Engine;
 use bsv::auth::{AuthMessage, MessageType, AUTH_PROTOCOL_ID};
 use bsv::primitives::PrivateKey;
