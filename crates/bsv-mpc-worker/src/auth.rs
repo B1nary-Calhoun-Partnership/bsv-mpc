@@ -160,9 +160,20 @@ pub async fn process_request_auth(
     // when it builds the signed BRC-104 payload for a General message.
     let handler_req = req.clone()?;
 
-    let result = process_auth_with_storage(req, storage, &options)
-        .await
-        .map_err(|e| Error::RustError(format!("BRC-31 auth: {e}")))?;
+    // A present-but-INVALID signature surfaces here as an `Err` (e.g. "Invalid
+    // message signature"). That is an authentication FAILURE, not a worker fault:
+    // it MUST be rejected as a clean 401 (matching the missing-auth → 401 shape),
+    // NOT propagated as an `Err` that the DO turns into a 500 exception (§07.6
+    // hygiene; reduces DoS / error-leak surface). We do NOT weaken any check —
+    // only map the verification-error case to a 401 status. The status decision is
+    // factored into `auth_error_status` so it is unit-testable without a live
+    // `worker::Request`.
+    let result = match process_auth_with_storage(req, storage, &options).await {
+        Ok(result) => result,
+        Err(e) => {
+            return Ok(AuthOutcome::Respond(auth_error_response(&e.to_string())?));
+        }
+    };
 
     match result {
         AuthResult::Response(resp) => Ok(AuthOutcome::Respond(resp)),
@@ -241,6 +252,28 @@ fn enforce_replay(req: &Request, storage: &DoSqlStorage<'_>) -> Result<Option<Re
         Ok(None)
     } else {
         Ok(Some(reject_401("stale/replayed request nonce (§07.1)")?))
+    }
+}
+
+/// HTTP status to return when `process_auth_with_storage` itself errors out.
+///
+/// A present-but-invalid BRC-31 signature (and any other authentication failure
+/// the middleware reports as an `Err`) is an UNAUTHORIZED outcome, not a server
+/// fault: it maps to **401**. This is a pure function so the mapping is
+/// unit-testable without constructing a live `worker::Request` (which can only be
+/// built on the `wasm32` target). It deliberately returns 401 for every
+/// middleware auth error — we never want such a failure to escape as a 500.
+fn auth_error_status(_middleware_error: &str) -> u16 {
+    401
+}
+
+/// Build the clean rejection response for a middleware auth error. The error
+/// detail is NOT echoed to the client (avoids leaking verification internals);
+/// the body matches the canonical missing-auth 401 shape.
+fn auth_error_response(middleware_error: &str) -> Result<Response> {
+    match auth_error_status(middleware_error) {
+        403 => reject_403("not authorized"),
+        _ => reject_401("invalid BRC-31 signature"),
     }
 }
 
@@ -524,6 +557,52 @@ mod tests {
         assert!(
             !verify_canonical(&server, &msg, &session),
             "tampering the request body must break the signature"
+        );
+    }
+
+    #[test]
+    fn corrupted_signature_yields_401_not_500() {
+        // Regression (fix/worker-authfail-401): a General message that carries a
+        // PRESENT but INVALID (corrupted) signature must be rejected as 401, not
+        // surfaced as a 500. We model the deployed path in two halves:
+        //
+        //   1. The canonical verification the worker DO runs (`verify_canonical`,
+        //      mirroring the middleware's private `verify_message_signature`)
+        //      REJECTS the corrupted signature — i.e. the middleware returns
+        //      `Err(InvalidAuthentication("Invalid message signature"))`.
+        //   2. `process_request_auth` maps that `Err` through `auth_error_status`
+        //      to a 401 outcome (never a propagated `Err` → 500).
+        let client = ProtoWallet::new(Some(key(0x22)));
+        let server = ProtoWallet::new(Some(key(0x11)));
+        let ssn = b64(0xA1);
+        let mut msg = canonical_client_general(
+            &client,
+            &server.identity_key(),
+            &ssn,
+            "POST",
+            "/custody/put-share",
+            br#"{"agent_id":"02abc","share":"deadbeef"}"#,
+        );
+        // Corrupt the signature (present but invalid) — exactly the deployed bug:
+        // a flipped byte in the DER signature, headers/body otherwise intact.
+        let sig = msg.signature.as_mut().expect("signature present");
+        let n = sig.len();
+        sig[n - 1] ^= 0xFF;
+        let session = server_session(&ssn, &client.identity_key().to_hex());
+
+        // Half 1: the worker's canonical verification rejects the corrupted sig,
+        // so `process_auth_with_storage` returns an `Err` on the deployed path.
+        assert!(
+            !verify_canonical(&server, &msg, &session),
+            "a corrupted signature must fail canonical verification (→ middleware Err)"
+        );
+
+        // Half 2: that middleware `Err` maps to a 401, NOT a 500. This is the
+        // exact status decision `process_request_auth` makes on the `Err` arm.
+        assert_eq!(
+            auth_error_status("BRC-31 auth: Invalid message signature"),
+            401,
+            "a present-but-invalid signature must be a 401, never a 500"
         );
     }
 
