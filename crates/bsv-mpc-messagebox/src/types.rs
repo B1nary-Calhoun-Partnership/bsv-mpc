@@ -147,3 +147,60 @@ pub const BOX_PRESIGN: &str = "mpc-presign";
 pub const BOX_ECDH: &str = "mpc-ecdh";
 /// Box name for Refresh ceremony envelopes.
 pub const BOX_REFRESH: &str = "mpc-refresh";
+
+// ---------------------------------------------------------------------------
+// Per-session presign mailboxes (MPC-Spec §06.17.2)
+// ---------------------------------------------------------------------------
+//
+// Mailboxes are IMPLICIT on a `message-box-server` relay: they're created on
+// the first `sendMessage` to a name and there's no create/delete API
+// ("allocate" = use the name; "delete after ack" = best-effort relay GC plus
+// `acknowledge`). Per §06.17.2 a presign session uses two transient mailboxes,
+// each scoped by the canonical SessionId hex (§04):
+//
+//   - `mpc_{session_id}`          — round-trip channel for the 3-round cggmp24
+//                                    protocol traffic.
+//   - `presig_return_{session_id}` — one-way return channel for the cosigner-
+//                                    encrypted presig-share ciphertexts.
+
+/// Round-trip mailbox name for a presign session's 3-round protocol traffic
+/// (§06.17.2): `mpc_{session_id_hex}`. `session_id_hex` is the 64-char
+/// lowercase-hex canonical SessionId (§04). Pure + deterministic.
+pub fn presign_protocol_box(session_id_hex: &str) -> String {
+    format!("mpc_{session_id_hex}")
+}
+
+/// One-way return mailbox name for a presign session's cosigner-encrypted
+/// share ciphertexts (§06.17.2): `presig_return_{session_id_hex}`. Pure +
+/// deterministic.
+pub fn presig_return_box(session_id_hex: &str) -> String {
+    format!("presig_return_{session_id_hex}")
+}
+
+#[cfg(test)]
+mod box_name_tests {
+    use super::*;
+
+    #[test]
+    fn presign_mailbox_names_are_session_scoped_and_deterministic() {
+        let sid = "f25e7c5e560e01926dfbfd70f3940352c1349e1e69a2f17c1668bda988014e0b";
+        // Exact §06.17.2 spelling.
+        assert_eq!(
+            presign_protocol_box(sid),
+            "mpc_f25e7c5e560e01926dfbfd70f3940352c1349e1e69a2f17c1668bda988014e0b"
+        );
+        assert_eq!(
+            presig_return_box(sid),
+            "presig_return_f25e7c5e560e01926dfbfd70f3940352c1349e1e69a2f17c1668bda988014e0b"
+        );
+        // Deterministic: same input → same name.
+        assert_eq!(presign_protocol_box(sid), presign_protocol_box(sid));
+        assert_eq!(presig_return_box(sid), presig_return_box(sid));
+        // Distinct sessions → distinct mailboxes (no cross-session collision).
+        let other = "00".repeat(32);
+        assert_ne!(presign_protocol_box(sid), presign_protocol_box(&other));
+        assert_ne!(presig_return_box(sid), presig_return_box(&other));
+        // The two channels for one session never collide.
+        assert_ne!(presign_protocol_box(sid), presig_return_box(sid));
+    }
+}
