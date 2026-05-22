@@ -679,7 +679,7 @@ pub fn apply_brc42_offset_public_data(
     offset: &Scalar<Secp256k1>,
 ) {
     for c in &mut public_data.commitments {
-        c.tilde_S = c.tilde_S + *offset * c.tilde_Delta;
+        c.tilde_S += *offset * c.tilde_Delta;
     }
 }
 

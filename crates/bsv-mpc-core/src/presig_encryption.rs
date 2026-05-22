@@ -101,11 +101,11 @@ pub fn decrypt_presig_share(
 /// BRC-42 offset for HD-derived signing).
 ///
 /// At sign-time the coordinator ships the cosigner its stored
-/// `cosigner_encrypted_share` + the message-to-sign (+ a BRC-42 offset for the
-/// HD path). The cosigner re-derives its wallet key, decrypts (same protocol_id
-/// + key_id=presig_id), deserializes the `cggmp24::Presignature`, applies the
-/// offset if present, and emits its serialized `PartialSignature` for the
-/// coordinator to combine. Single-use is enforced by the coordinator removing
+/// `cosigner_encrypted_share` plus the message-to-sign (and a BRC-42 offset for
+/// the HD path). The cosigner re-derives its wallet key, decrypts under the same
+/// protocol_id and key_id (= presig_id), deserializes the `cggmp24::Presignature`,
+/// applies the offset if present, and emits its serialized `PartialSignature` for
+/// the coordinator to combine. Single-use is enforced by the coordinator removing
 /// the bundle from the pool (§06.17.3).
 pub fn decrypt_and_issue_partial(
     wallet: &ProtoWallet,
