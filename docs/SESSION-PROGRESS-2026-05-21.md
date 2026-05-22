@@ -258,6 +258,16 @@ canonical @bsv BRC-31 wire, deployed, with a real mainnet spend.
   **mainnet TXID `96c2ebc592c77bab2fc3fba47993bc6638ec248c7f90caf68ba7fddb3cdabcfd`**
   (createAction via the deployed `bsv-mpc-worker` DO over the authed canonical relay;
   joint `1LkbL2a7g679uCGZRQ6ZBysckQxG6MrzBV`; confirmed on WhatsOnChain).
-- **Phase D (remaining):** publish `bsv-middleware-rs`/`bsv-middleware-cloudflare` (swap
-  git-rev→version); worker invalid-sig→500-not-401 mapping fix; MPC-Spec §07.10/§07.1 +
-  THREAT-MODEL A4/A7 scrub + author `07-brc31-auth.json`; then close #8.
+- **Phase D — DONE; #8 CLOSED.** TS-handshake conformance fix (service InitialResponse
+  `App`→`Counterparty`, `2130efe`) + worker invalid-sig→401 (`a3e660d`) — re-deployed
+  (worker `f232a13a`, container `abde42a9`) + re-proven (deploy_smoke + self_stocking
+  BSV-valid, no regression). THREAT-MODEL A4/A7 scrubbed (`a82fa6b`). MPC-Spec §07.10
+  update drafted on local branch `docs/0710-canonical-adoption` (held for review).
+  §07.11 vector drafted to `brc-drafts/07-brc31-auth.vector.draft.json` (`89449b9`;
+  signatures left as cross-impl placeholders — needs byte-lock like §06).
+  **Held (tracked in #5, per decision):** crates.io publish + git-rev→version swap;
+  §07.10 push; §07.2 touch-up; rate-limiting. bsv-mpc consumes the fixed crates via
+  git-rev (mainnet-proven), so publish is non-blocking.
+- **Account hygiene:** `jcalhoun-trifinlabs` logged out of gh (was drifting as the active
+  account); 3 mis-attributed #8 comments re-posted under Calgooon; middleware-repo git
+  configs set to Calgooon noreply. All commits attribute to Calgooon.
