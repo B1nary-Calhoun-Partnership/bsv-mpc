@@ -96,6 +96,32 @@ pub fn decrypt_presig_share(
     Ok(result.plaintext)
 }
 
+/// The §06.20 cosigner consume path: decrypt the coordinator-shipped BRC-2
+/// ciphertext, then issue this party's partial signature (optionally applying a
+/// BRC-42 offset for HD-derived signing).
+///
+/// At sign-time the coordinator ships the cosigner its stored
+/// `cosigner_encrypted_share` + the message-to-sign (+ a BRC-42 offset for the
+/// HD path). The cosigner re-derives its wallet key, decrypts (same protocol_id
+/// + key_id=presig_id), deserializes the `cggmp24::Presignature`, applies the
+/// offset if present, and emits its serialized `PartialSignature` for the
+/// coordinator to combine. Single-use is enforced by the coordinator removing
+/// the bundle from the pool (§06.17.3).
+pub fn decrypt_and_issue_partial(
+    wallet: &ProtoWallet,
+    presig_id: &str,
+    encrypted_share: &[u8],
+    message_hash: &[u8; 32],
+    brc42_offset: Option<[u8; 32]>,
+) -> Result<Vec<u8>> {
+    let presig_json = decrypt_presig_share(wallet, presig_id, encrypted_share)?;
+    crate::signing::issue_partial_signature_json_with_offset(
+        &presig_json,
+        message_hash,
+        brc42_offset,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

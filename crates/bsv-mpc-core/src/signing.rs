@@ -15,9 +15,10 @@
 //! [`process_round`](SigningCoordinator::process_round) combines them. Just field
 //! math — no Paillier/ZK rounds — so it fits the CF Worker wasm budget (ADR-018).
 //! Uses the `insecure-assume-preimage-known` cggmp24 feature (BSV sighashes are
-//! pre-hashed). **Base key only** — BRC-42 HD-derived signing (an `hmac_offset`)
-//! must use the 4-round path, since the offset is baked into a presignature at
-//! generation time.
+//! pre-hashed). HD-derived signing (a BRC-42 `offset`) is also supported on the
+//! 1-round path via [`apply_brc42_offset`] (§06.20): every signer applies the
+//! same offset to its presig share at consume-time, and the result verifies
+//! under `child_pub = root_pub + offset·G`.
 //!
 //! ### 2. Without Presignature (4 rounds) — implemented
 //!
@@ -45,7 +46,7 @@ use cggmp24::security_level::SecurityLevel128;
 use cggmp24::signing::{PartialSignature, PrehashedDataToSign, PresignaturePublicData};
 use cggmp24::supported_curves::Secp256k1;
 use cggmp24::ExecutionId;
-use generic_ec::Scalar;
+use generic_ec::{Scalar, SecretScalar};
 use round_based::state_machine::StateMachine;
 use sha2::{Digest, Sha256};
 
@@ -641,9 +642,69 @@ pub fn issue_partial_signature_json(
     presignature_json: &[u8],
     message_hash: &[u8; 32],
 ) -> Result<Vec<u8>> {
-    let presig: cggmp24::signing::Presignature<Secp256k1> =
+    issue_partial_signature_json_with_offset(presignature_json, message_hash, None)
+}
+
+/// Apply a BRC-42 additive shift to a presignature in place (MPC-Spec §03.8 /
+/// §06.20), enabling 1-round HD-derived signing from a presig.
+///
+/// Each cosigner's presig share satisfies `sigma_i = tilde_k_i·m + r·tilde_chi_i`,
+/// and the combined signature signs for the key whose private scalar is encoded
+/// in `Σ tilde_chi_i`. Shifting the root key by `offset` (child = root + offset)
+/// requires shifting each share's `tilde_chi` by `offset·tilde_k` — since
+/// `tilde_chi = chi/delta` and `tilde_k = k/delta`, `(chi + offset·k)/delta =
+/// tilde_chi + offset·tilde_k`. ALL signers MUST apply the SAME offset; the
+/// result verifies under `child_pub = root_pub + offset·G`.
+///
+/// Mirrors `rust-mpc/crates/brc42/src/presignature.rs::apply_brc42_offset`.
+pub fn apply_brc42_offset(
+    presig: &mut cggmp24::signing::Presignature<Secp256k1>,
+    offset: &Scalar<Secp256k1>,
+) {
+    let k: &Scalar<Secp256k1> = presig.tilde_k.as_ref();
+    let chi: &Scalar<Secp256k1> = presig.tilde_chi.as_ref();
+    let mut shifted = *chi + *offset * k;
+    presig.tilde_chi = SecretScalar::new(&mut shifted);
+}
+
+/// Companion to [`apply_brc42_offset`] for the coordinator's shared
+/// [`PresignaturePublicData`]: shift each commitment's `tilde_S` by
+/// `offset·tilde_Δ`. Required so `PartialSignature::combine`'s consistency check
+/// `σ_i·Γ == m·tilde_Δ_j + r·tilde_S_j` still holds after the secret-side shift
+/// (since `tilde_S_j = tilde_chi_j·Γ` and `tilde_Δ_j = tilde_k_j·Γ`). The
+/// coordinator MUST apply this to its public data whenever the signers apply the
+/// same `offset` to their presig shares.
+pub fn apply_brc42_offset_public_data(
+    public_data: &mut PresignaturePublicData<Secp256k1>,
+    offset: &Scalar<Secp256k1>,
+) {
+    for c in &mut public_data.commitments {
+        c.tilde_S = c.tilde_S + *offset * c.tilde_Delta;
+    }
+}
+
+/// Issue a partial signature from a serialized presignature, optionally applying
+/// a BRC-42 offset first (§06.20 HD path). The cosigner-side primitive consumed
+/// by [`crate::presig_encryption::decrypt_and_issue_partial`].
+///
+/// * `presignature_json` — serde-JSON of this party's `cggmp24::Presignature`.
+/// * `message_hash` — the 32-byte BSV sighash.
+/// * `brc42_offset` — `Some(32-byte BE scalar)` for HD-derived signing (applied
+///   to the presig before issuing); `None` signs the base joint key.
+///
+/// Returns serde-JSON of this party's [`cggmp24::PartialSignature`].
+pub fn issue_partial_signature_json_with_offset(
+    presignature_json: &[u8],
+    message_hash: &[u8; 32],
+    brc42_offset: Option<[u8; 32]>,
+) -> Result<Vec<u8>> {
+    let mut presig: cggmp24::signing::Presignature<Secp256k1> =
         serde_json::from_slice(presignature_json)
             .map_err(|e| MpcError::Signing(format!("deserialize presignature: {e}")))?;
+    if let Some(offset_bytes) = brc42_offset {
+        let offset = Scalar::<Secp256k1>::from_be_bytes_mod_order(offset_bytes);
+        apply_brc42_offset(&mut presig, &offset);
+    }
     let scalar = Scalar::<Secp256k1>::from_be_bytes_mod_order(*message_hash);
     let data_to_sign = PrehashedDataToSign::from_scalar(scalar).insecure_assume_preimage_known();
     let partial = presig.issue_partial_signature(data_to_sign);
@@ -1651,6 +1712,222 @@ mod tests {
         assert!(
             bsv_pubkey.verify(&message_hash, &bsv_sig),
             "BSV SDK must verify the 1-round presigned signature"
+        );
+    }
+
+    /// §06.20 sign-time consume with cosigner-side BRC-2 decrypt (base key).
+    ///
+    /// Mirrors the relay topology: party 0 is the coordinator (holds the
+    /// PresignaturePublicData, combines); party 1 is a cosigner whose presig
+    /// share is BRC-2-encrypted (§06.16), shipped, decrypted, and turned into a
+    /// partial via the §06.20 consume path. The combined signature MUST verify
+    /// under the joint key — proving the encrypted-share round-trip integrates
+    /// with signing end-to-end. Fails under any break in encrypt→decrypt→issue.
+    #[tokio::test]
+    async fn presig_consume_via_encrypted_share_base_key() {
+        let config = ThresholdConfig::new(2, 2).unwrap();
+        let key_shares = dkg_key_shares(2, 2);
+        let participants: Vec<u16> = vec![0, 1];
+        let mut rng = rand::rngs::OsRng;
+        let eid_bytes: [u8; 32] = rand::Rng::gen(&mut rng);
+        let eid_presign = ExecutionId::new(&eid_bytes);
+        let presigs = round_based::sim::run_with_setup(
+            participants.iter().map(|i| &key_shares[usize::from(*i)]),
+            |i, party, share| {
+                let party = buffer_outgoing(party);
+                let mut party_rng = rand::rngs::OsRng;
+                let participants = participants.clone();
+                async move {
+                    cggmp24::signing(eid_presign, i, &participants, share)
+                        .generate_presignature(&mut party_rng, party)
+                        .await
+                }
+            },
+        )
+        .unwrap()
+        .expect_ok()
+        .into_vec();
+
+        let session = SessionId::from_str_hash("presig-consume-base");
+        let share0 = key_share_to_encrypted(&key_shares[0], 0, config);
+        let mut coord0 = SigningCoordinator::new(session, share0, config, participants.clone());
+        let message_hash: [u8; 32] = {
+            let mut h = sha2::Sha256::new();
+            h.update(b"encrypted-share consume message");
+            let mut b = [0u8; 32];
+            b.copy_from_slice(&h.finalize());
+            b
+        };
+
+        let mut it = presigs.into_iter();
+        let presig0 = it.next().unwrap();
+        let presig1 = it.next().unwrap();
+
+        // Coordinator (party 0) issues its own partial + holds the public data.
+        let out0 = coord0
+            .sign_with_presignature(&message_hash, Box::new(presig0))
+            .expect("coord0 issue partial");
+
+        // Cosigner (party 1): the §06.16 + §06.20 round-trip on its OWN share.
+        let cosigner_priv = bsv::primitives::ec::PrivateKey::from_bytes(&[0x5b; 32]).unwrap();
+        let wallet = crate::presig_encryption::wallet_from_identity(&cosigner_priv);
+        let presig_id = "presig-consume-base-001";
+        let share_bytes = serde_json::to_vec(&presig1.0).expect("serialize cosigner presig");
+        let ciphertext =
+            crate::presig_encryption::encrypt_presig_share(&wallet, presig_id, &share_bytes)
+                .expect("BRC-2 encrypt share");
+        // ... ships to coordinator, stored opaque; at sign-time shipped back ...
+        let partial1_json = crate::presig_encryption::decrypt_and_issue_partial(
+            &wallet,
+            presig_id,
+            &ciphertext,
+            &message_hash,
+            None,
+        )
+        .expect("§06.20 decrypt + issue partial");
+
+        // Coordinator combines its own partial + the cosigner's (signing index 1).
+        let cosigner_msg = RoundMessage {
+            session_id: session,
+            round: 1,
+            from: ShareIndex(1),
+            to: None,
+            payload: partial1_json,
+        };
+        let result = coord0
+            .process_round(vec![cosigner_msg])
+            .expect("coord0 combine");
+        let sig = match result {
+            SigningRoundResult::Complete(r) => r,
+            _ => panic!("did not complete in 1 round"),
+        };
+        let _ = out0;
+
+        // The signature MUST verify under the joint public key.
+        let pubkey_bytes = key_shares[0].core.shared_public_key.to_bytes(true);
+        let bsv_pubkey = bsv::PublicKey::from_bytes(&pubkey_bytes).unwrap();
+        let mut sig_bytes = [0u8; 64];
+        sig_bytes[..32].copy_from_slice(&sig.r);
+        sig_bytes[32..].copy_from_slice(&sig.s);
+        let bsv_sig = bsv::Signature::from_compact(&sig_bytes).unwrap();
+        assert!(
+            bsv_pubkey.verify(&message_hash, &bsv_sig),
+            "§06.20: signature from a decrypted cosigner share must verify under the joint key"
+        );
+    }
+
+    /// §06.20 + §03.8 HD path: every signer applies the SAME BRC-42 offset to
+    /// its presig share at consume-time; the signature MUST verify under the
+    /// HD-derived child key `joint_pub + offset·G` (and MUST NOT verify under the
+    /// base joint key). Proves `apply_brc42_offset` enables 1-round HD signing —
+    /// the capability the old module doc said required the 4-round path.
+    #[tokio::test]
+    async fn presig_consume_with_brc42_offset_signs_child_key() {
+        use generic_ec::{Point, Scalar};
+        let config = ThresholdConfig::new(2, 2).unwrap();
+        let key_shares = dkg_key_shares(2, 2);
+        let participants: Vec<u16> = vec![0, 1];
+        let mut rng = rand::rngs::OsRng;
+        let eid_bytes: [u8; 32] = rand::Rng::gen(&mut rng);
+        let eid_presign = ExecutionId::new(&eid_bytes);
+        let presigs = round_based::sim::run_with_setup(
+            participants.iter().map(|i| &key_shares[usize::from(*i)]),
+            |i, party, share| {
+                let party = buffer_outgoing(party);
+                let mut party_rng = rand::rngs::OsRng;
+                let participants = participants.clone();
+                async move {
+                    cggmp24::signing(eid_presign, i, &participants, share)
+                        .generate_presignature(&mut party_rng, party)
+                        .await
+                }
+            },
+        )
+        .unwrap()
+        .expect_ok()
+        .into_vec();
+
+        let session = SessionId::from_str_hash("presig-consume-hd");
+        let share0 = key_share_to_encrypted(&key_shares[0], 0, config);
+        let mut coord0 = SigningCoordinator::new(session, share0, config, participants.clone());
+        let message_hash: [u8; 32] = {
+            let mut h = sha2::Sha256::new();
+            h.update(b"hd-offset consume message");
+            let mut b = [0u8; 32];
+            b.copy_from_slice(&h.finalize());
+            b
+        };
+
+        // A fixed 32-byte BRC-42 offset, applied identically by both signers.
+        let offset_bytes: [u8; 32] = {
+            let mut h = sha2::Sha256::new();
+            h.update(b"test-brc42-offset");
+            let mut b = [0u8; 32];
+            b.copy_from_slice(&h.finalize());
+            b
+        };
+        let offset = Scalar::<Secp256k1>::from_be_bytes_mod_order(offset_bytes);
+
+        let mut it = presigs.into_iter();
+        let (mut presig0, mut pub0) = it.next().unwrap();
+        let presig1 = it.next().unwrap();
+
+        // Coordinator applies the offset to its own presig (secret) AND to the
+        // shared public data (so combine's consistency check still holds).
+        apply_brc42_offset(&mut presig0, &offset);
+        apply_brc42_offset_public_data(&mut pub0, &offset);
+        let out0 = coord0
+            .sign_with_presignature(&message_hash, Box::new((presig0, pub0)))
+            .expect("coord0 issue partial");
+        let _ = out0;
+
+        // Cosigner: decrypt + apply the SAME offset via the §06.20 path.
+        let cosigner_priv = bsv::primitives::ec::PrivateKey::from_bytes(&[0x77; 32]).unwrap();
+        let wallet = crate::presig_encryption::wallet_from_identity(&cosigner_priv);
+        let presig_id = "presig-consume-hd-001";
+        let share_bytes = serde_json::to_vec(&presig1.0).unwrap();
+        let ciphertext =
+            crate::presig_encryption::encrypt_presig_share(&wallet, presig_id, &share_bytes)
+                .unwrap();
+        let partial1_json = crate::presig_encryption::decrypt_and_issue_partial(
+            &wallet,
+            presig_id,
+            &ciphertext,
+            &message_hash,
+            Some(offset_bytes),
+        )
+        .expect("§06.20 decrypt + offset + issue partial");
+
+        let cosigner_msg = RoundMessage {
+            session_id: session,
+            round: 1,
+            from: ShareIndex(1),
+            to: None,
+            payload: partial1_json,
+        };
+        let sig = match coord0.process_round(vec![cosigner_msg]).unwrap() {
+            SigningRoundResult::Complete(r) => r,
+            _ => panic!("did not complete"),
+        };
+
+        let mut sig_bytes = [0u8; 64];
+        sig_bytes[..32].copy_from_slice(&sig.r);
+        sig_bytes[32..].copy_from_slice(&sig.s);
+        let bsv_sig = bsv::Signature::from_compact(&sig_bytes).unwrap();
+
+        // child_pub = joint_pub + offset·G.
+        let joint_point = key_shares[0].core.shared_public_key;
+        let child_point = joint_point + Point::<Secp256k1>::generator() * offset;
+        let child_pub = bsv::PublicKey::from_bytes(&child_point.to_bytes(true)).unwrap();
+        let base_pub = bsv::PublicKey::from_bytes(&joint_point.to_bytes(true)).unwrap();
+
+        assert!(
+            child_pub.verify(&message_hash, &bsv_sig),
+            "HD signature must verify under child_pub = joint + offset·G"
+        );
+        assert!(
+            !base_pub.verify(&message_hash, &bsv_sig),
+            "HD signature must NOT verify under the base joint key"
         );
     }
 
