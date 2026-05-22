@@ -334,15 +334,17 @@ async fn within_stack_2of2_presign_assembles_bundle_via_messagebox() {
     });
 
     // ----- Listeners -----
-    // Coordinator listens on BOTH the protocol box and the return box.
-    let coord_proto_listener =
-        MessageBoxListener::start(coord_client.clone(), &protocol_box, coord_handler.handler_fn())
-            .await
-            .expect("coord protocol listener");
-    let coord_return_listener =
-        MessageBoxListener::start(coord_client.clone(), &return_box, coord_handler.handler_fn())
-            .await
-            .expect("coord return listener");
+    // Coordinator listens on BOTH boxes via a SINGLE connection (start_many):
+    // two competing subscriptions would split the identity's relay queue
+    // non-deterministically (return ct → protocol path, protocol msgs → return
+    // path). One connection + sentinel-round routing is race-free.
+    let coord_listener = MessageBoxListener::start_many(
+        coord_client.clone(),
+        vec![protocol_box.clone(), return_box.clone()],
+        coord_handler.handler_fn(),
+    )
+    .await
+    .expect("coord listener (protocol + return)");
     // Cosigner listens on the protocol box only.
     let cosigner_proto_listener = MessageBoxListener::start(
         cosigner_client.clone(),
@@ -475,7 +477,7 @@ async fn within_stack_2of2_presign_assembles_bundle_via_messagebox() {
     assert_eq!(cosigner_handler.live_session_count(), 0, "cosigner cleaned up");
 
     // ----- Cleanup -----
-    for l in [coord_proto_listener, coord_return_listener, cosigner_proto_listener] {
+    for l in [coord_listener, cosigner_proto_listener] {
         let _ = tokio::time::timeout(Duration::from_secs(10), l.shutdown()).await;
     }
     eprintln!("✔ done — total wall-clock {:?}", t0.elapsed());

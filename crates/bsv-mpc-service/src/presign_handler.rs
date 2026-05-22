@@ -67,11 +67,15 @@ use tracing::{debug, info, warn};
 
 use crate::messagebox::{HandlerFuture, OutgoingRoundMessage};
 
-/// Sentinel `RoundMessage.round` for a return-channel ciphertext. The 3-round
-/// presign protocol uses coordinator rounds 0..=N; the return share is shipped
-/// on the distinct `presig_return_{sid}` box, so the round number is only a
-/// marker (the dispatcher routes on `message_box`, not round).
-const RETURN_SHARE_ROUND: u8 = 0;
+/// Sentinel `RoundMessage.round` marking a return-channel ciphertext.
+///
+/// The dispatcher routes on THIS, not on `message_box`: the relay delivers by
+/// recipient identity and `DecodedRoundMessage.message_box` only reflects the
+/// subscribed set, so it cannot reliably distinguish a return ciphertext from
+/// protocol traffic when one party subscribes to both boxes. The 3-round presign
+/// emits coordinator rounds 1..=3, so `200` is unambiguous (and `200 + 1 = 201`
+/// stays within the envelope's `round + 1` wire encoding, u8-safe).
+const RETURN_SHARE_ROUND: u8 = 200;
 
 /// One live presign ceremony.
 struct CeremonySlot {
@@ -321,11 +325,11 @@ impl PresignHandler {
         &self,
         inbound: DecodedRoundMessage,
     ) -> anyhow::Result<Vec<OutgoingRoundMessage>> {
-        let session_id = inbound.round_msg.session_id;
-        let return_box = presig_return_box(&session_id.hex());
-
-        // Return-channel ciphertext for the coordinator? Route by box name.
-        if inbound.message_box == return_box {
+        // Route by the in-RoundMessage sentinel, NOT message_box: the relay
+        // delivers by identity and a single connection subscribes to both
+        // `mpc_{sid}` and `presig_return_{sid}`, so message_box can't tell them
+        // apart. A return ciphertext is marked by round == RETURN_SHARE_ROUND.
+        if inbound.round_msg.round == RETURN_SHARE_ROUND {
             self.collect_return_share(inbound).await?;
             return Ok(vec![]);
         }
@@ -448,14 +452,6 @@ impl PresignHandler {
             let wallet = wallet_from_identity(&self.inner.identity_priv);
             let ciphertext = encrypt_presig_share(&wallet, &presig_id, &serialized)
                 .map_err(|e| anyhow::anyhow!("encrypt_presig_share: {e}"))?;
-            eprintln!(
-                "DIAG-ENCRYPT: presig_id={} id_pub={} ct_len={} ct_head={} ct_tail={}",
-                presig_id,
-                hex::encode(self.inner.identity_priv.public_key().to_compressed()),
-                ciphertext.len(),
-                hex::encode(&ciphertext[..8.min(ciphertext.len())]),
-                hex::encode(&ciphertext[ciphertext.len().saturating_sub(8)..]),
-            );
 
             let coordinator = peers
                 .iter()
@@ -504,14 +500,6 @@ impl PresignHandler {
         let session_id = inbound.round_msg.session_id;
         let from_party = inbound.round_msg.from.0;
         let ciphertext = inbound.round_msg.payload;
-        eprintln!(
-            "DIAG-COLLECT: presig_id={} from={} ct_len={} ct_head={} ct_tail={}",
-            session_id.hex(),
-            from_party,
-            ciphertext.len(),
-            hex::encode(&ciphertext[..8.min(ciphertext.len())]),
-            hex::encode(&ciphertext[ciphertext.len().saturating_sub(8)..]),
-        );
 
         let pos = self
             .inner

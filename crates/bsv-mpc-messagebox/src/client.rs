@@ -253,6 +253,27 @@ impl MessageBoxClient {
             message_box.to_string(),
         ))
     }
+
+    /// Like [`subscribe_round_messages`] but over MULTIPLE mailboxes on a
+    /// SINGLE connection. Required when one party must receive traffic from two
+    /// boxes for the same ceremony (e.g. the presign coordinator listening on
+    /// both `mpc_{sid}` and `presig_return_{sid}` per §06.17.2): two separate
+    /// subscriptions would compete for the identity's relay queue and split
+    /// messages non-deterministically. One connection over both boxes avoids
+    /// that race. Dispatchers MUST route by an in-`RoundMessage` discriminator
+    /// (not `message_box`, which only reflects the subscribed set).
+    pub async fn subscribe_round_messages_many(
+        &self,
+        message_boxes: Vec<String>,
+    ) -> Result<RoundMessageSubscription> {
+        let label = message_boxes.join("+");
+        let env_sub = self.subscribe_many(message_boxes).await?;
+        Ok(RoundMessageSubscription::new(
+            env_sub,
+            self.identity_priv.clone(),
+            label,
+        ))
+    }
 }
 
 /// One typed inbound `RoundMessage` event surfaced by

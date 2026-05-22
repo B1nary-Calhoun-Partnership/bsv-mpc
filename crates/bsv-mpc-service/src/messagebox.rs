@@ -126,6 +126,38 @@ impl MessageBoxListener {
         })
     }
 
+    /// Like [`start`](Self::start) but subscribes to MULTIPLE mailboxes on a
+    /// single connection (one pump task). Use when one party must receive two
+    /// boxes for a ceremony (e.g. the presign coordinator on `mpc_{sid}` +
+    /// `presig_return_{sid}`): a single connection avoids the message-split race
+    /// two competing subscriptions would create. The `handler` MUST route by an
+    /// in-`RoundMessage` discriminator, not `message_box`.
+    pub async fn start_many<F>(
+        client: MessageBoxClient,
+        message_boxes: Vec<String>,
+        handler: F,
+    ) -> anyhow::Result<Self>
+    where
+        F: Fn(DecodedRoundMessage) -> HandlerFuture + Send + Sync + 'static,
+    {
+        let sub = client
+            .subscribe_round_messages_many(message_boxes.clone())
+            .await
+            .map_err(|e| anyhow::anyhow!("subscribe_round_messages_many({message_boxes:?}): {e}"))?;
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let handler: Arc<F> = Arc::new(handler);
+        let client_for_task = client.clone();
+        let handle = tokio::spawn(async move {
+            run_loop(client_for_task, sub, handler, shutdown_rx).await;
+        });
+
+        Ok(Self {
+            handle: Some(handle),
+            shutdown_tx: Some(shutdown_tx),
+        })
+    }
+
     /// Gracefully shut down — signals the pump, the pump runs
     /// `RoundMessageSubscription::shutdown` (which cascades to the
     /// underlying §06.4 `leaveRoom` path), then awaits the task exit.
