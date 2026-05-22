@@ -1080,6 +1080,9 @@ async fn relay_sign(
         agent_id: Some(state.bridge.agent_id().to_string()),
         // Filled by sign_over_relay from the proxy's BRC-31 session.
         auth_headers: vec![],
+        // §06.17.1 coordinator-holds-ciphertext is wired through the bundle path
+        // (issue #30); this pool-consume trigger leaves it `None`.
+        cosigner_encrypted_share: None,
     };
 
     state

@@ -385,6 +385,7 @@ To run (BURNS REAL SATS): E2E_MAINNET=1 cargo test -p bsv-mpc-proxy \\
             do_index: 0,
             agent_id: None,
             auth_headers: vec![],
+            cosigner_encrypted_share: None,
         },
         None, // unauthed POC route — no canonical signer
         Duration::from_secs(60),
@@ -652,6 +653,7 @@ async fn sec0620_deployed_decrypt_at_rest_real_mainnet_tx() {
         do_index: 0,
         agent_id: Some(joint_hex.clone()),
         auth_headers: vec![], // filled by sign_over_relay from the bridge session
+        cosigner_encrypted_share: None,
     };
     let sig = bridge
         .sign_over_relay(&sighash, box_b, trigger, Duration::from_secs(60))

@@ -339,6 +339,86 @@ impl SigningCoordinator {
         }])
     }
 
+    /// **Durable 1-round presigned signing from a persisted bundle (§06.17.1).**
+    ///
+    /// The §06.17.1 coordinator does NOT hold the live `(Presignature,
+    /// PresignaturePublicData)` tuple in memory — that tuple is not
+    /// `Serialize`, so a coordinator that restarts (or that loads a bundle it
+    /// persisted earlier) cannot use [`sign_with_presignature`](Self::sign_with_presignature).
+    /// Instead it persists a [`PresigBundle`](crate::types::PresigBundle) whose
+    /// `presig_bytes` is its own serialized presig share and whose `commitments`
+    /// (CBOR) reconstruct the shared `PresignaturePublicData` via
+    /// [`deserialize_presig_public_data`] (#25a). This method drives the combine
+    /// from exactly those durable artifacts:
+    ///
+    /// 1. issue THIS party's partial from its serialized presig share
+    ///    (pure field math — same primitive as the cosigner's
+    ///    [`crate::presig_encryption::decrypt_and_issue_partial`]),
+    /// 2. install the reconstructed public data so
+    ///    [`process_round`](Self::process_round) can `PartialSignature::combine`,
+    /// 3. enter [`SigningMode::Presigned`] and broadcast our partial.
+    ///
+    /// The caller then feeds each cosigner's partial (produced cosigner-side via
+    /// `decrypt_and_issue_partial` over the bundle's `cosigner_encrypted_shares`)
+    /// into [`process_round`](Self::process_round) to complete the signature.
+    ///
+    /// **Base key only** (same constraint as [`sign_with_presignature`](Self::sign_with_presignature)):
+    /// presignatures bake the key in at generation time, so BRC-42 HD-derived
+    /// signing must use the 4-round [`sign`](Self::sign) path.
+    ///
+    /// # Arguments
+    /// * `message_hash` — the 32-byte BSV sighash.
+    /// * `own_presig_json` — this party's serialized `cggmp24::Presignature`
+    ///   (the bundle's `presig_bytes`, decrypted from at-rest if sealed).
+    /// * `public_data` — the shared `PresignaturePublicData` reconstructed from
+    ///   the bundle's `commitments` via [`deserialize_presig_public_data`].
+    pub fn sign_from_bundle(
+        &mut self,
+        message_hash: &[u8; 32],
+        own_presig_json: &[u8],
+        public_data: PresignaturePublicData<Secp256k1>,
+    ) -> Result<Vec<RoundMessage>> {
+        if self.mode != SigningMode::NotStarted {
+            return Err(MpcError::Signing(
+                "sign_from_bundle() called but signing already started".into(),
+            ));
+        }
+
+        let presig: cggmp24::signing::Presignature<Secp256k1> =
+            serde_json::from_slice(own_presig_json).map_err(|e| {
+                MpcError::Signing(format!("deserialize own presig share from bundle: {e}"))
+            })?;
+
+        let my_signing_index = self.signing_index()?;
+
+        // BSV sighashes are prehashed; the `insecure-assume-preimage-known`
+        // cggmp24 feature (enabled) lets us treat the scalar as a DataToSign.
+        let scalar = Scalar::<Secp256k1>::from_be_bytes_mod_order(*message_hash);
+        let data_to_sign =
+            PrehashedDataToSign::from_scalar(scalar).insecure_assume_preimage_known();
+
+        // Issue this party's partial signature (consumes the presignature).
+        let my_partial = presig.issue_partial_signature(data_to_sign);
+
+        self.message_hash = Some(*message_hash);
+        self.presig_public_data = Some(public_data);
+        self.partial_sigs.insert(my_signing_index, my_partial);
+        self.mode = SigningMode::Presigned;
+        self.current_round = 1;
+
+        // Broadcast our partial signature. `from` is the signing-time index so
+        // the receiver keys it into commitment order for `combine`.
+        let payload = serde_json::to_vec(&my_partial)
+            .map_err(|e| MpcError::Signing(format!("serialize partial signature: {e}")))?;
+        Ok(vec![RoundMessage {
+            session_id: self.session_id,
+            round: 1,
+            from: ShareIndex(my_signing_index),
+            to: None,
+            payload,
+        }])
+    }
+
     /// Start the signing protocol (Round 1).
     ///
     /// Constructs the cggmp24 signing `StateMachine` and drives it inline

@@ -206,6 +206,7 @@ async fn service_provisions_do_pool_proxy_combines() {
         do_index: 0,
         agent_id: Some(joint_hex.clone()),
         auth_headers: vec![],
+        cosigner_encrypted_share: None,
     };
     let sig: SigningResult = bridge
         .sign_over_relay(&sighash, box_b, trigger, Duration::from_secs(60))

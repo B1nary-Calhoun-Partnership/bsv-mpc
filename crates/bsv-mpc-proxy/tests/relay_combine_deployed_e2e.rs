@@ -177,6 +177,7 @@ To run: RELAY_COMBINE_E2E=1 cargo test -p bsv-mpc-proxy \\
             do_index: 0,
             agent_id: None,
             auth_headers: vec![],
+            cosigner_encrypted_share: None,
         },
         None, // unauthed POC route — no canonical signer
         Duration::from_secs(40),
