@@ -446,6 +446,21 @@ async fn within_stack_2of2_presign_assembles_bundle_via_messagebox() {
         "coordinator's own sealed presig share present"
     );
 
+    // 3b) Durable public data (#25a): the bundle carries CBOR commitments +
+    //     gamma_hex that reconstruct into a usable PresignaturePublicData — so a
+    //     coordinator can combine from the persisted bundle after a restart, not
+    //     just from an in-memory pool.
+    assert!(!bundle.gamma_hex.is_empty(), "bundle MUST carry gamma_hex");
+    assert!(!bundle.commitments.is_empty(), "bundle MUST carry public-data commitments");
+    let reconstructed =
+        bsv_mpc_core::signing::deserialize_presig_public_data(&bundle.commitments)
+            .expect("bundle commitments MUST reconstruct into PresignaturePublicData");
+    assert_eq!(
+        reconstructed.commitments.len(),
+        parties_at_keygen.len(),
+        "reconstructed public data has one commitment per party"
+    );
+
     // 4) The collected ciphertext DECRYPTS back to the cosigner's real
     //    serialized presig share — proving the relay carried the genuine
     //    BRC-2 ciphertext (not a placeholder). decrypt under the cosigner's

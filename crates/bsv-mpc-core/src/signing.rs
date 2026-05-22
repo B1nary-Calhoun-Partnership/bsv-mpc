@@ -43,10 +43,12 @@
 use std::collections::VecDeque;
 
 use cggmp24::security_level::SecurityLevel128;
-use cggmp24::signing::{PartialSignature, PrehashedDataToSign, PresignaturePublicData};
+use cggmp24::signing::{
+    PartialSignature, PrehashedDataToSign, PresignatureCommitment, PresignaturePublicData,
+};
 use cggmp24::supported_curves::Secp256k1;
 use cggmp24::ExecutionId;
-use generic_ec::{Scalar, SecretScalar};
+use generic_ec::{NonZero, Point, Scalar, SecretScalar};
 use round_based::state_machine::StateMachine;
 use sha2::{Digest, Sha256};
 
@@ -681,6 +683,60 @@ pub fn apply_brc42_offset_public_data(
     for c in &mut public_data.commitments {
         c.tilde_S += *offset * c.tilde_Delta;
     }
+}
+
+/// CBOR wire form of [`PresignaturePublicData`]. The cggmp24 type isn't
+/// `Serialize`, but its component points are (generic-ec serde), so we mirror
+/// its public fields in a serde struct. Enables DURABLE storage of a presig
+/// bundle's public commitments so a coordinator can reconstruct + combine after
+/// a restart (MPC-Spec §06.17.1 / issue #25), rather than only from an
+/// in-memory pool.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PublicDataWire {
+    /// `Gamma` presignature commitment.
+    gamma: NonZero<Point<Secp256k1>>,
+    /// Per-party `(tilde_Delta, tilde_S)`, positional by signing index.
+    commitments: Vec<(Point<Secp256k1>, Point<Secp256k1>)>,
+}
+
+/// Serialize a [`PresignaturePublicData`] to deterministic CBOR for at-rest
+/// storage in `PresigBundle.commitments`.
+pub fn serialize_presig_public_data(
+    public_data: &PresignaturePublicData<Secp256k1>,
+) -> Result<Vec<u8>> {
+    let wire = PublicDataWire {
+        gamma: public_data.Gamma,
+        commitments: public_data
+            .commitments
+            .iter()
+            .map(|c| (c.tilde_Delta, c.tilde_S))
+            .collect(),
+    };
+    let mut out = Vec::new();
+    ciborium::ser::into_writer(&wire, &mut out)
+        .map_err(|e| MpcError::Signing(format!("serialize PresignaturePublicData: {e}")))?;
+    Ok(out)
+}
+
+/// Inverse of [`serialize_presig_public_data`] — reconstruct the public data
+/// from CBOR (via the public struct fields) so a coordinator that only holds the
+/// stored bundle can run `PartialSignature::combine`.
+pub fn deserialize_presig_public_data(
+    bytes: &[u8],
+) -> Result<PresignaturePublicData<Secp256k1>> {
+    let wire: PublicDataWire = ciborium::de::from_reader(bytes)
+        .map_err(|e| MpcError::Signing(format!("deserialize PresignaturePublicData: {e}")))?;
+    Ok(PresignaturePublicData {
+        Gamma: wire.gamma,
+        commitments: wire
+            .commitments
+            .into_iter()
+            .map(|(tilde_delta, tilde_s)| PresignatureCommitment {
+                tilde_Delta: tilde_delta,
+                tilde_S: tilde_s,
+            })
+            .collect(),
+    })
 }
 
 /// Issue a partial signature from a serialized presignature, optionally applying
@@ -1928,6 +1984,94 @@ mod tests {
         assert!(
             !base_pub.verify(&message_hash, &bsv_sig),
             "HD signature must NOT verify under the base joint key"
+        );
+    }
+
+    /// #25a durability gate: a coordinator that reconstructs its
+    /// PresignaturePublicData from CBOR storage (NOT from an in-memory pool)
+    /// still combines into a valid signature. Mirrors the relay topology but
+    /// round-trips the public data through serialize→deserialize first — proving
+    /// a coordinator can consume a persisted bundle across a restart.
+    #[tokio::test]
+    async fn serialized_public_data_combines_into_valid_signature() {
+        let config = ThresholdConfig::new(2, 2).unwrap();
+        let key_shares = dkg_key_shares(2, 2);
+        let participants: Vec<u16> = vec![0, 1];
+        let mut rng = rand::rngs::OsRng;
+        let eid_bytes: [u8; 32] = rand::Rng::gen(&mut rng);
+        let eid_presign = ExecutionId::new(&eid_bytes);
+        let presigs = round_based::sim::run_with_setup(
+            participants.iter().map(|i| &key_shares[usize::from(*i)]),
+            |i, party, share| {
+                let party = buffer_outgoing(party);
+                let mut party_rng = rand::rngs::OsRng;
+                let participants = participants.clone();
+                async move {
+                    cggmp24::signing(eid_presign, i, &participants, share)
+                        .generate_presignature(&mut party_rng, party)
+                        .await
+                }
+            },
+        )
+        .unwrap()
+        .expect_ok()
+        .into_vec();
+
+        let mut it = presigs.into_iter();
+        let (presig0, pubdata0) = it.next().unwrap();
+        let presig1 = it.next().unwrap();
+
+        // Persist the coordinator's public data, then reconstruct it as if
+        // loaded from a PresigBundle after a restart (in-memory pool gone).
+        let stored = serialize_presig_public_data(&pubdata0).unwrap();
+        let pubdata_reconstructed = deserialize_presig_public_data(&stored).unwrap();
+        assert_eq!(
+            pubdata_reconstructed, pubdata0,
+            "serialize→deserialize MUST preserve the public data exactly"
+        );
+
+        let session = SessionId::from_str_hash("durable-pubdata-test");
+        let share0 = key_share_to_encrypted(&key_shares[0], 0, config);
+        let mut coord0 = SigningCoordinator::new(session, share0, config, participants.clone());
+        let message_hash: [u8; 32] = {
+            let mut h = sha2::Sha256::new();
+            h.update(b"durable public-data combine");
+            let mut b = [0u8; 32];
+            b.copy_from_slice(&h.finalize());
+            b
+        };
+
+        // Coordinator signs with the RECONSTRUCTED public data (not pubdata0).
+        coord0
+            .sign_with_presignature(&message_hash, Box::new((presig0, pubdata_reconstructed)))
+            .expect("coord0 issue partial with reconstructed public data");
+
+        // Cosigner partial via the §06.20 path.
+        let presig1_bytes = serde_json::to_vec(&presig1.0).unwrap();
+        let partial1 = issue_partial_signature_json(&presig1_bytes, &message_hash).unwrap();
+        let sig = match coord0
+            .process_round(vec![RoundMessage {
+                session_id: session,
+                round: 1,
+                from: ShareIndex(1),
+                to: None,
+                payload: partial1,
+            }])
+            .expect("combine with reconstructed public data")
+        {
+            SigningRoundResult::Complete(r) => r,
+            _ => panic!("did not complete"),
+        };
+
+        let pubkey_bytes = key_shares[0].core.shared_public_key.to_bytes(true);
+        let bsv_pubkey = bsv::PublicKey::from_bytes(&pubkey_bytes).unwrap();
+        let mut sig_bytes = [0u8; 64];
+        sig_bytes[..32].copy_from_slice(&sig.r);
+        sig_bytes[32..].copy_from_slice(&sig.s);
+        let bsv_sig = bsv::Signature::from_compact(&sig_bytes).unwrap();
+        assert!(
+            bsv_pubkey.verify(&message_hash, &bsv_sig),
+            "signature combined from CBOR-reconstructed public data MUST verify"
         );
     }
 

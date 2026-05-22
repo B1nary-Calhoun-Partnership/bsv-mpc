@@ -525,6 +525,26 @@ pub fn serialize_party_presignature(raw: Box<dyn std::any::Any + Send>) -> Resul
         .map_err(|e| MpcError::Serialization(format!("serialize presignature: {e}")))
 }
 
+/// Like [`serialize_party_presignature`] but ALSO returns the durable CBOR of
+/// the shared `PresignaturePublicData` + the `Gamma` commitment hex — for the
+/// coordinator to persist in `PresigBundle.{commitments, gamma_hex}` (§06.17.1)
+/// so it can reconstruct and combine across a restart (#25). The cosigner-side
+/// (`PresignOutput` not serializable cross-crate) downcast must happen here in
+/// `bsv-mpc-core`. Returns `(presig_json, public_data_cbor, gamma_hex)`.
+pub fn serialize_party_presig_with_public_data(
+    raw: Box<dyn std::any::Any + Send>,
+) -> Result<(Vec<u8>, Vec<u8>, String)> {
+    let output = raw.downcast::<PresignOutput>().map_err(|_| {
+        MpcError::Serialization("raw presignature box is not a PresignOutput".into())
+    })?;
+    let (presig, public_data) = *output;
+    let presig_json = serde_json::to_vec(&presig)
+        .map_err(|e| MpcError::Serialization(format!("serialize presignature: {e}")))?;
+    let public_data_cbor = crate::signing::serialize_presig_public_data(&public_data)?;
+    let gamma_hex = hex::encode(public_data.Gamma.to_bytes(true));
+    Ok((presig_json, public_data_cbor, gamma_hex))
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
