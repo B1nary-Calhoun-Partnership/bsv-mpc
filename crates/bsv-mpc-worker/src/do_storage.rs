@@ -25,7 +25,7 @@
 //! - `mpc_presignatures(id PK, agent_id, session_id, data_hex, created_at)` — FIFO
 //!   per agent, ordered by `created_at` (ms) then `id`.
 
-use bsv_mpc_core::types::EncryptedShare;
+use bsv_mpc_core::types::{EncryptedShare, PresigBundle};
 use serde::Deserialize;
 use worker::{Date, Error, Result, SqlStorage, State};
 
@@ -69,6 +69,13 @@ struct PresigRow {
 #[derive(Deserialize)]
 struct CountRow {
     n: i64,
+}
+
+/// `SELECT row_id, bundle_cbor_hex` row (oldest PresigBundle).
+#[derive(Deserialize)]
+struct BundleRow {
+    row_id: String,
+    bundle_cbor_hex: String,
 }
 
 #[allow(dead_code)] // full storage surface; some methods land consumers in I-4a.2
@@ -171,6 +178,28 @@ impl<'a> DoSqlStorage<'a> {
                request_nonce TEXT NOT NULL, \
                seen_at INTEGER NOT NULL, \
                PRIMARY KEY (session_nonce, request_nonce)\
+             )",
+            None,
+        )?;
+        // PresigBundle pool (MPC-Spec §06.17.1 / ADR-0030): the coordinator's
+        // stored unit per presign session. `bundle_cbor_hex` is the full
+        // CBOR-encoded PresigBundle (its `presig_bytes` field is sealed at rest
+        // via `bsv_mpc_core::presig_at_rest`; `cosigner_encrypted_shares` are
+        // opaque BRC-2 ciphertext) — the DO never holds the at-rest key. The
+        // binding-triple columns (`policy_id`, `joint_pubkey`,
+        // `parties_at_keygen`) are denormalized out of the bundle so §06.18
+        // invalidation can DELETE by binding without decoding every row.
+        // `agent_id` = joint_pubkey hex = the pool key (§06.19 per-pubkey pool).
+        sql.exec(
+            "CREATE TABLE IF NOT EXISTS mpc_presig_bundles (\
+               row_id TEXT PRIMARY KEY, \
+               presig_id TEXT NOT NULL, \
+               agent_id TEXT NOT NULL, \
+               policy_id TEXT NOT NULL, \
+               joint_pubkey TEXT NOT NULL, \
+               parties_at_keygen TEXT NOT NULL, \
+               bundle_cbor_hex TEXT NOT NULL, \
+               created_at INTEGER NOT NULL\
              )",
             None,
         )?;
@@ -758,6 +787,146 @@ impl<'a> DoSqlStorage<'a> {
             vec![agent_id.into()],
         )?;
         Ok(n)
+    }
+
+    // ── PresigBundle pool (§06.17.1 / ADR-0030) ─────────────────────────
+
+    /// Persist a [`PresigBundle`] (§06.17.1). The binding triple is denormalized
+    /// into indexed columns; the body is the CBOR encoding (with `presig_bytes`
+    /// already sealed at rest by the caller via `presig_at_rest`). `row_id` is
+    /// server-generated (`presig_id` + monotonic seq) so a reused `presig_id`
+    /// can't collide on the PK.
+    pub fn store_presig_bundle(&self, bundle: &PresigBundle) -> Result<()> {
+        let (policy_id, joint_pubkey, parties_at_keygen) = bundle.storage_columns();
+        let cbor = bundle
+            .to_cbor()
+            .map_err(|e| Error::RustError(format!("encode PresigBundle: {e}")))?;
+        let cbor_hex = hex::encode(&cbor);
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let now = Self::now_ms();
+        let row_id = format!("{}:{now}:{seq}", bundle.presig_id);
+        self.sql().exec(
+            "INSERT INTO mpc_presig_bundles \
+               (row_id, presig_id, agent_id, policy_id, joint_pubkey, parties_at_keygen, bundle_cbor_hex, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            vec![
+                row_id.into(),
+                bundle.presig_id.clone().into(),
+                joint_pubkey.clone().into(),
+                policy_id.into(),
+                joint_pubkey.into(),
+                parties_at_keygen.into(),
+                cbor_hex.into(),
+                now.into(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Consume (FIFO, oldest-first) a [`PresigBundle`] for `agent_id`
+    /// (= joint_pubkey hex). Single-use (§06.17.3): the row is overwritten in
+    /// place (best-effort zeroize, §06.18) and then deleted, atomically within
+    /// this DO, before the decoded bundle is returned. A consumed bundle can
+    /// never be replayed.
+    pub fn consume_presig_bundle(&self, agent_id: &str) -> Result<Option<PresigBundle>> {
+        let rows: Vec<BundleRow> = self
+            .sql()
+            .exec(
+                "SELECT row_id, bundle_cbor_hex FROM mpc_presig_bundles WHERE agent_id = ? \
+                 ORDER BY created_at ASC, row_id ASC LIMIT 1",
+                vec![agent_id.into()],
+            )?
+            .to_array()?;
+        let Some(row) = rows.into_iter().next() else {
+            return Ok(None);
+        };
+        // Best-effort zeroize then delete (§06.18: overwrite, not logical-only).
+        self.zeroize_and_delete("row_id", &row.row_id)?;
+        let cbor = hex::decode(&row.bundle_cbor_hex)
+            .map_err(|e| Error::RustError(format!("decode bundle hex: {e}")))?;
+        let bundle = PresigBundle::from_cbor(&cbor)
+            .map_err(|e| Error::RustError(format!("decode PresigBundle: {e}")))?;
+        Ok(Some(bundle))
+    }
+
+    /// Count pooled bundles for `agent_id` (= joint_pubkey hex). §06.19 metric.
+    pub fn presig_bundle_count(&self, agent_id: &str) -> Result<u64> {
+        let rows: Vec<CountRow> = self
+            .sql()
+            .exec(
+                "SELECT COUNT(*) AS n FROM mpc_presig_bundles WHERE agent_id = ?",
+                vec![agent_id.into()],
+            )?
+            .to_array()?;
+        Ok(rows.first().map(|r| r.n as u64).unwrap_or(0))
+    }
+
+    /// §06.18 invalidation — delete all bundles for a joint_pubkey (share-refresh
+    /// commit / joint-pubkey change). Overwrite-then-delete (zeroize). Returns
+    /// the count purged. Atomic within this DO.
+    pub fn invalidate_bundles_for_joint_pubkey(&self, joint_pubkey_hex: &str) -> Result<u64> {
+        self.invalidate_bundles_where("joint_pubkey", joint_pubkey_hex)
+    }
+
+    /// §06.18 invalidation — delete all bundles bound to a prior cosigner subset
+    /// (operator replacement, §13.7). `parties_csv` is the canonical
+    /// ascending-ordered CSV (matches [`PresigBundle::storage_columns`]).
+    pub fn invalidate_bundles_for_subset(&self, parties_csv: &str) -> Result<u64> {
+        self.invalidate_bundles_where("parties_at_keygen", parties_csv)
+    }
+
+    /// §06.18 invalidation — delete all bundles whose `policy_id` no longer
+    /// matches the current manifest (policy update). Deletes every bundle bound
+    /// to a DIFFERENT policy than `current_policy_hex`.
+    pub fn invalidate_bundles_with_stale_policy(&self, current_policy_hex: &str) -> Result<u64> {
+        let n: u64 = {
+            let rows: Vec<CountRow> = self
+                .sql()
+                .exec(
+                    "SELECT COUNT(*) AS n FROM mpc_presig_bundles WHERE policy_id != ?",
+                    vec![current_policy_hex.into()],
+                )?
+                .to_array()?;
+            rows.first().map(|r| r.n as u64).unwrap_or(0)
+        };
+        self.sql().exec(
+            "UPDATE mpc_presig_bundles SET bundle_cbor_hex = hex(zeroblob(length(bundle_cbor_hex)/2)) \
+             WHERE policy_id != ?",
+            vec![current_policy_hex.into()],
+        )?;
+        self.sql().exec(
+            "DELETE FROM mpc_presig_bundles WHERE policy_id != ?",
+            vec![current_policy_hex.into()],
+        )?;
+        Ok(n)
+    }
+
+    /// Shared helper: count → overwrite (zeroize) → delete, for an equality
+    /// predicate on one column. Returns the count purged.
+    fn invalidate_bundles_where(&self, column: &str, value: &str) -> Result<u64> {
+        let count_sql = format!("SELECT COUNT(*) AS n FROM mpc_presig_bundles WHERE {column} = ?");
+        let rows: Vec<CountRow> = self.sql().exec(&count_sql, vec![value.into()])?.to_array()?;
+        let n = rows.first().map(|r| r.n as u64).unwrap_or(0);
+        let overwrite_sql = format!(
+            "UPDATE mpc_presig_bundles SET bundle_cbor_hex = hex(zeroblob(length(bundle_cbor_hex)/2)) WHERE {column} = ?"
+        );
+        self.sql().exec(&overwrite_sql, vec![value.into()])?;
+        let delete_sql = format!("DELETE FROM mpc_presig_bundles WHERE {column} = ?");
+        self.sql().exec(&delete_sql, vec![value.into()])?;
+        Ok(n)
+    }
+
+    /// Overwrite the sealed body of a single row (best-effort zeroize) then
+    /// delete it. Used by single-use consume.
+    fn zeroize_and_delete(&self, column: &str, value: &str) -> Result<()> {
+        let overwrite_sql = format!(
+            "UPDATE mpc_presig_bundles SET bundle_cbor_hex = hex(zeroblob(length(bundle_cbor_hex)/2)) WHERE {column} = ?"
+        );
+        self.sql().exec(&overwrite_sql, vec![value.into()])?;
+        let delete_sql = format!("DELETE FROM mpc_presig_bundles WHERE {column} = ?");
+        self.sql().exec(&delete_sql, vec![value.into()])?;
+        Ok(())
     }
 }
 

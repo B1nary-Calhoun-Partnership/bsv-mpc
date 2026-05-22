@@ -59,6 +59,7 @@
 //! - [`error`] — Proxy-specific error types
 
 pub mod bridge;
+pub mod burn_rate;
 pub mod config;
 pub mod error;
 pub mod fee_injector;
