@@ -56,7 +56,7 @@ What we are protecting, ranked by criticality.
 +-------------------+---+          +-------------------------------+
 ```
 
-**Trust boundary 1 (Proxy <-> KSS):** The most security-critical boundary. All MPC protocol messages cross here. Protected by HTTPS + BRC-31 mutual authentication (currently TODO on some KSS endpoints).
+**Trust boundary 1 (Proxy <-> KSS):** The most security-critical boundary. All MPC protocol messages cross here. Protected by HTTPS + BRC-31 mutual authentication. As of bsv-mpc #8 (Phase D), BRC-31 is implemented end-to-end on the canonical @bsv wire across all three crates: proxy uses `bsv_rs::auth::Peer`, the standalone service uses `bsv-middleware-rs`, and the CF Worker uses `bsv-middleware-cloudflare`. Owner-authorization, per-request replay-nonce consumption (§07.1), and header-vs-session identity binding (§07) are all enforced.
 
 **Trust boundary 2 (KSS <-> Overlay):** Node discovery and participation proof publication. Lower sensitivity -- overlay data is public by design.
 
@@ -124,9 +124,9 @@ The simplest configuration. One proxy holds share_B, one KSS holds share_A. Both
 | **Description** | Attacker intercepts HTTPS traffic between proxy and KSS, modifying protocol messages to cause signing of attacker-chosen messages. |
 | **Preconditions** | TLS interception (compromised CA, DNS hijacking, or proxy misconfiguration). |
 | **Impact** | **Critical.** If the attacker can modify the sighash sent to the KSS, they can redirect funds to their own address. |
-| **Mitigation (current)** | HTTPS with TLS 1.3 (reqwest with rustls-tls). BRC-31 mutual authentication is specified but the full handshake is TODO on KSS endpoints. |
-| **Mitigation (Beta)** | Complete BRC-31 implementation on all KSS mutation endpoints. BRC-31 provides message-level integrity independent of TLS. |
-| **Residual risk** | Until BRC-31 is fully implemented, TLS is the sole transport protection. This is the same security model as standard HTTPS APIs, but insufficient for a system designed to exceed that bar. |
+| **Mitigation (current)** | HTTPS with TLS 1.3 (reqwest with rustls-tls) **plus** BRC-31 mutual authentication on all KSS mutation endpoints (bsv-mpc #8, Phase D). The KSS verifies the canonical @bsv BRC-31 signature over the request payload before processing; a modified sighash invalidates the General-message signature, so the request is rejected (401) independently of TLS. BRC-31 thus provides message-level integrity that survives a TLS terminator or CA compromise. |
+| **Mitigation (deployed)** | Canonical BRC-31 wire is live: proxy uses `bsv_rs::auth::Peer`, service uses `bsv-middleware-rs`, worker uses `bsv-middleware-cloudflare` (deployed worker `f232a13a`, container standard-4). Proven on mainnet with a real-sats MPC-signed transaction: WhatsOnChain TXID `96c2ebc592c77bab2fc3fba47993bc6638ec248c7f90caf68ba7fddb3cdabcfd`. |
+| **Residual risk** | Low. Message-level integrity is now enforced. Residual risk reduces to identity-key compromise (an attacker who steals an authorized identity key can pass BRC-31) and the not-yet-implemented BRC-52 cosigner-certificate verification (§08.12) + policy-manifest enforcement (§09), which are a follow-on authorization layer above the auth layer. |
 
 #### ATTACK A5: Presignature Reuse (Nonce Reuse)
 
@@ -154,12 +154,12 @@ The simplest configuration. One proxy holds share_B, one KSS holds share_A. Both
 
 | Field | Detail |
 |-------|--------|
-| **Description** | BRC-31 auth is TODO on KSS mutation endpoints (`/dkg/init`, `/dkg/round`, `/sign/init`, `/sign/round`, `/presign/init`, `/presign/round`). An attacker who discovers the KSS URL can initiate protocol sessions. |
+| **Description** | An attacker who discovers the KSS URL attempts to initiate protocol sessions (`/dkg/init`, `/dkg/round`, `/sign/init`, `/sign/round`, `/presign/init`, `/presign/round`) without holding an authorized identity. |
 | **Preconditions** | KSS URL discovery (not secret, but not publicly advertised in Alpha). |
-| **Impact** | **High.** Attacker can initiate DKG (creating unwanted shares), trigger signing with crafted messages (though they still need the KSS's share to produce a valid signature), or exhaust presignatures via repeated presigning sessions. |
-| **Mitigation (current)** | `verify_agent_authorization()` is implemented and checks that the authenticated identity matches the requested `agent_id`, preventing cross-agent access. However, the upstream `verify_request()` that validates BRC-31 headers is TODO. |
-| **Mitigation (Beta)** | Complete BRC-31 implementation. Rate limiting on all KSS endpoints. |
-| **Residual risk** | This is a known gap. Until BRC-31 is complete, the KSS relies on obscurity of its URL and network-level access controls. |
+| **Impact** | **High** (if unauthenticated). Attacker could initiate DKG (creating unwanted shares), trigger signing with crafted messages, or exhaust presignatures via repeated presigning sessions. |
+| **Mitigation (current)** | **Resolved (bsv-mpc #8, Phase D).** All KSS mutation endpoints now require canonical @bsv BRC-31 mutual authentication. The upstream verification (handshake + per-request General-message signature) is implemented via `bsv-middleware-rs` (service) and `bsv-middleware-cloudflare` (worker); a request without a valid signature is rejected (401), and a present-but-invalid signature is rejected 401 (not 500). Owner-authorization (`verify_agent_authorization()`) still checks that the authenticated identity matches the requested `agent_id`, preventing cross-agent access. §07 identity-binding additionally requires the request's claimed identity header to equal the session identity the signature was bound to. §07.1 per-request replay-nonce consumption rejects a reused `(session_nonce, request_nonce)` pair (401), checked after signature verification so a forged nonce cannot poison the consumed set. |
+| **Mitigation (planned)** | Rate limiting on all KSS endpoints (defense-in-depth against authenticated-but-abusive callers). |
+| **Residual risk** | Low. The auth gap is closed and proven on mainnet (TXID `96c2ebc592c77bab2fc3fba47993bc6638ec248c7f90caf68ba7fddb3cdabcfd`). Remaining: rate limiting is not yet in place, and authorization above the auth layer (BRC-52 cosigner-cert verification §08.12 + policy manifest §09) is a follow-on layer. |
 
 #### ATTACK A8: BEEF Construction Manipulation
 
@@ -347,8 +347,8 @@ Intermediate protocol state (DKG rounds, signing sessions) must be cleaned up af
 |------|----------|-----------|--------|
 | Single KSS compromise (A1) | Critical | Low | **Accepted** -- mitigated by Beta 2-of-3 |
 | Presignature reuse (A5) | Critical | Very Low | **Mitigated** -- atomic FIFO consumption |
-| MITM on proxy-KSS (A4) | Critical | Low | **Partially mitigated** -- TLS only, BRC-31 TODO |
-| Unauthenticated KSS endpoints (A7) | High | Medium | **Known gap** -- BRC-31 TODO |
+| MITM on proxy-KSS (A4) | Critical | Low | **Mitigated** -- TLS + canonical BRC-31 message integrity (mainnet-proven) |
+| Unauthenticated KSS endpoints (A7) | High | Medium | **Resolved** -- canonical BRC-31 + owner-authz + replay (§07.1) + identity-binding (§07) |
 | Container share theft (A2) | High | Low | **Mitigated** -- encrypted at rest |
 | Fee manipulation (A6) | Medium | Low | **Accepted** -- operator controls proxy |
 | BEEF manipulation (A8) | Medium | Very Low | **Mitigated** -- multi-tier broadcast |
@@ -377,7 +377,7 @@ Intermediate protocol state (DKG rounds, signing sessions) must be cleaned up af
 
 ### Immediate (Alpha Hardening)
 
-1. **Complete BRC-31 authentication** on all KSS mutation endpoints. This is the highest-priority security gap. Port from `bsv-auth-cloudflare` (reference implementation at `~/bsv/rust-middleware`).
+1. **BRC-31 authentication — DONE (bsv-mpc #8, Phase D).** Canonical @bsv BRC-31 is implemented on all KSS mutation endpoints across all three crates (proxy `bsv_rs::auth::Peer`, service `bsv-middleware-rs`, worker `bsv-middleware-cloudflare`), with owner-authorization, §07.1 replay-nonce consumption, and §07 identity-binding enforced. Deployed (worker `f232a13a`, container standard-4) and mainnet-proven (TXID `96c2ebc592c77bab2fc3fba47993bc6638ec248c7f90caf68ba7fddb3cdabcfd`). Follow-on: BRC-52 cosigner-cert verification (§08.12) + policy-manifest enforcement (§09).
 2. **Add rate limiting** to KSS endpoints to prevent presignature exhaustion and protocol state flooding.
 3. **Implement session timeouts** for protocol state cleanup. Stale DKG/signing sessions should be garbage collected.
 
