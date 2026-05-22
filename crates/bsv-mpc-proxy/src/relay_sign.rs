@@ -48,6 +48,17 @@ pub struct DoTrigger {
     /// `request_signer` on [`combine_sign_over_relay`] when canonical signing of
     /// the exact body is required (the deployed worker verifies the canonical wire).
     pub auth_headers: Vec<(String, String)>,
+    /// **§06.17.1 coordinator-holds-ciphertext mode** (issue #30 / #25c): the
+    /// cosigner's BRC-2 ciphertext (`PresigBundle.cosigner_encrypted_shares[do_index]`)
+    /// that the coordinator persisted at presign-time. When `Some`, the
+    /// coordinator ships this opaque blob in the trigger body as
+    /// `cosigner_encrypted_share` and the worker decrypts it under its OWN
+    /// identity via `decrypt_and_issue_partial` (#25b) — the worker generated +
+    /// encrypted this share itself, so the coordinator never held the worker's
+    /// plaintext presig. Supersedes the POC `presig_a_json` plaintext shortcut.
+    /// `None` falls back to the pool/plaintext paths for legacy callers (the
+    /// field is non-breaking: omitted from the body when `None`).
+    pub cosigner_encrypted_share: Option<Vec<u8>>,
 }
 
 /// A canonical BRC-31 request signer: given `(method, path, body_bytes)`, returns
@@ -137,6 +148,12 @@ pub async fn combine_sign_over_relay(
     }
     if let Some(ref agent_id) = trigger.agent_id {
         trigger_body["agent_id"] = serde_json::json!(agent_id);
+    }
+    // §06.17.1: when the coordinator holds the cosigner's ciphertext, ship it so
+    // the worker decrypts its OWN share at sign-time (#25b decrypt_and_issue_partial)
+    // instead of consuming a proxy-provisioned plaintext presig from the pool.
+    if let Some(ref ct) = trigger.cosigner_encrypted_share {
+        trigger_body["cosigner_encrypted_share"] = serde_json::json!(hex::encode(ct));
     }
     // Serialize the body ONCE so the canonical signature covers the EXACT bytes
     // sent (NOT `.json()`, which re-serializes and could diverge from the signed

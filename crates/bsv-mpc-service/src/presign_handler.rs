@@ -194,6 +194,64 @@ impl BundleStore for InMemoryBundleStore {
     }
 }
 
+/// **Durable file-backed bundle store (§06.17.1).** One JSON file per
+/// `presig_id` under `root`, so an assembled [`PresigBundle`] survives a
+/// coordinator restart — the property the in-memory store cannot prove. The
+/// `PresigBundle` is fully `Serialize`/`Deserialize` (its `commitments`/
+/// `gamma_hex` carry the public data per #25a), so a coordinator that reloads a
+/// bundle from disk can reconstruct `PresignaturePublicData` and combine via
+/// [`SigningCoordinator::sign_from_bundle`](bsv_mpc_core::signing::SigningCoordinator::sign_from_bundle)
+/// — no live in-memory presig tuple required.
+///
+/// This is the interface the worker DO / SQLite store slots behind in
+/// production; the file impl is the hermetically-provable durable backing.
+#[derive(Clone)]
+pub struct FileBundleStore {
+    root: std::path::PathBuf,
+}
+
+impl FileBundleStore {
+    /// Open (creating if needed) a bundle store rooted at `root`.
+    pub fn new(root: impl Into<std::path::PathBuf>) -> anyhow::Result<Self> {
+        let root = root.into();
+        std::fs::create_dir_all(&root)
+            .map_err(|e| anyhow::anyhow!("create bundle store dir {}: {e}", root.display()))?;
+        Ok(Self { root })
+    }
+
+    /// Filesystem-safe path for a `presig_id` (hex/ascii ids only — the
+    /// canonical presig_id is a SessionId hex string, so this is total).
+    fn path_for(&self, presig_id: &str) -> std::path::PathBuf {
+        let safe: String = presig_id
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+            .collect();
+        self.root.join(format!("{safe}.json"))
+    }
+
+    /// Load a persisted bundle by `presig_id`, or `None` if absent.
+    pub fn get(&self, presig_id: &str) -> Option<PresigBundle> {
+        let path = self.path_for(presig_id);
+        let bytes = std::fs::read(&path).ok()?;
+        serde_json::from_slice(&bytes).ok()
+    }
+}
+
+impl BundleStore for FileBundleStore {
+    fn persist(&self, bundle: &PresigBundle) -> anyhow::Result<()> {
+        let path = self.path_for(&bundle.presig_id);
+        let bytes = serde_json::to_vec(bundle)
+            .map_err(|e| anyhow::anyhow!("serialize PresigBundle {}: {e}", bundle.presig_id))?;
+        // Write to a temp sibling then rename for atomic, restart-safe durability.
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, &bytes)
+            .map_err(|e| anyhow::anyhow!("write bundle {}: {e}", tmp.display()))?;
+        std::fs::rename(&tmp, &path)
+            .map_err(|e| anyhow::anyhow!("rename bundle into place {}: {e}", path.display()))?;
+        Ok(())
+    }
+}
+
 /// Clone-able handle. `Arc`-shared inside; the handler closure captures it.
 #[derive(Clone)]
 pub struct PresignHandler {
@@ -881,6 +939,53 @@ mod tests {
         assert_eq!(store.len(), 1);
         let got = store.get("presig-xyz").unwrap();
         assert_eq!(got, bundle);
+    }
+
+    /// **§06.17.1 durability** — the file-backed store survives a "restart":
+    /// persist with one handle, reopen a fresh handle on the same dir, and the
+    /// bundle reloads byte-identical. Also proves overwrite (re-persist) works.
+    #[test]
+    fn file_bundle_store_persists_reloads_and_overwrites() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Canonical presig_id = a 64-char session_id hex (the real shape).
+        let presig_id = "ab".repeat(32);
+        let bundle = PresigBundle {
+            presig_id: presig_id.clone(),
+            presig_bytes: vec![0xaa; 16],
+            cosigner_encrypted_shares: vec![
+                serde_bytes::ByteBuf::from(vec![]),
+                serde_bytes::ByteBuf::from(vec![0x01, 0x02, 0x03]),
+            ],
+            gamma_hex: "deadbeef".to_string(),
+            commitments: vec![0xc0, 0x1d],
+            policy_id: PolicyId([0x22; 32]),
+            joint_pubkey: vec![0x03; 33],
+            parties_at_keygen: vec![0, 1],
+            generated_at: 42,
+        };
+
+        {
+            let store = FileBundleStore::new(dir.path()).expect("open store");
+            assert!(store.get(&presig_id).is_none(), "empty before persist");
+            store.persist(&bundle).expect("persist");
+        }
+        // Fresh handle on the same dir = a coordinator restart.
+        let reopened = FileBundleStore::new(dir.path()).expect("reopen store");
+        let got = reopened.get(&presig_id).expect("reload after restart");
+        assert_eq!(got, bundle, "durable bundle reloads byte-identical");
+
+        // Overwrite (atomic rename) with a mutated bundle.
+        let mut bundle2 = bundle.clone();
+        bundle2.generated_at = 99;
+        reopened.persist(&bundle2).expect("re-persist");
+        assert_eq!(
+            reopened.get(&presig_id).expect("reload after overwrite"),
+            bundle2,
+            "re-persist overwrites in place"
+        );
+
+        // Unknown id → None.
+        assert!(reopened.get("nope").is_none());
     }
 
     /// **Item-1 gate** — PresigBundle assembly produces positional

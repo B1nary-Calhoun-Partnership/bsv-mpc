@@ -1336,6 +1336,14 @@ impl CosignerSessionDo {
             joint_pubkey_hex: Option<String>,
             #[serde(default)]
             session_id_hex: Option<String>,
+            /// §06.17.1 (issue #30): the coordinator-held BRC-2 ciphertext of
+            /// THIS worker's own presig share, hex-encoded. When present, the
+            /// worker decrypts this (under its own identity + the canonical
+            /// presig_id = session_id hex) instead of consuming a
+            /// proxy-provisioned plaintext presig from its DO pool — so the
+            /// coordinator never held the worker's plaintext share.
+            #[serde(default)]
+            cosigner_encrypted_share: Option<String>,
         }
 
         // ── 0. Owner-authz (BEFORE any share/presig material is touched) ────
@@ -1397,25 +1405,50 @@ impl CosignerSessionDo {
         let recipient_pub = PublicKey::from_hex(&body.recipient_pub_hex)
             .map_err(|e| Error::RustError(format!("recipient_pub_hex: {e:?}")))?;
 
-        // ── 3. Consume a provisioned presignature from THIS joint key's pool ──
-        // The pool is segregated by the joint key (`agent_id`), so a sign for
-        // this joint key only ever consumes its own correlated presignatures —
-        // never a leftover from another joint key/run (#7 finding 5). The
-        // matching Presignature_B is held by the combiner; only A ships.
-        let (ciphertext, presig_id) = match store.consume_presignature(&body.agent_id)? {
-            Some(p) => p,
-            None => {
-                return Response::error(
-                    "no presignature available in pool — provision via /ceremony/ingest-presig",
-                    409,
-                )
+        // ── 3. Obtain THIS worker's at-rest BRC-2 ciphertext + its presig_id ──
+        // §06.17.1 (issue #30): if the COORDINATOR shipped the worker's own
+        // ciphertext in the trigger, decrypt THAT — the worker generated +
+        // self-encrypted this share at presign-time and the coordinator only
+        // ever held the opaque blob (it could never read the plaintext). The
+        // canonical presig_id the worker sealed under is the session_id hex
+        // (the §06.16 / presign-handler convention). This supersedes the POC
+        // proxy-provisioned-plaintext pool path.
+        //
+        // Otherwise, fall back to consuming a provisioned presignature from THIS
+        // joint key's pool (#14 / §06.20). The pool is segregated by the joint
+        // key (`agent_id`), so a sign for this joint key only ever consumes its
+        // own correlated presignatures — never a leftover from another joint
+        // key/run (#7 finding 5).
+        let (ciphertext, presig_id) = match &body.cosigner_encrypted_share {
+            Some(ct_hex) => {
+                let ct = hex::decode(ct_hex).map_err(|e| {
+                    Error::RustError(format!("cosigner_encrypted_share hex: {e}"))
+                })?;
+                if ct.is_empty() {
+                    return Response::error("cosigner_encrypted_share is empty", 400);
+                }
+                // §06.17.1 binds the BRC-2 key to the canonical presig_id =
+                // session_id hex (the same key_id the presign handler sealed
+                // under). Single-use enforcement for the bundle path is the
+                // coordinator's responsibility (it holds + invalidates the
+                // bundle); the worker is stateless on this branch.
+                (ct, session_id.hex())
             }
+            None => match store.consume_presignature(&body.agent_id)? {
+                Some(p) => p,
+                None => {
+                    return Response::error(
+                        "no presignature: provide cosigner_encrypted_share (§06.17.1) \
+                         or provision the pool via /ceremony/ingest-presig",
+                        409,
+                    )
+                }
+            },
         };
-        // §06.20: the pool row is the worker's at-rest BRC-2 ciphertext. Decrypt
-        // under the same key_id (`presig_id`) it was sealed with at ingest, then
+        // §06.20 / §06.17.1: the ciphertext is the worker's at-rest BRC-2 blob.
+        // Decrypt under the same key_id (`presig_id`) it was sealed with, then
         // issue this party's partial — byte-identical to a plaintext-issued
-        // partial (issue_partial is deterministic). Single-use already enforced
-        // (consume deleted the row).
+        // partial (issue_partial is deterministic).
         let wallet = self.presig_wallet()?;
         let partial_json = bsv_mpc_core::presig_encryption::decrypt_and_issue_partial(
             &wallet,
