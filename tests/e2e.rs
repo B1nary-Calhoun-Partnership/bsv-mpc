@@ -15,6 +15,7 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, RwLock};
 
+use bsv::primitives::ec::PrivateKey;
 use bsv_mpc_core::types::*;
 use cggmp24::security_level::SecurityLevel128;
 use cggmp24::supported_curves::Secp256k1;
@@ -288,6 +289,19 @@ async fn setup() -> TestEnv {
     let joint_key_hex = hex::encode(&dkg_result_0.joint_key.compressed);
     let joint_address = dkg_result_0.joint_key.address.clone();
 
+    // ── Real enforced BRC-31 auth (NO dev-mode unauthenticated fallback) ──
+    // The e2e must exercise the canonical mutual-auth path end-to-end, not a
+    // stubbed/degraded one. The proxy's owner identity is pinned deterministically
+    // via MPC_PROXY_IDENTITY_KEY so the KSS can authorize it against the share's
+    // owner_identity (§08.1). Mirrors proxy_enforced_cosigner_e2e.rs.
+    let proxy_identity_bytes = [0x99u8; 32];
+    std::env::set_var("MPC_PROXY_IDENTITY_KEY", hex::encode(proxy_identity_bytes));
+    let proxy_owner_hex = PrivateKey::from_bytes(&proxy_identity_bytes)
+        .expect("valid proxy identity key")
+        .public_key()
+        .to_hex();
+    let kss_server_key = PrivateKey::from_bytes(&[0xd1u8; 32]).expect("valid KSS server key");
+
     // ── Start KSS ──────────────────────────────────────────────────────
     let kss_port = find_free_port().await;
     let kss_url = format!("http://127.0.0.1:{kss_port}");
@@ -295,10 +309,11 @@ async fn setup() -> TestEnv {
     let kss_storage =
         bsv_mpc_service::SqliteShareStorage::open("/tmp/e2e-kss").expect("open KSS storage");
 
-    // Pre-seed KSS with share_0 (keyed by agent_id = hex(joint_key))
+    // Pre-seed KSS with share_0 (keyed by agent_id = hex(joint_key)), binding the
+    // owner to the proxy's pinned identity so enforced owner-authz (§08.1) passes.
     let mut kss_storage = kss_storage;
     kss_storage
-        .store_share(&joint_key_hex, &dkg_result_0.share)
+        .store_share_with_owner(&joint_key_hex, &dkg_result_0.share, &proxy_owner_hex)
         .expect("store KSS share");
 
     let kss_state = Arc::new(bsv_mpc_service::AppState {
@@ -306,7 +321,7 @@ async fn setup() -> TestEnv {
         storage: RwLock::new(kss_storage),
         started_at: chrono::Utc::now(),
         provision: None,
-        auth: bsv_mpc_service::AuthState::dev(),
+        auth: bsv_mpc_service::AuthState::with_key(kss_server_key),
         custody: None,
     });
 
@@ -341,7 +356,11 @@ async fn setup() -> TestEnv {
         fee_threshold: None,
         max_presignatures: 0, // Disable background presigning
         encryption_key: None,
-        arc_api_key: "<REDACTED-ARC-API-KEY>".into(),
+        // Read the real TAAL/ARC key from env for the mainnet broadcast gate
+        // (E2E_MAINNET runs); falls back to the inert placeholder for the
+        // no-network in-process run. Never hardcode the secret in-tree.
+        arc_api_key: std::env::var("MPC_ARC_API_KEY")
+            .unwrap_or_else(|_| "<REDACTED-ARC-API-KEY>".into()),
         threshold_configs: vec!["2-of-2".to_string()],
         min_balance_sats: None,
         relay_url: "https://rust-message-box.dev-a3e.workers.dev".into(),
@@ -521,11 +540,10 @@ async fn test_signature_roundtrip(env: &TestEnv, client: &Client) {
     .await;
     let elapsed = start.elapsed();
 
-    if let Some(error) = resp.get("error") {
-        eprintln!("  createSignature error (may be protocol sync issue): {error}");
-        eprintln!("  SKIP (signing protocol exchange needs debugging)\n");
-        return;
-    }
+    assert!(
+        resp.get("error").is_none(),
+        "createSignature must succeed (full 4-round 2PC ECDSA over HTTP to the KSS): {resp}"
+    );
 
     let signature = resp["signature"].as_str().expect("signature hex");
     assert!(
@@ -760,11 +778,10 @@ async fn test_derived_key_signing(env: &TestEnv, client: &Client) {
     .await;
     let elapsed = start.elapsed();
 
-    if let Some(error) = resp.get("error") {
-        eprintln!("  createSignature error: {error}");
-        eprintln!("  SKIP (derived key signing protocol needs debugging)\n");
-        return;
-    }
+    assert!(
+        resp.get("error").is_none(),
+        "derived-key createSignature must succeed (BRC-42 HMAC offset through the full MPC ceremony): {resp}"
+    );
 
     let signature = resp["signature"].as_str().expect("signature hex");
     assert!(
@@ -862,7 +879,11 @@ async fn test_mainnet_transaction(env: &TestEnv, client: &Client) {
                 "satoshis": 5000,
                 "lockingScript": locking_script,
                 "outputDescription": "Fund MPC E2E test address"
-            }]
+            }],
+            // Force a SYNCHRONOUS broadcast — the default delayed broadcast queues
+            // the funding tx and it never reaches the network, so the child spend
+            // can never reference it ("Missing inputs").
+            "options": { "acceptDelayedBroadcast": false }
         }))
         .send()
         .await
@@ -892,6 +913,44 @@ async fn test_mainnet_transaction(env: &TestEnv, client: &Client) {
         "  Funded: txid={fund_txid} ({} bytes)",
         fund_raw_tx.len() / 2
     );
+
+    // Wait for the funding tx to be accepted by the network before spending. The
+    // wallet broadcasts via ARC/TAAL (acceptDelayedBroadcast=false above), and
+    // WoC's tx-by-hash does NOT reliably surface unconfirmed mempool txs — so poll
+    // ARC status directly. The child spend chains off this parent in ARC's
+    // mempool. Requires MPC_ARC_API_KEY (the mainnet broadcast gate sets it).
+    let arc_key = std::env::var("MPC_ARC_API_KEY").unwrap_or_default();
+    let arc_url = format!("https://arc.taal.com/v1/tx/{fund_txid}");
+    eprintln!("  Waiting for funding tx to be SEEN_ON_NETWORK (ARC/TAAL)...");
+    let mut last_status = String::new();
+    let mut seen = false;
+    for attempt in 1..=12u64 {
+        tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+        if let Ok(r) = client
+            .get(&arc_url)
+            .header("Authorization", format!("Bearer {arc_key}"))
+            .send()
+            .await
+        {
+            if r.status().is_success() {
+                let j: Value = r.json().await.unwrap_or_default();
+                last_status = j["txStatus"].as_str().unwrap_or("").to_string();
+                eprintln!("  ARC status (attempt {attempt}): {last_status}");
+                if matches!(last_status.as_str(), "SEEN_ON_NETWORK" | "MINED") {
+                    seen = true;
+                    break;
+                }
+            }
+        }
+    }
+    // The child spend chains off this parent: it must be SEEN_ON_NETWORK (network
+    // nodes have it), not merely ANNOUNCED, or the child broadcast races ahead of
+    // a parent the miners haven't accepted yet.
+    assert!(
+        seen,
+        "funding tx {fund_txid} MUST be SEEN_ON_NETWORK before spending (last status: {last_status:?})"
+    );
+    eprintln!("  Funding tx SEEN_ON_NETWORK (status: {last_status})");
 
     // Step 2: Internalize the funding transaction.
     // Use auto-scan mode (no "outputs" array) — the handler will scan all outputs
@@ -1080,7 +1139,7 @@ async fn test_all_endpoints_no_panic(env: &TestEnv, client: &Client) {
         &format!("{base_url}/createSignature"),
         &json!({
             "data": test_data,
-            "protocolID": [2, "no-panic-test"],
+            "protocolID": [2, "no panic test"],
             "keyID": "k1",
             "counterparty": "anyone"
         }),
@@ -1098,7 +1157,7 @@ async fn test_all_endpoints_no_panic(env: &TestEnv, client: &Client) {
         &json!({
             "data": hex::encode(b"test"),
             "signature": "00".repeat(64),
-            "protocolID": [2, "no-panic-test"],
+            "protocolID": [2, "no panic test"],
             "keyID": "k1",
             "counterparty": "anyone",
             "forSelf": true
@@ -1142,7 +1201,7 @@ async fn test_all_endpoints_no_panic(env: &TestEnv, client: &Client) {
         &format!("{base_url}/encrypt"),
         &json!({
             "plaintext": plaintext,
-            "protocolID": [2, "no-panic-test"],
+            "protocolID": [2, "no panic test"],
             "keyID": "enc-np",
             "counterparty": "anyone"
         }),
@@ -1156,7 +1215,7 @@ async fn test_all_endpoints_no_panic(env: &TestEnv, client: &Client) {
         &format!("{base_url}/decrypt"),
         &json!({
             "ciphertext": "AAAA",
-            "protocolID": [2, "no-panic-test"],
+            "protocolID": [2, "no panic test"],
             "keyID": "dec-np",
             "counterparty": "anyone"
         }),
@@ -1171,7 +1230,7 @@ async fn test_all_endpoints_no_panic(env: &TestEnv, client: &Client) {
         &format!("{base_url}/createHmac"),
         &json!({
             "data": hmac_data,
-            "protocolID": [2, "no-panic-test"],
+            "protocolID": [2, "no panic test"],
             "keyID": "hmac-np",
             "counterparty": "anyone"
         }),
@@ -1186,7 +1245,7 @@ async fn test_all_endpoints_no_panic(env: &TestEnv, client: &Client) {
         &json!({
             "data": hmac_data,
             "hmac": "0000000000000000000000000000000000000000000000000000000000000000",
-            "protocolID": [2, "no-panic-test"],
+            "protocolID": [2, "no panic test"],
             "keyID": "hmac-np",
             "counterparty": "anyone"
         }),

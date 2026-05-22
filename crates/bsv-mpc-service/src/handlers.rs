@@ -612,7 +612,24 @@ pub async fn handle_sign_init(
         None => None,
     };
 
-    let session_id = SessionId::from_str_hash(&body.session_id);
+    // The proxy sends the canonical session_id as 64-char hex; reconstruct the
+    // SAME SessionId via from_hex. HARD-ERROR on malformed hex (mirror of the
+    // presign handler): the previous `from_str_hash` fallback silently RE-HASHED
+    // the hex into a *different* SessionId → a divergent cggmp24 ExecutionId →
+    // the 2PC ceremony aborted at round 2 with a confusing "signing protocol
+    // failed" far from the real cause. A non-hex session_id here is a caller bug;
+    // fail loudly at the boundary.
+    let session_id = match SessionId::from_hex(&body.session_id) {
+        Ok(id) => id,
+        Err(e) => {
+            return err_response(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "session_id must be the canonical 64-char hex SessionId (got malformed: {e})"
+                ),
+            )
+        }
+    };
     let config = share.config;
     let participants: Vec<u16> = (0..config.parties).collect();
     let mut coordinator = SigningCoordinator::new(session_id, share, config, participants);

@@ -297,6 +297,7 @@ mod tests {
             basket: None,
             tags: vec![],
             created_at: Utc::now(),
+            source_beef: None,
         }
     }
 
@@ -316,6 +317,7 @@ mod tests {
             basket: Some(basket.to_string()),
             tags: tags.into_iter().map(String::from).collect(),
             created_at: Utc::now(),
+            source_beef: None,
         }
     }
 

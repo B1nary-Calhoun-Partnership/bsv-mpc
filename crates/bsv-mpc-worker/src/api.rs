@@ -562,8 +562,12 @@ pub async fn handle_sign_init(mut req: Request, store: &dyn MpcStore) -> Result<
     let signing_session_id = generate_session_id("sign").map_err(Error::from)?;
 
     // Create signing coordinator for party 0
-    // KSS is party 0, proxy is party 1 — standard 2-of-2 participants
-    let session_id = SessionId::from_str_hash(&body.session_id);
+    // KSS is party 0, proxy is party 1 — standard 2-of-2 participants.
+    // Reconstruct the SAME SessionId the proxy sent (canonical 64-char hex) via
+    // from_hex. `from_str_hash` would RE-HASH the hex into a *different*
+    // SessionId → a divergent cggmp24 ExecutionId → the ceremony aborts mid-round.
+    let session_id = SessionId::from_hex(&body.session_id)
+        .map_err(|e| Error::from(format!("session_id must be canonical 64-char hex: {e}")))?;
     let config = share.config;
     let participants: Vec<u16> = (0..config.parties).collect();
 
@@ -691,8 +695,11 @@ pub async fn handle_presign_init(mut req: Request, store: &dyn MpcStore) -> Resu
 
     let presign_session_id = generate_session_id("presign").map_err(Error::from)?;
 
-    // Create presigning manager for party 0
-    let session_id = SessionId::from_str_hash(&body.session_id);
+    // Create presigning manager for party 0. Reconstruct the SAME SessionId the
+    // proxy sent (canonical 64-char hex); `from_str_hash` would re-hash it into a
+    // divergent cggmp24 ExecutionId → the presig fails to complete.
+    let session_id = SessionId::from_hex(&body.session_id)
+        .map_err(|e| Error::from(format!("session_id must be canonical 64-char hex: {e}")))?;
     let participants: Vec<u16> = (0..share.config.parties).collect();
 
     let mut manager = PresigningManager::new(session_id, share, participants, body.count as usize);

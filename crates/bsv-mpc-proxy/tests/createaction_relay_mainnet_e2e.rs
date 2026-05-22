@@ -275,6 +275,7 @@ To run (BURNS REAL SATS): E2E_MAINNET=1 cargo test -p bsv-mpc-proxy \\
             basket: Some("default".into()),
             tags: vec![],
             created_at: chrono::Utc::now(),
+            source_beef: None,
         },
     )
     .await
