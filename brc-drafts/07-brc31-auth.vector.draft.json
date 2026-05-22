@@ -1,0 +1,119 @@
+{
+  "DRAFT": true,
+  "DRAFT_WARNING": "UNRATIFIED DRAFT. Not committed to MPC-Spec. Defines cross-impl wire (rust-mpc consumes it) and therefore requires cross-impl byte-lock coordination (Python primary + Rust cross-validator + rust-mpc agreement) before promotion to MPC-Spec conformance/test-vectors/07-brc31-auth.json. Signature fields are placeholders pending a canonical bsv-rs create_signature run with pinned identity keys. See 07-brc31-auth.vector.README.md.",
+  "spec_section": "07",
+  "spec_title": "Canonical BRC-31 Mutual Authentication",
+  "encoding": "bsv-rs auth wire (bsv_rs::auth). General-message payload = HttpRequest::to_payload / HttpResponse::to_payload. Handshake signing per AuthMessage::signing_data + get_key_id.",
+  "auth_version": "0.1",
+  "auth_protocol_id": "auth message signature",
+  "security_level": "Counterparty",
+  "payload_format": {
+    "request": "[request_id: 32B][method: varint+str][path: varint+str | -1][search: varint+str | -1][headers: varint count + (varint+key, varint+val) pairs][body: varint+bytes | -1]",
+    "response": "[request_id: 32B][status: varint][headers: varint count + (varint+key, varint+val) pairs][body: varint+bytes | -1]",
+    "varint": "value<253 -> 1 byte; <0x10000 -> 0xFD + u16 LE; <0x1_0000_0000 -> 0xFE + u32 LE; else 0xFF + u64 LE; value -1 (empty/missing) -> 0xFF repeated 9 times",
+    "signed_headers": "Only x-bsv-* (excluding x-bsv-auth-*), authorization, and content-type are carried in the payload, sorted bytewise by key. The x-bsv-auth-* transport headers (version, identity-key, nonce, your-nonce, signature, request-id) are NOT part of the signed payload.",
+    "general_signing_data": "= the General-message payload bytes verbatim (no version byte prefix)",
+    "handshake_signing_data": "InitialResponse signs yourNonce(initiator, base64-decoded) || initialNonce(responder, base64-decoded). key_id = \"{yourNonce} {initialNonce}\". InitialRequest is unsigned (starts the handshake)."
+  },
+  "test_only_keys": {
+    "WARNING": "Pinned test material. DO NOT USE IN PRODUCTION.",
+    "test_only_initiator_identity_priv_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+    "test_only_responder_identity_priv_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+    "test_only_request_id_source": "SHA256(\"calhoun-binary-mpc-brc31-vector-req\")",
+    "test_only_initiator_nonce_source": "SHA256(\"calhoun-binary-mpc-brc31-initiator-nonce\")",
+    "test_only_responder_nonce_source": "SHA256(\"calhoun-binary-mpc-brc31-responder-nonce\")"
+  },
+  "PENDING_DERIVATION": {
+    "note": "These identity pubkeys and all signature_* fields below MUST be filled by a canonical bsv-rs run (PublicKey::from_private_key + Peer::sign_message via create_signature under protocol \"auth message signature\", SecurityLevel::Counterparty, the listed key_id, counterparty = Other(peer identity)). They are left as placeholders so no fabricated bytes get treated as byte-locked.",
+    "initiator_identity_pub_hex": "<COMPUTED_BY_CROSS_IMPL>",
+    "responder_identity_pub_hex": "<COMPUTED_BY_CROSS_IMPL>"
+  },
+  "vectors": [
+    {
+      "name": "brc31-vector-A-handshake-initial-response",
+      "case": "valid",
+      "description": "(a) Valid InitialRequest -> InitialResponse handshake. Initiator sends an unsigned InitialRequest carrying its session nonce (initialNonce). Responder replies with an InitialResponse signed over yourNonce||initialNonce at SecurityLevel::Counterparty. MUST verify and establish a session.",
+      "initial_request": {
+        "version": "0.1",
+        "message_type": "initialRequest",
+        "identity_key_hex": "<initiator_identity_pub_hex>",
+        "initial_nonce_base64": "10EDopT3q5fDPM49lcJbMRfMesQH1JEUCEmBqaxjJLs=",
+        "initial_nonce_hex": "d74103a294f7ab97c33cce3d95c25b3117cc7ac407d49114084981a9ac6324bb",
+        "signed": false,
+        "note": "InitialRequest is not signed (AuthMessage::signing_data returns empty for InitialRequest)."
+      },
+      "initial_response": {
+        "version": "0.1",
+        "message_type": "initialResponse",
+        "identity_key_hex": "<responder_identity_pub_hex>",
+        "your_nonce_base64": "10EDopT3q5fDPM49lcJbMRfMesQH1JEUCEmBqaxjJLs=",
+        "initial_nonce_base64": "TQSKOiG7FVsOhHXpcaPTBWxKyp/ZUD5l5r4DpSmCFrc=",
+        "initial_nonce_hex_responder_session_nonce": "4d048a3a21bb155b0e8475e971a3d3056c4aca9fd9503e65e6be03a5298216b7",
+        "key_id": "10EDopT3q5fDPM49lcJbMRfMesQH1JEUCEmBqaxjJLs= TQSKOiG7FVsOhHXpcaPTBWxKyp/ZUD5l5r4DpSmCFrc=",
+        "signing_data_hex": "d74103a294f7ab97c33cce3d95c25b3117cc7ac407d49114084981a9ac6324bb4d048a3a21bb155b0e8475e971a3d3056c4aca9fd9503e65e6be03a5298216b7",
+        "signing_data_len_bytes": 64,
+        "signature_der_hex": "<COMPUTED_BY_CROSS_IMPL>"
+      },
+      "expected": { "verify": true }
+    },
+    {
+      "name": "brc31-vector-B-general-request",
+      "case": "valid",
+      "description": "(b) Valid General-message request payload + signature. A POST /sign/init request body, encoded via HttpRequest::to_payload, signed under the established session. signing_data == the payload itself. MUST verify.",
+      "request": {
+        "method": "POST",
+        "path": "/sign/init",
+        "search": "",
+        "request_id_hex": "de6d1165b30631f000e8163593ace8c98c00872a96d13859a7c7ee07886e17e7",
+        "headers_in_payload": [ ["content-type", "application/json"] ],
+        "body_utf8": "{\"agent_id\":\"agent-vector-A\",\"round\":0,\"session_id\":\"f25e7c5e560e01926dfbfd70f3940352c1349e1e69a2f17c1668bda988014e0b\"}",
+        "body_len_bytes": 119
+      },
+      "payload_hex": "de6d1165b30631f000e8163593ace8c98c00872a96d13859a7c7ee07886e17e704504f53540a2f7369676e2f696e6974ffffffffffffffffff010c636f6e74656e742d74797065106170706c69636174696f6e2f6a736f6e777b226167656e745f6964223a226167656e742d766563746f722d41222c22726f756e64223a302c2273657373696f6e5f6964223a2266323565376335653536306530313932366466626664373066333934303335326331333439653165363961326631376331363638626461393838303134653062227d",
+      "payload_len_bytes": 208,
+      "payload_sha256_hex": "64af1f9f30ba0284a646b1481c2b769093d1dc04c7f22906301f0d97b324b8c1",
+      "signing_data_equals": "payload_hex",
+      "signature_der_hex": "<COMPUTED_BY_CROSS_IMPL>",
+      "response_payload_hex": "de6d1165b30631f000e8163593ace8c98c00872a96d13859a7c7ee07886e17e7c8010c636f6e74656e742d74797065106170706c69636174696f6e2f6a736f6e657b226f6b223a747275652c22726f756e64223a302c2273657373696f6e5f6964223a2266323565376335653536306530313932366466626664373066333934303335326331333439653165363961326631376331363638626461393838303134653062227d",
+      "response_payload_len_bytes": 166,
+      "response_payload_sha256_hex": "23901ddf13545ad265c633ada6fb6a1f40906c3dd6edff12c3def1770559d7af",
+      "expected": { "verify": true }
+    },
+    {
+      "name": "brc31-vector-C-replay-reused-nonce",
+      "case": "reject",
+      "description": "(c) Replay: a second request reuses the same per-request nonce on the same session. The (session_nonce = your_nonce, request_nonce = nonce) pair was already consumed. §07.1 MUST reject with HTTP 401. The check runs AFTER signature verification, so the signature itself is valid here — only the replay-nonce consumption fails.",
+      "replayed_pair": {
+        "your_nonce_base64": "TQSKOiG7FVsOhHXpcaPTBWxKyp/ZUD5l5r4DpSmCFrc=",
+        "request_nonce_base64": "10EDopT3q5fDPM49lcJbMRfMesQH1JEUCEmBqaxjJLs=",
+        "note": "your_nonce = server (responder) session nonce; request_nonce = the fresh per-request nonce, reused verbatim from vector B's first send."
+      },
+      "expected": { "verify_signature": true, "accept": false, "http_status": 401, "reason": "§07.1 replay: per-request nonce already consumed" }
+    },
+    {
+      "name": "brc31-vector-D-wrong-identity",
+      "case": "reject",
+      "description": "(d) Wrong identity: the request's x-bsv-auth-identity-key header does not match the identity the session signature was bound to (§07 identity-binding), OR the General-message signature does not verify against the claimed identity key. MUST reject with HTTP 401.",
+      "tamper": {
+        "claimed_identity_hex": "<a different valid secp256k1 pubkey, not the session identity>",
+        "signature_was_made_with": "responder_identity_priv (mismatched)"
+      },
+      "expected": { "verify": false, "accept": false, "http_status": 401, "reason": "§07 identity-binding: header identity != session identity / signature does not verify against claimed key" }
+    },
+    {
+      "name": "brc31-vector-E-malformed",
+      "case": "reject",
+      "description": "(e) Malformed: a signed request missing required nonce headers (x-bsv-auth-nonce / x-bsv-auth-your-nonce) OR a truncated payload that fails to decode via HttpRequest::from_payload. MUST reject (protocol violation -> 401), NOT silently skip the replay/identity defenses, and NOT 500.",
+      "variants": [
+        { "kind": "missing_nonce_headers", "expected": { "accept": false, "http_status": 401 } },
+        { "kind": "truncated_payload", "payload_hex": "de6d1165b30631f000e8163593ace8c98c00872a96d138", "expected": { "accept": false, "http_status": 401 } },
+        { "kind": "present_but_invalid_signature", "expected": { "accept": false, "http_status": 401, "note": "explicitly 401 not 500 — see bsv-mpc commit a3e660d" } }
+      ]
+    }
+  ],
+  "cross_check": {
+    "varint_decode_of_payload_hex": "04='POST'(len4); 0a='/sign/init'(len10); ff*9=search -1; 01=1 header; 0c='content-type'(12); 10='application/json'(16); 77=body len 119",
+    "payload_encoder_source": "mirrors bsv-rs/src/auth/transports/http.rs write_varint (L443-464) + HttpRequest::to_payload (L219-268) + HttpResponse::to_payload (L288-317)",
+    "what_is_NOT_yet_locked": "all signature_der_hex fields, both identity pubkeys — require a canonical bsv-rs create_signature run; see README"
+  }
+}
