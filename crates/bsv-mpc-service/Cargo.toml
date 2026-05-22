@@ -22,6 +22,8 @@ axum.workspace = true
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# Presign bundle assembly: `cosigner_encrypted_shares` is `Vec<serde_bytes::ByteBuf>`.
+serde_bytes.workspace = true
 sha2.workspace = true
 hex.workspace = true
 getrandom = "0.2"
@@ -45,3 +47,9 @@ tempfile.workspace = true
 reqwest.workspace = true
 serde_json.workspace = true
 tracing-subscriber.workspace = true
+# presign_2of2_via_messagebox_e2e generates real 2-of-2 key shares locally via
+# the round_based simulator (keygen + auxinfo) before driving presign over the
+# live relay — same pattern as bsv-mpc-core's presigning.rs tests.
+round-based = { workspace = true, features = ["sim", "state-machine"] }
+futures = { workspace = true }
+pin-project = { workspace = true }
