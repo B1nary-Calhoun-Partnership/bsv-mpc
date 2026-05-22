@@ -367,6 +367,7 @@ To run (BURNS REAL SATS): E2E_MAINNET=1 cargo test -p bsv-mpc-proxy \\
             agent_id: None,
             auth_headers: vec![],
         },
+        None, // unauthed POC route — no canonical signer
         Duration::from_secs(60),
     )
     .await

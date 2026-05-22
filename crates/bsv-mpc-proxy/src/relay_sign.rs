@@ -44,9 +44,18 @@ pub struct DoTrigger {
     /// unauthed POC route.
     pub agent_id: Option<String>,
     /// **Production mode**: BRC-31 auth headers (name, value) for the authed
-    /// `/sign-relay` route. Empty for the unauthed POC route.
+    /// `/sign-relay` route. Empty for the unauthed POC route. Superseded by
+    /// `request_signer` on [`combine_sign_over_relay`] when canonical signing of
+    /// the exact body is required (the deployed worker verifies the canonical wire).
     pub auth_headers: Vec<(String, String)>,
 }
+
+/// A canonical BRC-31 request signer: given `(method, path, body_bytes)`, returns
+/// the `x-bsv-auth-*` headers signed over the EXACT body bytes. Supplied by the
+/// proxy bridge (its worker session) so the relay-built `/sign-relay` body can be
+/// signed AFTER it is serialized inside [`combine_sign_over_relay`].
+pub type RelayRequestSigner<'a> =
+    &'a (dyn Fn(&str, &str, &[u8]) -> Result<Vec<(String, String)>> + Send + Sync);
 
 /// The combiner's signing-time index = position of its share index within
 /// `participants` (matches `SigningCoordinator`'s internal convention).
@@ -88,6 +97,10 @@ pub async fn combine_sign_over_relay(
     my_presig_box: Box<dyn std::any::Any + Send>,
     joint_key: &JointPublicKey,
     trigger: DoTrigger,
+    // When `Some`, signs the EXACT serialized trigger body with canonical BRC-31
+    // (the deployed worker `/sign-relay` verifies the canonical wire). When
+    // `None`, falls back to `trigger.auth_headers` (unauthed POC / legacy callers).
+    request_signer: Option<RelayRequestSigner<'_>>,
     recv_timeout: Duration,
 ) -> Result<SigningResult> {
     let proto = |e: bsv_mpc_messagebox::error::MessageBoxError| MpcError::Protocol(e.to_string());
@@ -125,12 +138,29 @@ pub async fn combine_sign_over_relay(
     if let Some(ref agent_id) = trigger.agent_id {
         trigger_body["agent_id"] = serde_json::json!(agent_id);
     }
+    // Serialize the body ONCE so the canonical signature covers the EXACT bytes
+    // sent (NOT `.json()`, which re-serializes and could diverge from the signed
+    // bytes).
+    let body_bytes = serde_json::to_vec(&trigger_body)
+        .map_err(|e| MpcError::Protocol(format!("serialize sign-relay body: {e}")))?;
     let mut builder = http
         .post(&trigger.url)
         .header("content-type", "application/json")
-        .json(&trigger_body);
-    for (name, value) in &trigger.auth_headers {
-        builder = builder.header(name, value);
+        .body(body_bytes.clone());
+    if let Some(sign) = request_signer {
+        // Canonical: sign over (POST, url-path, exact body). The worker
+        // reconstructs the same path (e.g. "/sign-relay") from the request it
+        // receives, so client + server agree byte-for-byte.
+        let path = reqwest::Url::parse(&trigger.url)
+            .map(|u| u.path().to_string())
+            .unwrap_or_else(|_| "/sign-relay".to_string());
+        for (name, value) in sign("POST", &path, &body_bytes)? {
+            builder = builder.header(name, value);
+        }
+    } else {
+        for (name, value) in &trigger.auth_headers {
+            builder = builder.header(name, value);
+        }
     }
     let resp = builder
         .send()

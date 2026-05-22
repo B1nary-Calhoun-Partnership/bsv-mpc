@@ -1425,14 +1425,24 @@ impl MpcBridge {
                 .map_err(|_| MpcError::Protocol("auth mutex poisoned".into()))?;
             auth.auth_key().clone()
         };
-        // The DO `/sign-relay` trigger is the WORKER leg (legacy BRC-31 wire) and
-        // is exercised only by deployed, env-gated e2e. Its canonical-wire
-        // migration is a separate (worker-side) change. The bridge no longer
-        // pre-injects its (now canonical) per-request auth headers here, because
-        // canonical headers must be signed over the EXACT trigger body — which is
-        // serialized inside `combine_sign_over_relay`, after this point — and
-        // because the unchanged worker still verifies the legacy profile. Callers
-        // that already populated `trigger.auth_headers` are left untouched.
+        // Canonical `/sign-relay` auth: the trigger body is serialized inside
+        // `combine_sign_over_relay`, so we pass a signer closure (capturing our
+        // worker BRC-31 session) that signs the EXACT serialized body there. The
+        // deployed worker verifies the canonical wire (§07).
+        let auth_for_sign = self.auth.clone();
+        let request_signer = move |method: &str,
+                                   path: &str,
+                                   body: &[u8]|
+              -> bsv_mpc_core::error::Result<Vec<(String, String)>> {
+            let guard = auth_for_sign
+                .lock()
+                .map_err(|_| MpcError::Protocol("auth mutex poisoned".into()))?;
+            Ok(guard
+                .auth_header_pairs(method, path, body)?
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect())
+        };
         // Fresh, unique session id PER SIGN — it correlates this sign's §05
         // relay envelope so the combiner can filter out stale/other partials on
         // the shared `mpc-sign` box (the crypto is presig-based + session-
@@ -1454,6 +1464,7 @@ impl MpcBridge {
             my_presig_box,
             &self.joint_key,
             trigger,
+            Some(&request_signer),
             recv_timeout,
         )
         .await
