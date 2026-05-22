@@ -177,8 +177,10 @@ async fn find_utxo_on_woc(
     expected_locking_hex: &str,
 ) -> Option<(u32, u64)> {
     let url = format!("https://api.whatsonchain.com/v1/bsv/main/tx/hash/{fund_txid}");
-    for attempt in 1..=8 {
-        let wait = attempt * 3;
+    // WoC indexing can lag a freshly-broadcast tx by several minutes under load.
+    // Poll on a steady 15s cadence for up to ~5 minutes before giving up.
+    for attempt in 1..=20 {
+        let wait = 15;
         eprintln!("  WoC attempt {attempt}: waiting {wait}s for indexing...");
         tokio::time::sleep(Duration::from_secs(wait)).await;
         let Ok(resp) = http.get(&url).send().await else {
@@ -231,6 +233,23 @@ async fn broadcast_via_arc(http: &reqwest::Client, raw_tx_hex: &str) -> bool {
         }
     }
     false
+}
+
+/// Extract the raw funding tx hex from a wallet `createAction` response.
+///
+/// wallet:3321 returns the signed tx as `tx` (atomic BEEF, a JSON byte array)
+/// alongside `txid`. The wallet's own broadcaster has been observed to report
+/// `sendWithResults: unproven` while the tx never propagates to public miners
+/// (WoC/GorillaPool 404). So we extract the raw tx and broadcast it ourselves
+/// via ARC — the same public path the spending tx uses — to guarantee the
+/// funding UTXO actually lands on mainnet.
+fn raw_tx_hex_from_create_action(resp: &serde_json::Value) -> Option<String> {
+    let arr = resp.get("tx")?.as_array()?;
+    let beef: Vec<u8> = arr.iter().map(|v| v.as_u64().unwrap_or(0) as u8).collect();
+    let tx = bsv::Transaction::from_atomic_beef(&beef)
+        .or_else(|_| bsv::Transaction::from_beef(&beef, None))
+        .ok()?;
+    Some(tx.to_hex())
 }
 
 #[tokio::test]
@@ -423,6 +442,275 @@ To run (BURNS REAL SATS): E2E_MAINNET=1 cargo test -p bsv-mpc-proxy \\
     eprintln!("  spending_txid:  {txid_hex}");
     eprintln!("  drained_back:   {change} sats (fee {fee})");
     eprintln!("  cosigner:       deployed bsv-mpc-worker DO (share_A partial over relay)");
+    eprintln!("  combiner:       bsv-mpc-proxy (share_B)");
+    eprintln!("  view: https://whatsonchain.com/tx/{txid_hex}");
+    eprintln!("  total wall-clock: {:?}", t0.elapsed());
+}
+
+// ============================================================================
+// #25b — §06.20 worker-self-encrypt-at-rest, DEPLOYED, REAL SATS
+// ============================================================================
+//
+// The §06.20 capstone: identical to the I-5 gate above EXCEPT the deployed
+// worker holds its presig as BRC-2 self-encrypted CIPHERTEXT at rest and
+// DECRYPTS it at sign-time. To force the decrypt-of-stored-ciphertext path we
+// drive the AUTHED pool route (not the unauthed `/poc/sign-relay` body path):
+//
+//   1. Real 2-of-2 DKG → joint key (share1 = proxy's share_B).
+//   2. `MpcBridge` from share_B (stable identity + BRC-31 handshake w/ worker).
+//   3. `provision_presig_to_do` → authed `/ceremony/ingest-presig`: the worker
+//      BRC-2 self-encrypts Presignature_A and stores the CIPHERTEXT in its pool.
+//   4. Fund the joint P2PKH on mainnet via wallet:3321; build the BIP-143 sighash.
+//   5. `sign_over_relay` → authed `/sign-relay`: the worker CONSUMES the pooled
+//      ciphertext, DECRYPTS it under the same presig_id (§06.20), issues its
+//      partial over the relay; the proxy combines into a BSV-valid signature.
+//   6. PRE-FLIGHT verify (low-s + joint-pubkey), then broadcast via ARC.
+//
+// This is the worker-self-encrypt-at-rest §06.20 variant. The full
+// coordinator-holds-ciphertext topology (§06.17.1) is deferred to #25c.
+//
+// REAL SATS. Gated on `E2E_MAINNET=1` (shares the i5 env + worker URL).
+//
+// ```bash
+// MESSAGEBOX_RELAY_URL=https://rust-message-box.dev-a3e.workers.dev \
+//   E2E_MAINNET=1 DEPLOYED_WORKER_URL=https://bsv-mpc-kss.dev-a3e.workers.dev \
+//   cargo test -p bsv-mpc-proxy --test i5_real_sats_deployed_e2e \
+//   sec0620_deployed_decrypt_at_rest_real_mainnet_tx \
+//   --release -- --nocapture --test-threads=1
+// ```
+#[tokio::test]
+async fn sec0620_deployed_decrypt_at_rest_real_mainnet_tx() {
+    use bsv_mpc_core::types::DkgResult;
+    use bsv_mpc_proxy::bridge::MpcBridge;
+    use bsv_mpc_proxy::config::ProxyConfig;
+
+    if !opt_in() {
+        eprintln!(
+            "E2E_MAINNET=1 not set — skipping #25b §06.20 decrypt-at-rest real-sats gate."
+        );
+        return;
+    }
+    let _ = tracing_subscriber::fmt::try_init();
+    let t0 = std::time::Instant::now();
+    let worker_url =
+        std::env::var("DEPLOYED_WORKER_URL").unwrap_or_else(|_| DEFAULT_WORKER.to_string());
+    let relay_url =
+        std::env::var("MESSAGEBOX_RELAY_URL").unwrap_or_else(|_| DEFAULT_RELAY.to_string());
+    let http = reqwest::Client::new();
+
+    // ── 1. Real 2-of-2 DKG → joint key (share1 = proxy's share_B). ──────────
+    let (joint, share0, share1) = run_dkg_2of2();
+    let joint_hex = hex::encode(&joint.compressed);
+    let mut joint_arr = [0u8; 33];
+    joint_arr.copy_from_slice(&joint.compressed);
+    let joint_pub = PublicKey::from_bytes(&joint_arr).expect("joint pubkey");
+    let joint_locking = p2pkh_locking_script(&joint_pub.hash160());
+    eprintln!("✔ DKG joint_pubkey={joint_hex} address={}", joint.address);
+
+    // Correlated presig pair: Presignature_A (→ worker pool), box_B (→ proxy).
+    let (presig_a_json, box_b) = gen_presig_pair(share0, share1.clone());
+
+    // ── 2. MpcBridge from share_B → stable identity + BRC-31 handshake. ─────
+    let dkg_session = SessionId::from_str_hash("i5-dkg");
+    let dkg_result = DkgResult {
+        joint_key: joint.clone(),
+        share: share1,
+        session_id: dkg_session,
+    };
+    let dir = std::env::temp_dir();
+    let share_path = dir.join(format!("sec0620_share_{}.json", std::process::id()));
+    tokio::fs::write(&share_path, serde_json::to_vec(&dkg_result).unwrap())
+        .await
+        .expect("write share file");
+    let config = ProxyConfig {
+        port: 3329,
+        kss_url: worker_url.clone(),
+        share_path: share_path.to_string_lossy().to_string(),
+        fee_per_signing: 0,
+        fee_addresses: vec![],
+        fee_threshold: None,
+        max_presignatures: 5,
+        encryption_key: None,
+        arc_api_key: "test_key".into(),
+        threshold_configs: vec!["2-of-2".to_string()],
+        min_balance_sats: None,
+        relay_url: relay_url.clone(),
+        relay_sign: false,
+        presign_url: None,
+    };
+    let bridge = MpcBridge::new(&config)
+        .await
+        .expect("MpcBridge::new (BRC-31 handshake with deployed worker)");
+    eprintln!("✔ proxy stable identity authed with deployed worker");
+
+    // ── 3. Provision Presignature_A → worker pool (authed). The worker BRC-2
+    //       self-encrypts it and stores the CIPHERTEXT (§06.20). ─────────────
+    let presig_id = format!("sec0620-presig-{}", std::process::id());
+    bridge
+        .provision_presig_to_do(&joint_hex, &presig_a_json, "sec0620-session", &presig_id)
+        .await
+        .expect("provision presig to DO pool (authed /ceremony/ingest-presig)");
+    eprintln!("✔ Presignature_A provisioned → worker self-encrypted it at rest (§06.20)");
+
+    // ── 4. Fund the joint P2PKH address via wallet:3321. ────────────────────
+    let funding_amount: u64 = 1500;
+    let fund_resp = http
+        .post("http://localhost:3321/createAction")
+        .header("Origin", "http://admin.com")
+        .header("Content-Type", "application/json")
+        .json(&serde_json::json!({
+            "description": "bsv-mpc #25b §06.20 decrypt-at-rest mainnet gate",
+            "outputs": [{
+                "satoshis": funding_amount,
+                "lockingScript": hex::encode(&joint_locking),
+                "outputDescription": "MPC joint P2PKH"
+            }]
+        }))
+        .send()
+        .await
+        .expect("wallet:3321 reachable");
+    let fund_status = fund_resp.status();
+    let fund_text = fund_resp.text().await.unwrap_or_default();
+    assert!(
+        fund_status.is_success(),
+        "wallet createAction failed ({fund_status}): {fund_text}"
+    );
+    let fund_json: serde_json::Value = serde_json::from_str(&fund_text).expect("fund JSON");
+    let fund_txid = fund_json["txid"]
+        .as_str()
+        .expect("createAction txid")
+        .to_string();
+    eprintln!("✔ wallet built funding tx: txid={fund_txid}");
+
+    // Self-broadcast the funding tx via public ARC (the wallet's own broadcaster
+    // does not reliably reach public miners — see helper doc).
+    let fund_raw = raw_tx_hex_from_create_action(&fund_json)
+        .expect("extract raw funding tx from wallet createAction response");
+    let funded = broadcast_via_arc(&http, &fund_raw).await;
+    assert!(funded, "funding tx MUST broadcast to mainnet via ARC");
+    eprintln!("✔ funding tx broadcast to mainnet via ARC");
+
+    let locking_hex = hex::encode(&joint_locking);
+    let (vout, value) = find_utxo_on_woc(&http, &fund_txid, &locking_hex)
+        .await
+        .expect("MUST find funding UTXO on WoC");
+    eprintln!("✔ UTXO {fund_txid}:{vout} ({value} sats)");
+
+    // ── 5. Build the spending tx + BIP-143 sighash (drain back to wallet). ──
+    let mut prev_txid = [0u8; 32];
+    prev_txid.copy_from_slice(&hex::decode(&fund_txid).expect("txid hex"));
+    prev_txid.reverse();
+    let fee: u64 = 200;
+    let change = value.checked_sub(fee).expect("UTXO must cover fee");
+
+    let wallet_pub_hex = http
+        .post("http://localhost:3321/getPublicKey")
+        .header("Origin", "http://admin.com")
+        .header("Content-Type", "application/json")
+        .json(&serde_json::json!({"identityKey": true}))
+        .send()
+        .await
+        .expect("getPublicKey")
+        .json::<serde_json::Value>()
+        .await
+        .expect("getPublicKey JSON")["publicKey"]
+        .as_str()
+        .expect("publicKey")
+        .to_string();
+    let change_script = p2pkh_locking_script(
+        &PublicKey::from_hex(&wallet_pub_hex)
+            .expect("wallet pub")
+            .hash160(),
+    );
+
+    let scope = SIGHASH_ALL | SIGHASH_FORKID;
+    let sighash = compute_sighash_for_signing(&SighashParams {
+        version: 1,
+        inputs: &[TxInput {
+            txid: prev_txid,
+            output_index: vout,
+            script: vec![],
+            sequence: 0xFFFFFFFF,
+        }],
+        outputs: &[TxOutput {
+            satoshis: change,
+            script: change_script.clone(),
+        }],
+        locktime: 0,
+        input_index: 0,
+        subscript: &joint_locking,
+        satoshis: value,
+        scope,
+    });
+    eprintln!("✔ sighash: {}", hex::encode(sighash));
+
+    // ── 6. Authed /sign-relay: worker DECRYPTS its at-rest ciphertext, issues
+    //       its partial over the relay, proxy combines. ─────────────────────
+    let trigger = DoTrigger {
+        url: format!("{worker_url}/sign-relay"),
+        presig_a_json: vec![], // pool path: worker consumes + decrypts from its pool
+        do_index: 0,
+        agent_id: Some(joint_hex.clone()),
+        auth_headers: vec![], // filled by sign_over_relay from the bridge session
+    };
+    let sig = bridge
+        .sign_over_relay(&sighash, box_b, trigger, Duration::from_secs(60))
+        .await
+        .expect("proxy + deployed worker co-sign via authed /sign-relay (§06.20 decrypt-at-rest)");
+    eprintln!("✔ co-signed via decrypt-at-rest pool path: DER {} bytes", sig.signature.len());
+
+    // ── 7. PRE-FLIGHT verify — fail-closed BEFORE broadcast. ────────────────
+    let mut r = [0u8; 32];
+    let mut s = [0u8; 32];
+    r.copy_from_slice(&sig.r);
+    s.copy_from_slice(&sig.s);
+    let bsv_sig = Signature::new(r, s);
+    assert!(
+        bsv_sig.is_low_s(),
+        "MPC signature MUST be low-s (BIP-62) — refusing to broadcast"
+    );
+    assert!(
+        joint_pub.verify(&sighash, &bsv_sig),
+        "PRE-FLIGHT: signature MUST verify under the joint pubkey before we burn sats"
+    );
+    eprintln!("✔ pre-flight ECDSA verify under joint pubkey: PASS");
+
+    // ── 8. Assemble + broadcast. ────────────────────────────────────────────
+    let tx_sig = TransactionSignature::new(bsv_sig, scope);
+    let unlocking =
+        p2pkh_unlocking_script(&tx_sig.to_checksig_format(), &joint_pub.to_compressed());
+    let raw_tx = serialize_transaction(
+        1,
+        &[(prev_txid, vout, unlocking, 0xFFFFFFFF)],
+        &[(change, change_script)],
+        0,
+    );
+    let mut txid = sha256d(&raw_tx);
+    txid.reverse();
+    let txid_hex = hex::encode(txid);
+    let raw_tx_hex = hex::encode(&raw_tx);
+    eprintln!("✔ assembled tx {} bytes — TXID={txid_hex}", raw_tx.len());
+
+    let ok = broadcast_via_arc(&http, &raw_tx_hex).await;
+    assert!(
+        ok,
+        "ARC broadcast MUST succeed — TXID={txid_hex} rawTx={raw_tx_hex}"
+    );
+
+    let _ = tokio::fs::remove_file(&share_path).await;
+
+    eprintln!();
+    eprintln!("╔══════════════════════════════════════════════════════════════╗");
+    eprintln!("║  #25b §06.20 GATE — DEPLOYED DECRYPT-AT-REST REAL MAINNET TX  ║");
+    eprintln!("╚══════════════════════════════════════════════════════════════╝");
+    eprintln!("  joint_pubkey:   {joint_hex}");
+    eprintln!("  joint_address:  {}", joint.address);
+    eprintln!("  funding_txid:   {fund_txid}");
+    eprintln!("  funded_sats:    {value}");
+    eprintln!("  spending_txid:  {txid_hex}");
+    eprintln!("  drained_back:   {change} sats (fee {fee})");
+    eprintln!("  presig path:    worker self-encrypted at ingest, DECRYPTED at sign (§06.20)");
+    eprintln!("  cosigner:       deployed bsv-mpc-worker DO (authed /sign-relay pool consume)");
     eprintln!("  combiner:       bsv-mpc-proxy (share_B)");
     eprintln!("  view: https://whatsonchain.com/tx/{txid_hex}");
     eprintln!("  total wall-clock: {:?}", t0.elapsed());

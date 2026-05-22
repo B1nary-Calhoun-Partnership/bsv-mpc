@@ -58,10 +58,11 @@ struct StateRow {
     state_hex: String,
 }
 
-/// `SELECT id, data_hex` row (oldest presignature).
+/// `SELECT id, presig_id, data_hex` row (oldest presignature).
 #[derive(Deserialize)]
 struct PresigRow {
     id: String,
+    presig_id: String,
     data_hex: String,
 }
 
@@ -128,10 +129,19 @@ impl<'a> DoSqlStorage<'a> {
                agent_id TEXT NOT NULL, \
                session_id TEXT NOT NULL, \
                data_hex TEXT NOT NULL, \
-               created_at INTEGER NOT NULL\
+               created_at INTEGER NOT NULL, \
+               presig_id TEXT NOT NULL DEFAULT ''\
              )",
             None,
         )?;
+        // §06.20 migration: DOs whose `mpc_presignatures` predates the
+        // `presig_id` column (the BRC-2 key_id needed to decrypt the at-rest
+        // ciphertext at sign-time). ADD COLUMN is idempotent-by-intent — swallow
+        // the "duplicate column" error so re-running on a migrated DO is a no-op.
+        let _ = sql.exec(
+            "ALTER TABLE mpc_presignatures ADD COLUMN presig_id TEXT NOT NULL DEFAULT ''",
+            None,
+        );
         sql.exec(
             "CREATE TABLE IF NOT EXISTS mpc_primes (\
                session_id TEXT PRIMARY KEY, \
@@ -718,25 +728,29 @@ impl<'a> DoSqlStorage<'a> {
         let now = Self::now_ms();
         let row_id = format!("{presig_id}:{now}:{seq}");
         self.sql().exec(
-            "INSERT INTO mpc_presignatures (id, agent_id, session_id, data_hex, created_at) \
-             VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO mpc_presignatures (id, agent_id, session_id, data_hex, created_at, presig_id) \
+             VALUES (?, ?, ?, ?, ?, ?)",
             vec![
                 row_id.into(),
                 agent_id.into(),
                 session_id.into(),
                 hex.into(),
                 now.into(),
+                presig_id.into(),
             ],
         )?;
         Ok(())
     }
 
-    /// Consume (remove + return) the oldest presignature for an agent.
-    pub fn consume_presignature(&self, agent_id: &str) -> Result<Option<Vec<u8>>> {
+    /// Consume (remove + return) the oldest presignature for an agent, with its
+    /// `presig_id`. The `presig_id` is the BRC-2 `key_id` under which the stored
+    /// bytes were self-encrypted at ingest (§06.20), so the sign-time decrypt
+    /// re-derives the same key. Returns `(stored_bytes, presig_id)`.
+    pub fn consume_presignature(&self, agent_id: &str) -> Result<Option<(Vec<u8>, String)>> {
         let rows: Vec<PresigRow> = self
             .sql()
             .exec(
-                "SELECT id, data_hex FROM mpc_presignatures WHERE agent_id = ? \
+                "SELECT id, presig_id, data_hex FROM mpc_presignatures WHERE agent_id = ? \
                  ORDER BY created_at ASC, id ASC LIMIT 1",
                 vec![agent_id.into()],
             )?
@@ -750,7 +764,7 @@ impl<'a> DoSqlStorage<'a> {
         )?;
         let bytes = hex::decode(&row.data_hex)
             .map_err(|e| Error::RustError(format!("decode presignature hex: {e}")))?;
-        Ok(Some(bytes))
+        Ok(Some((bytes, row.presig_id)))
     }
 
     /// Count available mpc_presignatures for an agent.

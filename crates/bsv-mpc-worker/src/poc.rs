@@ -177,6 +177,18 @@ impl CosignerSessionDo {
         Ok(key.public_key().to_hex())
     }
 
+    /// Build the worker's BRC-2 self-encryption wallet from `SERVER_PRIVATE_KEY`
+    /// (reloaded every call — never cached). This is the key-holder for the
+    /// §06.20 presig-share self-encryption: only the worker can encrypt its
+    /// presig at ingest and decrypt it at sign-time, so the at-rest pool row is
+    /// opaque ciphertext the DO never holds a usable plaintext copy of.
+    fn presig_wallet(&self) -> Result<bsv::wallet::ProtoWallet> {
+        let priv_hex = self.env.secret("SERVER_PRIVATE_KEY")?.to_string();
+        let key = PrivateKey::from_hex(&priv_hex)
+            .map_err(|e| Error::RustError(format!("SERVER_PRIVATE_KEY parse: {e:?}")))?;
+        Ok(bsv_mpc_core::presig_encryption::wallet_from_identity(&key))
+    }
+
     /// Build the DO-SQLite-backed KSS store (schema ensured) for the KSS
     /// handlers. The store's tables are co-located in this DO's SQLite, so a
     /// DKG-completed share persists durably (survives eviction).
@@ -665,11 +677,25 @@ impl CosignerSessionDo {
         {
             return Ok(resp);
         }
+        // §06.20: BRC-2 self-encrypt the presig to the WORKER's own identity
+        // BEFORE it touches durable storage. The proxy ships plaintext
+        // `Presignature_A` over the authed channel (the deployed POC topology),
+        // but only the key-holder can BRC-2 self-encrypt, so the worker seals its
+        // own share here. The pool row is opaque ciphertext keyed by `presig_id`
+        // (the BRC-2 key_id); the matching sign-time decrypt re-derives the same
+        // key. (Full coordinator-holds-ciphertext §06.17.1 is #25c.)
+        let wallet = self.presig_wallet()?;
+        let ciphertext = bsv_mpc_core::presig_encryption::encrypt_presig_share(
+            &wallet,
+            &body.presig_id,
+            &presig_bytes,
+        )
+        .map_err(|e| Error::RustError(format!("§06.20 self-encrypt presig: {e}")))?;
         store.store_presignature(
             &body.agent_id,
             &body.session_id,
             &body.presig_id,
-            &presig_bytes,
+            &ciphertext,
         )?;
         let pool_count = store.presignature_count(&body.agent_id)?;
 
@@ -721,17 +747,34 @@ impl CosignerSessionDo {
         }
 
         let presig_id = format!("poc-presig-{}", Date::now().as_millis());
-        store.store_presignature(&agent_id, "poc-presig-pool", &presig_id, &presig_bytes)?;
+        // §06.20: self-encrypt at ingest, decrypt at sign — same as production.
+        let wallet = self.presig_wallet()?;
+        let ciphertext = bsv_mpc_core::presig_encryption::encrypt_presig_share(
+            &wallet,
+            &presig_id,
+            &presig_bytes,
+        )
+        .map_err(|e| Error::RustError(format!("§06.20 self-encrypt presig: {e}")))?;
+        store.store_presignature(&agent_id, "poc-presig-pool", &presig_id, &ciphertext)?;
         let count_after_store = store.presignature_count(&agent_id)?;
 
-        let consumed = store
+        let (consumed_ct, consumed_id) = store
             .consume_presignature(&agent_id)?
             .ok_or_else(|| Error::RustError("pool empty after store".into()))?;
         let count_after_consume = store.presignature_count(&agent_id)?;
-        let round_trip_matches = consumed == presig_bytes;
+        // The at-rest row is ciphertext; the byte-identical round-trip is the
+        // recovered PLAINTEXT presig, not the stored bytes.
+        let recovered = bsv_mpc_core::presig_encryption::decrypt_presig_share(
+            &wallet,
+            &consumed_id,
+            &consumed_ct,
+        )
+        .map_err(|e| Error::RustError(format!("§06.20 decrypt presig: {e}")))?;
+        let round_trip_matches = recovered == presig_bytes;
 
-        let partial_json = bsv_mpc_core::signing::issue_partial_signature_json(&consumed, &sighash)
-            .map_err(|e| Error::RustError(format!("issue_partial from consumed presig: {e}")))?;
+        let partial_json =
+            bsv_mpc_core::signing::issue_partial_signature_json(&recovered, &sighash)
+                .map_err(|e| Error::RustError(format!("issue_partial from consumed presig: {e}")))?;
 
         Response::from_json(&serde_json::json!({
             "route": "poc/presig-pool",
@@ -1052,13 +1095,28 @@ impl CosignerSessionDo {
             hex::encode(rnd)
         );
         let agent_id = presig_id.clone(); // unique per-call pool slot (isolation)
-        store.store_presignature(&agent_id, "poc-sign-relay", &presig_id, &presig_bytes)?;
-        let consumed = store
+        // §06.20: self-encrypt at ingest, decrypt at sign (same as production).
+        let wallet = self.presig_wallet()?;
+        let ciphertext = bsv_mpc_core::presig_encryption::encrypt_presig_share(
+            &wallet,
+            &presig_id,
+            &presig_bytes,
+        )
+        .map_err(|e| Error::RustError(format!("§06.20 self-encrypt presig: {e}")))?;
+        store.store_presignature(&agent_id, "poc-sign-relay", &presig_id, &ciphertext)?;
+        let (consumed_ct, consumed_id) = store
             .consume_presignature(&agent_id)?
             .ok_or_else(|| Error::RustError("pool empty after store".into()))?;
-        let round_trip_matches = consumed == presig_bytes;
-        let partial_json = bsv_mpc_core::signing::issue_partial_signature_json(&consumed, &sighash)
-            .map_err(|e| Error::RustError(format!("issue_partial: {e}")))?;
+        let recovered = bsv_mpc_core::presig_encryption::decrypt_presig_share(
+            &wallet,
+            &consumed_id,
+            &consumed_ct,
+        )
+        .map_err(|e| Error::RustError(format!("§06.20 decrypt presig: {e}")))?;
+        let round_trip_matches = recovered == presig_bytes;
+        let partial_json =
+            bsv_mpc_core::signing::issue_partial_signature_json(&recovered, &sighash)
+                .map_err(|e| Error::RustError(format!("issue_partial: {e}")))?;
 
         // ── 4. Wrap the partial as a canonical §05 MessageEnvelope ───────
         let round_msg = RoundMessage {
@@ -1344,7 +1402,7 @@ impl CosignerSessionDo {
         // this joint key only ever consumes its own correlated presignatures —
         // never a leftover from another joint key/run (#7 finding 5). The
         // matching Presignature_B is held by the combiner; only A ships.
-        let consumed = match store.consume_presignature(&body.agent_id)? {
+        let (ciphertext, presig_id) = match store.consume_presignature(&body.agent_id)? {
             Some(p) => p,
             None => {
                 return Response::error(
@@ -1353,8 +1411,20 @@ impl CosignerSessionDo {
                 )
             }
         };
-        let partial_json = bsv_mpc_core::signing::issue_partial_signature_json(&consumed, &sighash)
-            .map_err(|e| Error::RustError(format!("issue_partial: {e}")))?;
+        // §06.20: the pool row is the worker's at-rest BRC-2 ciphertext. Decrypt
+        // under the same key_id (`presig_id`) it was sealed with at ingest, then
+        // issue this party's partial — byte-identical to a plaintext-issued
+        // partial (issue_partial is deterministic). Single-use already enforced
+        // (consume deleted the row).
+        let wallet = self.presig_wallet()?;
+        let partial_json = bsv_mpc_core::presig_encryption::decrypt_and_issue_partial(
+            &wallet,
+            &presig_id,
+            &ciphertext,
+            &sighash,
+            None,
+        )
+        .map_err(|e| Error::RustError(format!("§06.20 decrypt+issue_partial: {e}")))?;
 
         // ── 4. Wrap the partial as a canonical §05 MessageEnvelope ───────
         let round_msg = RoundMessage {
