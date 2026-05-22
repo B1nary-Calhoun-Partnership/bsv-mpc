@@ -235,3 +235,29 @@ to push. Worker deploy: `eval "$(grep '^export CLOUDFLARE' secrets.md)"` then
   migration, in-process proof) → C (lockstep redeploy + re-prove all authed e2e
   + real-sats) → D (MPC-Spec §07.10 + THREAT-MODEL scrub + author
   `07-brc31-auth.json` + close #8). Full detail in issue #8 comments.
+
+## 2026-05-21 (cont.) — #8 canonical BRC-31 migration COMPLETE + on-chain proven
+Phases A→C done; the whole proxy/service/worker auth stack now speaks the
+canonical @bsv BRC-31 wire, deployed, with a real mainnet spend.
+
+- **Phase B (merged `b27ed91`):** proxy→`bsv_rs::auth::Peer` wire; service→
+  `bsv-middleware-rs`; worker→`bsv-middleware-cloudflare` (DO-SQLite SessionStorage).
+  Owner-authz preserved; §07.1 replay + §07 identity-binding added. In-process gates
+  green (service_owner_authz, proxy_enforced, conformance_07).
+- **Canonical-crate bugs found+fixed (Calhooon, we maintain):** (1) `bsv-middleware-rs`
+  key_id/SecurityLevel/`for_self` (`61e1f49`); (2) `bsv-middleware-rs` BRC-104 payload
+  encoding — leading `0x00`, `varint(0)` vs `-1` empties, unsorted headers — now reuses
+  canonical `bsv-rs HttpRequest::to_payload` (`57a0b8b`, `bsv-mpc 1ea8d48`); (3)
+  `bsv-middleware-cloudflare` pluggable `SessionStorage` (`96efe6f`). Each runtime-proven
+  against `bsv-rs` ground truth.
+- **Phase C deployed (lockstep):** worker `8573b420`, container `8b11e16f` — CPU fix
+  `standard-1`→`standard-4` (½→4 vCPU; Paillier DKG was blowing the timeout) + `sleepAfter`
+  30m + observability. proxy `/sign-relay` canonical auth wired (`679940a`; leg-1 had
+  deferred it). `deploy_smoke` pass; `self_stocking_loop` full loop → BSV-valid 2-of-2.
+- **🔗 REAL-SATS GATE (Phase C end-proof):** `createaction_relay_mainnet_e2e` →
+  **mainnet TXID `96c2ebc592c77bab2fc3fba47993bc6638ec248c7f90caf68ba7fddb3cdabcfd`**
+  (createAction via the deployed `bsv-mpc-worker` DO over the authed canonical relay;
+  joint `1LkbL2a7g679uCGZRQ6ZBysckQxG6MrzBV`; confirmed on WhatsOnChain).
+- **Phase D (remaining):** publish `bsv-middleware-rs`/`bsv-middleware-cloudflare` (swap
+  git-rev→version); worker invalid-sig→500-not-401 mapping fix; MPC-Spec §07.10/§07.1 +
+  THREAT-MODEL A4/A7 scrub + author `07-brc31-auth.json`; then close #8.
