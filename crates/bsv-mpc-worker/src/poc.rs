@@ -60,6 +60,7 @@ fn is_authed_path(path: &str) -> bool {
             | "/ceremony/seed-primes"
             | "/ceremony/ingest-presig"
             | "/sign-relay"
+            | "/presign-relay"
             | "/custody/put-share"
             | "/custody/get-share"
     ) || path.starts_with("/shares/")
@@ -123,12 +124,18 @@ impl DurableObject for CosignerSessionDo {
             // §07.6 production sibling of `/poc/sign-relay`: BRC-31-gated (above)
             // + owner-authz, consuming a provisioned presig from the DO pool.
             "/sign-relay" => self.handle_prod_sign_relay(req).await,
+            // §06.17.1 Stage 2 (#30): the worker self-presigns over the relay as
+            // a cosigner, self-encrypts its share, ships the ct to the coordinator.
+            "/presign-relay" => self.handle_presign_relay(req).await,
             "/poc/handshake" => self.handle_handshake().await,
             // ── KSS routes (I-4a.2: storage-backed by this DO's SQLite) ──
             // Auth is enforced at the Worker entrypoint before forwarding.
             // The live coordinators live in this DO isolate's statics (per-
             // session pinning); durable shares live in DO SQLite.
-            "/dkg/init" => crate::api::handle_dkg_init(req).await,
+            "/dkg/init" => {
+                let store = self.kss_store()?;
+                crate::api::handle_dkg_init(req, &store).await
+            }
             "/dkg/round" => {
                 let store = self.kss_store()?;
                 crate::api::handle_dkg_round(req, &store).await
@@ -1583,6 +1590,446 @@ impl CosignerSessionDo {
             "instance_constructed_at_ms": self.instance_constructed_at_ms,
         }))
     }
+
+    /// `POST /presign-relay` — **§06.17.1 Stage 2 (issue #30)**: the deployed
+    /// worker drives a [`PresigningManager`] as a COSIGNER over the live relay,
+    /// generates its OWN presig share, BRC-2 self-encrypts it (under the
+    /// canonical `presig_id = session_id hex`), and ships the OPAQUE ciphertext
+    /// to the coordinator on `presig_return_{sid}`. The coordinator never holds
+    /// the worker's plaintext share — superseding the POC `/ceremony/ingest-presig`
+    /// (proxy-generates-both) path.
+    ///
+    /// This is the production sibling of the native
+    /// [`bsv_mpc_service::PresignHandler`] cosigner role, lifted into the wasm DO
+    /// over the same raw Socket.IO + BRC-103 relay scaffolding as
+    /// [`Self::handle_prod_sign_relay`] (the worker has no native
+    /// `MessageBoxClient`/`MessageBoxListener` — those are `#[cfg(not(wasm32))]`).
+    ///
+    /// The worker is **party 1** (cosigner); the coordinator (proxy) is **party
+    /// 0**. The presign protocol traffic is broadcast (cggmp24 round messages are
+    /// `to = None`), so the worker addresses every outbound to the coordinator on
+    /// the per-session `mpc_{sid}` mailbox; the coordinator's own listener feeds
+    /// its [`PresigningManager`] and replies on the same box.
+    ///
+    /// Request body: `{ agent_id (joint pubkey hex, the share key),
+    /// coordinator_pub_hex (coordinator identity), session_id_hex (32-byte canonical
+    /// presign SessionId), joint_pubkey_hex? (33-byte), my_index? (default 1),
+    /// coordinator_index? (default 0) }`.
+    ///
+    /// Owner-authz (§08.1): only the share's DKG-time owner may drive a presign.
+    async fn handle_presign_relay(&self, mut req: Request) -> Result<Response> {
+        use bsv::auth::transports::socketio::build_envelope_payload;
+        use bsv::auth::transports::socketio::codec::{EngineIoPacket, SocketIoPacket};
+        use bsv::auth::{
+            install_app_event_listener, run_dispatch, Peer, PeerOptions, SocketIoFrameSource,
+            SocketIoSink, SocketIoTransport,
+        };
+        use bsv::primitives::ec::PublicKey;
+        use bsv::wallet::ProtoWallet;
+        use bsv_mpc_core::canonical::{
+            canonical_execution_id, ExecutionParams, PhaseTag,
+        };
+        use bsv_mpc_core::envelope::{
+            unwrap_envelope_to_round_message, wrap_round_message, WrapParams,
+        };
+        use bsv_mpc_core::presigning::{
+            serialize_party_presignature, PresigningManager, PresigningRoundResult,
+        };
+        use bsv_mpc_core::types::{RoundMessage, SessionId, ShareIndex};
+        use bsv_mpc_messagebox::transport_wasm::{polling_handshake, WsHandle};
+        use bsv_mpc_messagebox::types::{presig_return_box, presign_protocol_box};
+        use bsv_mpc_messagebox::wire::{unwrap_body_to_envelope, wrap_envelope_to_body};
+        use futures::future::{select, Either};
+        use futures::StreamExt;
+        use serde_json::json;
+        use std::time::Duration;
+        use wasm_bindgen_futures::spawn_local;
+
+        #[derive(serde::Deserialize)]
+        struct PresignRelayRequest {
+            agent_id: String,
+            coordinator_pub_hex: String,
+            session_id_hex: String,
+            #[serde(default)]
+            joint_pubkey_hex: Option<String>,
+            #[serde(default)]
+            my_index: Option<u16>,
+            #[serde(default)]
+            coordinator_index: Option<u16>,
+        }
+
+        // ── 0. Owner-authz (BEFORE any share material is touched) ────────
+        let caller = crate::api::caller_identity(&req);
+        let body: PresignRelayRequest = req.json().await?;
+        let store = self.kss_store()?;
+        if let Some(resp) =
+            crate::api::authz_owner_or_reject(caller.as_deref(), &store, &body.agent_id)?
+        {
+            return Ok(resp);
+        }
+
+        // ── 1. Decode inputs ────────────────────────────────────────────
+        let my_index = body.my_index.unwrap_or(1);
+        let coordinator_index = body.coordinator_index.unwrap_or(0);
+
+        let session_id = {
+            let b = hex::decode(&body.session_id_hex)
+                .map_err(|e| Error::RustError(format!("session_id_hex: {e}")))?;
+            if b.len() != 32 {
+                return Response::error("session_id_hex must be 32 bytes", 400);
+            }
+            let mut a = [0u8; 32];
+            a.copy_from_slice(&b);
+            SessionId(a)
+        };
+        let sid_hex = session_id.hex();
+
+        // ── 2. Load THIS worker's share for the joint key ────────────────
+        let share = store
+            .get_share(&body.agent_id)?
+            .ok_or_else(|| Error::RustError(format!("no share for agent {}", body.agent_id)))?;
+
+        // joint_pubkey: trust the share's bound key; cross-check the request hint.
+        let joint_pubkey: [u8; 33] = {
+            let jpk = &share.joint_pubkey_compressed;
+            if jpk.len() != 33 {
+                return Response::error(
+                    "share.joint_pubkey_compressed is not 33 bytes — presign needs the joint key",
+                    409,
+                );
+            }
+            let mut a = [0u8; 33];
+            a.copy_from_slice(jpk);
+            a
+        };
+        if let Some(h) = &body.joint_pubkey_hex {
+            let hinted = hex::decode(h)
+                .map_err(|e| Error::RustError(format!("joint_pubkey_hex: {e}")))?;
+            if hinted != joint_pubkey {
+                return Response::error(
+                    "joint_pubkey_hex does not match the stored share's joint key",
+                    409,
+                );
+            }
+        }
+
+        // ── 3. Identity + the coordinator recipient ──────────────────────
+        let priv_hex = self.env.secret("SERVER_PRIVATE_KEY")?.to_string();
+        let client_priv = PrivateKey::from_hex(&priv_hex)
+            .map_err(|e| Error::RustError(format!("SERVER_PRIVATE_KEY parse: {e:?}")))?;
+        let client_pub_hex = client_priv.public_key().to_hex();
+        let coordinator_pub = PublicKey::from_hex(&body.coordinator_pub_hex)
+            .map_err(|e| Error::RustError(format!("coordinator_pub_hex: {e:?}")))?;
+
+        // ── 4. Build the cosigner PresigningManager + round-1 ────────────
+        // Participants are the 0-based party indices (matches /presign/init).
+        let participants: Vec<u16> = (0..share.config.parties).collect();
+        let mut manager =
+            PresigningManager::new(session_id, share, participants, 1);
+        let round1 = manager
+            .init_generate()
+            .map_err(|e| Error::RustError(format!("PresigningManager::init_generate: {e}")))?;
+
+        // Canonical Presign execution_id prefix (§02.2) — same derivation the
+        // native PresignHandler uses, so the within-stack envelopes agree.
+        let eid = canonical_execution_id(&ExecutionParams::new_v1(
+            PhaseTag::Presign,
+            session_id,
+            joint_pubkey,
+        ));
+        let mut eid_prefix = [0u8; 8];
+        eid_prefix.copy_from_slice(&eid[..8]);
+        let phase = PhaseTag::Presign.envelope_str().to_string();
+
+        let protocol_box = presign_protocol_box(&sid_hex);
+        let return_box = presig_return_box(&sid_hex);
+
+        // Helper: wrap a batch of cggmp24 round messages addressed to the
+        // coordinator (broadcast `to = None` → the single peer; p2p → matched).
+        let wrap_to_coordinator =
+            |msgs: &[RoundMessage]| -> std::result::Result<Vec<serde_json::Value>, String> {
+                let mut bodies = Vec::new();
+                for rm in msgs {
+                    // 2-party presign: every message goes to the coordinator. A
+                    // p2p `to` of anyone-but-coordinator would be a protocol bug.
+                    if let Some(ShareIndex(to)) = rm.to {
+                        if to != coordinator_index {
+                            return Err(format!(
+                                "presign round message addressed to party {to}, \
+                                 but the only peer is coordinator {coordinator_index}"
+                            ));
+                        }
+                    }
+                    let params = WrapParams {
+                        to_party: coordinator_index,
+                        joint_pubkey,
+                        phase: phase.clone(),
+                        execution_id_prefix: eid_prefix,
+                        correlation_id: None,
+                        traceparent: None,
+                    };
+                    let env = wrap_round_message(rm, params, &coordinator_pub, &client_priv)
+                        .map_err(|e| format!("wrap_round_message: {e}"))?;
+                    bodies.push(wrap_envelope_to_body(&env));
+                }
+                Ok(bodies)
+            };
+
+        let round1_bodies = wrap_to_coordinator(&round1).map_err(Error::RustError)?;
+
+        // ── 5. Dial the relay (the I-3b2-proven Socket.IO + BRC-103 path) ─
+        let t0 = Date::now().as_millis();
+        let relay = self
+            .env
+            .var("RELAY_URL")
+            .map(|v| v.to_string())
+            .unwrap_or_else(|_| DEFAULT_RELAY_URL.to_string());
+
+        let handshake = polling_handshake(&relay).await?;
+        let mut ws = WsHandle::open_and_upgrade(&relay, &handshake.sid)
+            .await
+            .map_err(Error::RustError)?;
+        let sink = ws.sender();
+
+        sink.send_socketio(&SocketIoPacket::Connect {
+            nsp: "/".to_string(),
+            data: None,
+        })
+        .map_err(Error::RustError)?;
+        loop {
+            match ws.recv_engineio().await.map_err(Error::RustError)? {
+                EngineIoPacket::Ping(payload) => {
+                    let _ = sink.send_engineio(&EngineIoPacket::Pong(payload));
+                }
+                EngineIoPacket::Message(payload) => {
+                    if let Ok(SocketIoPacket::Connect { .. }) = SocketIoPacket::decode(&payload) {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let transport = SocketIoTransport::new(sink.clone());
+        let callback = transport.callback_handle();
+        let dispatch_sink = sink.clone();
+        let wallet = ProtoWallet::new(Some(client_priv.clone()));
+        let peer = Peer::new(PeerOptions {
+            wallet,
+            transport,
+            certificates_to_request: None,
+            session_manager: None,
+            auto_persist_last_session: true,
+            originator: Some("presign-relay".to_string()),
+        });
+        peer.start();
+        let (mut events, _cb_id) = install_app_event_listener(&peer).await;
+        spawn_local(run_dispatch(ws, dispatch_sink, callback));
+
+        // Join our OWN {id}-mpc_{sid} room (drives the BRC-103 handshake; this is
+        // also where the coordinator's protocol replies arrive — the relay
+        // delivers a message to the recipient's `{recipient}-{box}` room).
+        let own_proto_room = format!("{client_pub_hex}-{protocol_box}");
+        peer.to_peer(
+            &build_envelope_payload("joinRoom", &json!(own_proto_room)),
+            None,
+            Some(20_000),
+        )
+        .await
+        .map_err(|e| Error::RustError(format!("to_peer(joinRoom protocol): {e:?}")))?;
+        let handshake_rtt_ms = Date::now().as_millis() - t0;
+
+        // Server identity = sender of the first inbound General (the relay).
+        let server_identity =
+            match select(events.next(), worker::Delay::from(Duration::from_secs(8))).await {
+                Either::Left((Some(ev), _)) => Some(ev.sender.to_hex()),
+                _ => None,
+            };
+        let Some(server_id) = server_identity.clone() else {
+            return Response::error("relay did not authenticate (no server identity)", 502);
+        };
+
+        // Helper: build the relay `sendMessage` General payload for a wrapped
+        // body to a recipient on a box (the bytes `peer.to_peer` ships).
+        let send_body = |message_box: &str,
+                         recipient: &str,
+                         body_val: &serde_json::Value|
+         -> Vec<u8> {
+            let now_ms = Date::now().as_millis();
+            let message_id = format!("presig-{now_ms}-{}", rand_suffix());
+            build_envelope_payload(
+                "sendMessage",
+                &json!({
+                    "messageBox": message_box,
+                    "message": {
+                        "messageId": message_id,
+                        "recipient": recipient,
+                        "body": body_val,
+                    }
+                }),
+            )
+        };
+
+        // ── 6. Ship round-1 to the coordinator ───────────────────────────
+        let mut rounds_sent = 0usize;
+        for body_val in &round1_bodies {
+            let payload = send_body(&protocol_box, &body.coordinator_pub_hex, body_val);
+            peer.to_peer(&payload, Some(&server_id), Some(20_000))
+                .await
+                .map_err(|e| Error::RustError(format!("send round-1: {e:?}")))?;
+            rounds_sent += 1;
+        }
+
+        // ── 7. Drive the 3-round presign loop over the relay ─────────────
+        // Receive coordinator protocol messages on `{self}-mpc_{sid}`, feed the
+        // SM, ship replies, until the SM reaches Complete. A generous overall
+        // deadline guards against a stalled relay.
+        let proto_send_evt = format!("sendMessage-{own_proto_room}");
+        let overall_deadline = Date::now().as_millis() + 90_000;
+        let mut rounds_recv = 0usize;
+        let mut serialized_share: Option<Vec<u8>> = None;
+
+        while Date::now().as_millis() < overall_deadline {
+            let ev = match select(events.next(), worker::Delay::from(Duration::from_secs(20))).await
+            {
+                Either::Left((Some(ev), _)) => ev,
+                _ => break, // idle timeout — relay went quiet
+            };
+            if ev.event_name != proto_send_evt {
+                continue; // not a protocol message for our box
+            }
+            let Some(raw_body) = ev.data.get("body") else {
+                continue;
+            };
+            let env = match unwrap_body_to_envelope(raw_body) {
+                Ok(e) => e,
+                Err(e) => {
+                    console_log!("presign-relay: skip undecodable inbound: {e}");
+                    continue;
+                }
+            };
+            // Verify the coordinator's BRC-31 signature + BRC-78-decrypt to us.
+            let rm = match unwrap_envelope_to_round_message(
+                &env,
+                &client_priv,
+                Some(&coordinator_pub),
+            ) {
+                Ok(rm) => rm,
+                Err(e) => {
+                    console_log!("presign-relay: skip unverifiable inbound: {e}");
+                    continue;
+                }
+            };
+            // Only this session's traffic (the box is session-scoped, but be
+            // defensive against relay backfill of a stale session).
+            if rm.session_id != session_id {
+                continue;
+            }
+            rounds_recv += 1;
+
+            match manager
+                .process_generate_round(vec![rm])
+                .map_err(|e| Error::RustError(format!("process_generate_round: {e}")))?
+            {
+                PresigningRoundResult::NextRound(next) => {
+                    let bodies = wrap_to_coordinator(&next).map_err(Error::RustError)?;
+                    for body_val in &bodies {
+                        let payload =
+                            send_body(&protocol_box, &body.coordinator_pub_hex, body_val);
+                        peer.to_peer(&payload, Some(&server_id), Some(20_000))
+                            .await
+                            .map_err(|e| Error::RustError(format!("send round: {e:?}")))?;
+                        rounds_sent += 1;
+                    }
+                }
+                PresigningRoundResult::Complete => {
+                    // §06.16 step 3: extract this party's raw presig share and
+                    // serialize it (the serializable `Presignature`, NOT the
+                    // public data — the coordinator holds that).
+                    let (_meta, raw) = manager.take_raw().ok_or_else(|| {
+                        Error::RustError("presign complete but pool empty".into())
+                    })?;
+                    let serialized = serialize_party_presignature(raw).map_err(|e| {
+                        Error::RustError(format!("serialize_party_presignature: {e}"))
+                    })?;
+                    serialized_share = Some(serialized);
+                    break;
+                }
+            }
+        }
+
+        let Some(serialized) = serialized_share else {
+            return Response::error(
+                format!(
+                    "presign did not complete over the relay \
+                     (rounds_sent={rounds_sent} rounds_recv={rounds_recv})"
+                ),
+                504,
+            );
+        };
+
+        // ── 8. BRC-2 self-encrypt the share + ship the ct to the coordinator ──
+        // The §06.17.1 / §06.16 self-encryption: key_id = canonical presig_id =
+        // session_id hex (the SAME key_id the sign-time `decrypt_and_issue_partial`
+        // re-derives — #25b). The coordinator only ever holds this opaque blob.
+        let presig_wallet = self.presig_wallet()?;
+        let ciphertext = bsv_mpc_core::presig_encryption::encrypt_presig_share(
+            &presig_wallet,
+            &sid_hex,
+            &serialized,
+        )
+        .map_err(|e| Error::RustError(format!("encrypt_presig_share: {e}")))?;
+
+        // Wrap the ciphertext as a §05 envelope on the RETURN box, marked with
+        // the sentinel round the native PresignHandler routes on (RETURN_SHARE
+        // = 200) so the coordinator's dispatcher collects it as a return share.
+        let return_round_msg = RoundMessage {
+            session_id,
+            round: 200, // PresignHandler::RETURN_SHARE_ROUND sentinel
+            from: ShareIndex(my_index),
+            to: Some(ShareIndex(coordinator_index)),
+            payload: ciphertext.clone(),
+        };
+        let return_params = WrapParams {
+            to_party: coordinator_index,
+            joint_pubkey,
+            phase: phase.clone(),
+            execution_id_prefix: eid_prefix,
+            correlation_id: None,
+            traceparent: None,
+        };
+        let return_env =
+            wrap_round_message(&return_round_msg, return_params, &coordinator_pub, &client_priv)
+                .map_err(|e| Error::RustError(format!("wrap return ciphertext: {e}")))?;
+        let return_body = wrap_envelope_to_body(&return_env);
+        let return_payload = send_body(&return_box, &body.coordinator_pub_hex, &return_body);
+        let return_sent = peer
+            .to_peer(&return_payload, Some(&server_id), Some(20_000))
+            .await
+            .is_ok();
+
+        Response::from_json(&serde_json::json!({
+            "route": "presign-relay",
+            "client_identity": client_pub_hex,
+            "coordinator": body.coordinator_pub_hex,
+            "owner": caller,
+            "server_identity": server_identity,
+            "session_id_hex": sid_hex,
+            "presig_id": sid_hex,
+            "my_index": my_index,
+            "coordinator_index": coordinator_index,
+            "protocol_box": protocol_box,
+            "return_box": return_box,
+            "rounds_sent": rounds_sent,
+            "rounds_recv": rounds_recv,
+            "ciphertext_len": ciphertext.len(),
+            "ciphertext_hex": hex::encode(&ciphertext),
+            "return_sent": return_sent,
+            "handshake_rtt_ms": handshake_rtt_ms,
+            "relay": relay,
+            "instance_constructed_at_ms": self.instance_constructed_at_ms,
+        }))
+    }
 }
 
 /// Native stub — the relay-handshake POC is wasm32-only (the Socket.IO +
@@ -1601,6 +2048,18 @@ impl CosignerSessionDo {
     async fn handle_prod_sign_relay(&self, _req: Request) -> Result<Response> {
         Response::error("/sign-relay is wasm32-only (deployed CF Worker)", 501)
     }
+
+    async fn handle_presign_relay(&self, _req: Request) -> Result<Response> {
+        Response::error("/presign-relay is wasm32-only (deployed CF Worker)", 501)
+    }
+}
+
+/// 8 hex chars of fresh entropy for unique relay `messageId`s.
+#[cfg(target_arch = "wasm32")]
+fn rand_suffix() -> String {
+    let mut b = [0u8; 4];
+    let _ = getrandom::getrandom(&mut b);
+    hex::encode(b)
 }
 
 /// Forward a `/poc/*` request from the Worker entrypoint to the singleton

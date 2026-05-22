@@ -974,6 +974,9 @@ impl MpcStore for DoSqlStorage<'_> {
     fn total_presignature_count(&self) -> std::result::Result<u64, String> {
         DoSqlStorage::total_presignature_count(self).map_err(|e| e.to_string())
     }
+    fn get_primes(&self, session_id: &str) -> std::result::Result<Option<String>, String> {
+        DoSqlStorage::get_primes(self, session_id).map_err(|e| e.to_string())
+    }
 }
 
 /// Durable BRC-31 session store (§07.7) backed by this DO's SQLite.

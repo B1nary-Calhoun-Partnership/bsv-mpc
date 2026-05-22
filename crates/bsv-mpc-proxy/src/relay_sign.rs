@@ -234,3 +234,172 @@ pub async fn combine_sign_over_relay(
         )),
     }
 }
+
+/// **§06.17.1 coordinator-holds-ciphertext sign over the relay (issue #30 /
+/// #25c Stage 2).**
+///
+/// The production-binary analog of the Stage-1 hermetic capstone
+/// (`sign_from_bundle_hermetic_e2e`), driven against the DEPLOYED worker over
+/// the live relay. The coordinator does NOT consume a raw presig box from a
+/// pool; it signs from a durable [`PresigBundle`](bsv_mpc_core::types::PresigBundle)
+/// it persisted at presign-time (the worker self-presigned + self-encrypted its
+/// share; the coordinator only ever held the opaque ciphertext).
+///
+/// Flow:
+/// 1. Connect to the relay as `identity_priv`; subscribe to `mpc-sign`.
+/// 2. Unseal the coordinator's OWN presig share from `bundle.presig_bytes`
+///    (under `at_rest_root` + `bundle.presig_id`), reconstruct the shared
+///    `PresignaturePublicData` from `bundle.commitments`, and `sign_from_bundle`
+///    → the coordinator's own partial.
+/// 3. Trigger the deployed worker `/sign-relay` with the cosigner's BRC-2
+///    ciphertext (`bundle.cosigner_encrypted_shares[do_index]`) so the worker
+///    decrypts its OWN share (`decrypt_and_issue_partial`, #25b) and relays its
+///    partial — the coordinator never re-sends a plaintext presig.
+/// 4. Receive the worker's partial over the relay; combine → [`SigningResult`].
+#[allow(clippy::too_many_arguments)]
+pub async fn combine_sign_from_bundle_over_relay(
+    relay_url: &str,
+    identity_priv: PrivateKey,
+    share: EncryptedShare,
+    participants: Vec<u16>,
+    config: ThresholdConfig,
+    session_id: SessionId,
+    sighash: &[u8; 32],
+    bundle: &bsv_mpc_core::types::PresigBundle,
+    at_rest_root: &[u8; 32],
+    joint_key: &JointPublicKey,
+    mut trigger: DoTrigger,
+    request_signer: Option<RelayRequestSigner<'_>>,
+    recv_timeout: Duration,
+) -> Result<SigningResult> {
+    use bsv_mpc_core::presig_at_rest::{derive_presig_at_rest_key, unseal_presig_bytes};
+    use bsv_mpc_core::signing::deserialize_presig_public_data;
+
+    let proto = |e: bsv_mpc_messagebox::error::MessageBoxError| MpcError::Protocol(e.to_string());
+
+    // The coordinator's positional slot in the bundle = its index within
+    // `parties_at_keygen`. Its own ciphertext slot is empty (plaintext sealed in
+    // `presig_bytes`); the cosigner's ciphertext lives at `do_index`'s position.
+    let do_pos = bundle
+        .parties_at_keygen
+        .iter()
+        .position(|&p| p == trigger.do_index)
+        .ok_or_else(|| {
+            MpcError::Signing(format!(
+                "cosigner party {} not in bundle.parties_at_keygen {:?}",
+                trigger.do_index, bundle.parties_at_keygen
+            ))
+        })?;
+    let cosigner_ct = bundle
+        .cosigner_encrypted_shares
+        .get(do_pos)
+        .map(|b| b.clone().into_vec())
+        .unwrap_or_default();
+    if cosigner_ct.is_empty() {
+        return Err(MpcError::Signing(format!(
+            "bundle has no cosigner ciphertext at position {do_pos} (party {})",
+            trigger.do_index
+        )));
+    }
+    trigger.cosigner_encrypted_share = Some(cosigner_ct);
+
+    // 1. Relay client + subscription BEFORE triggering the DO.
+    let combiner = MessageBoxClient::new(relay_url, identity_priv).map_err(proto)?;
+    let combiner_pub = combiner.identity_hex().await.map_err(proto)?;
+    let mut sub = combiner
+        .subscribe_round_messages(BOX_SIGN)
+        .await
+        .map_err(proto)?;
+
+    // 2. Sign FROM the bundle: unseal own share, reconstruct public data, issue
+    //    the coordinator's own partial (no live presig tuple required).
+    let at_rest_key = derive_presig_at_rest_key(at_rest_root, &bundle.presig_id);
+    let own_presig_json = unseal_presig_bytes(&bundle.presig_bytes, &at_rest_key)
+        .map_err(|e| MpcError::Signing(format!("unseal coordinator presig share: {e}")))?;
+    let public_data = deserialize_presig_public_data(&bundle.commitments)
+        .map_err(|e| MpcError::Signing(format!("reconstruct PresignaturePublicData: {e}")))?;
+    let my_index = signing_index(&share, &participants)?;
+    let mut coord = SigningCoordinator::new(session_id, share, config, participants);
+    coord.sign_from_bundle(sighash, &own_presig_json, public_data)?;
+
+    // 3. Trigger the worker with the cosigner ciphertext (no plaintext presig).
+    let http = reqwest::Client::new();
+    let mut trigger_body = serde_json::json!({
+        "sighash_hex": hex::encode(sighash),
+        "recipient_pub_hex": combiner_pub,
+        "from_index": trigger.do_index,
+        "to_index": my_index,
+        "joint_pubkey_hex": hex::encode(&joint_key.compressed),
+        "session_id_hex": session_id.hex(),
+    });
+    if let Some(ref agent_id) = trigger.agent_id {
+        trigger_body["agent_id"] = serde_json::json!(agent_id);
+    }
+    if let Some(ref ct) = trigger.cosigner_encrypted_share {
+        trigger_body["cosigner_encrypted_share"] = serde_json::json!(hex::encode(ct));
+    }
+    let body_bytes = serde_json::to_vec(&trigger_body)
+        .map_err(|e| MpcError::Protocol(format!("serialize sign-relay body: {e}")))?;
+    let mut builder = http
+        .post(&trigger.url)
+        .header("content-type", "application/json")
+        .body(body_bytes.clone());
+    if let Some(sign) = request_signer {
+        let path = reqwest::Url::parse(&trigger.url)
+            .map(|u| u.path().to_string())
+            .unwrap_or_else(|_| "/sign-relay".to_string());
+        for (name, value) in sign("POST", &path, &body_bytes)? {
+            builder = builder.header(name, value);
+        }
+    } else {
+        for (name, value) in &trigger.auth_headers {
+            builder = builder.header(name, value);
+        }
+    }
+    let resp = builder
+        .send()
+        .await
+        .map_err(|e| MpcError::Protocol(format!("trigger DO sign-relay: {e}")))?;
+    let status = resp.status();
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| MpcError::Protocol(format!("DO sign-relay response: {e}")))?;
+    if !status.is_success() || body["sent"] != serde_json::json!(true) {
+        return Err(MpcError::Protocol(format!(
+            "DO sign-relay did not send (status {status}): {body}"
+        )));
+    }
+
+    // 4. Receive the worker's partial over the relay; combine. Filter to THIS
+    //    sign's session (the `mpc-sign` box is shared + backfilled).
+    let deadline = tokio::time::Instant::now() + recv_timeout;
+    let round_msg = loop {
+        let remaining = deadline
+            .checked_duration_since(tokio::time::Instant::now())
+            .ok_or_else(|| MpcError::Protocol("timed out awaiting DO partial over relay".into()))?;
+        let decoded = tokio::time::timeout(remaining, sub.next())
+            .await
+            .map_err(|_| MpcError::Protocol("timed out awaiting DO partial over relay".into()))?
+            .ok_or_else(|| MpcError::Protocol("relay subscription closed before partial".into()))?
+            .map_err(proto)?;
+        let rm = decoded.round_msg;
+        if rm.from == ShareIndex(trigger.do_index) && rm.session_id == session_id {
+            break rm;
+        }
+        tracing::debug!(
+            from = rm.from.0,
+            stale_session = %rm.session_id.hex(),
+            "relay: skipping unrelated/stale partial (not this sign's session)"
+        );
+    };
+
+    let result = coord.process_round(vec![round_msg])?;
+    sub.shutdown().await;
+    match result {
+        SigningRoundResult::Complete(sig) => Ok(sig),
+        SigningRoundResult::NextRound(_) => Err(MpcError::Signing(
+            "combiner did not complete after the DO's partial".into(),
+        )),
+    }
+}

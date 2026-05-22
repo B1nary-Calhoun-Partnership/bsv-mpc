@@ -147,6 +147,12 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         .post_async("/sign-relay", |req, ctx| async move {
             poc::forward_to_cosigner_do(req, &ctx.env).await
         })
+        // §06.17.1 Stage 2 (#30): the worker self-presigns over the relay as a
+        // cosigner, BRC-2 self-encrypts its share, and ships the ct to the
+        // coordinator (BRC-31 + owner-authz gated inside the DO).
+        .post_async("/presign-relay", |req, ctx| async move {
+            poc::forward_to_cosigner_do(req, &ctx.env).await
+        })
         // #9: durable custody of a cosigner's KEK-wrapped share_A (BRC-31 +
         // owner-authz; the DO stores only sealed bytes).
         .post_async("/custody/put-share", |req, ctx| async move {

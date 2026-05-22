@@ -176,6 +176,27 @@ struct DkgInitRequest {
     agent_id: String,
     config: ThresholdConfig,
     label: Option<String>,
+    /// Key under which the proxy pre-seeded Paillier primes (via
+    /// `/ceremony/seed-primes`) so the deployed wasm worker can complete the DKG
+    /// without in-wasm safe-prime generation (CF-CPU-prohibitive). `None` for
+    /// native cosigners that generate primes inline.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    primes_session_id: Option<String>,
+}
+
+/// Request body for `POST /ceremony/seed-primes`.
+#[derive(Serialize, Debug)]
+struct SeedPrimesRequest {
+    session_id: String,
+    primes_json: String,
+}
+
+/// Response from `POST /ceremony/seed-primes` (fields ignored; we only need 2xx).
+#[derive(Deserialize, Debug)]
+struct SeedPrimesResponse {
+    #[allow(dead_code)]
+    #[serde(default)]
+    stored: bool,
 }
 
 /// Response from `POST /dkg/init`.
@@ -615,11 +636,43 @@ async fn run_dkg_over_http_inner(
     let handle = tokio::runtime::Handle::current();
 
     tokio::task::spawn_blocking(move || {
+        // §06.10.1 — seed the WORKER's (party 0's) Paillier primes off-worker so
+        // its aux_info phase skips in-wasm safe-prime generation (CF-CPU-
+        // prohibitive → 500). The proxy (party 1) generates its own primes
+        // inline (native, fine). Seed under a fresh random key the worker reads
+        // via `primes_session_id` in `/dkg/init`. Skipped when unauthed (dev /
+        // native cosigners that generate inline).
+        let primes_session_id = if auth.is_some() {
+            use bsv_mpc_core::dkg::generate_test_primes;
+            use rand::RngCore;
+            let mut rng = rand::rngs::OsRng;
+            let primes = generate_test_primes(&mut rng);
+            let primes_json = serde_json::to_string(&primes).map_err(|e| {
+                MpcError::Serialization(format!("serialize seeded primes: {e}"))
+            })?;
+            let mut seed = [0u8; 16];
+            rng.fill_bytes(&mut seed);
+            let key = format!("dkg-primes-{}", hex_encode(&seed));
+            let seed_url = format!("{kss_url}/ceremony/seed-primes");
+            let seed_req = SeedPrimesRequest {
+                session_id: key.clone(),
+                primes_json,
+            };
+            let _seed_resp: SeedPrimesResponse = match &auth {
+                Some(a) => kss_post(&handle, &client, &seed_url, "/ceremony/seed-primes", &seed_req, a)?,
+                None => unreachable!("primes seeded only when authed"),
+            };
+            Some(key)
+        } else {
+            None
+        };
+
         let init_url = format!("{kss_url}/dkg/init");
         let init_req = DkgInitRequest {
             agent_id: String::new(),
             config,
             label: Some("proxy-dkg-over-http".into()),
+            primes_session_id,
         };
         // Start the cosigner's DKG session FIRST (party 0). The cosigner picks
         // the session id; the proxy MUST adopt it so both derive the SAME
@@ -1531,6 +1584,74 @@ impl MpcBridge {
         Ok(())
     }
 
+    /// **§06.17.1 Stage 2 (issue #30)** — trigger the deployed worker to drive
+    /// its presign-over-relay as a COSIGNER, over the authed `/presign-relay`
+    /// route. The worker generates its OWN presig share, BRC-2 self-encrypts it,
+    /// and ships the ciphertext to `coordinator_pub_hex` on `presig_return_{sid}`.
+    ///
+    /// This POST runs the ENTIRE 3-round presign synchronously in the worker's
+    /// handler, so the coordinator MUST already have its `PresignHandler` +
+    /// `MessageBoxListener` live (and have `initiate`d the session) BEFORE this
+    /// call returns — the worker's round-1 lands on the coordinator's protocol
+    /// box while the worker blocks awaiting replies. Returns the worker's JSON
+    /// response (carrying `ciphertext_hex`, `return_sent`, `rounds_*`).
+    pub async fn trigger_presign_over_relay(
+        &self,
+        agent_id: &str,
+        coordinator_pub_hex: &str,
+        session_id_hex: &str,
+        joint_pubkey_hex: &str,
+        my_index: u16,
+        coordinator_index: u16,
+    ) -> bsv_mpc_core::error::Result<serde_json::Value> {
+        let path = "/presign-relay";
+        let url = format!("{}{path}", self.kss_url);
+        let body = serde_json::json!({
+            "agent_id": agent_id,
+            "coordinator_pub_hex": coordinator_pub_hex,
+            "session_id_hex": session_id_hex,
+            "joint_pubkey_hex": joint_pubkey_hex,
+            "my_index": my_index,
+            "coordinator_index": coordinator_index,
+        });
+        let body_bytes = serde_json::to_vec(&body)
+            .map_err(|e| MpcError::Serialization(format!("serialize presign-relay: {e}")))?;
+        let mut builder = self
+            .client
+            .post(&url)
+            .header("content-type", "application/json")
+            .body(body_bytes.clone());
+        {
+            let auth = self
+                .auth
+                .lock()
+                .map_err(|_| MpcError::Protocol("auth mutex poisoned".into()))?;
+            if !auth.is_authenticated() {
+                return Err(MpcError::Protocol(
+                    "proxy not authenticated with KSS — cannot trigger presign-relay".into(),
+                ));
+            }
+            for (name, value) in auth.auth_header_pairs("POST", path, &body_bytes)? {
+                builder = builder.header(name, value);
+            }
+        }
+        let resp = builder
+            .send()
+            .await
+            .map_err(|e| MpcError::Protocol(format!("presign-relay request: {e}")))?;
+        let status = resp.status();
+        let json: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| MpcError::Protocol(format!("presign-relay response: {e}")))?;
+        if !status.is_success() {
+            return Err(MpcError::Protocol(format!(
+                "presign-relay returned {status}: {json}"
+            )));
+        }
+        Ok(json)
+    }
+
     /// Get the root BSV PublicKey.
     pub fn root_pub(&self) -> &PublicKey {
         &self.root_pub
@@ -1557,6 +1678,30 @@ impl MpcBridge {
     /// Get the agent identity (hex-encoded compressed joint public key).
     pub fn agent_id(&self) -> &str {
         &self.agent_id
+    }
+
+    /// The proxy's stable BRC-31 / relay identity public key (hex). This is the
+    /// `auth_key` identity used both as the share's DKG-time `owner_identity`
+    /// (§08.1) and as the relay identity in [`Self::sign_over_relay`]. For
+    /// §06.17.1 it is the `coordinator_pub_hex` the worker ships its presign
+    /// protocol replies + return ciphertext to.
+    pub fn auth_identity_hex(&self) -> bsv_mpc_core::error::Result<String> {
+        let auth = self
+            .auth
+            .lock()
+            .map_err(|_| MpcError::Protocol("auth mutex poisoned".into()))?;
+        Ok(auth.auth_key().public_key().to_hex())
+    }
+
+    /// Clone of the proxy's stable BRC-31 / relay identity private key — for a
+    /// coordinator that drives its own `MessageBoxClient` listener over the relay
+    /// with the SAME identity the worker ships to (§06.17.1 Stage 2).
+    pub fn auth_identity_priv(&self) -> bsv_mpc_core::error::Result<PrivateKey> {
+        let auth = self
+            .auth
+            .lock()
+            .map_err(|_| MpcError::Protocol("auth mutex poisoned".into()))?;
+        Ok(auth.auth_key().clone())
     }
 
     /// The cosigner (KSS / deployed DO) party's signing-time index — the `from`

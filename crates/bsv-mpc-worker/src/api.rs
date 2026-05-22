@@ -102,6 +102,14 @@ pub struct DkgInitRequest {
     pub config: ThresholdConfig,
     /// Optional session label for debugging.
     pub label: Option<String>,
+    /// Optional key under which the caller pre-seeded Paillier
+    /// `PregeneratedPrimes` via `/ceremony/seed-primes`. When present, the DKG
+    /// coordinator loads those primes (so the CF-CPU-prohibitive in-wasm safe-
+    /// prime generation is skipped during aux_info) — REQUIRED for a real DKG to
+    /// complete on the deployed wasm worker. Omit for local/native cosigners
+    /// that can generate primes inline.
+    #[serde(default)]
+    pub primes_session_id: Option<String>,
 }
 
 /// Response from `POST /dkg/init`.
@@ -400,7 +408,7 @@ fn is_owner_authorized(caller: Option<&str>, owner: Option<&str>) -> bool {
 /// 4. Call `coordinator.init()` to generate round 1 messages.
 /// 5. Store the live coordinator in the global session map.
 /// 6. Return the bundled round 1 message.
-pub async fn handle_dkg_init(mut req: Request) -> Result<Response> {
+pub async fn handle_dkg_init(mut req: Request, store: &dyn MpcStore) -> Result<Response> {
     // Capture the authenticated caller (verified at the entrypoint) BEFORE the
     // body consumes `req` — it becomes the share's owner_identity (§08.1 / #5).
     let owner_identity = caller_identity(&req).unwrap_or_default();
@@ -416,6 +424,27 @@ pub async fn handle_dkg_init(mut req: Request) -> Result<Response> {
 
     // Create DKG coordinator for party 0 (KSS is always party 0)
     let mut coordinator = DkgCoordinator::new(session_id, config, ShareIndex(0));
+
+    // Load pre-seeded Paillier primes if the caller staged them (REQUIRED on the
+    // deployed wasm worker — in-wasm safe-prime generation blows the CF CPU
+    // budget). Without seeding, aux_info falls back to inline generation, which
+    // 500s on CF; with it, the DKG completes deterministically.
+    if let Some(primes_sid) = &body.primes_session_id {
+        match store.get_primes(primes_sid) {
+            Ok(Some(primes_json)) => {
+                coordinator
+                    .set_pregenerated_primes_from_json(&primes_json)
+                    .map_err(|e| Error::from(format!("apply seeded primes: {e}")))?;
+            }
+            Ok(None) => {
+                return Response::error(
+                    format!("no seeded primes for primes_session_id {primes_sid} — POST /ceremony/seed-primes first"),
+                    409,
+                );
+            }
+            Err(e) => return Err(Error::from(e)),
+        }
+    }
 
     // Initialize — produces round 1 messages (Feldman VSS commitments + ZK proofs)
     let messages = coordinator.init().map_err(|e| Error::from(e.to_string()))?;

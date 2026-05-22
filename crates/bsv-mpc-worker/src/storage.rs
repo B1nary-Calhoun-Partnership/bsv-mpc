@@ -107,6 +107,13 @@ pub trait MpcStore {
     fn get_share_metadata(&self, agent_id: &str) -> Result<Option<ShareMetadata>, String>;
     fn share_count(&self) -> Result<usize, String>;
     fn total_presignature_count(&self) -> Result<u64, String>;
+    /// Read Paillier `PregeneratedPrimes` (serde-JSON) staged under `session_id`
+    /// via `/ceremony/seed-primes`, if any. Backends without a primes table
+    /// (in-memory test store) return `None` (DKG then generates inline). The
+    /// deployed DO-SQLite backend overrides this to read `mpc_primes`.
+    fn get_primes(&self, _session_id: &str) -> Result<Option<String>, String> {
+        Ok(None)
+    }
 }
 
 /// In-memory share storage wrapper.
