@@ -98,6 +98,13 @@ tokio = { version = "1", features = ["full"] }
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
+# CBOR for the wire-stable PresigBundle (ADR-0030 §125: CBOR-encoded for
+# cross-instance migration / operator handoff per §13.7). ciborium is the
+# maintained canonical CBOR crate (serde_cbor is deprecated/unmaintained).
+ciborium = "0.2"
+# serde_bytes makes byte-typed fields encode as CBOR byte strings (bstr) rather
+# than arrays-of-int, matching the §06.17.1 PresigBundle wire shape (bstr/bstr32/bstr33).
+serde_bytes = "0.11"
 hex = "0.4"
 
 # HTTP

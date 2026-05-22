@@ -18,6 +18,8 @@ generic-ec-zkp.workspace = true
 bsv = { package = "bsv-rs", version = "0.3.11", features = ["transaction", "wallet", "auth"] }
 serde.workspace = true
 serde_json.workspace = true
+ciborium.workspace = true
+serde_bytes.workspace = true
 hex.workspace = true
 sha2.workspace = true
 hmac.workspace = true

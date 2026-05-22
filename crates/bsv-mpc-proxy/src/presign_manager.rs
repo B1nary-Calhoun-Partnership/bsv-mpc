@@ -33,9 +33,11 @@
 
 use std::any::Any;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use bsv_mpc_core::types::Presignature;
 
+use crate::burn_rate::{BurnRateRegulator, InvalidationReason};
 use crate::server::AppState;
 
 /// A pooled presignature plus its non-serializable raw output.
@@ -91,6 +93,17 @@ pub struct PresignManager {
 
     /// Total presignatures consumed by signing requests (for metrics).
     total_consumed: u64,
+
+    /// §06.19 burn-rate regulator: drives target/low-water/cap + the
+    /// consumed/invalidated counters. Time is sourced from [`Self::start`].
+    regulator: BurnRateRegulator,
+
+    /// Monotonic clock origin; `start.elapsed()` feeds the regulator's EWMA.
+    start: Instant,
+
+    /// `mpc.presig.regen_in_flight` — regen sessions currently running. Set by
+    /// the background replenish task around each parallel launch batch.
+    regen_in_flight: usize,
 }
 
 impl PresignManager {
@@ -101,7 +114,15 @@ impl PresignManager {
             max_size,
             total_generated: 0,
             total_consumed: 0,
+            regulator: BurnRateRegulator::new(),
+            start: Instant::now(),
+            regen_in_flight: 0,
         }
+    }
+
+    /// Monotonic seconds since construction — the regulator's clock.
+    fn now_secs(&self) -> f64 {
+        self.start.elapsed().as_secs_f64()
     }
 
     /// Take one presignature from the front of the pool (FIFO), discarding its
@@ -114,6 +135,7 @@ impl PresignManager {
             None
         } else {
             self.total_consumed += 1;
+            self.regulator.record_consumption(self.now_secs());
             Some(self.pool.remove(0).presig)
         }
     }
@@ -128,6 +150,7 @@ impl PresignManager {
             None
         } else {
             self.total_consumed += 1;
+            self.regulator.record_consumption(self.now_secs());
             // We own the entry now; unwrap the Sync shim. `into_inner` only
             // fails on a poisoned mutex, which is impossible here (never locked).
             Some(
@@ -170,12 +193,64 @@ impl PresignManager {
         self.pool.is_empty()
     }
 
-    /// Whether the pool should be replenished.
-    ///
-    /// Triggers when the pool is below 50% capacity. The hysteresis avoids
-    /// oscillation between full and half-full states.
+    /// Whether the pool should be replenished — the §06.19 trigger: available
+    /// below the burn-rate-derived `low_water`. (Supersedes the old fixed
+    /// 50%-of-capacity heuristic; `max_size` now only bounds storage.)
     pub fn should_replenish(&self) -> bool {
-        self.pool.len() < self.max_size / 2
+        self.pool.len() < self.low_water_mark()
+    }
+
+    /// §06.19 `burn_rate` (consumptions/sec) — `mpc.presig.burn_rate`.
+    pub fn burn_rate(&self) -> f64 {
+        self.regulator.burn_rate(self.now_secs())
+    }
+
+    /// §06.19 `target_pool_size = max(8, ceil(burn_rate * 30))`.
+    pub fn target_pool_size(&self) -> usize {
+        self.regulator.target_pool_size(self.now_secs())
+    }
+
+    /// §06.19 `low_water = ceil(target * 0.5)`.
+    pub fn low_water_mark(&self) -> usize {
+        self.regulator.low_water(self.now_secs())
+    }
+
+    /// §06.19 `high_water_cap = target * 2` — storage bound. Also clamped by
+    /// `max_size` (the hard storage ceiling).
+    pub fn high_water_cap(&self) -> usize {
+        self.regulator.high_water_cap(self.now_secs()).min(self.max_size)
+    }
+
+    /// How many presign sessions to launch now (§06.19), given regens already
+    /// in flight. Also clamped so the pool + in-flight never exceeds `max_size`.
+    pub fn regen_count(&self) -> usize {
+        let by_rate = self
+            .regulator
+            .regen_count(self.now_secs(), self.pool.len(), self.regen_in_flight);
+        let hard_room = self
+            .max_size
+            .saturating_sub(self.pool.len() + self.regen_in_flight);
+        by_rate.min(hard_room)
+    }
+
+    /// `mpc.presig.regen_in_flight` (gauge).
+    pub fn regen_in_flight(&self) -> usize {
+        self.regen_in_flight
+    }
+
+    /// Set the in-flight regen gauge (the background task brackets each launch).
+    pub fn set_regen_in_flight(&mut self, n: usize) {
+        self.regen_in_flight = n;
+    }
+
+    /// Record a §06.18 invalidation event (`bundles_invalidated_total{reason}`).
+    pub fn record_invalidation(&mut self, reason: InvalidationReason, count: u64) {
+        self.regulator.record_invalidation(reason, count);
+    }
+
+    /// `mpc.presig.bundles_invalidated_total{reason}` (counter).
+    pub fn bundles_invalidated(&self, reason: InvalidationReason) -> u64 {
+        self.regulator.bundles_invalidated_total(reason)
     }
 
     /// Maximum pool capacity.
@@ -238,40 +313,64 @@ pub async fn background_replenish(state: Arc<AppState>) {
 
         tokio::time::sleep(tokio::time::Duration::from_secs(sleep_secs)).await;
 
-        let should_replenish = {
+        // §06.19: launch `regen_count` sessions this cycle (0 when the pool is
+        // at/above low_water, or when in-flight + available already covers the
+        // target). The count brings the pool to `target` bounded by the cap.
+        let count = {
             let mgr = state.presign_manager.read().await;
-            mgr.should_replenish()
+            mgr.regen_count()
         };
-
-        if !should_replenish {
-            // Pool is healthy — reset backoff and continue.
+        if count == 0 {
             consecutive_failures = 0;
             continue;
         }
 
-        match state.bridge.presign_raw().await {
-            Ok((presig, raw)) => {
-                let mut mgr = state.presign_manager.write().await;
-                let pool_size_before = mgr.len();
-                mgr.add(presig, raw);
-                tracing::debug!(
-                    pool_size_before,
-                    pool_size_after = mgr.len(),
-                    max = mgr.max_size(),
-                    total_generated = mgr.total_generated(),
-                    "Presignature added to pool"
-                );
-                consecutive_failures = 0;
+        // Publish the in-flight gauge for the duration of the batch (§06.19
+        // metric + feeds the next cycle's cap arithmetic).
+        {
+            let mut mgr = state.presign_manager.write().await;
+            mgr.set_regen_in_flight(count);
+        }
+
+        // Launch the `count` presign sessions in PARALLEL (§06.19). Each
+        // `presign_raw` runs an independent 3-round session (independent
+        // SessionId + mailbox pair) and the awaits overlap.
+        let results =
+            futures::future::join_all((0..count).map(|_| state.bridge.presign_raw())).await;
+
+        let (mut added, mut last_err) = (0usize, None::<String>);
+        {
+            let mut mgr = state.presign_manager.write().await;
+            for r in results {
+                match r {
+                    Ok((presig, raw)) => {
+                        mgr.add(presig, raw);
+                        added += 1;
+                    }
+                    Err(e) => last_err = Some(e.to_string()),
+                }
             }
-            Err(e) => {
-                consecutive_failures = consecutive_failures.saturating_add(1);
-                tracing::warn!(
-                    error = %e,
-                    consecutive_failures,
-                    next_retry_secs = (BASE_INTERVAL_SECS * 2u64.saturating_pow(consecutive_failures)).min(MAX_BACKOFF_SECS),
-                    "Failed to generate presignature"
-                );
-            }
+            mgr.set_regen_in_flight(0);
+            tracing::debug!(
+                launched = count,
+                added,
+                pool_size = mgr.len(),
+                target = mgr.target_pool_size(),
+                burn_rate = mgr.burn_rate(),
+                "burn-rate regen batch complete"
+            );
+        }
+
+        if added > 0 {
+            consecutive_failures = 0;
+        } else {
+            consecutive_failures = consecutive_failures.saturating_add(1);
+            tracing::warn!(
+                error = last_err.unwrap_or_default(),
+                consecutive_failures,
+                next_retry_secs = (BASE_INTERVAL_SECS * 2u64.saturating_pow(consecutive_failures)).min(MAX_BACKOFF_SECS),
+                "burn-rate regen batch produced no presignatures"
+            );
         }
     }
 }

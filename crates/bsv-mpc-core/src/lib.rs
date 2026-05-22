@@ -59,6 +59,8 @@ pub mod envelope;
 pub mod error;
 pub mod hd;
 pub mod paillier_pool;
+pub mod presig_at_rest;
+pub mod presig_encryption;
 pub mod presigning;
 pub mod proof;
 pub mod refresh;
@@ -70,6 +72,7 @@ pub mod types;
 pub use error::{MpcError, Result};
 pub use refresh::RefreshResult;
 pub use types::{
-    DkgResult, EncryptedShare, JointPublicKey, ParticipationProof, Presignature, RoundMessage,
-    SessionId, ShareIndex, SigningResult, ThresholdConfig,
+    DkgResult, EncryptedShare, InvalidationTrigger, JointPublicKey, ParticipationProof, PolicyId,
+    PresigBinding, PresigBundle, Presignature, RoundMessage, SessionId, ShareIndex, SigningResult,
+    ThresholdConfig,
 };
