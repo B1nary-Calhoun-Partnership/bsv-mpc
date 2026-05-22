@@ -46,8 +46,11 @@ use crate::storage::SqliteShareStorage;
 /// so the lock isn't held across a `spawn_blocking` boundary.
 struct CoordinatorSlot {
     coord: DkgCoordinator,
-    peer_pub_hex: String,
-    peer_party_index: u16,
+    /// All OTHER parties: `(party_index, identity_pub_hex)`. A broadcast
+    /// `RoundMessage` (`to == None`) fans out to every peer; a p2p one
+    /// (`to == Some(idx)`, e.g. a threshold-keygen VSS share) routes only to
+    /// the peer whose index matches. For 2-party this is a 1-element vec.
+    peers: Vec<(u16, String)>,
 }
 
 struct DkgHandlerInner {
@@ -114,13 +117,14 @@ impl DkgHandler {
     /// fires with the `DkgResult` the moment this party's ceremony
     /// completes.
     ///
-    /// Both parties in a 2-of-2 call `initiate` before any traffic
-    /// flows; the round-1 sends happen in parallel.
+    /// Every party calls `initiate` before any traffic flows; the round-1
+    /// sends happen in parallel. `peers` is every OTHER party as
+    /// `(party_index, identity_pub_hex)` — one entry for 2-of-2, two for
+    /// 2-of-3, etc. Broadcast round-1 messages fan out to all of them.
     pub async fn initiate(
         &self,
         session_id: SessionId,
-        peer_pub_hex: String,
-        peer_party_index: u16,
+        peers: Vec<(u16, String)>,
     ) -> anyhow::Result<(oneshot::Receiver<DkgResult>, Vec<OutgoingRoundMessage>)> {
         let inner = self.inner.clone();
         let coord_session = session_id;
@@ -150,20 +154,14 @@ impl DkgHandler {
         .map_err(|e| anyhow::anyhow!("init task panicked: {e}"))??;
 
         let (completion_tx, completion_rx) = oneshot::channel::<DkgResult>();
+        let outgoing = wrap_outgoing(&initial_round_msgs, session_id, &peers);
         {
             let mut coords = self
                 .inner
                 .coordinators
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
-            coords.insert(
-                session_id,
-                CoordinatorSlot {
-                    coord,
-                    peer_pub_hex: peer_pub_hex.clone(),
-                    peer_party_index,
-                },
-            );
+            coords.insert(session_id, CoordinatorSlot { coord, peers });
         }
         {
             let mut tx = self
@@ -173,13 +171,6 @@ impl DkgHandler {
                 .unwrap_or_else(|p| p.into_inner());
             tx.insert(session_id, completion_tx);
         }
-
-        let outgoing = wrap_outgoing(
-            &initial_round_msgs,
-            session_id,
-            peer_pub_hex,
-            peer_party_index,
-        );
         Ok((completion_rx, outgoing))
     }
 
@@ -227,11 +218,7 @@ async fn dispatch_one(
         return Ok(vec![]);
     };
 
-    let CoordinatorSlot {
-        mut coord,
-        peer_pub_hex,
-        peer_party_index,
-    } = slot;
+    let CoordinatorSlot { mut coord, peers } = slot;
     let inbound_round_msg = inbound.round_msg;
 
     let (round_result, coord) = tokio::task::spawn_blocking(move || {
@@ -245,15 +232,9 @@ async fn dispatch_one(
 
     match round_result {
         DkgRoundResult::NextRound(next_msgs) => {
+            let outgoing = wrap_outgoing(&next_msgs, session_id, &peers);
             let mut coords = inner.coordinators.lock().unwrap_or_else(|p| p.into_inner());
-            coords.insert(
-                session_id,
-                CoordinatorSlot {
-                    coord,
-                    peer_pub_hex: peer_pub_hex.clone(),
-                    peer_party_index,
-                },
-            );
+            coords.insert(session_id, CoordinatorSlot { coord, peers });
             drop(coords);
             debug!(
                 "DkgHandler: session={} round {} produced {} outbound msgs",
@@ -261,12 +242,7 @@ async fn dispatch_one(
                 next_msgs.first().map(|m| m.round).unwrap_or(0),
                 next_msgs.len()
             );
-            Ok(wrap_outgoing(
-                &next_msgs,
-                session_id,
-                peer_pub_hex,
-                peer_party_index,
-            ))
+            Ok(outgoing)
         }
         DkgRoundResult::Complete(dkg_result) => {
             let share_session_hex = dkg_result.session_id.hex();
@@ -308,8 +284,7 @@ async fn dispatch_one(
 fn wrap_outgoing(
     round_msgs: &[RoundMessage],
     session_id: SessionId,
-    peer_pub_hex: String,
-    peer_party_index: u16,
+    peers: &[(u16, String)],
 ) -> Vec<OutgoingRoundMessage> {
     let eid = canonical_execution_id(&ExecutionParams::new_v1(
         PhaseTag::DkgKeygen,
@@ -319,22 +294,40 @@ fn wrap_outgoing(
     let mut prefix = [0u8; 8];
     prefix.copy_from_slice(&eid[..8]);
 
-    round_msgs
-        .iter()
-        .map(|rm| OutgoingRoundMessage {
-            recipient_pub_hex: peer_pub_hex.clone(),
-            message_box: bsv_mpc_messagebox::types::BOX_DKG.to_string(),
-            round_msg: rm.clone(),
-            params: WrapParams {
-                to_party: peer_party_index,
-                joint_pubkey: [0u8; 33], // §05.4.3 — DKG keygen, no joint key yet
-                phase: "dkg".into(),
-                execution_id_prefix: prefix,
-                correlation_id: None,
-                traceparent: None,
-            },
-        })
-        .collect()
+    let mut out = Vec::new();
+    for rm in round_msgs {
+        // Route by the cggmp24 recipient surfaced on `RoundMessage.to`:
+        // `None` = broadcast → ship to every peer; `Some(idx)` = p2p (e.g. a
+        // threshold-keygen VSS share) → ship only to the matching peer.
+        let targets: Vec<&(u16, String)> = match rm.to {
+            None => peers.iter().collect(),
+            Some(ShareIndex(idx)) => peers.iter().filter(|(p, _)| *p == idx).collect(),
+        };
+        if targets.is_empty() {
+            warn!(
+                "DkgHandler: outgoing p2p message to party {:?} not in peer set {:?}; dropping",
+                rm.to,
+                peers.iter().map(|(p, _)| *p).collect::<Vec<_>>()
+            );
+            continue;
+        }
+        for (idx, hex) in targets {
+            out.push(OutgoingRoundMessage {
+                recipient_pub_hex: hex.clone(),
+                message_box: bsv_mpc_messagebox::types::BOX_DKG.to_string(),
+                round_msg: rm.clone(),
+                params: WrapParams {
+                    to_party: *idx,
+                    joint_pubkey: [0u8; 33], // §05.4.3 — DKG keygen, no joint key yet
+                    phase: "dkg".into(),
+                    execution_id_prefix: prefix,
+                    correlation_id: None,
+                    traceparent: None,
+                },
+            });
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -379,20 +372,17 @@ mod tests {
         let a = wrap_outgoing(
             std::slice::from_ref(&rm),
             SessionId([0xaa; 32]),
-            "02deadbeef".into(),
-            1,
+            &[(1u16, "02deadbeef".to_string())],
         );
         let b = wrap_outgoing(
             std::slice::from_ref(&rm),
             SessionId([0xaa; 32]),
-            "02deadbeef".into(),
-            1,
+            &[(1u16, "02deadbeef".to_string())],
         );
         let c = wrap_outgoing(
             std::slice::from_ref(&rm),
             SessionId([0xbb; 32]), // different session
-            "02deadbeef".into(),
-            1,
+            &[(1u16, "02deadbeef".to_string())],
         );
         // Determinism + session-binding properties of canonical
         // ExecutionId (§02): same input → same prefix; different

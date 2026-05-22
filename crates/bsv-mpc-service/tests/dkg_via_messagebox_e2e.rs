@@ -154,11 +154,11 @@ async fn within_stack_2of2_dkg_byte_identical_joint_pubkey() {
     // ----- Both sides initiate (sequential — order doesn't matter,
     //       both run init() and produce their round-1 messages) -----
     let (alice_completion, alice_initial_outbound) = alice_handler
-        .initiate(session_id, bob_pub.clone(), 1)
+        .initiate(session_id, vec![(1, bob_pub.clone())])
         .await
         .expect("alice initiate");
     let (bob_completion, bob_initial_outbound) = bob_handler
-        .initiate(session_id, alice_pub.clone(), 0)
+        .initiate(session_id, vec![(0, alice_pub.clone())])
         .await
         .expect("bob initiate");
     assert!(!alice_initial_outbound.is_empty(), "alice round-1 outbound");

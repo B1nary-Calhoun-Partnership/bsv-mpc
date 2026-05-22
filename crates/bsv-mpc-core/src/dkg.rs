@@ -78,6 +78,14 @@ pub struct WireMessage {
     pub sender: u16,
     /// Whether this message should be broadcast to all parties.
     pub is_broadcast: bool,
+    /// P2P recipient party index. `None` for broadcast. Lets the transport
+    /// route per-recipient in n-party (>2) ceremonies, where one round can
+    /// emit *distinct* p2p messages to different peers (e.g. threshold-keygen
+    /// Feldman/VSS share evaluations). 2-party ceremonies never needed this
+    /// (the single peer is unambiguous); `serde(default)` +
+    /// `skip_serializing_if` keep the 2-party wire byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recipient: Option<u16>,
     /// The serialized cggmp24 protocol message.
     pub msg: serde_json::Value,
 }
@@ -87,9 +95,14 @@ pub(crate) fn outgoing_to_wire<M: Serialize>(
     sender: u16,
     out: round_based::Outgoing<M>,
 ) -> std::result::Result<WireMessage, MpcError> {
+    let recipient = match out.recipient {
+        round_based::MessageDestination::OneParty(idx) => Some(idx),
+        round_based::MessageDestination::AllParties => None,
+    };
     Ok(WireMessage {
         sender,
-        is_broadcast: out.recipient.is_broadcast(),
+        is_broadcast: recipient.is_none(),
+        recipient,
         msg: serde_json::to_value(&out.msg).map_err(|e| {
             MpcError::Serialization(format!("failed to serialize outgoing message: {e}"))
         })?,
@@ -794,13 +807,16 @@ where
                 let wire_bytes = serde_json::to_vec(&wire).map_err(|e| {
                     err_ctor(format!("{phase_tag}: failed to serialize outgoing: {e}"))
                 })?;
-                // Transport layer handles per-recipient routing via the
-                // wire-level recipient info; we don't pin a destination here.
+                // Surface the cggmp24 recipient on the RoundMessage so the
+                // transport routes per-recipient (broadcast → all peers; p2p →
+                // the named party) without decoding the inner payload. `None`
+                // = broadcast (2-party + most DKG rounds); `Some(idx)` = a p2p
+                // message such as a threshold-keygen VSS share to one peer.
                 outgoing.push(RoundMessage {
                     session_id,
                     round: current_round,
                     from: ShareIndex(my_index),
-                    to: None,
+                    to: wire.recipient.map(ShareIndex),
                     payload: wire_bytes,
                 });
             }
@@ -1094,6 +1110,7 @@ mod tests {
         let wire = WireMessage {
             sender: 0,
             is_broadcast: true,
+            recipient: None,
             msg: serde_json::json!({"test": "data", "value": 42}),
         };
 

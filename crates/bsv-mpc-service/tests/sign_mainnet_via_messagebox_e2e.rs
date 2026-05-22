@@ -240,12 +240,12 @@ To run (BURNS REAL SATS):
 
     let (alice_dkg_rx, alice_dkg_out) = alice
         .dkg_handler
-        .initiate(dkg_session_id, bob.pub_hex.clone(), 1)
+        .initiate(dkg_session_id, vec![(1, bob.pub_hex.clone())])
         .await
         .expect("alice dkg initiate");
     let (bob_dkg_rx, bob_dkg_out) = bob
         .dkg_handler
-        .initiate(dkg_session_id, alice.pub_hex.clone(), 0)
+        .initiate(dkg_session_id, vec![(0, alice.pub_hex.clone())])
         .await
         .expect("bob dkg initiate");
 
