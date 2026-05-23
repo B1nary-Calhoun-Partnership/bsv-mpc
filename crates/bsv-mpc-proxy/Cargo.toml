@@ -9,6 +9,12 @@ description = "BRC-100 compatible MPC signing proxy — drop-in replacement for 
 [dependencies]
 bsv-mpc-core = { path = "../bsv-mpc-core" }
 bsv-mpc-messagebox = { path = "../bsv-mpc-messagebox" }
+# §06.17.1 (#30, CONTAINER target): the proxy = coordinator reuses the
+# relay-proven `PresignHandler` (cosigner-collect + PresigBundle assembly) +
+# `FileBundleStore` from the native service crate, rather than reimplementing the
+# coordinator SM. The service is a native (axum/tokio) crate — same target as the
+# proxy — so this is a normal dependency.
+bsv-mpc-service = { path = "../bsv-mpc-service" }
 bsv.workspace = true
 axum.workspace = true
 tokio.workspace = true
@@ -32,6 +38,9 @@ anyhow.workspace = true
 # #12 relay-combiner deployed e2e: generate a real DKG + correlated presig pair
 # (bsv-mpc-core public API) and serialize Presignature_A (needs the cggmp24 type).
 cggmp24.workspace = true
-# #4 provisioning e2e: exercise the native cosigner/container's
-# ProvisionConfig::ship_presignature path (ships Presignature_A to the DO).
-bsv-mpc-service = { path = "../bsv-mpc-service" }
+# §06.17.1 CONTAINER-target hermetic gate (#30): generate real 2-of-2 key shares
+# locally via the round_based simulator (keygen + auxinfo) before driving the
+# presign-over-relay against an in-process bsv-mpc-service.
+round-based = { workspace = true, features = ["sim", "state-machine"] }
+pin-project = { workspace = true }
+tempfile = { workspace = true }

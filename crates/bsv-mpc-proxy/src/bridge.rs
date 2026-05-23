@@ -1401,6 +1401,188 @@ impl MpcBridge {
         }
     }
 
+    /// **§06.17.1 coordinator-holds-ciphertext presign (issue #30, CONTAINER
+    /// target)** — run the presign over the relay as the coordinator against the
+    /// deployed CF Container cosigner (`presign_url`), assembling + persisting the
+    /// `PresigBundle` to `bundle_store`. The container generates + BRC-2
+    /// self-encrypts its OWN presig share and ships the opaque ciphertext back;
+    /// the proxy never holds the container's plaintext share.
+    pub async fn coordinate_presign_bundle(
+        &self,
+        bundle_store: std::sync::Arc<bsv_mpc_service::FileBundleStore>,
+        at_rest_root: [u8; 32],
+        policy_id: bsv_mpc_core::types::PolicyId,
+        timeout: std::time::Duration,
+    ) -> bsv_mpc_core::error::Result<bsv_mpc_core::types::PresigBundle> {
+        let identity_priv = {
+            let auth = self
+                .auth
+                .lock()
+                .map_err(|_| MpcError::Protocol("auth mutex poisoned".into()))?;
+            auth.auth_key().clone()
+        };
+        // The proxy is the coordinator; the container is the cosigner.
+        let coordinator_party = self.share.share_index.0;
+        let cosigner_party = self.cosigner_index();
+        let parties_at_keygen: Vec<u16> = {
+            let mut p = self.participants.clone();
+            p.sort_unstable();
+            p
+        };
+        // Ensure the proxy's share carries the 33-byte joint pubkey (presign needs it).
+        let mut share = self.share.clone();
+        if share.joint_pubkey_compressed.len() != 33 {
+            share.joint_pubkey_compressed = self.joint_key.compressed.clone();
+        }
+        // Fresh presign session id (canonical 32-byte hex), bound to the joint key.
+        let presign_session = {
+            use rand::RngCore;
+            let mut seed = [0u8; 16];
+            rand::rngs::OsRng.fill_bytes(&mut seed);
+            SessionId::from_str_hash(&format!("presig-{}-{}", self.agent_id, hex_encode(&seed)))
+        };
+
+        // BRC-31 sign the container's `/presign-relay/init` over the canonical
+        // wire (the cosigner session — same identity, container-scoped session).
+        let presign_auth = self.presign_auth.clone();
+        let request_signer = move |method: &str,
+                                   path: &str,
+                                   body: &[u8]|
+              -> bsv_mpc_core::error::Result<Vec<(String, String)>> {
+            let guard = presign_auth
+                .lock()
+                .map_err(|_| MpcError::Protocol("presign auth mutex poisoned".into()))?;
+            if !guard.is_authenticated() {
+                return Ok(vec![]);
+            }
+            Ok(guard
+                .auth_header_pairs(method, path, body)?
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect())
+        };
+
+        crate::relay_presign::coordinate_presign_over_relay(
+            &self.relay_url,
+            identity_priv,
+            share,
+            coordinator_party,
+            cosigner_party,
+            parties_at_keygen,
+            policy_id,
+            at_rest_root,
+            presign_session,
+            bundle_store,
+            crate::relay_presign::CosignerArm {
+                url: format!("{}/presign-relay/init", self.presign_url),
+                agent_id: self.agent_id.clone(),
+            },
+            &request_signer,
+            timeout,
+        )
+        .await
+    }
+
+    /// **§06.17.1 sign-from-bundle over the relay (issue #30, CONTAINER target)**
+    /// — at sign-time, reconstruct the coordinator's own partial from the durable
+    /// `bundle` + ship the container's OWN ciphertext to its `/sign-relay`; the
+    /// container decrypts it under its own identity, issues + relays its partial,
+    /// and the proxy combines into the final signature. Base key only.
+    pub async fn sign_from_bundle_over_relay(
+        &self,
+        sighash: &[u8; 32],
+        bundle: &bsv_mpc_core::types::PresigBundle,
+        at_rest_root: [u8; 32],
+        recv_timeout: std::time::Duration,
+    ) -> bsv_mpc_core::error::Result<SigningResult> {
+        let identity_priv = {
+            let auth = self
+                .auth
+                .lock()
+                .map_err(|_| MpcError::Protocol("auth mutex poisoned".into()))?;
+            auth.auth_key().clone()
+        };
+        // Unseal the coordinator's own presig share from the durable bundle.
+        let at_rest_key =
+            bsv_mpc_core::presig_at_rest::derive_presig_at_rest_key(&at_rest_root, &bundle.presig_id);
+        let own_presig_json =
+            bsv_mpc_core::presig_at_rest::unseal_presig_bytes(&bundle.presig_bytes, &at_rest_key)
+                .map_err(|e| MpcError::Protocol(format!("unseal own presig share: {e}")))?;
+
+        // The container's positional ciphertext slot (= its keygen-subset index).
+        let cosigner_party = self.cosigner_index();
+        let pos = bundle
+            .parties_at_keygen
+            .iter()
+            .position(|&p| p == cosigner_party)
+            .ok_or_else(|| {
+                MpcError::Protocol(format!(
+                    "cosigner party {cosigner_party} not in bundle parties {:?}",
+                    bundle.parties_at_keygen
+                ))
+            })?;
+        let cosigner_ct = bundle.cosigner_encrypted_shares[pos].clone().into_vec();
+        if cosigner_ct.is_empty() {
+            return Err(MpcError::Protocol(
+                "bundle has no cosigner ciphertext at the container's positional slot".into(),
+            ));
+        }
+
+        // Per-sign correlation session id (relay routing label).
+        let sign_session = {
+            use rand::RngCore;
+            let mut seed = [0u8; 16];
+            rand::rngs::OsRng.fill_bytes(&mut seed);
+            SessionId::from_str_hash(&format!("relay-sign-{}", hex_encode(&seed)))
+        };
+
+        let auth_for_sign = self.presign_auth.clone();
+        let request_signer = move |method: &str,
+                                   path: &str,
+                                   body: &[u8]|
+              -> bsv_mpc_core::error::Result<Vec<(String, String)>> {
+            let guard = auth_for_sign
+                .lock()
+                .map_err(|_| MpcError::Protocol("presign auth mutex poisoned".into()))?;
+            if !guard.is_authenticated() {
+                return Ok(vec![]);
+            }
+            Ok(guard
+                .auth_header_pairs(method, path, body)?
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect())
+        };
+
+        let trigger = crate::relay_sign::DoTrigger {
+            url: format!("{}/sign-relay", self.presign_url),
+            presig_a_json: vec![],
+            do_index: cosigner_party,
+            agent_id: Some(self.agent_id.clone()),
+            auth_headers: vec![],
+            cosigner_encrypted_share: None,
+        };
+
+        crate::relay_sign::combine_sign_from_bundle_over_relay(
+            &self.relay_url,
+            identity_priv,
+            self.share.clone(),
+            self.participants.clone(),
+            self.share.config,
+            sign_session,
+            sighash,
+            &own_presig_json,
+            &bundle.commitments,
+            cosigner_ct,
+            &bundle.presig_id,
+            &self.joint_key,
+            trigger,
+            Some(&request_signer),
+            recv_timeout,
+        )
+        .await
+    }
+
     /// **ADR-018 relay sign (#12)** — combine the deployed DO's partial over
     /// the MessageBox relay into a final signature, with this proxy as the
     /// combiner.

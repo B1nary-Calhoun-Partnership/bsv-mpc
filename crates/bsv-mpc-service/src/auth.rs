@@ -150,6 +150,13 @@ impl AuthState {
         self.wallet.is_none()
     }
 
+    /// Whether this cosigner has an enforced server identity (i.e. a
+    /// `MPC_SERVER_PRIVATE_KEY` was configured). The relay sign/presign handlers
+    /// require one; this lets a route reject early in dev mode.
+    pub fn has_server_identity(&self) -> bool {
+        self.wallet.is_some()
+    }
+
     fn put_session(&self, session: AuthSession) {
         self.sessions
             .lock()
@@ -395,6 +402,26 @@ fn verify_request(
     Ok(CallerIdentity {
         identity_key: peer_identity_key.to_string(),
     })
+}
+
+/// Resolve this cosigner's secp256k1 server identity key from the environment
+/// (`MPC_SERVER_PRIVATE_KEY`, hex). §06.17.1 / §06.20 (issue #30, CONTAINER
+/// target): the relay sign-handler and the presign-over-relay listener BOTH use
+/// this key — as the relay / BRC-31 identity AND as the BRC-2 self-encryption
+/// wallet for the cosigner's own presig share. It MUST be the SAME key the share
+/// was self-encrypted under at presign-time so `decrypt_and_issue_partial`
+/// re-derives the same wallet key at sign-time.
+///
+/// Mirrors the worker DO's `presig_wallet()` (which reads the `SERVER_PRIVATE_KEY`
+/// secret on every call): reading from the process env keeps the relay/BRC-2
+/// identity in lockstep with [`AuthState::from_env`]'s BRC-31 server identity
+/// (the container injects the SAME secret into the env at start).
+pub fn server_identity_priv_from_env() -> anyhow::Result<PrivateKey> {
+    let hex = std::env::var(SERVER_KEY_ENV).map_err(|_| {
+        anyhow::anyhow!("{SERVER_KEY_ENV} not set — relay sign/presign require a server identity")
+    })?;
+    PrivateKey::from_hex(hex.trim())
+        .map_err(|e| anyhow::anyhow!("{SERVER_KEY_ENV} invalid hex: {e:?}"))
 }
 
 // ── Owner authorization (§08.1) ─────────────────────────────────────────────

@@ -343,6 +343,36 @@ fn bundle_outgoing_messages(messages: &[RoundMessage]) -> Result<RoundMessage, S
     })
 }
 
+// ── Re-exports for the relay handlers (§06.17.1 CONTAINER target, #30) ──────
+//
+// `crate::relay_handlers` reuses these internal helpers (same auth/share/parse
+// semantics as the HTTP routes). Thin `pub` wrappers keep the helpers private to
+// this module while letting the relay routes share the exact decision logic.
+
+/// `pub` wrapper over [`parse_body`] for `crate::relay_handlers`.
+pub fn parse_body_pub<T: serde::de::DeserializeOwned>(
+    body: &Bytes,
+) -> Result<T, (StatusCode, Json<serde_json::Value>)> {
+    parse_body(body)
+}
+
+/// `pub` wrapper over [`authz_owner`] for `crate::relay_handlers`.
+pub fn authz_owner_pub(
+    state: &AppState,
+    caller: &crate::auth::CallerIdentity,
+    agent_id: &str,
+) -> Option<(StatusCode, Json<serde_json::Value>)> {
+    authz_owner(state, caller, agent_id)
+}
+
+/// `pub` wrapper over [`load_share_or_recover`] for `crate::relay_handlers`.
+pub async fn load_share_or_recover_pub(
+    state: &AppState,
+    agent_id: &str,
+) -> Result<bsv_mpc_core::types::EncryptedShare, (StatusCode, Json<serde_json::Value>)> {
+    load_share_or_recover(state, agent_id).await
+}
+
 // ── Handlers ──────────────────────────────────────────────────────────────
 
 /// `POST /dkg/init` — Start a Distributed Key Generation ceremony.

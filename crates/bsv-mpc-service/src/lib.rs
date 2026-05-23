@@ -10,6 +10,8 @@ pub mod handlers;
 pub mod messagebox;
 pub mod presign_handler;
 pub mod provision;
+pub mod relay_handlers;
+pub mod sign_relay_handler;
 pub mod signing_handler;
 pub mod storage;
 
@@ -90,6 +92,18 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // Presigning protocol
         .route("/presign/init", post(handlers::handle_presign_init))
         .route("/presign/round", post(handlers::handle_presign_round))
+        // §06.17.1 container-as-cosigner over the relay (#30, CONTAINER target):
+        // arm the presign-over-relay cosigner + co-sign from the coordinator-held
+        // ciphertext. Additive — does NOT alter the §06.20 HTTP presign/sign path.
+        .route(
+            "/presign-relay/identity",
+            get(relay_handlers::handle_presign_relay_identity),
+        )
+        .route(
+            "/presign-relay/init",
+            post(relay_handlers::handle_presign_relay_init),
+        )
+        .route("/sign-relay", post(relay_handlers::handle_sign_relay))
         // Read-only
         .route("/health", get(handlers::handle_health))
         .route(
