@@ -13,6 +13,7 @@ pub mod provision;
 pub mod refresh_handler;
 pub mod refresh_relay_handlers;
 pub mod reshar_handler;
+pub mod reshare_relay_handlers;
 pub mod relay_handlers;
 pub mod sign_relay_handler;
 pub mod signing_handler;
@@ -119,6 +120,18 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/refresh-relay/init",
             post(refresh_relay_handlers::handle_refresh_relay_init),
+        )
+        // §18.2 container cross-(t,n) reshare over the relay (#35c pt2, CONTAINER
+        // target): arm the container as a reshare peer (phase A throwaway DKG +
+        // phase B PSS), combine, then store the rotated new-(t,n) share + purge
+        // presigs. Heavy MPC — container only, NOT the worker isolate.
+        .route(
+            "/reshare-relay/identity",
+            get(reshare_relay_handlers::handle_reshare_relay_identity),
+        )
+        .route(
+            "/reshare-relay/init",
+            post(reshare_relay_handlers::handle_reshare_relay_init),
         )
         // Read-only
         .route("/health", get(handlers::handle_health))

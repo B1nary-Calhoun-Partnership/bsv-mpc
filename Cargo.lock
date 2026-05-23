@@ -363,6 +363,7 @@ dependencies = [
  "cggmp24",
  "chrono",
  "futures",
+ "generic-ec",
  "hex",
  "hmac",
  "pin-project",

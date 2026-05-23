@@ -41,8 +41,13 @@ futures.workspace = true
 # already locked in the workspace patch table at the root Cargo.toml.
 cggmp24.workspace = true
 
-[dev-dependencies]
+# §18.2 reshare-relay handler: production safe-prime generation for the throwaway
+# new-set DKG (`PregeneratedPrimes::generate`) needs an RNG; generic-ec types for
+# decoding the NEW set's eval points and extracting the OLD share's secret/eval.
 rand.workspace = true
+generic-ec = { workspace = true }
+
+[dev-dependencies]
 tempfile.workspace = true
 reqwest.workspace = true
 serde_json.workspace = true

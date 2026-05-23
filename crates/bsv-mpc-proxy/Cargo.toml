@@ -33,11 +33,13 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 chrono.workspace = true
 anyhow.workspace = true
+# §18.2 reshare-over-relay orchestrator (#35c pt2): the proxy plays the new-set
+# parties in-process — it needs the cggmp24 KeyShare type + generic-ec scalars to
+# build the NEW eval points and extract the proxy's OLD secret/eval from its share.
+cggmp24.workspace = true
+generic-ec = { workspace = true }
 
 [dev-dependencies]
-# #12 relay-combiner deployed e2e: generate a real DKG + correlated presig pair
-# (bsv-mpc-core public API) and serialize Presignature_A (needs the cggmp24 type).
-cggmp24.workspace = true
 # §06.17.1 CONTAINER-target hermetic gate (#30): generate real 2-of-2 key shares
 # locally via the round_based simulator (keygen + auxinfo) before driving the
 # presign-over-relay against an in-process bsv-mpc-service.

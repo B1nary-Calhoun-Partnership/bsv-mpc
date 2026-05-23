@@ -226,6 +226,36 @@ fn hex_decode(hex: &str) -> std::result::Result<Vec<u8>, MpcError> {
         .collect()
 }
 
+/// Result of a §18.2 cross-(t,n) reshare over the relay
+/// ([`MpcBridge::reshare_change_threshold_over_relay`]). The joint pubkey is
+/// UNCHANGED (the §18 invariant); the proxy holds the two new-set parties' shares
+/// (the container stored party 0).
+#[derive(Debug, Clone)]
+pub struct ReshareSummary {
+    /// The UNCHANGED joint pubkey (hex compressed) — the reshare invariant.
+    pub joint_pubkey_hex: String,
+    /// The new threshold `t'`.
+    pub new_threshold: u16,
+    /// The new party count `n'`.
+    pub new_parties: u16,
+    /// The proxy's signing-ready new-set KeyShares: `(new_index, KeyShare JSON)`.
+    /// Parties 1 and 2 of the new 2-of-3 set (party 0 is held by the container).
+    pub proxy_key_shares_json: Vec<(u16, Vec<u8>)>,
+}
+
+/// Fresh isolated (HashMap-backed) storage for a proxy throwaway-DKG party — its
+/// share is DISCARDED (only the aux is combined), so the data_dir is never
+/// written; a unique temp path avoids collisions between the two parties.
+fn fresh_throwaway_storage() -> Arc<RwLock<bsv_mpc_service::SqliteShareStorage>> {
+    use rand::RngCore;
+    let mut tag = [0u8; 8];
+    rand::rngs::OsRng.fill_bytes(&mut tag);
+    let dir = std::env::temp_dir().join(format!("mpc-proxy-reshare-throwaway-{}", hex_encode(&tag)));
+    let path = dir.to_string_lossy().to_string();
+    let s = bsv_mpc_service::SqliteShareStorage::open(&path).expect("open throwaway storage");
+    Arc::new(RwLock::new(s))
+}
+
 // ============================================================================
 // BRC-31 Auth Client (proxy → KSS)
 // ============================================================================
@@ -1637,6 +1667,384 @@ impl MpcBridge {
         )?;
 
         Ok((hex_encode(&commit.joint_pubkey_compressed), audit.purged))
+    }
+
+    /// **§18.2 cross-(t,n) reshare 2-of-2 → 2-of-3 over the relay (issue #35c pt2),
+    /// CONTAINER target.**
+    ///
+    /// Moves party 0 of the proven `reshar_full_2of2_to_2of3_via_messagebox_e2e`
+    /// ceremony onto the deployed container; the PROXY plays the two remaining
+    /// new-set parties (new index 1 = the continuing contributor that reuses the
+    /// proxy's OLD secret, new index 2 = recipient-only) as in-process agents over
+    /// the relay, each with its own fresh relay identity.
+    ///
+    /// Sequence (mirrors the proven test exactly, two sequential phases):
+    /// - **Phase A:** a throwaway new-set 2-of-3 DKG over `mpc-dkg` (the proxy's two
+    ///   parties + the container) — each party keeps its own aux (aux is
+    ///   key-independent).
+    /// - **Phase B:** the cross-(t,n) PSS reshare of the ORIGINAL key K over
+    ///   `mpc-refresh`, preserving the joint pubkey.
+    /// - **Combine:** `combine_reshared_with_aux(pss, throwaway_dkg)` for each of the
+    ///   proxy's two parties → signing-ready new-set KeyShares.
+    ///
+    /// The container is armed ASYNC (so the relay can sync all parties while the
+    /// proxy drives its own); its HTTP response is awaited before the proxy's
+    /// own PSS commit. The container stores its own rotated (new-(t,n)) share.
+    ///
+    /// Returns a [`ReshareSummary`] with the UNCHANGED joint pubkey and the proxy's
+    /// two new-set KeyShares (the proxy holds parties 1 and 2; the container stored
+    /// party 0). NOTE: this method does NOT mutate the proxy's live `self.share`
+    /// (which remains the OLD 2-of-2 share); persisting/installing the new-set
+    /// shares for a subsequent 2-of-3 sign is left to the caller / a follow-up.
+    pub async fn reshare_change_threshold_over_relay(
+        &self,
+        timeout: std::time::Duration,
+    ) -> bsv_mpc_core::error::Result<ReshareSummary> {
+        use bsv_mpc_core::reshar_coordinator::{
+            combine_reshared_with_aux, ContributorInputs, ResharConfig,
+        };
+        use bsv_mpc_messagebox::types::{BOX_DKG, BOX_REFRESH};
+        use bsv_mpc_messagebox::MessageBoxClient;
+        use bsv_mpc_service::{DkgHandler, MessageBoxListener, ResharHandler};
+        use cggmp24::security_level::SecurityLevel128;
+        use cggmp24::supported_curves::Secp256k1;
+        use cggmp24::{KeyShare, PregeneratedPrimes};
+        use generic_ec::{NonZero, Scalar, SecretScalar};
+        use rand::RngCore;
+
+        let proto =
+            |e: bsv_mpc_messagebox::error::MessageBoxError| MpcError::Protocol(e.to_string());
+
+        // ── New 2-of-3 params (fixed for the deployed 2-of-2 → 2-of-3 path) ──
+        let new_t: u16 = 2;
+        let n_new: u16 = 3;
+        let new_cfg = ThresholdConfig::new(new_t, n_new)?;
+        let new_eval: Vec<NonZero<Scalar<Secp256k1>>> = (1..=n_new)
+            .map(|i| {
+                NonZero::from_scalar(Scalar::from(i as u64))
+                    .ok_or_else(|| MpcError::Protocol("zero new eval point".into()))
+            })
+            .collect::<bsv_mpc_core::error::Result<_>>()?;
+        let new_eval_points_hex: Vec<String> = new_eval
+            .iter()
+            .map(|s| hex_encode(s.as_ref().to_be_bytes().as_bytes()))
+            .collect();
+        let contributor_new_indices: Vec<u16> = vec![0, 1];
+        let contributor_old_indices: Vec<u16> = vec![0, 1];
+
+        // ── The UNCHANGED joint pubkey K ──
+        let jpk_bytes: Vec<u8> = {
+            let mut s = self.current_share();
+            if s.joint_pubkey_compressed.len() != 33 {
+                s.joint_pubkey_compressed = self.joint_key.compressed.clone();
+            }
+            s.joint_pubkey_compressed
+        };
+        if jpk_bytes.len() != 33 {
+            return Err(MpcError::Protocol(
+                "reshare: joint pubkey must be 33 bytes".into(),
+            ));
+        }
+
+        // ── Extract the proxy's OLD secret + eval points from its OLD share ──
+        // (the proxy is old index 1 of the 2-of-2 = new index 1, a contributor).
+        let old_share = self.current_share();
+        let old_keyshare: KeyShare<Secp256k1, SecurityLevel128> =
+            serde_json::from_slice(&old_share.ciphertext).map_err(|e| {
+                MpcError::Protocol(format!("reshare: bad proxy old key share: {e}"))
+            })?;
+        let proxy_old_index: u16 = old_keyshare.core.i;
+        let old_eval: Vec<NonZero<Scalar<Secp256k1>>> = old_keyshare
+            .core
+            .key_info
+            .vss_setup
+            .as_ref()
+            .ok_or_else(|| MpcError::Protocol("reshare: proxy old share has no VSS setup".into()))?
+            .I
+            .clone();
+        let proxy_old_secret: Scalar<Secp256k1> =
+            *<SecretScalar<Secp256k1> as AsRef<Scalar<Secp256k1>>>::as_ref(&old_keyshare.core.x);
+        // The contributor subset's OLD eval points (ascending by old index).
+        let subset_old_eval: Vec<NonZero<Scalar<Secp256k1>>> = contributor_old_indices
+            .iter()
+            .map(|k| old_eval[*k as usize])
+            .collect();
+
+        // ── Sessions ──
+        let mk_session = |tag: &str| {
+            let mut seed = [0u8; 16];
+            rand::rngs::OsRng.fill_bytes(&mut seed);
+            SessionId::from_str_hash(&format!("reshare-{tag}-{}-{}", self.agent_id, hex_encode(&seed)))
+        };
+        let dkg_session = mk_session("dkg");
+        let reshare_session = mk_session("pss");
+
+        // ── The proxy's TWO in-process new-set parties (1, 2): fresh relay
+        //    identities + clients ──
+        let proxy_new_indices: [u16; 2] = [1, 2];
+        let mut proxy_privs: Vec<PrivateKey> = Vec::new();
+        let mut proxy_clients: Vec<MessageBoxClient> = Vec::new();
+        let mut proxy_pubs: Vec<String> = Vec::new();
+        for _ in 0..2 {
+            let mut b = [0u8; 32];
+            rand::rngs::OsRng.fill_bytes(&mut b);
+            b[0] |= 0x01;
+            let p = PrivateKey::from_bytes(&b)
+                .map_err(|e| MpcError::Protocol(format!("reshare: party identity: {e}")))?;
+            let c = MessageBoxClient::new(&self.relay_url, p.clone()).map_err(proto)?;
+            let ph = c.identity_hex().await.map_err(proto)?;
+            proxy_privs.push(p);
+            proxy_clients.push(c);
+            proxy_pubs.push(ph);
+        }
+
+        // ── Fetch the container's relay identity (new party 0) FIRST (§06.17) ──
+        let init_url = format!("{}/reshare-relay/init", self.presign_url);
+        let container_pub_hex = crate::relay_reshare::fetch_peer_identity(&init_url).await?;
+
+        // The full new-set identity map: 0 = container, 1/2 = proxy parties.
+        let identity_for = |idx: u16| -> String {
+            match idx {
+                0 => container_pub_hex.clone(),
+                1 => proxy_pubs[0].clone(),
+                2 => proxy_pubs[1].clone(),
+                _ => unreachable!("only 0,1,2 in a 2-of-3 reshare"),
+            }
+        };
+        let peers_for = |me: u16| -> Vec<(u16, String)> {
+            (0..n_new)
+                .filter(|&k| k != me)
+                .map(|k| (k, identity_for(k)))
+                .collect()
+        };
+
+        // ── Arm the container (new party 0) FIRST + ASYNC so its phase-A slot is
+        //    live before the proxy ships round-1 (§06.17 ordering). The container
+        //    runs BOTH phases SEQUENTIALLY for party 0 (phase A on mpc-dkg, then —
+        //    after aux completes — phase B on mpc-refresh) and stores its rotated
+        //    new-(t,n) share on commit. The proxy mirrors that sequencing below;
+        //    phase A (a JOINT DKG) completing is the cross-party sync to phase B.
+        //    Sequential per identity (one relay subscription at a time) avoids the
+        //    §06.17 two-subscription split race. ──
+        let presign_auth = self.presign_auth.clone();
+        let arm = crate::relay_reshare::ContainerArm {
+            url: init_url,
+            agent_id: self.agent_id.clone(),
+            dkg_session_hex: dkg_session.hex(),
+            reshare_session_hex: reshare_session.hex(),
+            my_new_index: 0,
+            new_threshold: new_t,
+            new_parties: n_new,
+            new_eval_points_hex,
+            contributor_new_indices: contributor_new_indices.clone(),
+            contributor_old_indices: contributor_old_indices.clone(),
+            peers: proxy_new_indices
+                .iter()
+                .enumerate()
+                .map(|(pos, &idx)| crate::relay_reshare::ReshareRelayPeer {
+                    index: idx,
+                    pub_hex: proxy_pubs[pos].clone(),
+                })
+                .collect(),
+        };
+        let arm_timeout = timeout + std::time::Duration::from_secs(60);
+        let arm_handle = tokio::spawn(async move {
+            let request_signer = move |method: &str,
+                                       path: &str,
+                                       body: &[u8]|
+                  -> bsv_mpc_core::error::Result<Vec<(String, String)>> {
+                let guard = presign_auth
+                    .lock()
+                    .map_err(|_| MpcError::Protocol("presign auth mutex poisoned".into()))?;
+                if !guard.is_authenticated() {
+                    return Ok(vec![]);
+                }
+                Ok(guard
+                    .auth_header_pairs(method, path, body)?
+                    .into_iter()
+                    .map(|(k, v)| (k.to_string(), v))
+                    .collect())
+            };
+            crate::relay_reshare::arm_container(&arm, &request_signer, arm_timeout).await
+        });
+
+        // ════ PHASE A — throwaway 2-of-3 DKG over the relay (proxy parties 1,2) ══
+        // Two safe-prime sets generated in parallel (the slow step).
+        let mut primes: Vec<PregeneratedPrimes<SecurityLevel128>> =
+            tokio::task::spawn_blocking(|| {
+                (0..2)
+                    .map(|_| {
+                        std::thread::spawn(|| {
+                            PregeneratedPrimes::<SecurityLevel128>::generate(&mut rand::rngs::OsRng)
+                        })
+                    })
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .map(|h| h.join().expect("prime thread"))
+                    .collect()
+            })
+            .await
+            .map_err(|e| MpcError::Protocol(format!("reshare: prime gen task panicked: {e}")))?;
+
+        let dkg_handlers: Vec<DkgHandler> = proxy_new_indices
+            .iter()
+            .map(|&idx| DkgHandler::new(new_cfg, idx, fresh_throwaway_storage()))
+            .collect();
+        for h in &dkg_handlers {
+            h.seed_primes_for(dkg_session, primes.remove(0));
+        }
+        let mut dkg_listeners: Vec<MessageBoxListener> = Vec::new();
+        for (pos, h) in dkg_handlers.iter().enumerate() {
+            let l = MessageBoxListener::start(proxy_clients[pos].clone(), BOX_DKG, h.handler_fn())
+                .await
+                .map_err(|e| MpcError::Protocol(format!("reshare dkg listener: {e}")))?;
+            dkg_listeners.push(l);
+        }
+        let mut dkg_rxs = Vec::new();
+        let mut dkg_sends: Vec<(usize, Vec<bsv_mpc_service::OutgoingRoundMessage>)> = Vec::new();
+        for (pos, &idx) in proxy_new_indices.iter().enumerate() {
+            let (rx, out) = dkg_handlers[pos]
+                .initiate(dkg_session, peers_for(idx))
+                .await
+                .map_err(|e| MpcError::Protocol(format!("reshare dkg initiate: {e}")))?;
+            dkg_rxs.push(rx);
+            dkg_sends.push((pos, out));
+        }
+        for (pos, out) in dkg_sends {
+            for o in out {
+                proxy_clients[pos]
+                    .send_round_message(&o.recipient_pub_hex, &o.message_box, &o.round_msg, o.params)
+                    .await
+                    .map_err(proto)?;
+            }
+        }
+
+        // Await phase A (proxy parties' aux), then RELEASE the DKG subscriptions
+        // before phase B starts (sequential — one subscription per identity).
+        let mut proxy_aux: Vec<bsv_mpc_core::types::DkgResult> = Vec::new();
+        for (pos, &idx) in proxy_new_indices.iter().enumerate() {
+            match tokio::time::timeout(timeout, &mut dkg_rxs[pos]).await {
+                Ok(Ok(r)) => proxy_aux.push(r),
+                Ok(Err(e)) => {
+                    for l in dkg_listeners { let _ = l.shutdown().await; }
+                    return Err(MpcError::Protocol(format!("reshare: party {idx} DKG channel dropped: {e}")));
+                }
+                Err(_) => {
+                    for l in dkg_listeners { let _ = l.shutdown().await; }
+                    return Err(MpcError::Protocol(format!("reshare: party {idx} timed out awaiting throwaway DKG aux")));
+                }
+            }
+        }
+        for l in dkg_listeners { let _ = tokio::time::timeout(std::time::Duration::from_secs(10), l.shutdown()).await; }
+
+        // ════ PHASE B — cross-(t,n) PSS reshare over the relay (proxy parties 1,2) ══
+        let reshar_handlers: Vec<ResharHandler> =
+            proxy_new_indices.iter().map(|_| ResharHandler::new()).collect();
+        let mut pss_listeners: Vec<MessageBoxListener> = Vec::new();
+        for (pos, h) in reshar_handlers.iter().enumerate() {
+            let l =
+                MessageBoxListener::start(proxy_clients[pos].clone(), BOX_REFRESH, h.handler_fn())
+                    .await
+                    .map_err(|e| MpcError::Protocol(format!("reshare pss listener: {e}")))?;
+            pss_listeners.push(l);
+        }
+        let mut pss_rxs = Vec::new();
+        let mut pss_sends: Vec<(usize, Vec<bsv_mpc_service::OutgoingRoundMessage>)> = Vec::new();
+        for (pos, &idx) in proxy_new_indices.iter().enumerate() {
+            // New party 1 is the continuing contributor (uses the proxy's old
+            // secret); new party 2 is recipient-only.
+            let contributor = if idx == 1 {
+                let my_subset_pos = contributor_old_indices
+                    .iter()
+                    .position(|k| *k == proxy_old_index)
+                    .ok_or_else(|| {
+                        MpcError::Protocol(format!(
+                            "reshare: proxy old index {proxy_old_index} not in contributor set"
+                        ))
+                    })?;
+                Some(ContributorInputs {
+                    my_subset_pos,
+                    subset_eval_points: subset_old_eval.clone(),
+                    my_old_secret: proxy_old_secret,
+                })
+            } else {
+                None
+            };
+            let config = ResharConfig {
+                session_id: reshare_session,
+                my_new_index: idx,
+                new_eval_points: new_eval.clone(),
+                new_t,
+                contributor_new_indices: contributor_new_indices.clone(),
+                original_joint_pubkey: jpk_bytes.clone(),
+                contributor,
+            };
+            let (rx, out) = reshar_handlers[pos]
+                .initiate(config, peers_for(idx))
+                .await
+                .map_err(|e| MpcError::Protocol(format!("reshare pss initiate: {e}")))?;
+            pss_rxs.push(rx);
+            pss_sends.push((pos, out));
+        }
+        for (pos, out) in pss_sends {
+            for o in out {
+                proxy_clients[pos]
+                    .send_round_message(&o.recipient_pub_hex, &o.message_box, &o.round_msg, o.params)
+                    .await
+                    .map_err(proto)?;
+            }
+        }
+
+        // ── Await phase B (PSS commits) + combine each with its phase-A aux ──
+        let mut proxy_key_shares_json: Vec<(u16, Vec<u8>)> = Vec::new();
+        for (pos, &idx) in proxy_new_indices.iter().enumerate() {
+            let commit = match tokio::time::timeout(timeout, &mut pss_rxs[pos]).await {
+                Ok(Ok(c)) => c,
+                Ok(Err(e)) => {
+                    for l in pss_listeners { let _ = l.shutdown().await; }
+                    return Err(MpcError::Protocol(format!("reshare: party {idx} PSS channel dropped: {e}")));
+                }
+                Err(_) => {
+                    for l in pss_listeners { let _ = l.shutdown().await; }
+                    return Err(MpcError::Protocol(format!("reshare: party {idx} timed out awaiting PSS commit")));
+                }
+            };
+            if commit.joint_pubkey_compressed != jpk_bytes {
+                for l in pss_listeners { let _ = l.shutdown().await; }
+                return Err(MpcError::Protocol(format!(
+                    "reshare: party {idx} joint pubkey CHANGED (reshare invariant violated)"
+                )));
+            }
+            let combined =
+                combine_reshared_with_aux(&commit.incomplete_share_json, &proxy_aux[pos].share.ciphertext)?;
+            proxy_key_shares_json.push((idx, combined));
+        }
+        for l in pss_listeners { let _ = tokio::time::timeout(std::time::Duration::from_secs(10), l.shutdown()).await; }
+
+        // ── Confirm the container armed + responded (it stored its own party-0
+        //    share on commit). ──
+        match arm_handle.await {
+            Ok(Ok(armed_pub)) => {
+                if armed_pub != container_pub_hex {
+                    return Err(MpcError::Protocol(format!(
+                        "reshare: container relay identity changed between identity ({container_pub_hex}) and arm ({armed_pub})"
+                    )));
+                }
+            }
+            Ok(Err(e)) => return Err(e),
+            Err(e) => {
+                return Err(MpcError::Protocol(format!(
+                    "reshare: container arm task panicked: {e}"
+                )))
+            }
+        }
+
+        Ok(ReshareSummary {
+            joint_pubkey_hex: hex_encode(&jpk_bytes),
+            new_threshold: new_t,
+            new_parties: n_new,
+            proxy_key_shares_json,
+        })
     }
 
     /// Shared §06.18 invalidation primitive: purge every bundle the `trigger`

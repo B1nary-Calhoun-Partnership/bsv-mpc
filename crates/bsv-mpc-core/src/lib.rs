@@ -75,7 +75,8 @@ pub use error::{MpcError, Result};
 pub use refresh::RefreshResult;
 pub use refresh_coordinator::{RefreshCommit, RefreshCoordinator, RefreshRoundResult};
 pub use reshar_coordinator::{
-    ContributorInputs, ResharCommit, ResharConfig, ResharCoordinator, ResharRoundResult,
+    combine_reshared_with_aux, ContributorInputs, ResharCommit, ResharConfig, ResharCoordinator,
+    ResharRoundResult,
 };
 pub use types::{
     DkgResult, EncryptedShare, InvalidationTrigger, JointPublicKey, ParticipationProof, PolicyId,

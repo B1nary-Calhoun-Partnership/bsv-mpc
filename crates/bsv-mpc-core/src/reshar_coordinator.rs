@@ -294,6 +294,60 @@ impl ResharCoordinator {
     }
 }
 
+/// Combine a reshared `IncompleteKeyShare` (for the ORIGINAL key, from the PSS
+/// phase) with the **aux** from a throwaway new-set DKG (for a different key) into
+/// a signing-ready `KeyShare` for the ORIGINAL key.
+///
+/// The deployed cross-(t,n) reshare obtains the new party set's aux by running a
+/// throwaway DKG over the relay and keeping each party's own aux — aux is
+/// independent of the secret-share value, so `from_parts(reshared_incomplete,
+/// throwaway_aux)` is valid (proven composable in the #35a/#35b/#35c gates). This
+/// re-uses the proven n-party relay DKG for aux without any new aux-only protocol.
+///
+/// - `incomplete_share_json` — serialized `IncompleteKeyShare` from a [`ResharCommit`].
+/// - `throwaway_keyshare_json` — serialized cggmp24 `KeyShare` from the throwaway
+///   new-set DKG (this party's, at the SAME new-set index). Its keygen part is
+///   discarded; only its `aux` is used.
+///
+/// # Errors
+/// `MpcError::Protocol` on decode failure, index mismatch between the reshared
+/// share and the throwaway share, or `from_parts` validation failure.
+pub fn combine_reshared_with_aux(
+    incomplete_share_json: &[u8],
+    throwaway_keyshare_json: &[u8],
+) -> Result<Vec<u8>> {
+    use cggmp24::key_share::{IncompleteKeyShare, KeyShare, Validate};
+    use cggmp24::security_level::SecurityLevel128;
+
+    let incomplete: IncompleteKeyShare<Secp256k1> = serde_json::from_slice(incomplete_share_json)
+        .map_err(|e| MpcError::Protocol(format!("reshar combine: bad incomplete share: {e}")))?;
+    let throwaway: KeyShare<Secp256k1, SecurityLevel128> =
+        serde_json::from_slice(throwaway_keyshare_json)
+            .map_err(|e| MpcError::Protocol(format!("reshar combine: bad throwaway share: {e}")))?;
+
+    // The aux must be for the SAME party index as the reshared share.
+    if incomplete.clone().into_inner().i != throwaway.core.i {
+        return Err(MpcError::Protocol(format!(
+            "reshar combine: index mismatch (incomplete {} vs aux {})",
+            incomplete.clone().into_inner().i,
+            throwaway.core.i
+        )));
+    }
+
+    // The aux inside a complete KeyShare is by-construction valid; re-wrap the
+    // DirtyAuxInfo as the validated AuxInfo `from_parts` expects.
+    let aux = throwaway
+        .into_inner()
+        .aux
+        .validate()
+        .map_err(|e| MpcError::Protocol(format!("reshar combine: aux re-validate: {e}")))?;
+    let combined: KeyShare<Secp256k1, SecurityLevel128> =
+        KeyShare::from_parts((incomplete, aux))
+            .map_err(|e| MpcError::Protocol(format!("reshar combine: from_parts failed: {e}")))?;
+    serde_json::to_vec(&combined)
+        .map_err(|e| MpcError::Protocol(format!("reshar combine: serialize: {e}")))
+}
+
 fn scalar_to_bytes(s: &Scalar<Secp256k1>) -> Vec<u8> {
     s.to_be_bytes().as_bytes().to_vec()
 }
