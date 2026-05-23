@@ -12,6 +12,7 @@ pub mod presign_handler;
 pub mod provision;
 pub mod refresh_handler;
 pub mod refresh_relay_handlers;
+pub mod reshar_handler;
 pub mod relay_handlers;
 pub mod sign_relay_handler;
 pub mod signing_handler;
@@ -20,6 +21,7 @@ pub mod storage;
 pub use auth::AuthState;
 pub use dkg_handler::DkgHandler;
 pub use refresh_handler::RefreshHandler;
+pub use reshar_handler::ResharHandler;
 pub use messagebox::{HandlerFuture, MessageBoxListener, OutgoingRoundMessage};
 pub use presign_handler::{
     BundleStore, FileBundleStore, InMemoryBundleStore, PresignHandler, PresignHandlerConfig,
