@@ -281,10 +281,13 @@ impl SigningCoordinator {
     /// Worker wasm budget; the heavy presig generation runs natively per
     /// ADR-018).
     ///
-    /// **Base key only.** Presignatures bake the key in at generation time and
-    /// `issue_partial_signature`/`combine` take no additive shift, so BRC-42
-    /// HD-derived signing (`hmac_offset`) must use the 4-round [`sign`](Self::sign)
-    /// path. Callers with a non-`None` offset must not use this method.
+    /// **Base key (no offset).** This signs for the base joint key. For BRC-42
+    /// HD-derived child-key signing in the same single round, use
+    /// [`sign_with_presignature_with_offset`](Self::sign_with_presignature_with_offset)
+    /// with the 32-byte offset (issue #26) — that path applies the additive shift
+    /// to both the secret presig share and the shared public data, matching the
+    /// offset every cosigner applies via
+    /// [`crate::presig_encryption::decrypt_and_issue_partial`].
     ///
     /// # Arguments
     /// * `message_hash` — the 32-byte SHA-256d BSV sighash.
@@ -295,19 +298,60 @@ impl SigningCoordinator {
         message_hash: &[u8; 32],
         presignature_raw: Box<dyn std::any::Any + Send>,
     ) -> Result<Vec<RoundMessage>> {
+        self.sign_with_presignature_with_offset(message_hash, presignature_raw, None)
+    }
+
+    /// **1-round HD-derived signing from a presignature (MPC-Spec §03.8 / §06.20,
+    /// issue #26).**
+    ///
+    /// Identical to [`sign_with_presignature`](Self::sign_with_presignature) but,
+    /// when `brc42_offset` is `Some(off)`, applies the BRC-42 additive shift to
+    /// THIS (coordinator) party's presig share AND to the shared public data
+    /// BEFORE issuing its own partial — exactly as the hermetic test
+    /// `presig_consume_with_brc42_offset_signs_child_key` does manually:
+    /// `apply_brc42_offset(&mut presig, &off)` +
+    /// `apply_brc42_offset_public_data(&mut public_data, &off)`. ALL signers
+    /// (this coordinator + every cosigner via
+    /// [`crate::presig_encryption::decrypt_and_issue_partial`]) MUST apply the
+    /// SAME 32-byte offset; the combined signature then verifies under
+    /// `child_pub = joint_pub + offset·G` and NOT under the base joint key.
+    ///
+    /// With `brc42_offset == None` this is byte-for-byte equivalent to
+    /// `sign_with_presignature` (base-key signing).
+    ///
+    /// # Arguments
+    /// * `message_hash` — the 32-byte SHA-256d BSV sighash.
+    /// * `presignature_raw` — the boxed `(Presignature, PresignaturePublicData)`.
+    /// * `brc42_offset` — optional 32-byte BRC-42 offset; interpreted as a scalar
+    ///   via `Scalar::from_be_bytes_mod_order` (same as the cosigner side).
+    pub fn sign_with_presignature_with_offset(
+        &mut self,
+        message_hash: &[u8; 32],
+        presignature_raw: Box<dyn std::any::Any + Send>,
+        brc42_offset: Option<[u8; 32]>,
+    ) -> Result<Vec<RoundMessage>> {
         if self.mode != SigningMode::NotStarted {
             return Err(MpcError::Signing(
                 "sign_with_presignature() called but signing already started".into(),
             ));
         }
 
-        let (presig, public_data) = *presignature_raw
+        let (mut presig, mut public_data) = *presignature_raw
             .downcast::<crate::presigning::PresignOutput>()
             .map_err(|_| {
                 MpcError::Signing(
                     "presignature_raw is not the expected cggmp24 presignature type".into(),
                 )
             })?;
+
+        // BRC-42 HD-derived signing (issue #26): apply the SAME additive offset
+        // the cosigners apply, on BOTH the secret presig share and the shared
+        // public data, before issuing this party's partial.
+        if let Some(off) = brc42_offset {
+            let off_scalar = Scalar::<Secp256k1>::from_be_bytes_mod_order(off);
+            apply_brc42_offset(&mut presig, &off_scalar);
+            apply_brc42_offset_public_data(&mut public_data, &off_scalar);
+        }
 
         let my_signing_index = self.signing_index()?;
 
@@ -378,16 +422,42 @@ impl SigningCoordinator {
         own_presig_json: &[u8],
         public_data: PresignaturePublicData<Secp256k1>,
     ) -> Result<Vec<RoundMessage>> {
+        self.sign_from_bundle_with_offset(message_hash, own_presig_json, public_data, None)
+    }
+
+    /// HD-derived (§06.20) variant of [`sign_from_bundle`](Self::sign_from_bundle):
+    /// when `brc42_offset` is `Some`, applies the BRC-42 additive shift to BOTH
+    /// this party's presig ([`apply_brc42_offset`]) AND the shared public data
+    /// ([`apply_brc42_offset_public_data`]) before issuing the partial, so the
+    /// combined signature verifies under `child_pub = joint + offset·G`. The
+    /// cosigner applies the SAME offset via
+    /// [`crate::presig_encryption::decrypt_and_issue_partial`]. `None` = base key
+    /// (identical to [`sign_from_bundle`]).
+    pub fn sign_from_bundle_with_offset(
+        &mut self,
+        message_hash: &[u8; 32],
+        own_presig_json: &[u8],
+        mut public_data: PresignaturePublicData<Secp256k1>,
+        brc42_offset: Option<[u8; 32]>,
+    ) -> Result<Vec<RoundMessage>> {
         if self.mode != SigningMode::NotStarted {
             return Err(MpcError::Signing(
                 "sign_from_bundle() called but signing already started".into(),
             ));
         }
 
-        let presig: cggmp24::signing::Presignature<Secp256k1> =
+        let mut presig: cggmp24::signing::Presignature<Secp256k1> =
             serde_json::from_slice(own_presig_json).map_err(|e| {
                 MpcError::Signing(format!("deserialize own presig share from bundle: {e}"))
             })?;
+
+        // §06.20 HD path: shift this party's presig + the shared public data by the
+        // BRC-42 offset (matches the cosigner's decrypt_and_issue_partial(Some)).
+        if let Some(off) = brc42_offset {
+            let off_scalar = Scalar::<Secp256k1>::from_be_bytes_mod_order(off);
+            apply_brc42_offset(&mut presig, &off_scalar);
+            apply_brc42_offset_public_data(&mut public_data, &off_scalar);
+        }
 
         let my_signing_index = self.signing_index()?;
 
@@ -2138,6 +2208,126 @@ mod tests {
         assert!(
             !base_pub.verify(&message_hash, &bsv_sig),
             "HD signature must NOT verify under the base joint key"
+        );
+    }
+
+    /// §06.20 + §03.8 + issue #26 RELAY-INTERNAL HD path: the SAME scenario as
+    /// `presig_consume_with_brc42_offset_signs_child_key`, but the coordinator
+    /// applies its BRC-42 offset THROUGH the production entry point
+    /// [`SigningCoordinator::sign_with_presignature_with_offset`] (NOT the manual
+    /// `apply_brc42_offset` calls). Proves the relay sign path the proxy drives
+    /// produces a child-key signature that verifies under `joint + offset·G` and
+    /// NOT under the base joint key — i.e. the internal offset wiring matches the
+    /// proven primitive exactly.
+    #[tokio::test]
+    async fn presig_relay_internal_offset_signs_child_key() {
+        use generic_ec::{Point, Scalar};
+        let config = ThresholdConfig::new(2, 2).unwrap();
+        let key_shares = dkg_key_shares(2, 2);
+        let participants: Vec<u16> = vec![0, 1];
+        let mut rng = rand::rngs::OsRng;
+        let eid_bytes: [u8; 32] = rand::Rng::gen(&mut rng);
+        let eid_presign = ExecutionId::new(&eid_bytes);
+        let presigs = round_based::sim::run_with_setup(
+            participants.iter().map(|i| &key_shares[usize::from(*i)]),
+            |i, party, share| {
+                let party = buffer_outgoing(party);
+                let mut party_rng = rand::rngs::OsRng;
+                let participants = participants.clone();
+                async move {
+                    cggmp24::signing(eid_presign, i, &participants, share)
+                        .generate_presignature(&mut party_rng, party)
+                        .await
+                }
+            },
+        )
+        .unwrap()
+        .expect_ok()
+        .into_vec();
+
+        let session = SessionId::from_str_hash("presig-relay-internal-hd");
+        let share0 = key_share_to_encrypted(&key_shares[0], 0, config);
+        let mut coord0 = SigningCoordinator::new(session, share0, config, participants.clone());
+        let message_hash: [u8; 32] = {
+            let mut h = sha2::Sha256::new();
+            h.update(b"relay-internal hd-offset message");
+            let mut b = [0u8; 32];
+            b.copy_from_slice(&h.finalize());
+            b
+        };
+
+        // A fixed 32-byte BRC-42 offset, applied identically by both signers.
+        let offset_bytes: [u8; 32] = {
+            let mut h = sha2::Sha256::new();
+            h.update(b"test-brc42-offset");
+            let mut b = [0u8; 32];
+            b.copy_from_slice(&h.finalize());
+            b
+        };
+
+        let mut it = presigs.into_iter();
+        let (presig0, pub0) = it.next().unwrap();
+        let presig1 = it.next().unwrap();
+
+        // Coordinator applies the offset via the PRODUCTION entry point — NOT the
+        // manual apply_brc42_offset / apply_brc42_offset_public_data calls.
+        let out0 = coord0
+            .sign_with_presignature_with_offset(
+                &message_hash,
+                Box::new((presig0, pub0)),
+                Some(offset_bytes),
+            )
+            .expect("coord0 issue partial (internal offset)");
+        let _ = out0;
+
+        // Cosigner: decrypt + apply the SAME offset via the §06.20 path.
+        let cosigner_priv = bsv::primitives::ec::PrivateKey::from_bytes(&[0x77; 32]).unwrap();
+        let wallet = crate::presig_encryption::wallet_from_identity(&cosigner_priv);
+        let presig_id = "presig-relay-internal-hd-001";
+        let share_bytes = serde_json::to_vec(&presig1.0).unwrap();
+        let ciphertext =
+            crate::presig_encryption::encrypt_presig_share(&wallet, presig_id, &share_bytes)
+                .unwrap();
+        let partial1_json = crate::presig_encryption::decrypt_and_issue_partial(
+            &wallet,
+            presig_id,
+            &ciphertext,
+            &message_hash,
+            Some(offset_bytes),
+        )
+        .expect("§06.20 decrypt + offset + issue partial");
+
+        let cosigner_msg = RoundMessage {
+            session_id: session,
+            round: 1,
+            from: ShareIndex(1),
+            to: None,
+            payload: partial1_json,
+        };
+        let sig = match coord0.process_round(vec![cosigner_msg]).unwrap() {
+            SigningRoundResult::Complete(r) => r,
+            _ => panic!("did not complete"),
+        };
+
+        let mut sig_bytes = [0u8; 64];
+        sig_bytes[..32].copy_from_slice(&sig.r);
+        sig_bytes[32..].copy_from_slice(&sig.s);
+        let bsv_sig = bsv::Signature::from_compact(&sig_bytes).unwrap();
+
+        // child_pub = joint_pub + offset·G.
+        let offset = Scalar::<Secp256k1>::from_be_bytes_mod_order(offset_bytes);
+        let joint_point = key_shares[0].core.shared_public_key;
+        let child_point = joint_point + Point::<Secp256k1>::generator() * offset;
+        let child_pub = bsv::PublicKey::from_bytes(&child_point.to_bytes(true)).unwrap();
+        let base_pub = bsv::PublicKey::from_bytes(&joint_point.to_bytes(true)).unwrap();
+
+        assert!(
+            child_pub.verify(&message_hash, &bsv_sig),
+            "relay-internal HD signature must verify under child_pub = joint + offset·G"
+        );
+        assert!(
+            !base_pub.verify(&message_hash, &bsv_sig),
+            "relay-internal HD signature must NOT verify under the base joint key"
         );
     }
 

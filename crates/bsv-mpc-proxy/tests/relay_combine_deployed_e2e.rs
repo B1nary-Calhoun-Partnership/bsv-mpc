@@ -171,6 +171,7 @@ To run: RELAY_COMBINE_E2E=1 cargo test -p bsv-mpc-proxy \\
         &sighash,
         box_b,
         &joint,
+        None, // base-key sign (no BRC-42 offset)
         DoTrigger {
             url: format!("{worker_url}/poc/sign-relay"),
             presig_a_json,
@@ -178,6 +179,7 @@ To run: RELAY_COMBINE_E2E=1 cargo test -p bsv-mpc-proxy \\
             agent_id: None,
             auth_headers: vec![],
             cosigner_encrypted_share: None,
+            brc42_offset: None,
         },
         None, // unauthed POC route — no canonical signer
         Duration::from_secs(40),

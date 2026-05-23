@@ -1344,6 +1344,13 @@ impl CosignerSessionDo {
             /// coordinator never held the worker's plaintext share.
             #[serde(default)]
             cosigner_encrypted_share: Option<String>,
+            /// **BRC-42 HD-derived child-key signing (MPC-Spec §06.20, issue
+            /// #26).** Hex of the 32-byte BRC-42 additive offset the combiner
+            /// applied to its own presig + public data; this worker applies the
+            /// SAME offset in `decrypt_and_issue_partial`. Omitted/`None` =
+            /// base-key signing.
+            #[serde(default)]
+            brc42_offset: Option<String>,
         }
 
         // ── 0. Owner-authz (BEFORE any share/presig material is touched) ────
@@ -1381,6 +1388,22 @@ impl CosignerSessionDo {
                 a
             }
             None => [0u8; 33],
+        };
+
+        // §06.20 / issue #26: optional BRC-42 offset (hex of 32 bytes). Reject
+        // malformed hex / wrong length with 400 (mirrors the sighash decode).
+        let brc42_offset = match &body.brc42_offset {
+            Some(h) => {
+                let b = hex::decode(h)
+                    .map_err(|e| Error::RustError(format!("brc42_offset: {e}")))?;
+                if b.len() != 32 {
+                    return Response::error("brc42_offset must be 32 bytes", 400);
+                }
+                let mut a = [0u8; 32];
+                a.copy_from_slice(&b);
+                Some(a)
+            }
+            None => None,
         };
 
         let session_id = match &body.session_id_hex {
@@ -1455,7 +1478,7 @@ impl CosignerSessionDo {
             &presig_id,
             &ciphertext,
             &sighash,
-            None,
+            brc42_offset,
         )
         .map_err(|e| Error::RustError(format!("§06.20 decrypt+issue_partial: {e}")))?;
 

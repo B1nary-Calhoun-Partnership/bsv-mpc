@@ -379,6 +379,7 @@ To run (BURNS REAL SATS): E2E_MAINNET=1 cargo test -p bsv-mpc-proxy \\
         &sighash,
         box_b,
         &joint,
+        None, // base-key sign (no BRC-42 offset)
         DoTrigger {
             url: format!("{worker_url}/poc/sign-relay"),
             presig_a_json,
@@ -386,6 +387,7 @@ To run (BURNS REAL SATS): E2E_MAINNET=1 cargo test -p bsv-mpc-proxy \\
             agent_id: None,
             auth_headers: vec![],
             cosigner_encrypted_share: None,
+            brc42_offset: None,
         },
         None, // unauthed POC route — no canonical signer
         Duration::from_secs(60),
@@ -654,9 +656,10 @@ async fn sec0620_deployed_decrypt_at_rest_real_mainnet_tx() {
         agent_id: Some(joint_hex.clone()),
         auth_headers: vec![], // filled by sign_over_relay from the bridge session
         cosigner_encrypted_share: None,
+        brc42_offset: None,
     };
     let sig = bridge
-        .sign_over_relay(&sighash, box_b, trigger, Duration::from_secs(60))
+        .sign_over_relay(&sighash, box_b, None, trigger, Duration::from_secs(60))
         .await
         .expect("proxy + deployed worker co-sign via authed /sign-relay (§06.20 decrypt-at-rest)");
     eprintln!("✔ co-signed via decrypt-at-rest pool path: DER {} bytes", sig.signature.len());

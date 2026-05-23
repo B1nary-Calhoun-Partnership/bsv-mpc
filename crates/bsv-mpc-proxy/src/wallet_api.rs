@@ -1056,12 +1056,17 @@ pub async fn get_public_key(
 ///
 /// Consumes one raw presig box from the proxy pool (`take_raw`); relay mode
 /// requires the pool to be stocked with `Presignature_B`s correlated (FIFO) with
-/// the cosigner DO's `Presignature_A` pool (provisioning automation, #4). Only
-/// base-key signing is supported here — BRC-42 HD-derived (`hmac_offset`)
-/// signing stays on the legacy 4-round HTTP path (handoff §3).
+/// the cosigner DO's `Presignature_A` pool (provisioning automation, #4).
+///
+/// BRC-42 HD-derived signing now works over the relay (MPC-Spec §06.20, issue
+/// #26): when `hmac_offset` is `Some`, the 32-byte additive offset is applied
+/// combiner-side (own presig + public data) AND shipped to the cosigner so it
+/// applies the SAME shift in `decrypt_and_issue_partial`. The result verifies
+/// under `child_pub = joint + offset·G`. `None` = base-key signing.
 async fn relay_sign(
     state: &AppState,
     sighash: &[u8; 32],
+    hmac_offset: Option<[u8; 32]>,
 ) -> std::result::Result<bsv_mpc_core::types::SigningResult, String> {
     let raw = {
         let mut mgr = state.presign_manager.write().await;
@@ -1083,11 +1088,20 @@ async fn relay_sign(
         // §06.17.1 coordinator-holds-ciphertext is wired through the bundle path
         // (issue #30); this pool-consume trigger leaves it `None`.
         cosigner_encrypted_share: None,
+        // Set by sign_over_relay from `hmac_offset` (the combiner applies it
+        // locally + ships the hex to the cosigner).
+        brc42_offset: None,
     };
 
     state
         .bridge
-        .sign_over_relay(sighash, raw, trigger, std::time::Duration::from_secs(60))
+        .sign_over_relay(
+            sighash,
+            raw,
+            hmac_offset,
+            trigger,
+            std::time::Duration::from_secs(60),
+        )
         .await
         .map_err(|e| format!("relay sign failed: {e}"))
 }
@@ -1171,11 +1185,13 @@ pub async fn create_signature_impl(state: &AppState, body: Value) -> Value {
         None
     };
 
-    // ADR-018 relay mode: route base-key signing through the deployed cosigner
-    // over the relay. HD-derived (hmac_offset) signing stays on the 4-round HTTP
-    // path (handoff §3 — the offset is baked into a presig at generation time).
-    let signing_result = if state.config.relay_sign && hmac_offset.is_none() {
-        match relay_sign(state, &msg_hash).await {
+    // ADR-018 relay mode: route signing through the deployed cosigner over the
+    // relay. Both base-key AND BRC-42 HD-derived (hmac_offset) signing now work
+    // over the relay (MPC-Spec §06.20, issue #26): the offset is applied at
+    // consume-time on both the combiner and cosigner sides, so HD signing no
+    // longer requires the legacy 4-round HTTP path.
+    let signing_result = if state.config.relay_sign {
+        match relay_sign(state, &msg_hash, hmac_offset).await {
             Ok(result) => result,
             Err(e) => return json!({ "error": format!("MPC signing failed: {}", e) }),
         }
@@ -1494,7 +1510,10 @@ pub async fn create_action_impl(state: &AppState, body: Value) -> Value {
         // path runs. (BRC-42-derived-key inputs would compute an offset and stay
         // on the HTTP path; not yet supported here.)
         let signing_result = if state.config.relay_sign {
-            match relay_sign(state, &sighash).await {
+            // createAction inputs spend the root-key P2PKH address → base-key
+            // sign (no BRC-42 offset). HD-derived `createSignature` uses the
+            // offset-carrying relay path (issue #26).
+            match relay_sign(state, &sighash, None).await {
                 Ok(result) => result,
                 Err(e) => return json!({"error": format!("signing input {} failed: {}", i, e)}),
             }

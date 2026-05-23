@@ -390,7 +390,7 @@ async fn container_refresh_then_sign_deployed_real_mainnet_tx() {
 
     // ── 8. Sign from bundle #2 (REFRESHED shares) over the relay ───────────────
     let sig = bridge
-        .sign_from_bundle_over_relay(&sighash, &bundle2, at_rest_root, Duration::from_secs(60))
+        .sign_from_bundle_over_relay(&sighash, &bundle2, at_rest_root, Duration::from_secs(60), None)
         .await
         .expect("§06.17.1 sign from refreshed bundle over relay");
     eprintln!("✔ co-signed with REFRESHED shares: DER {} bytes", sig.signature.len());

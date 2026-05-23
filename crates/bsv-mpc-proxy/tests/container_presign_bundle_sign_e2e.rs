@@ -411,6 +411,7 @@ async fn container_self_presigns_coordinator_holds_ct_then_signs_from_bundle() {
         agent_id: Some(agent_id.clone()),
         auth_headers: vec![],
         cosigner_encrypted_share: None, // shipped explicitly by the bundle-combine fn
+        brc42_offset: None,
     };
     let participants: Vec<u16> = parties_at_keygen.clone();
     let sig_result = combine_sign_from_bundle_over_relay(

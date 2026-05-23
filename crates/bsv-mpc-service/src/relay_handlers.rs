@@ -335,6 +335,12 @@ pub struct SignRelayRequest {
     /// The combiner's signing-time index.
     #[serde(default)]
     pub to_index: Option<u16>,
+    /// **BRC-42 HD-derived child-key signing (MPC-Spec §06.20, issue #26).** Hex
+    /// of the 32-byte BRC-42 additive offset the combiner applied to its own
+    /// presig + public data; this cosigner applies the SAME offset in
+    /// `decrypt_and_issue_partial`. Omitted/`None` = base-key signing.
+    #[serde(default)]
+    pub brc42_offset: Option<String>,
 }
 
 /// `POST /sign-relay` — the container co-signs over the relay from its own
@@ -412,6 +418,16 @@ pub async fn handle_sign_relay(
         .clone()
         .unwrap_or_else(|| session_id.hex());
 
+    // §06.20 / issue #26: optional BRC-42 offset (hex of 32 bytes). Reuse the
+    // 32-byte decode helper; reject malformed hex/length with 400.
+    let brc42_offset = match &body.brc42_offset {
+        Some(h) => match decode_32(h) {
+            Ok(a) => Some(a),
+            Err(e) => return err_response(StatusCode::BAD_REQUEST, format!("brc42_offset: {e}")),
+        },
+        None => None,
+    };
+
     let outcome = match cosign_over_relay(SignRelayParams {
         identity_priv,
         recipient_pub_hex: body.recipient_pub_hex.clone(),
@@ -423,6 +439,7 @@ pub async fn handle_sign_relay(
         from_index: body.from_index.unwrap_or(0),
         to_index: body.to_index.unwrap_or(1),
         relay_url: relay_url(),
+        brc42_offset,
     })
     .await
     {

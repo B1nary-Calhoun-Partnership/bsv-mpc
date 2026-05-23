@@ -1,41 +1,23 @@
-//! **§06.17.1 CONTAINER-target — DEPLOYED, REAL SATS (issue #30 / #25c Stage 2).**
+//! **§06.20 HD-derived child-key signing over the relay — DEPLOYED, REAL SATS (issue #26).**
 //!
-//! The capstone for the corrected Stage 2: the deployed CF **Container** cosigner
-//! (`bsv-mpc-service-container`, full native `bsv-mpc-service`) generates + BRC-2
-//! self-encrypts its OWN presig share over the live relay; the proxy =
-//! coordinator holds ONLY the opaque ciphertext (the §06.17.1 threshold gain over
-//! the POC proxy-knows-both-shares shortcut), persists the `PresigBundle`, and at
-//! sign-time ships the ciphertext back to the container's `/sign-relay`. The
-//! container decrypts it under its OWN identity, issues + relays its partial; the
-//! proxy combines into a BSV-valid signature that funds + spends a REAL mainnet TX.
+//! Proves 1-round BRC-42 HD-derived signing through the deployed CF Container
+//! cosigner: the proxy funds a BRC-42 *child* address (`child = joint + offset·G`),
+//! then signs the spend over the relay with the offset applied on BOTH sides —
+//! the coordinator via `sign_from_bundle_with_offset` and the deployed container
+//! via `decrypt_and_issue_partial(Some(offset))` (§06.20). The combined signature
+//! MUST verify under the CHILD pubkey (and must NOT verify under the base joint
+//! key), then spends the child address on mainnet.
 //!
-//! Flow:
-//!   1. **Real distributed authed DKG** against the deployed container
-//!      (`run_dkg_over_http_authed`) → the container holds `share_A` (recorded
-//!      owner = the proxy identity, §08.1); the proxy holds `share_B`. No trusted
-//!      dealer — neither party ever holds the other's share.
-//!   2. `MpcBridge` from `share_B`, `presign_url` = the container (the heavy-MPC
-//!      cosigner) — handshakes BRC-31 with it.
-//!   3. `coordinate_presign_bundle` → drives the §06.17.1 presign over the relay;
-//!      the container self-presigns + self-encrypts; the bundle is persisted to a
-//!      `FileBundleStore`.
-//!   4. Fund the joint P2PKH on mainnet via wallet:3321; self-broadcast the funding
-//!      tx via ARC (wallet broadcast doesn't always propagate — #25b); build the
-//!      BIP-143 sighash.
-//!   5. `sign_from_bundle_over_relay` → ships the container's own ciphertext to
-//!      `/sign-relay`; the container decrypts + co-signs over the relay; the proxy
-//!      combines.
-//!   6. PRE-FLIGHT verify (low-s + joint-pubkey) — fail-closed BEFORE broadcast.
-//!   7. Broadcast via ARC; cite the TXID.
+//! This is the production-grade proof for #26: the relay sign path now passes the
+//! BRC-42 offset end-to-end (no more base-key-only). Mirrors the proven
+//! `container_sec0617_deployed_mainnet_e2e` bundle path, funding a child address.
 //!
-//! REAL SATS. Gated on `CONTAINER_SEC0617_MAINNET=1`. Requires a BRC-100 wallet at
-//! `http://localhost:3321` (Origin `http://admin.com`) with spendable sats, plus
-//! outbound to WhatsOnChain + ARC. `DEPLOYED_CONTAINER_URL` /
-//! `MESSAGEBOX_RELAY_URL` default to the Calhoun `dev-a3e` deployments.
+//! REAL SATS. Gated on `CONTAINER_HD_RELAY_MAINNET=1`. Requires a BRC-100 wallet
+//! at `http://localhost:3321` (Origin `http://admin.com`) with spendable sats.
 //!
 //! ```bash
-//! CONTAINER_SEC0617_MAINNET=1 cargo test -p bsv-mpc-proxy \
-//!   --test container_sec0617_deployed_mainnet_e2e \
+//! CONTAINER_HD_RELAY_MAINNET=1 cargo test -p bsv-mpc-proxy \
+//!   --test container_hd_relay_deployed_mainnet_e2e \
 //!   --release -- --nocapture --test-threads=1
 //! ```
 
@@ -49,6 +31,7 @@ use bsv::primitives::bsv::tx_signature::TransactionSignature;
 use bsv::primitives::ec::{PrivateKey, PublicKey, Signature};
 use bsv::primitives::encoding::Writer;
 use bsv::primitives::hash::sha256d;
+use bsv_mpc_core::hd::{compute_brc42_hmac, compute_invoice, derive_anyone_pubkey};
 use bsv_mpc_core::types::{PolicyId, ThresholdConfig};
 use bsv_mpc_proxy::bridge::{run_dkg_over_http_authed, MpcBridge};
 use bsv_mpc_proxy::config::ProxyConfig;
@@ -58,7 +41,7 @@ const DEFAULT_CONTAINER: &str = "https://bsv-mpc-service-container.dev-a3e.worke
 const DEFAULT_RELAY: &str = "https://rust-message-box.dev-a3e.workers.dev";
 
 fn opt_in() -> bool {
-    std::env::var("CONTAINER_SEC0617_MAINNET").ok().as_deref() == Some("1")
+    std::env::var("CONTAINER_HD_RELAY_MAINNET").ok().as_deref() == Some("1")
 }
 
 fn p2pkh_locking_script(pubkey_hash: &[u8; 20]) -> Vec<u8> {
@@ -137,17 +120,23 @@ async fn find_utxo_on_woc(
 }
 
 async fn broadcast_via_arc(http: &reqwest::Client, raw_tx_hex: &str) -> bool {
-    for arc in &["https://arc.taal.com", "https://arc.gorillapool.io"] {
+    // TAAL ARC needs a Bearer token (else 401); GorillaPool is keyless. Token from
+    // env `TAAL_ARC_TOKEN`, else the known mainnet key (parity with the proven
+    // container_reshare test that funds + propagates successfully).
+    let taal_token = std::env::var("TAAL_ARC_TOKEN")
+        .unwrap_or_else(|_| "mainnet_9596de07e92300c6287e4393594ae39c".to_string());
+    for arc in &["https://arc.gorillapool.io", "https://arc.taal.com"] {
         let url = format!("{arc}/v1/tx");
         eprintln!("  broadcast via {url}");
-        let Ok(resp) = http
+        let mut req = http
             .post(&url)
             .header("Content-Type", "application/json")
-            .header("XDeployment-ID", "bsv-mpc-sec0617-container")
-            .json(&serde_json::json!({ "rawTx": raw_tx_hex }))
-            .send()
-            .await
-        else {
+            .header("XDeployment-ID", "bsv-mpc-hd-relay-container")
+            .json(&serde_json::json!({ "rawTx": raw_tx_hex }));
+        if arc.contains("taal") {
+            req = req.header("Authorization", format!("Bearer {taal_token}"));
+        }
+        let Ok(resp) = req.send().await else {
             continue;
         };
         let status = resp.status();
@@ -175,12 +164,12 @@ fn raw_tx_hex_from_create_action(resp: &serde_json::Value) -> Option<String> {
 }
 
 #[tokio::test]
-async fn container_sec0617_self_presign_deployed_real_mainnet_tx() {
+async fn container_hd_child_key_signs_over_relay_deployed_real_mainnet() {
     if !opt_in() {
         eprintln!(
-            "CONTAINER_SEC0617_MAINNET=1 not set — skipping §06.17.1 CONTAINER real-sats gate.\n\
-             To run (BURNS REAL SATS): CONTAINER_SEC0617_MAINNET=1 cargo test -p bsv-mpc-proxy \\\n\
-             --test container_sec0617_deployed_mainnet_e2e --release -- --nocapture --test-threads=1"
+            "CONTAINER_HD_RELAY_MAINNET=1 not set — skipping §06.20 HD-over-relay real-sats gate.\n\
+             To run (BURNS REAL SATS): CONTAINER_HD_RELAY_MAINNET=1 cargo test -p bsv-mpc-proxy \\\n\
+             --test container_hd_relay_deployed_mainnet_e2e --release -- --nocapture --test-threads=1"
         );
         return;
     }
@@ -192,17 +181,13 @@ async fn container_sec0617_self_presign_deployed_real_mainnet_tx() {
         std::env::var("MESSAGEBOX_RELAY_URL").unwrap_or_else(|_| DEFAULT_RELAY.to_string());
     let http = reqwest::Client::new();
 
-    // The proxy's stable BRC-31 owner identity (§07.4) — used for authed DKG, the
-    // presign-relay/init + sign-relay triggers, and the relay combiner identity.
-    let proxy_identity = PrivateKey::from_bytes(&[0x37u8; 32]).expect("proxy identity key");
+    let proxy_identity = PrivateKey::from_bytes(&[0x26u8; 32]).expect("proxy identity key");
     std::env::set_var(
         "MPC_PROXY_IDENTITY_KEY",
         hex::encode(proxy_identity.to_bytes()),
     );
 
     // ── 1. Real distributed authed DKG against the DEPLOYED container ──────────
-    //    The container holds share_A (owner-bound to the proxy identity, §08.1);
-    //    the proxy holds share_B. Heavy (Paillier primes inline) — minutes.
     eprintln!("(real distributed DKG against the deployed container — minutes)");
     let config = ThresholdConfig::new(2, 2).expect("2-of-2");
     let dkg_b = run_dkg_over_http_authed(&container_url, config, proxy_identity.clone())
@@ -213,17 +198,33 @@ async fn container_sec0617_self_presign_deployed_real_mainnet_tx() {
     let mut joint_arr = [0u8; 33];
     joint_arr.copy_from_slice(&joint.compressed);
     let joint_pub = PublicKey::from_bytes(&joint_arr).expect("joint pubkey");
-    let joint_locking = p2pkh_locking_script(&joint_pub.hash160());
-    eprintln!("✔ DKG joint_pubkey={joint_hex} address={}", joint.address);
+    eprintln!("✔ DKG joint_pubkey={joint_hex}");
+
+    // ── 1b. Derive a BRC-42 child key (the "anyone" derivation: child = joint +
+    //        offset·G, offset = HMAC(joint_pub_compressed, invoice)). We fund +
+    //        spend THIS child address; the offset is applied at sign-time. ──────
+    let protocol = "mpc hd relay";
+    let key_id = "child-key-26-001";
+    let level = 2u8;
+    let invoice = compute_invoice(level, protocol, key_id).expect("invoice");
+    let offset: [u8; 32] = compute_brc42_hmac(&joint_pub, &invoice);
+    let child_pub = derive_anyone_pubkey(&joint_pub, protocol, key_id, level).expect("child pub");
+    let child_arr = child_pub.to_compressed();
+    let child_locking = p2pkh_locking_script(&child_pub.hash160());
+    eprintln!(
+        "✔ BRC-42 child: invoice={invoice} child_pubkey={} (offset={})",
+        hex::encode(child_arr),
+        hex::encode(offset)
+    );
 
     // ── 2. MpcBridge from share_B, presign_url = the container ─────────────────
     let dir = std::env::temp_dir();
-    let share_path = dir.join(format!("sec0617_container_share_{}.json", std::process::id()));
+    let share_path = dir.join(format!("hd_relay_container_share_{}.json", std::process::id()));
     tokio::fs::write(&share_path, serde_json::to_vec(&dkg_b).unwrap())
         .await
         .expect("write share file");
     let proxy_config = ProxyConfig {
-        port: 3331,
+        port: 3336,
         kss_url: container_url.clone(),
         share_path: share_path.to_string_lossy().to_string(),
         fee_per_signing: 0,
@@ -236,16 +237,14 @@ async fn container_sec0617_self_presign_deployed_real_mainnet_tx() {
         min_balance_sats: None,
         relay_url: relay_url.clone(),
         relay_sign: false,
-        // The container is the heavy-MPC cosigner — presign + the §06.17.1 routes
-        // live there.
         presign_url: Some(container_url.clone()),
     };
     let bridge = MpcBridge::new(&proxy_config)
         .await
         .expect("MpcBridge::new (BRC-31 handshake with deployed container)");
-    eprintln!("✔ proxy authed with deployed container (share_B + stable identity)");
+    eprintln!("✔ proxy authed with deployed container");
 
-    // ── 3. §06.17.1 presign over the relay → durable PresigBundle ──────────────
+    // ── 3. §06.17.1 presign over the relay → durable PresigBundle (base key) ───
     let bundle_dir = tempfile::tempdir().expect("bundle dir");
     let bundle_store = Arc::new(FileBundleStore::new(bundle_dir.path()).expect("bundle store"));
     let at_rest_root = [0x42u8; 32];
@@ -258,27 +257,21 @@ async fn container_sec0617_self_presign_deployed_real_mainnet_tx() {
         )
         .await
         .expect("§06.17.1 presign over relay → bundle");
-    eprintln!(
-        "✔ PresigBundle assembled — presig_id={} (container self-presigned + self-encrypted)",
-        bundle.presig_id
-    );
-    // Reload from disk (durable across coordinator restart).
-    let bundle = bundle_store
-        .get(&bundle.presig_id)
-        .expect("bundle reloads from disk");
+    let bundle = bundle_store.get(&bundle.presig_id).expect("bundle reloads");
+    eprintln!("✔ PresigBundle assembled — presig_id={}", bundle.presig_id);
 
-    // ── 4. Fund the joint P2PKH on mainnet via wallet:3321 ─────────────────────
+    // ── 4. Fund the CHILD P2PKH on mainnet via wallet:3321 ─────────────────────
     let funding_amount: u64 = 1500;
     let fund_resp = http
         .post("http://localhost:3321/createAction")
         .header("Origin", "http://admin.com")
         .header("Content-Type", "application/json")
         .json(&serde_json::json!({
-            "description": "bsv-mpc §06.17.1 container self-presign gate",
+            "description": "bsv-mpc §06.20 HD-over-relay gate (fund child)",
             "outputs": [{
                 "satoshis": funding_amount,
-                "lockingScript": hex::encode(&joint_locking),
-                "outputDescription": "MPC joint P2PKH"
+                "lockingScript": hex::encode(&child_locking),
+                "outputDescription": "MPC BRC-42 child P2PKH"
             }]
         }))
         .send()
@@ -292,15 +285,14 @@ async fn container_sec0617_self_presign_deployed_real_mainnet_tx() {
     );
     let fund_json: serde_json::Value = serde_json::from_str(&fund_text).expect("fund JSON");
     let fund_txid = fund_json["txid"].as_str().expect("createAction txid").to_string();
-    eprintln!("✔ funded joint address: txid={fund_txid}");
-    // Self-broadcast the funding tx via ARC (wallet broadcast may not propagate).
+    eprintln!("✔ funded child address: txid={fund_txid}");
     if let Some(raw) = raw_tx_hex_from_create_action(&fund_json) {
-        eprintln!("  self-broadcasting funding tx via ARC to guarantee propagation...");
+        eprintln!("  self-broadcasting funding tx via ARC...");
         let _ = broadcast_via_arc(&http, &raw).await;
     }
 
-    // ── 5. Find the UTXO + build the BIP-143 sighash (drain back to wallet) ────
-    let locking_hex = hex::encode(&joint_locking);
+    // ── 5. Find the UTXO + build the BIP-143 sighash over the CHILD script ─────
+    let locking_hex = hex::encode(&child_locking);
     let (vout, value) = find_utxo_on_woc(&http, &fund_txid, &locking_hex)
         .await
         .expect("MUST find funding UTXO on WoC");
@@ -344,35 +336,47 @@ async fn container_sec0617_self_presign_deployed_real_mainnet_tx() {
         }],
         locktime: 0,
         input_index: 0,
-        subscript: &joint_locking,
+        subscript: &child_locking,
         satoshis: value,
         scope,
     });
     eprintln!("✔ sighash: {}", hex::encode(sighash));
 
-    // ── 6. §06.17.1 sign from the durable bundle over the relay ────────────────
+    // ── 6. §06.20 HD sign from the bundle over the relay WITH the offset ───────
+    //     The coordinator applies the offset to its presig + public data; the
+    //     deployed container applies the SAME offset via decrypt_and_issue_partial.
     let sig = bridge
-        .sign_from_bundle_over_relay(&sighash, &bundle, at_rest_root, Duration::from_secs(60), None)
+        .sign_from_bundle_over_relay(
+            &sighash,
+            &bundle,
+            at_rest_root,
+            Duration::from_secs(60),
+            Some(offset),
+        )
         .await
-        .expect("§06.17.1 sign from bundle over relay (container decrypts + co-signs)");
-    eprintln!("✔ co-signed via §06.17.1 bundle path: DER {} bytes", sig.signature.len());
+        .expect("§06.20 HD sign from bundle over relay (offset applied both sides)");
+    eprintln!("✔ co-signed via §06.20 HD relay path: DER {} bytes", sig.signature.len());
 
-    // ── 7. PRE-FLIGHT verify — fail-closed BEFORE broadcast ────────────────────
+    // ── 7. PRE-FLIGHT verify under the CHILD key — fail-closed BEFORE broadcast ─
     let mut r = [0u8; 32];
     let mut s = [0u8; 32];
     r.copy_from_slice(&sig.r);
     s.copy_from_slice(&sig.s);
     let bsv_sig = Signature::new(r, s);
-    assert!(bsv_sig.is_low_s(), "MPC signature MUST be low-s (BIP-62) — refusing to broadcast");
+    assert!(bsv_sig.is_low_s(), "MPC signature MUST be low-s (BIP-62)");
     assert!(
-        joint_pub.verify(&sighash, &bsv_sig),
-        "PRE-FLIGHT: signature MUST verify under the joint pubkey before we burn sats"
+        child_pub.verify(&sighash, &bsv_sig),
+        "PRE-FLIGHT: HD signature MUST verify under the CHILD pubkey (joint + offset·G)"
     );
-    eprintln!("✔ pre-flight ECDSA verify under joint pubkey: PASS");
+    assert!(
+        !joint_pub.verify(&sighash, &bsv_sig),
+        "HD signature MUST NOT verify under the base joint key (offset must have taken effect)"
+    );
+    eprintln!("✔ pre-flight: verifies under CHILD key, rejects under base key — offset took effect");
 
-    // ── 8. Assemble + broadcast ────────────────────────────────────────────────
+    // ── 8. Assemble + broadcast (unlock with the CHILD pubkey) ─────────────────
     let tx_sig = TransactionSignature::new(bsv_sig, scope);
-    let unlocking = p2pkh_unlocking_script(&tx_sig.to_checksig_format(), &joint_pub.to_compressed());
+    let unlocking = p2pkh_unlocking_script(&tx_sig.to_checksig_format(), &child_arr);
     let raw_tx = serialize_transaction(
         1,
         &[(prev_txid, vout, unlocking, 0xFFFFFFFF)],
@@ -391,16 +395,14 @@ async fn container_sec0617_self_presign_deployed_real_mainnet_tx() {
 
     eprintln!();
     eprintln!("╔══════════════════════════════════════════════════════════════╗");
-    eprintln!("║  §06.17.1 CONTAINER TARGET — DEPLOYED COSIGNER REAL MAINNET TX ║");
+    eprintln!("║  §06.20 HD-DERIVED CHILD-KEY SIGN OVER RELAY — DEPLOYED — REAL ║");
     eprintln!("╚══════════════════════════════════════════════════════════════╝");
-    eprintln!("  joint_pubkey:   {joint_hex}");
-    eprintln!("  joint_address:  {}", joint.address);
-    eprintln!("  presig_id:      {}", bundle.presig_id);
-    eprintln!("  funding_txid:   {fund_txid}");
-    eprintln!("  funded_sats:    {value}");
-    eprintln!("  spending_txid:  {txid_hex}");
-    eprintln!("  cosigner:       deployed bsv-mpc-service CONTAINER (self-presign + self-encrypt + decrypt)");
-    eprintln!("  combiner:       bsv-mpc-proxy (coordinator, held only the ciphertext)");
+    eprintln!("  base joint_pubkey: {joint_hex}");
+    eprintln!("  invoice:           {invoice}");
+    eprintln!("  child_pubkey:      {}", hex::encode(child_arr));
+    eprintln!("  child_address:     spent (BRC-42 derived)");
+    eprintln!("  funding_txid:      {fund_txid}");
+    eprintln!("  spending_txid:     {txid_hex}  (signed with BRC-42 offset over the relay)");
     eprintln!("  view: https://whatsonchain.com/tx/{txid_hex}");
     eprintln!("  total wall-clock: {:?}", t0.elapsed());
 }

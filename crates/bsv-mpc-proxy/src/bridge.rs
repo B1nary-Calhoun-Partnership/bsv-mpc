@@ -2273,6 +2273,7 @@ impl MpcBridge {
         bundle: &bsv_mpc_core::types::PresigBundle,
         at_rest_root: [u8; 32],
         recv_timeout: std::time::Duration,
+        hmac_offset: Option<[u8; 32]>,
     ) -> bsv_mpc_core::error::Result<SigningResult> {
         let identity_priv = {
             let auth = self
@@ -2340,6 +2341,11 @@ impl MpcBridge {
             agent_id: Some(self.agent_id.clone()),
             auth_headers: vec![],
             cosigner_encrypted_share: None,
+            // §06.20 HD path (issue #26): when set, both the coordinator
+            // (sign_from_bundle_with_offset) and the cosigner
+            // (decrypt_and_issue_partial) apply this BRC-42 offset → the combined
+            // signature verifies under child_pub = joint + offset·G. None = base key.
+            brc42_offset: hmac_offset.map(|o| hex_encode(&o)),
         };
 
         crate::relay_sign::combine_sign_from_bundle_over_relay(
@@ -2376,9 +2382,17 @@ impl MpcBridge {
         &self,
         sighash: &[u8; 32],
         my_presig_box: Box<dyn std::any::Any + Send>,
-        trigger: crate::relay_sign::DoTrigger,
+        // **BRC-42 HD-derived signing over the relay (issue #26).** When `Some`,
+        // the 32-byte BRC-42 offset is applied combiner-side (own presig + public
+        // data) AND shipped (hex) to the cosigner so it applies the SAME shift.
+        // `None` = base-key signing.
+        brc42_offset: Option<[u8; 32]>,
+        mut trigger: crate::relay_sign::DoTrigger,
         recv_timeout: std::time::Duration,
     ) -> bsv_mpc_core::error::Result<SigningResult> {
+        // Ship the offset to the cosigner in the trigger body (hex), matching the
+        // bytes the combiner applies locally.
+        trigger.brc42_offset = brc42_offset.map(|o| hex_encode(&o));
         let identity_priv = {
             let auth = self
                 .auth
@@ -2424,6 +2438,7 @@ impl MpcBridge {
             sighash,
             my_presig_box,
             &self.joint_key,
+            brc42_offset,
             trigger,
             Some(&request_signer),
             recv_timeout,

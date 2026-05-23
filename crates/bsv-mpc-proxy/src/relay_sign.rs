@@ -59,6 +59,15 @@ pub struct DoTrigger {
     /// `None` falls back to the pool/plaintext paths for legacy callers (the
     /// field is non-breaking: omitted from the body when `None`).
     pub cosigner_encrypted_share: Option<Vec<u8>>,
+    /// **BRC-42 HD-derived child-key signing over the relay (MPC-Spec §06.20,
+    /// issue #26).** Hex of the 32-byte BRC-42 additive offset. When `Some`, the
+    /// combiner applies it to ITS OWN presig + public data (via
+    /// `sign_with_presignature_with_offset`) and ships it in the trigger body as
+    /// `brc42_offset` so the cosigner applies the SAME offset in
+    /// `decrypt_and_issue_partial`. ALL signers apply the same offset; the
+    /// resulting signature verifies under `child_pub = joint + offset·G`. `None`
+    /// = base-key signing (omitted from the body, non-breaking for legacy callers).
+    pub brc42_offset: Option<String>,
 }
 
 /// A canonical BRC-31 request signer: given `(method, path, body_bytes)`, returns
@@ -107,6 +116,13 @@ pub async fn combine_sign_over_relay(
     sighash: &[u8; 32],
     my_presig_box: Box<dyn std::any::Any + Send>,
     joint_key: &JointPublicKey,
+    // **BRC-42 HD-derived signing (issue #26).** When `Some`, this is the 32-byte
+    // additive offset the combiner applies to its OWN presig + public data; the
+    // SAME bytes are shipped (hex) to the cosigner via the trigger body so it
+    // applies the identical shift in `decrypt_and_issue_partial`. The combined
+    // signature then verifies under `child_pub = joint + offset·G`. `None` =
+    // base-key signing (unchanged behavior).
+    brc42_offset: Option<[u8; 32]>,
     trigger: DoTrigger,
     // When `Some`, signs the EXACT serialized trigger body with canonical BRC-31
     // (the deployed worker `/sign-relay` verifies the canonical wire). When
@@ -128,7 +144,7 @@ pub async fn combine_sign_over_relay(
     // 2. Prime our coordinator (issues our own partial; holds public data).
     let my_index = signing_index(&share, &participants)?;
     let mut coord = SigningCoordinator::new(session_id, share, config, participants);
-    coord.sign_with_presignature(sighash, my_presig_box)?;
+    coord.sign_with_presignature_with_offset(sighash, my_presig_box, brc42_offset)?;
 
     // 3. Trigger the DO to issue + relay its partial to us.
     //    Production: presig is consumed from the DO pool (no `presignature_hex`
@@ -154,6 +170,13 @@ pub async fn combine_sign_over_relay(
     // instead of consuming a proxy-provisioned plaintext presig from the pool.
     if let Some(ref ct) = trigger.cosigner_encrypted_share {
         trigger_body["cosigner_encrypted_share"] = serde_json::json!(hex::encode(ct));
+    }
+    // §06.20 / issue #26: ship the BRC-42 offset (hex) so the cosigner applies the
+    // SAME additive shift in `decrypt_and_issue_partial`. The combiner already
+    // applied it to its own presig + public data above (via `brc42_offset` →
+    // `sign_with_presignature_with_offset`); both sides MUST use identical bytes.
+    if let Some(ref h) = trigger.brc42_offset {
+        trigger_body["brc42_offset"] = serde_json::json!(h);
     }
     // Serialize the body ONCE so the canonical signature covers the EXACT bytes
     // sent (NOT `.json()`, which re-serializes and could diverge from the signed
@@ -292,7 +315,21 @@ pub async fn combine_sign_from_bundle_over_relay(
     let public_data = bsv_mpc_core::signing::deserialize_presig_public_data(commitments)?;
     let my_index = signing_index(&share, &participants)?;
     let mut coord = SigningCoordinator::new(sign_session_id, share, config, participants);
-    coord.sign_from_bundle(sighash, own_presig_json, public_data)?;
+    // §06.20 HD path: when the trigger carries a BRC-42 offset, the coordinator
+    // applies it to its own presig + the shared public data; the cosigner applies
+    // the SAME offset below. None = base key.
+    let offset_bytes: Option<[u8; 32]> = match &trigger.brc42_offset {
+        Some(h) => {
+            let v = hex::decode(h)
+                .map_err(|e| MpcError::Protocol(format!("brc42_offset hex: {e}")))?;
+            let arr: [u8; 32] = v
+                .try_into()
+                .map_err(|_| MpcError::Protocol("brc42_offset must be 32 bytes".into()))?;
+            Some(arr)
+        }
+        None => None,
+    };
+    coord.sign_from_bundle_with_offset(sighash, own_presig_json, public_data, offset_bytes)?;
 
     // 3. Trigger the container's /sign-relay shipping the cosigner's own
     //    ciphertext (the §06.17.1 path).
@@ -309,6 +346,9 @@ pub async fn combine_sign_from_bundle_over_relay(
     });
     if let Some(ref agent_id) = trigger.agent_id {
         trigger_body["agent_id"] = serde_json::json!(agent_id);
+    }
+    if let Some(ref offset_hex) = trigger.brc42_offset {
+        trigger_body["brc42_offset"] = serde_json::json!(offset_hex);
     }
     let body_bytes = serde_json::to_vec(&trigger_body)
         .map_err(|e| MpcError::Protocol(format!("serialize sign-relay body: {e}")))?;

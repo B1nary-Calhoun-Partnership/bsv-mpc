@@ -70,6 +70,13 @@ pub struct SignRelayParams {
     pub to_index: u16,
     /// MessageBox relay URL.
     pub relay_url: String,
+    /// **BRC-42 HD-derived child-key signing (MPC-Spec §06.20, issue #26).**
+    /// When `Some`, the 32-byte BRC-42 additive offset this cosigner applies to
+    /// its presig share at consume-time (passed straight to
+    /// `decrypt_and_issue_partial`). MUST be the SAME offset the combiner applied
+    /// to its own presig + public data; the combined signature then verifies
+    /// under `child_pub = joint + offset·G`. `None` = base-key signing.
+    pub brc42_offset: Option<[u8; 32]>,
 }
 
 /// Outcome of a relay co-sign — surfaced to the route for the JSON response.
@@ -92,15 +99,17 @@ pub async fn cosign_over_relay(params: SignRelayParams) -> anyhow::Result<SignRe
     }
 
     // 1. Decrypt the at-rest BRC-2 blob under THIS cosigner's identity + the
-    //    canonical presig_id, then issue this party's partial. None = base key
-    //    (no BRC-42 offset; HD-derived signing stays on the legacy HTTP path).
+    //    canonical presig_id, then issue this party's partial. `brc42_offset`
+    //    carries the BRC-42 additive shift for 1-round HD-derived signing
+    //    (§06.20, issue #26) — the SAME offset the combiner applies; `None` =
+    //    base key.
     let wallet = wallet_from_identity(&params.identity_priv);
     let partial_json = decrypt_and_issue_partial(
         &wallet,
         &params.presig_id,
         &params.cosigner_encrypted_share,
         &params.sighash,
-        None,
+        params.brc42_offset,
     )
     .map_err(|e| anyhow::anyhow!("§06.17.1 decrypt+issue_partial: {e}"))?;
 

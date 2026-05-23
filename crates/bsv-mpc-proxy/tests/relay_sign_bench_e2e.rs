@@ -244,10 +244,11 @@ async fn relay_online_sign_latency() {
             agent_id: Some(joint_hex.clone()),
             auth_headers: vec![],
             cosigner_encrypted_share: None,
+            brc42_offset: None,
         };
         let t = Instant::now();
         let sig = bridge
-            .sign_over_relay(&sighash, box_b, trigger, Duration::from_secs(60))
+            .sign_over_relay(&sighash, box_b, None, trigger, Duration::from_secs(60))
             .await
             .expect("relay sign");
         let ms = t.elapsed().as_millis();

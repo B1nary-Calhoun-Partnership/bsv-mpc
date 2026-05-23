@@ -226,9 +226,10 @@ async fn proxy_cosigns_through_authed_sign_relay() {
         agent_id: Some(joint_hex.clone()),
         auth_headers: vec![], // filled by sign_over_relay from the bridge session
         cosigner_encrypted_share: None,
+        brc42_offset: None,
     };
     let sig: SigningResult = bridge
-        .sign_over_relay(&sighash, box_b, trigger, Duration::from_secs(60))
+        .sign_over_relay(&sighash, box_b, None, trigger, Duration::from_secs(60))
         .await
         .expect("proxy + deployed DO co-sign over the AUTHED relay route");
     assert_bsv_valid(&joint, &sighash, &sig);

@@ -207,9 +207,10 @@ async fn service_provisions_do_pool_proxy_combines() {
         agent_id: Some(joint_hex.clone()),
         auth_headers: vec![],
         cosigner_encrypted_share: None,
+        brc42_offset: None,
     };
     let sig: SigningResult = bridge
-        .sign_over_relay(&sighash, box_b, trigger, Duration::from_secs(60))
+        .sign_over_relay(&sighash, box_b, None, trigger, Duration::from_secs(60))
         .await
         .expect("proxy combines the service-provisioned presig over the relay");
     assert_bsv_valid(&joint, &sighash, &sig);
