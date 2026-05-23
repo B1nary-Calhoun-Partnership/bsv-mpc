@@ -1686,6 +1686,53 @@ impl MpcBridge {
         Ok(())
     }
 
+    /// The current §06.17.1 binding triple `(policy_id, joint_pubkey,
+    /// parties_at_keygen)` a bundle must match to be consumable.
+    pub fn current_binding(
+        &self,
+        policy_id: bsv_mpc_core::types::PolicyId,
+    ) -> bsv_mpc_core::types::PresigBinding {
+        let mut parties = self.participants.clone();
+        parties.sort_unstable();
+        bsv_mpc_core::types::PresigBinding {
+            policy_id,
+            joint_pubkey: self.joint_key.compressed.clone(),
+            parties_at_keygen: parties,
+        }
+    }
+
+    /// **§06.17.3 single-use consume + §06.18 consume-time guard.** Atomically
+    /// remove the bundle for `presig_id` from `bundle_store` (so it can NEVER be
+    /// consumed twice — the CVE-2025-66017 mitigation) and re-check its binding
+    /// triple against the current ceremony (defense in depth: a stale bundle that
+    /// somehow escaped a §06.18 deletion still cannot be signed). On a binding
+    /// mismatch the bundle stays removed (it is dead either way) and signing is
+    /// refused.
+    pub fn consume_bundle_for_sign(
+        &self,
+        bundle_store: &bsv_mpc_service::FileBundleStore,
+        presig_id: &str,
+        current_policy: bsv_mpc_core::types::PolicyId,
+    ) -> bsv_mpc_core::error::Result<bsv_mpc_core::types::PresigBundle> {
+        use bsv_mpc_service::BundleStore;
+        let bundle = bundle_store
+            .consume(presig_id)
+            .map_err(|e| MpcError::Protocol(format!("bundle consume failed: {e}")))?
+            .ok_or_else(|| {
+                MpcError::Protocol(format!(
+                    "presig bundle {presig_id} already consumed or absent (single-use §06.17.3)"
+                ))
+            })?;
+        let current = self.current_binding(current_policy);
+        if !bundle.matches_binding(&current) {
+            return Err(MpcError::Protocol(format!(
+                "presig bundle {presig_id} failed the §06.18 consume-time binding check \
+                 (stale policy/joint-pubkey/subset); refusing to sign (bundle now purged)"
+            )));
+        }
+        Ok(bundle)
+    }
+
     /// **§06.17.1 sign-from-bundle over the relay (issue #30, CONTAINER target)**
     /// — at sign-time, reconstruct the coordinator's own partial from the durable
     /// `bundle` + ship the container's OWN ciphertext to its `/sign-relay`; the
@@ -2529,6 +2576,75 @@ mod refresh_rotation_tests {
             reloaded_enc.current_share_scalar(),
             scalar0,
             "reloaded encrypted-at-rest rotated share matches"
+        );
+    }
+
+    #[tokio::test]
+    async fn consume_for_sign_is_single_use_and_binding_gated() {
+        use bsv_mpc_core::types::{PolicyId, PresigBundle};
+        use bsv_mpc_service::FileBundleStore;
+
+        // A bridge whose joint key the bundle must match.
+        let jpk = vec![0x02u8; 33];
+        let bridge = MpcBridge::new_for_test(JointPublicKey {
+            compressed: jpk.clone(),
+            address: "1Guard".into(),
+        });
+        let policy = PolicyId([0x09; 32]);
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileBundleStore::new(dir.path()).unwrap();
+
+        let mk = |id: &str, pol: [u8; 32], jp: Vec<u8>| PresigBundle {
+            presig_id: id.into(),
+            presig_bytes: vec![1],
+            cosigner_encrypted_shares: vec![
+                serde_bytes::ByteBuf::from(vec![]),
+                serde_bytes::ByteBuf::from(vec![2]),
+            ],
+            gamma_hex: "ab".into(),
+            commitments: vec![1],
+            policy_id: PolicyId(pol),
+            joint_pubkey: jp,
+            parties_at_keygen: vec![0, 1],
+            generated_at: 1,
+        };
+
+        // Matching bundle: consume once OK, second time Err (single-use).
+        use bsv_mpc_service::BundleStore;
+        let good_id = "aa".repeat(32);
+        store.persist(&mk(&good_id, [0x09; 32], jpk.clone())).unwrap();
+        let got = bridge
+            .consume_bundle_for_sign(&store, &good_id, policy)
+            .expect("matching bundle consumes");
+        assert_eq!(got.presig_id, good_id);
+        assert!(
+            bridge
+                .consume_bundle_for_sign(&store, &good_id, policy)
+                .is_err(),
+            "second consume MUST fail (single-use §06.17.3)"
+        );
+
+        // Stale-binding bundle (wrong joint pubkey): guard refuses + purges it.
+        let stale_id = "bb".repeat(32);
+        store
+            .persist(&mk(&stale_id, [0x09; 32], vec![0x03; 33]))
+            .unwrap();
+        let err = bridge.consume_bundle_for_sign(&store, &stale_id, policy);
+        assert!(err.is_err(), "binding mismatch MUST refuse signing (§06.18 guard)");
+        assert!(
+            store.consume(&stale_id).unwrap().is_none(),
+            "the stale bundle is purged by the consume, not left for reuse"
+        );
+
+        // Wrong policy id also fails the binding check.
+        let pol_id = "cc".repeat(32);
+        store.persist(&mk(&pol_id, [0xFF; 32], jpk.clone())).unwrap();
+        assert!(
+            bridge
+                .consume_bundle_for_sign(&store, &pol_id, policy)
+                .is_err(),
+            "wrong policy_id MUST fail the consume-time binding check"
         );
     }
 

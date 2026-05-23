@@ -44,3 +44,6 @@ cggmp24.workspace = true
 round-based = { workspace = true, features = ["sim", "state-machine"] }
 pin-project = { workspace = true }
 tempfile = { workspace = true }
+# #22a consume-guard test builds PresigBundles (cosigner_encrypted_shares is
+# Vec<serde_bytes::ByteBuf>).
+serde_bytes = { workspace = true }

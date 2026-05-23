@@ -163,6 +163,14 @@ pub trait BundleStore: Send + Sync {
     /// cosigner-subset change, joint-pubkey rekey) before any sign request that
     /// could use a now-stale bundle.
     fn invalidate(&self, trigger: &InvalidationTrigger) -> anyhow::Result<u64>;
+
+    /// §06.17.3 **single-use consume**: atomically remove the bundle for
+    /// `presig_id` and return it, or `None` if it is absent / already consumed.
+    /// The removal MUST be atomic so a bundle can be consumed **at most once**
+    /// even under concurrent sign requests — this is the spec-level mitigation for
+    /// the CVE-2025-66017 presignature-forgery class. Removal zeroizes the bytes
+    /// (same erase semantics as [`invalidate`](Self::invalidate)).
+    fn consume(&self, presig_id: &str) -> anyhow::Result<Option<PresigBundle>>;
 }
 
 /// In-memory bundle store (tests / single-process demos). Keyed by `presig_id`.
@@ -216,6 +224,15 @@ impl BundleStore for InMemoryBundleStore {
             map.remove(id);
         }
         Ok(doomed.len() as u64)
+    }
+
+    fn consume(&self, presig_id: &str) -> anyhow::Result<Option<PresigBundle>> {
+        // `HashMap::remove` under the lock is atomic — a second consume returns None.
+        Ok(self
+            .inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(presig_id))
     }
 }
 
@@ -325,6 +342,40 @@ impl BundleStore for FileBundleStore {
             }
         }
         Ok(purged)
+    }
+
+    fn consume(&self, presig_id: &str) -> anyhow::Result<Option<PresigBundle>> {
+        let path = self.path_for(presig_id);
+        // Atomic claim: rename the bundle file to a unique sibling. `rename` is
+        // atomic on POSIX, so exactly one concurrent consumer wins; the loser's
+        // rename fails with NotFound → None. This makes single-use race-free
+        // (§06.17.3) without a lock spanning the read.
+        static CLAIM_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let seq = CLAIM_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let claim = path.with_extension(format!(
+            "consuming.{}.{nanos}.{seq}",
+            std::process::id()
+        ));
+        match std::fs::rename(&path, &claim) {
+            Ok(()) => {
+                let bytes = std::fs::read(&claim)
+                    .map_err(|e| anyhow::anyhow!("read claimed bundle {}: {e}", claim.display()))?;
+                let bundle: PresigBundle = serde_json::from_slice(&bytes).map_err(|e| {
+                    anyhow::anyhow!("parse claimed bundle {}: {e}", claim.display())
+                })?;
+                // Zeroize the claimed copy (overwrite-then-remove) per §06.18.
+                Self::zeroize_and_remove(&claim).map_err(|e| {
+                    anyhow::anyhow!("zeroize consumed bundle {}: {e}", claim.display())
+                })?;
+                Ok(Some(bundle))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(anyhow::anyhow!("claim bundle {}: {e}", path.display())),
+        }
     }
 }
 
@@ -1276,5 +1327,85 @@ mod tests {
             .unwrap();
         assert_eq!(purged, 1);
         assert!(store.get(&"22".repeat(32)).is_none(), "pool now empty");
+    }
+
+    // ── §06.17.3 single-use consume ──────────────────────────────────────
+
+    #[test]
+    fn in_memory_consume_is_single_use() {
+        let store = InMemoryBundleStore::new();
+        store
+            .persist(&bundle_with("c1", [0x11; 32], vec![0x02; 33], vec![0, 1]))
+            .unwrap();
+        // First consume returns the bundle; second yields None (single-use).
+        let first = store.consume("c1").unwrap();
+        assert!(first.is_some(), "first consume returns the bundle");
+        assert_eq!(first.unwrap().presig_id, "c1");
+        assert!(
+            store.consume("c1").unwrap().is_none(),
+            "a bundle MUST NOT be consumable twice (§06.17.3)"
+        );
+        assert!(store.get("c1").is_none(), "consumed bundle is gone");
+    }
+
+    #[test]
+    fn file_consume_is_single_use_and_zeroizes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = FileBundleStore::new(dir.path()).expect("open");
+        let id = "cc".repeat(32);
+        store
+            .persist(&bundle_with(&id, [0x11; 32], vec![0x02; 33], vec![0, 1]))
+            .unwrap();
+        let path = store.path_for(&id);
+        assert!(path.exists());
+
+        let first = store.consume(&id).unwrap();
+        assert!(first.is_some(), "first consume returns the bundle");
+        assert!(!path.exists(), "consumed bundle file removed (zeroized)");
+        assert!(
+            store.consume(&id).unwrap().is_none(),
+            "second consume yields None (single-use §06.17.3)"
+        );
+        // No stray consuming.* claim files left behind.
+        let leftovers = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .count();
+        assert_eq!(leftovers, 0, "no claim/temp files left after consume");
+    }
+
+    #[test]
+    fn file_consume_concurrent_yields_bundle_at_most_once() {
+        // Two threads race to consume the same bundle; EXACTLY one wins.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(FileBundleStore::new(dir.path()).expect("open"));
+        let id = "dd".repeat(32);
+        store
+            .persist(&bundle_with(&id, [0x11; 32], vec![0x02; 33], vec![0, 1]))
+            .unwrap();
+
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let wins = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let store = store.clone();
+            let id = id.clone();
+            let barrier = barrier.clone();
+            let wins = wins.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                if store.consume(&id).unwrap().is_some() {
+                    wins.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(
+            wins.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "EXACTLY one concurrent consumer may win (atomic single-use)"
+        );
     }
 }
