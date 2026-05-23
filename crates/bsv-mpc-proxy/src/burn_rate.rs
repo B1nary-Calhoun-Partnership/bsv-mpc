@@ -43,6 +43,53 @@ pub enum InvalidationReason {
     Rekey,
 }
 
+impl InvalidationReason {
+    /// The canonical `reason` metric label (§06.19): refresh|subset|policy|rekey.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Refresh => "refresh",
+            Self::Subset => "subset",
+            Self::Policy => "policy",
+            Self::Rekey => "rekey",
+        }
+    }
+}
+
+/// A §10-aligned audit record for a §06.18 presig-bundle invalidation. Emitted to
+/// the local audit log (`tracing` target `mpc_audit`) on every trigger. The full
+/// §10.5 Merkle-STH on-chain anchoring is separate audit-layer infrastructure;
+/// this is the structured event that anchoring projects from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvalidationAudit {
+    /// §10.3-style event kind.
+    pub event_kind: &'static str,
+    /// Which §06.18 trigger fired.
+    pub reason: InvalidationReason,
+    /// The joint pubkey (hex) the invalidation scoped over.
+    pub joint_pubkey_hex: String,
+    /// Number of bundles purged (zeroized).
+    pub purged: u64,
+    /// Unix milliseconds when the trigger committed.
+    pub timestamp_ms: u64,
+}
+
+impl InvalidationAudit {
+    /// Build the audit record for `purged` bundles invalidated under `reason`.
+    pub fn new(reason: InvalidationReason, joint_pubkey_hex: String, purged: u64) -> Self {
+        let timestamp_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        Self {
+            event_kind: "PresigBundlesInvalidated",
+            reason,
+            joint_pubkey_hex,
+            purged,
+            timestamp_ms,
+        }
+    }
+}
+
 /// Pure §06.19 burn-rate regulator. Holds the EWMA + lifetime counters; all
 /// time-dependent reads take an injected monotonic `now_secs`.
 #[derive(Debug, Clone)]

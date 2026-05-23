@@ -1558,7 +1558,6 @@ impl MpcBridge {
         presign_manager: std::sync::Arc<RwLock<crate::presign_manager::PresignManager>>,
         timeout: std::time::Duration,
     ) -> bsv_mpc_core::error::Result<(String, u64)> {
-        use bsv_mpc_service::BundleStore;
 
         let identity_priv = {
             let auth = self
@@ -1627,22 +1626,112 @@ impl MpcBridge {
         // 2. Persist the rotated DkgResult to disk (so a restart loads it too).
         self.persist_rotated_share(share_path, encryption_key, &commit.rotated_share)?;
 
-        // 3. §06.18 ShareRefresh invalidation: purge every bundle for this jpk.
-        let purged = bundle_store
-            .invalidate(&bsv_mpc_core::types::InvalidationTrigger::ShareRefresh {
+        // 3. §06.18 ShareRefresh invalidation (metric + §10 audit) for this jpk.
+        let audit = self.invalidate_bundles(
+            &bundle_store,
+            &presign_manager,
+            &bsv_mpc_core::types::InvalidationTrigger::ShareRefresh {
                 joint_pubkey: &commit.joint_pubkey_compressed,
-            })
-            .map_err(|e| MpcError::Protocol(format!("refresh: bundle invalidation failed: {e}")))?;
-        if let Ok(mut mgr) = presign_manager.write() {
-            mgr.record_invalidation(crate::burn_rate::InvalidationReason::Refresh, purged);
-        }
-        tracing::info!(
-            agent_id = %self.agent_id,
-            purged_bundles = purged,
-            "refresh-over-relay: share hot-swapped + persisted, {purged} presig bundles invalidated (§06.18 refresh)"
-        );
+            },
+            crate::burn_rate::InvalidationReason::Refresh,
+        )?;
 
-        Ok((hex_encode(&commit.joint_pubkey_compressed), purged))
+        Ok((hex_encode(&commit.joint_pubkey_compressed), audit.purged))
+    }
+
+    /// Shared §06.18 invalidation primitive: purge every bundle the `trigger`
+    /// fires on (zeroized), record the `bundles_invalidated_total{reason}` metric
+    /// (§06.19), and emit the §10 audit record to the `mpc_audit` log. Returns the
+    /// [`InvalidationAudit`](crate::burn_rate::InvalidationAudit) record.
+    ///
+    /// All four §06.18 triggers funnel through here (ShareRefresh via
+    /// [`refresh_over_relay`](Self::refresh_over_relay); the [`on_policy_update`],
+    /// [`on_cosigner_subset_change`], [`on_joint_pubkey_rekey`] entry points below)
+    /// so the metric + audit are uniform.
+    pub fn invalidate_bundles(
+        &self,
+        bundle_store: &bsv_mpc_service::FileBundleStore,
+        presign_manager: &RwLock<crate::presign_manager::PresignManager>,
+        trigger: &bsv_mpc_core::types::InvalidationTrigger,
+        reason: crate::burn_rate::InvalidationReason,
+    ) -> bsv_mpc_core::error::Result<crate::burn_rate::InvalidationAudit> {
+        use bsv_mpc_service::BundleStore;
+        let purged = bundle_store
+            .invalidate(trigger)
+            .map_err(|e| MpcError::Protocol(format!("bundle invalidation failed: {e}")))?;
+        if let Ok(mut mgr) = presign_manager.write() {
+            mgr.record_invalidation(reason, purged);
+        }
+        let audit = crate::burn_rate::InvalidationAudit::new(
+            reason,
+            hex_encode(&self.joint_key.compressed),
+            purged,
+        );
+        // §10 audit log line (the structured event §10.5 STH anchoring projects from).
+        tracing::info!(
+            target: "mpc_audit",
+            event_kind = audit.event_kind,
+            reason = reason.label(),
+            joint_pubkey = %audit.joint_pubkey_hex,
+            purged = audit.purged,
+            timestamp_ms = audit.timestamp_ms,
+            agent_id = %self.agent_id,
+            "§06.18 presig-bundle invalidation"
+        );
+        Ok(audit)
+    }
+
+    /// **§09 policy-manifest update trigger** (§06.18): purge every bundle whose
+    /// `policy_id` no longer matches `current_policy_id`. Call from the §09
+    /// policy-update path when it lands (no §09 engine in bsv-mpc yet — this is the
+    /// ready, tested entry point).
+    pub fn on_policy_update(
+        &self,
+        bundle_store: &bsv_mpc_service::FileBundleStore,
+        presign_manager: &RwLock<crate::presign_manager::PresignManager>,
+        current_policy_id: bsv_mpc_core::types::PolicyId,
+    ) -> bsv_mpc_core::error::Result<crate::burn_rate::InvalidationAudit> {
+        self.invalidate_bundles(
+            bundle_store,
+            presign_manager,
+            &bsv_mpc_core::types::InvalidationTrigger::PolicyUpdate { current_policy_id },
+            crate::burn_rate::InvalidationReason::Policy,
+        )
+    }
+
+    /// **§13.7 cosigner-subset change trigger** (§06.18): purge every bundle bound
+    /// to the `prior_subset` (an operator was replaced). Call from the §13.7
+    /// operator-replacement path.
+    pub fn on_cosigner_subset_change(
+        &self,
+        bundle_store: &bsv_mpc_service::FileBundleStore,
+        presign_manager: &RwLock<crate::presign_manager::PresignManager>,
+        prior_subset: &[u16],
+    ) -> bsv_mpc_core::error::Result<crate::burn_rate::InvalidationAudit> {
+        self.invalidate_bundles(
+            bundle_store,
+            presign_manager,
+            &bsv_mpc_core::types::InvalidationTrigger::CosignerSubsetChange { prior_subset },
+            crate::burn_rate::InvalidationReason::Subset,
+        )
+    }
+
+    /// **§18 post-recovery rekey trigger** (§06.18): purge every bundle for the
+    /// `prior_joint_pubkey` after a catastrophic-recovery rekey to a NEW joint key
+    /// (distinct from routine refresh, which preserves the key). Call from the §18
+    /// recovery rekey path.
+    pub fn on_joint_pubkey_rekey(
+        &self,
+        bundle_store: &bsv_mpc_service::FileBundleStore,
+        presign_manager: &RwLock<crate::presign_manager::PresignManager>,
+        prior_joint_pubkey: &[u8],
+    ) -> bsv_mpc_core::error::Result<crate::burn_rate::InvalidationAudit> {
+        self.invalidate_bundles(
+            bundle_store,
+            presign_manager,
+            &bsv_mpc_core::types::InvalidationTrigger::JointPubkeyChange { prior_joint_pubkey },
+            crate::burn_rate::InvalidationReason::Rekey,
+        )
     }
 
     /// Write the rotated `DkgResult` to `share_path` atomically (temp + rename),
@@ -2646,6 +2735,68 @@ mod refresh_rotation_tests {
                 .is_err(),
             "wrong policy_id MUST fail the consume-time binding check"
         );
+    }
+
+    #[tokio::test]
+    async fn invalidation_trigger_entry_points_purge_and_audit() {
+        use bsv_mpc_core::types::{PolicyId, PresigBundle};
+        use bsv_mpc_service::{BundleStore, FileBundleStore};
+        use crate::burn_rate::InvalidationReason;
+        use crate::presign_manager::PresignManager;
+
+        let jpk = vec![0x02u8; 33];
+        let bridge = MpcBridge::new_for_test(JointPublicKey {
+            compressed: jpk.clone(),
+            address: "1Inval".into(),
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileBundleStore::new(dir.path()).unwrap();
+        let mgr = RwLock::new(PresignManager::new(16));
+
+        let mk = |id: &str, pol: [u8; 32], jp: Vec<u8>, parties: Vec<u16>| PresigBundle {
+            presig_id: id.into(),
+            presig_bytes: vec![1],
+            cosigner_encrypted_shares: vec![serde_bytes::ByteBuf::from(vec![])],
+            gamma_hex: "ab".into(),
+            commitments: vec![1],
+            policy_id: PolicyId(pol),
+            joint_pubkey: jp,
+            parties_at_keygen: parties,
+            generated_at: 1,
+        };
+
+        // PolicyUpdate: a stale-policy bundle is purged; current-policy survives.
+        store.persist(&mk(&"a1".repeat(32), [0x09; 32], jpk.clone(), vec![0, 1])).unwrap();
+        store.persist(&mk(&"a2".repeat(32), [0xFF; 32], jpk.clone(), vec![0, 1])).unwrap();
+        let audit = bridge
+            .on_policy_update(&store, &mgr, PolicyId([0x09; 32]))
+            .unwrap();
+        assert_eq!(audit.purged, 1, "only the stale-policy bundle purged");
+        assert_eq!(audit.reason, InvalidationReason::Policy);
+        assert_eq!(audit.event_kind, "PresigBundlesInvalidated");
+        assert_eq!(audit.joint_pubkey_hex, hex_encode(&jpk));
+        assert!(store.get(&"a1".repeat(32)).is_some());
+        assert!(store.get(&"a2".repeat(32)).is_none());
+
+        // CosignerSubsetChange(prior=[0,1]) purges the [0,1] bundle.
+        store.persist(&mk(&"b1".repeat(32), [0x09; 32], jpk.clone(), vec![0, 1])).unwrap();
+        store.persist(&mk(&"b2".repeat(32), [0x09; 32], jpk.clone(), vec![0, 2])).unwrap();
+        let audit = bridge.on_cosigner_subset_change(&store, &mgr, &[0, 1]).unwrap();
+        // Two [0,1]-subset bundles exist now: a1 (survived the policy purge) + b1.
+        assert_eq!(audit.purged, 2, "both [0,1]-subset bundles purged");
+        assert_eq!(audit.reason, InvalidationReason::Subset);
+
+        // JointPubkeyChange(prior=JPK) purges remaining JPK bundles.
+        let audit = bridge.on_joint_pubkey_rekey(&store, &mgr, &jpk).unwrap();
+        assert_eq!(audit.reason, InvalidationReason::Rekey);
+        // Everything for this jpk is now gone.
+        assert!(store.get(&"b2".repeat(32)).is_none());
+
+        // Metric counters reflect each reason.
+        let m = mgr.read().unwrap();
+        assert_eq!(m.bundles_invalidated(InvalidationReason::Policy), 1);
+        assert_eq!(m.bundles_invalidated(InvalidationReason::Subset), 2);
+        assert!(m.bundles_invalidated(InvalidationReason::Rekey) >= 1);
     }
 
     #[tokio::test]
