@@ -10,6 +10,8 @@ pub mod handlers;
 pub mod messagebox;
 pub mod presign_handler;
 pub mod provision;
+pub mod refresh_handler;
+pub mod refresh_relay_handlers;
 pub mod relay_handlers;
 pub mod sign_relay_handler;
 pub mod signing_handler;
@@ -17,6 +19,7 @@ pub mod storage;
 
 pub use auth::AuthState;
 pub use dkg_handler::DkgHandler;
+pub use refresh_handler::RefreshHandler;
 pub use messagebox::{HandlerFuture, MessageBoxListener, OutgoingRoundMessage};
 pub use presign_handler::{
     BundleStore, FileBundleStore, InMemoryBundleStore, PresignHandler, PresignHandlerConfig,
@@ -104,6 +107,17 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             post(relay_handlers::handle_presign_relay_init),
         )
         .route("/sign-relay", post(relay_handlers::handle_sign_relay))
+        // §18.2 container key-refresh over the relay (#10, CONTAINER target):
+        // arm the container as a refresh peer + rotate-on-commit (purges presigs
+        // per §18.9). Heavy MPC — container only, NOT the worker isolate.
+        .route(
+            "/refresh-relay/identity",
+            get(refresh_relay_handlers::handle_refresh_relay_identity),
+        )
+        .route(
+            "/refresh-relay/init",
+            post(refresh_relay_handlers::handle_refresh_relay_init),
+        )
         // Read-only
         .route("/health", get(handlers::handle_health))
         .route(

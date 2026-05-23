@@ -53,3 +53,7 @@ tracing-subscriber.workspace = true
 round-based = { workspace = true, features = ["sim", "state-machine"] }
 futures = { workspace = true }
 pin-project = { workspace = true }
+# refresh_2of2_via_messagebox_e2e inspects rotated scalars/points + signs with
+# the refreshed shares to prove the relay refresh produced a working sharing.
+generic-ec = { workspace = true }
+sha2 = { workspace = true }

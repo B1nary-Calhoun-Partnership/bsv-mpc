@@ -394,6 +394,7 @@ dependencies = [
  "cggmp24",
  "chrono",
  "futures",
+ "generic-ec",
  "getrandom 0.2.17",
  "hex",
  "pin-project",
