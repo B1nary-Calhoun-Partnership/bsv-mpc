@@ -12,19 +12,22 @@
 //!    here means bsv-mpc derives a DIFFERENT BRC-2 key than the canonical @bsv
 //!    SDK / rust-mpc for the same presig, so no cross-impl decrypt would work.
 //!
-//! 2. **Ciphertext byte-lock (#[ignore] — gated on MPC-Spec #9).** The full
-//!    `IV(32) ‖ ct ‖ tag` byte-equality assertion needs (a) the reference impl
-//!    run that fills the `__TBD__` ciphertexts using the pinned 32-byte IV, and
-//!    (b) a test-only `encrypt_with_iv` seam in bsv-rs (production `encrypt`
-//!    generates the IV randomly — no SDK exposes IV injection). Until both land,
-//!    this tier is `#[ignore]`d so CI stays green without faking the lock.
+//! 2. **Ciphertext byte-lock (LOCKED — runs now).** For each vector, BRC-2
+//!    self-encrypt under the pinned 32-byte IV via the deterministic
+//!    `encrypt_presig_share_with_iv` seam (bsv-rs ≥ 0.3.12) and assert the
+//!    `IV(32) ‖ ct ‖ tag` output matches byte-for-byte. The locked ciphertexts
+//!    are canonical — reproduced identically by @bsv/sdk (TS), go-sdk, and
+//!    OpenSSL with the same wallet-derived key + IV — so this is a true
+//!    cross-impl lock, not a single-impl echo.
 //!
 //! Negative tests (§06.21.1) and the round-trip path run now via
 //! `bsv_mpc_core::presig_encryption`.
 
 use bsv::primitives::ec::PrivateKey;
 use bsv_mpc_core::hd::{compute_brc42_hmac, compute_invoice};
-use bsv_mpc_core::presig_encryption::{decrypt_presig_share, encrypt_presig_share, wallet_from_identity};
+use bsv_mpc_core::presig_encryption::{
+    decrypt_presig_share, encrypt_presig_share, encrypt_presig_share_with_iv, wallet_from_identity,
+};
 use serde_json::Value;
 
 const VECTORS: &str = include_str!("fixtures/06-presig-bundle-encryption.json");
@@ -165,28 +168,40 @@ fn vector3_roundtrip_decrypt() {
     assert_eq!(pt, expected, "vector-3 round-trip plaintext mismatch");
 }
 
-/// Tier 2 — full ciphertext byte-lock. GATED on MPC-Spec #9 (the reference run
-/// that fills `expected.ciphertext_with_tag_hex` using the pinned 32-byte IV) +
-/// a test-only `encrypt_with_iv` seam in bsv-rs. Until then this is ignored so
-/// we never green-theater a lock we can't actually verify.
+/// Tier 2 — full ciphertext byte-lock (§06.16). For each vector, BRC-2
+/// self-encrypt the plaintext under the pinned 32-byte IV via the deterministic
+/// `encrypt_presig_share_with_iv` seam (bsv-rs ≥ 0.3.12) and assert the
+/// `IV(32) ‖ ct ‖ tag` output matches the locked vector byte-for-byte. The locked
+/// ciphertexts are canonical: reproduced byte-for-byte by @bsv/sdk (TS), go-sdk,
+/// and OpenSSL with the same wallet-derived key + IV. Also re-asserts the
+/// round-trip through the canonical (random-IV-path) `decrypt_presig_share`,
+/// proving the seam used the same key as the production wallet path.
 #[test]
-#[ignore = "blocked on MPC-Spec #9 (TBD ciphertexts) + bsv-rs encrypt_with_iv IV-injection seam"]
 fn ciphertext_byte_lock() {
     let r = root();
     let vectors = r["vectors"].as_array().unwrap();
-    // Guard: the reference run (MPC-Spec #9) must have filled the __TBD__ slots.
-    let still_tbd = vectors.iter().any(|v| {
-        v["expected"]["ciphertext_with_tag_hex"]
-            .as_str()
-            .map(|c| c.contains("TBD"))
-            .unwrap_or(true)
-    });
-    assert!(
-        !still_tbd,
-        "vectors still carry __TBD__ ciphertexts; MPC-Spec #9 not yet landed"
-    );
-    // Once #9 lands AND bsv-rs exposes encrypt_with_iv(pinned IV), assert per vector:
-    //   let ct = encrypt_presig_share_with_iv(&wallet, presig_id, &plaintext, &iv32);
-    //   assert_eq!(hex::encode(ct), expected, "{name}: ciphertext byte-lock");
-    unimplemented!("wire up once #9 + encrypt_with_iv land");
+    assert_eq!(vectors.len(), 3, "§06 has 3 presig-bundle vectors");
+    for v in vectors {
+        let name = s(v, "name");
+        let inp = &v["inputs"];
+        let priv_key =
+            PrivateKey::from_bytes(&hex::decode(s(inp, "wallet_identity_priv_hex")).unwrap())
+                .unwrap();
+        let presig_id = s(inp, "presig_id");
+        let plaintext = hex::decode(s(inp, "presig_share_plaintext_hex")).unwrap();
+        let iv_vec = hex::decode(s(inp, "aes_gcm_iv_hex")).unwrap();
+        assert_eq!(iv_vec.len(), 32, "{name}: canonical 32-byte IV");
+        let mut iv = [0u8; 32];
+        iv.copy_from_slice(&iv_vec);
+        let expected = s(&v["expected"], "ciphertext_with_tag_hex");
+
+        let wallet = wallet_from_identity(&priv_key);
+        let ct = encrypt_presig_share_with_iv(&wallet, presig_id, &iv, &plaintext).unwrap();
+        assert_eq!(hex::encode(&ct), expected, "{name}: ciphertext byte-lock");
+
+        // Round-trip through the canonical decrypt path — proves the deterministic
+        // seam derived the SAME BRC-2 key the production wallet path uses.
+        let pt = decrypt_presig_share(&wallet, presig_id, &ct).unwrap();
+        assert_eq!(pt, plaintext, "{name}: round-trip decrypt under canonical path");
+    }
 }

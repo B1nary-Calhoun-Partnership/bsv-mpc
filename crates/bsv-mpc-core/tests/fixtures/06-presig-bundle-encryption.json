@@ -1,14 +1,14 @@
 {
   "spec_section": "06.16",
-  "spec_title": "Presignature share \u2014 BRC-2 self-encryption byte-lock",
+  "spec_title": "Presignature share — BRC-2 self-encryption byte-lock",
   "adr": "0030",
-  "status": "intermediate-values-locked; ciphertext requires reference impl run with a pinned 32-byte IV (MPC-Spec #9)",
+  "status": "ciphertexts locked (canonical; reproduced byte-for-byte by @bsv/sdk TS, go-sdk, OpenSSL, and bsv-rs)",
   "description": "Byte-locks the deterministic intermediate values (wallet pub, BRC-42 invoice, shared_secret, HMAC offset) for the BRC-2 self-encryption derivation. The AES-256-GCM key is NOT the HMAC offset directly: per the canonical BSV SymmetricKey, the key is the x-coordinate of the derived child-key self-ECDH point. Full ciphertext byte-lock requires a reference impl run that injects the pinned IV (no SDK exposes IV injection in its production encrypt path; both impls add a test-only encrypt_with_iv seam for this vector).",
   "iv_convention": {
     "iv_size_bytes": 32,
     "ciphertext_format": "IV(32) || ciphertext || authTag(16)",
     "rationale": "32-byte IV is the canonical BSV SymmetricKey convention across ALL ecosystem SDKs; a 12-byte IV matches none of them. Verified 2026-05-22: @bsv/sdk (TS) src/primitives/SymmetricKey.ts:44,86 (Random(32), ivLength=32); go-sdk primitives/ec/symmetric.go:29,64 (make([]byte,32), message[:32]); bsv-rs 0.3.11 (bsv-mpc) src/primitives/symmetric.rs:50; bsv-sdk 0.2.82 (rust-mpc) src/primitives/symmetric_key.rs:4 ('with the TS SDK's 32-byte IV convention'). NOTE: rust-mpc's 12-byte nonce in crates/storage/src/encryption.rs is its separate at-rest storage layer, NOT the BRC-2 presig path. Both presig paths delegate to their SDK's 32-byte SymmetricKey. The prior 12-byte aes_gcm_iv_hex values in this vector were mis-authored placeholders and have been corrected to 32 bytes.",
-    "corrected": "2026-05-22 (Calhoun; both stewards have authority per partnership playbook). The expected ciphertexts remain TBD pending the reference run under MPC-Spec #9 using these corrected 32-byte IVs."
+    "corrected": "2026-05-22 (Calhoun; both stewards have authority per partnership playbook). The 32-byte IV is canonical across @bsv/sdk (TS), go-sdk, and bsv-rs. The expected ciphertexts are now LOCKED (computed under these corrected 32-byte IVs; reproduced byte-for-byte by ts-sdk, go-sdk, OpenSSL, and bsv-rs 0.3.12 — see aes_key_note)."
   },
   "vectors": [
     {
@@ -30,7 +30,7 @@
         "hmac_offset_hex": "8ba89460314ad90da34d36c4121415a128b29cc64cb6d80f74713aa65e1c7db2"
       },
       "expected": {
-        "ciphertext_with_tag_hex": "__TBD-by-ref-impl__"
+        "ciphertext_with_tag_hex": "0a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20212223242526272829e2a271ace2152ed67202236642d8273e70bd19594b50ff9f29efb70c9dcf7a07f24ecf77fb89c086047cf0e0119e9c4b"
       },
       "computed_by_loop3": {
         "wallet_pub_compressed_hex": "031b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f",
@@ -49,7 +49,7 @@
         "aes_gcm_iv_hex": "1b2c3d4e5f6071829384a5b6c7d8e9fa0b1c2d3e4f60718293a4b5c6d7e8f900",
         "protocol_security_level": 2,
         "protocol_name": "  MPCPresig  ",
-        "_canonicalized_to": "mpcpresig (after .to_lowercase().trim() per \u00a703.2)",
+        "_canonicalized_to": "mpcpresig (after .to_lowercase().trim() per §03.2)",
         "counterparty": "Self_"
       },
       "intermediate_byte_locked": {
@@ -60,7 +60,7 @@
         "hmac_offset_hex": "3427ae709951ad9901ba023a43b8e5ec13ef806bcf419476e874938200d2be3a"
       },
       "expected": {
-        "ciphertext_with_tag_hex": "__TBD-by-ref-impl__"
+        "ciphertext_with_tag_hex": "1b2c3d4e5f6071829384a5b6c7d8e9fa0b1c2d3e4f60718293a4b5c6d7e8f900e264a7ca43d917f95ced6b2c2bad3666e1f9565a73db8de74368fe24f73bc2d8a5fe0576a17fcc0299bf756309847071"
       }
     },
     {
@@ -80,7 +80,7 @@
         "hmac_offset_hex": "8c83913a7527a54ee94b25e307831921c2309ba2c94301e055fc94db2944e86d"
       },
       "expected": {
-        "ciphertext_with_tag_hex": "__TBD-by-ref-impl__",
+        "ciphertext_with_tag_hex": "2c3d4e5f6071829384a5b6c7d8e9fa0b1c2d3e4f60718293a4b5c6d7e8f90011cad80ea89124972c43a5f317a2e55137e27d0d960a666f55ab7e7dc5bd4c191293acaa5c7c2de0c04843f794f1c7c136",
         "roundtrip_decrypt_plaintext_hex": "deadbeefcafebabe0011223344556677889900aabbccddeeff0123456789abcd"
       }
     }
@@ -100,7 +100,9 @@
     },
     {
       "name": "different-presig_id-different-ciphertext",
-      "description": "SAME plaintext, two different presig_ids \u2192 ciphertexts MUST differ."
+      "description": "SAME plaintext, two different presig_ids → ciphertexts MUST differ."
     }
-  ]
+  ],
+  "notes": [],
+  "aes_key_note": "AES-256-GCM key = X-coordinate of the BRC-2 self-ECDH of the DERIVED child key (ProtoWallet.deriveSymmetricKey(Self_, [2,'mpcpresig'], presig_id)) — i.e. derive the child private+public from the identity key via computeInvoiceNumber, then ECDH them and take the 32-byte x-coordinate. This is NOT the x-coordinate of the level-1 'shared_secret_compressed_hex' intermediate above (that is an earlier step in the BRC-42 chain). Worked example v1 (identity priv = 01*32, presig_id = presig-test-vector-001): AES key = 49cdd123c957cd9421d36f4c18f47a3dd4654fee6a4c054b6eb20143b5b1c35e. The locked ciphertexts are reproduced byte-for-byte by @bsv/sdk (TS), go-sdk, OpenSSL, and bsv-rs 0.3.12 (SymmetricKey::encrypt_with_iv) with the pinned 32-byte IV."
 }

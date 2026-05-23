@@ -28,7 +28,9 @@
 //! `tests/conformance_06_presig_bundle_encryption.rs`.
 
 use bsv::primitives::ec::PrivateKey;
-use bsv::wallet::{Counterparty, DecryptArgs, EncryptArgs, ProtoWallet, Protocol, SecurityLevel};
+use bsv::wallet::{
+    Counterparty, DecryptArgs, EncryptArgs, KeyDeriverApi, ProtoWallet, Protocol, SecurityLevel,
+};
 
 use crate::error::{MpcError, Result};
 
@@ -73,6 +75,36 @@ pub fn encrypt_presig_share(
         })
         .map_err(|e| MpcError::Encryption(format!("presig share encrypt: {e}")))?;
     Ok(result.ciphertext)
+}
+
+/// **Conformance/test-only** deterministic-IV variant of [`encrypt_presig_share`]
+/// (§06.16 ciphertext byte-lock).
+///
+/// Derives the **identical** BRC-2 self-encryption `SymmetricKey` that
+/// [`encrypt_presig_share`] uses — the same `key_deriver().derive_symmetric_key(
+/// presig_protocol(), presig_id, Self_)` the wallet's `encrypt` calls internally
+/// — then encrypts with a **caller-supplied 32-byte IV** via
+/// [`bsv::primitives::SymmetricKey::encrypt_with_iv`]. The output is byte-identical
+/// to what [`encrypt_presig_share`] would have produced had it drawn this IV, and
+/// it round-trips through [`decrypt_presig_share`] unchanged (the conformance test
+/// asserts this — proving the key matches the canonical wallet path).
+///
+/// This exists ONLY so the §06.16 cross-impl conformance vector can byte-lock the
+/// ciphertext (the random IV is the sole nondeterminism). Production MUST use
+/// [`encrypt_presig_share`] — IV reuse under AES-GCM is catastrophic.
+pub fn encrypt_presig_share_with_iv(
+    wallet: &ProtoWallet,
+    presig_id: &str,
+    iv: &[u8; 32],
+    share_bytes: &[u8],
+) -> Result<Vec<u8>> {
+    let symmetric_key = wallet
+        .key_deriver()
+        .derive_symmetric_key(&presig_protocol(), presig_id, &Counterparty::Self_)
+        .map_err(|e| MpcError::Encryption(format!("presig key derive: {e}")))?;
+    symmetric_key
+        .encrypt_with_iv(iv, share_bytes)
+        .map_err(|e| MpcError::Encryption(format!("presig share encrypt_with_iv: {e}")))
 }
 
 /// Inverse of [`encrypt_presig_share`] — BRC-2 self-decrypt at sign-time (§06.20).
