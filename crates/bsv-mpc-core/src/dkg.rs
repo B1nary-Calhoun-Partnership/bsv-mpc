@@ -276,7 +276,27 @@ pub struct DkgCoordinator {
     /// Use [`set_pregenerated_primes`](Self::set_pregenerated_primes) or
     /// [`with_pool`](Self::with_pool) to provide them.
     pregenerated_primes: Option<cggmp24::PregeneratedPrimes<SecurityLevel128>>,
+
+    /// Optional **late-seeded** prime cell, shared with the caller. Lets a
+    /// caller `init()` (and ship keygen round-1) BEFORE the slow safe-prime
+    /// generation finishes, then drop the primes in here once ready — the
+    /// keygen→auxinfo transition ([`handle_keygen_complete`](Self::handle_keygen_complete))
+    /// consults this cell as a fallback when `pregenerated_primes` is empty.
+    /// If still empty at transition time, the auxinfo SM generates primes
+    /// inline (the existing slow-but-correct fallback). This is what unblocks
+    /// the §06.17 reshare ordering invariant: every party subscribes + ships
+    /// round-1 immediately (no late relay join), and primes catch up before
+    /// (or are generated during) the auxinfo phase. See
+    /// [`crate::dkg::SharedPrimeCell`].
+    late_primes: Option<SharedPrimeCell>,
 }
+
+/// A caller-shared cell for [late-seeding primes](DkgCoordinator::set_late_prime_cell)
+/// into a coordinator that has already started (`init()` called). The caller
+/// keeps a clone of the `Arc` and drops primes in once safe-prime generation
+/// finishes; the coordinator pulls from it at the keygen→auxinfo transition.
+pub type SharedPrimeCell =
+    std::sync::Arc<std::sync::Mutex<Option<cggmp24::PregeneratedPrimes<SecurityLevel128>>>>;
 
 // SAFETY: `DkgCoordinator` is structurally `!Send` because the cggmp24
 // state machines it holds (`Box<dyn StateMachine<...>>`) carry
@@ -327,6 +347,7 @@ impl DkgCoordinator {
             keygen_joint_pubkey: None,
             eid_bytes,
             pregenerated_primes: None,
+            late_primes: None,
         }
     }
 
@@ -342,6 +363,21 @@ impl DkgCoordinator {
         primes: cggmp24::PregeneratedPrimes<SecurityLevel128>,
     ) {
         self.pregenerated_primes = Some(primes);
+    }
+
+    /// Attach a caller-shared [`SharedPrimeCell`] used as a fallback prime
+    /// source at the keygen→auxinfo transition.
+    ///
+    /// Unlike [`set_pregenerated_primes`](Self::set_pregenerated_primes), this
+    /// MAY be set before `init()` and **filled by the caller afterwards** (even
+    /// while the keygen phase is already running). This is the mechanism that
+    /// lets a party `init()` + ship keygen round-1 immediately — before the
+    /// ~30-90s safe-prime generation completes — so it never joins the relay
+    /// late. Primes are consumed from the cell exactly once, at the transition.
+    /// If the cell is still empty then, the auxinfo phase falls back to inline
+    /// prime generation (slow but correct).
+    pub fn set_late_prime_cell(&mut self, cell: SharedPrimeCell) {
+        self.late_primes = Some(cell);
     }
 
     /// Set pregenerated primes from their serde-JSON form — the shape used to
@@ -646,7 +682,13 @@ impl DkgCoordinator {
             ));
         let my_index = self.my_index.0;
         let n = self.config.parties;
-        let primes_opt = self.pregenerated_primes.take();
+        // Prefer eagerly-set primes; otherwise pull from the caller-shared late
+        // cell (the §06.17 ordering fix — primes seeded after init()/round-1).
+        let primes_opt = self.pregenerated_primes.take().or_else(|| {
+            self.late_primes
+                .as_ref()
+                .and_then(|cell| cell.lock().unwrap_or_else(|p| p.into_inner()).take())
+        });
 
         let sm: AuxInfoSm = Box::new(wrap_protocol(move |party| async move {
             let eid = ExecutionId::new(&aux_eid_bytes);

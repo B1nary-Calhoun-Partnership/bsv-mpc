@@ -24,7 +24,7 @@
 //! inject primes generated ahead of time; typical pattern is one set
 //! per `(session_id, party)` generated at process start.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use bsv_mpc_core::canonical::{canonical_execution_id, ExecutionParams, PhaseTag};
@@ -62,6 +62,29 @@ struct DkgHandlerInner {
     /// One-shot primes keyed by `session_id`. Consumed at coordinator
     /// instantiation; populated via [`DkgHandler::seed_primes_for`].
     primes_pool: Mutex<HashMap<SessionId, PregeneratedPrimes<SecurityLevel128>>>,
+    /// Per-session **late-prime cells**, shared with the live coordinator. An
+    /// [`initiate`](DkgHandler::initiate) installs one per session and hands a
+    /// clone to the coordinator via `set_late_prime_cell`; the caller fills it
+    /// later via [`seed_primes_late`](DkgHandler::seed_primes_late). This is the
+    /// §06.17 ordering fix: subscribe + initiate + ship keygen round-1 FIRST
+    /// (no late relay join), then generate the slow safe primes and drop them
+    /// in — the coordinator pulls them at the keygen→auxinfo transition.
+    late_prime_cells: Mutex<HashMap<SessionId, bsv_mpc_core::dkg::SharedPrimeCell>>,
+    /// **Early-inbound buffer** for messages that arrive BEFORE this party has
+    /// [`initiate`](DkgHandler::initiate)d its coordinator for that session.
+    ///
+    /// In a multi-party ceremony over the relay, parties subscribe + initiate +
+    /// ship round-1 concurrently (and across process boundaries — proxy +
+    /// container — there is NO global "all-initiate-before-any-ship" barrier).
+    /// So a peer's round-1 can be delivered (live OR via backfill) to a party
+    /// whose coordinator is not yet registered. The old code DROPPED such
+    /// messages — and the relay never re-delivers them, so the joint DKG could
+    /// never gather all round-1 commitments and stalled (the deployed
+    /// `party N timed out awaiting throwaway DKG aux` bug). We instead BUFFER
+    /// them here, keyed by session, and replay them the moment that session's
+    /// coordinator is registered in `initiate`. cggmp24's SM already buffers
+    /// out-of-order rounds internally, so replay order across rounds is safe.
+    pending_inbound: Mutex<HashMap<SessionId, Vec<DecodedRoundMessage>>>,
 }
 
 /// Clone-able handle. Cheap (`Arc`-shared inside); the handler closure
@@ -92,6 +115,8 @@ impl DkgHandler {
                 coordinators: Mutex::new(HashMap::new()),
                 completion_tx: Mutex::new(HashMap::new()),
                 primes_pool: Mutex::new(HashMap::new()),
+                late_prime_cells: Mutex::new(HashMap::new()),
+                pending_inbound: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -112,6 +137,46 @@ impl DkgHandler {
             .insert(session_id, primes);
     }
 
+    /// **Late-seed** primes for a session that has already been
+    /// [`initiate`](Self::initiate)d. Unlike [`seed_primes_for`](Self::seed_primes_for)
+    /// (which MUST run before `initiate` because it is consumed at coordinator
+    /// instantiation), this drops primes into the per-session shared cell the
+    /// live coordinator consults at its keygen→auxinfo transition.
+    ///
+    /// This is what lets a party `initiate` + ship keygen round-1 immediately —
+    /// BEFORE the ~30-90s safe-prime generation finishes — so it never joins the
+    /// relay late (the §06.17 ordering invariant). Call it as soon as prime
+    /// generation completes. If the keygen phase happens to outrun prime gen,
+    /// the auxinfo phase falls back to inline generation (slow but correct);
+    /// seeding after that point is a harmless no-op.
+    ///
+    /// No-op if `initiate` was never called for `session_id` (no cell exists).
+    pub fn seed_primes_late(
+        &self,
+        session_id: SessionId,
+        primes: PregeneratedPrimes<SecurityLevel128>,
+    ) {
+        let cell = self
+            .inner
+            .late_prime_cells
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&session_id)
+            .cloned();
+        if let Some(cell) = cell {
+            *cell.lock().unwrap_or_else(|p| p.into_inner()) = Some(primes);
+            debug!(
+                "DkgHandler: late-seeded primes for session {}",
+                hex::encode(session_id.as_bytes())
+            );
+        } else {
+            warn!(
+                "DkgHandler: seed_primes_late for session {} with no live cell (initiate not called?); dropping",
+                hex::encode(session_id.as_bytes())
+            );
+        }
+    }
+
     /// Pre-create the coordinator for `session_id`, run `init()`, and
     /// return the initial round-1 outbound messages + a receiver that
     /// fires with the `DkgResult` the moment this party's ceremony
@@ -129,6 +194,21 @@ impl DkgHandler {
         let inner = self.inner.clone();
         let coord_session = session_id;
 
+        // Install (or reuse) the per-session late-prime cell BEFORE init, and
+        // hand a clone to the coordinator. This lets the caller `initiate` +
+        // ship round-1 now and `seed_primes_late` afterwards (§06.17 ordering).
+        let late_cell: bsv_mpc_core::dkg::SharedPrimeCell = {
+            let mut cells = inner
+                .late_prime_cells
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            cells
+                .entry(coord_session)
+                .or_insert_with(|| std::sync::Arc::new(std::sync::Mutex::new(None)))
+                .clone()
+        };
+        let coord_late_cell = late_cell.clone();
+
         let (coord, initial_round_msgs) = tokio::task::spawn_blocking(
             move || -> anyhow::Result<(DkgCoordinator, Vec<RoundMessage>)> {
                 let mut coord = DkgCoordinator::new(
@@ -144,6 +224,10 @@ impl DkgHandler {
                 {
                     coord.set_pregenerated_primes(primes);
                 }
+                // Fallback prime source for late-seeded primes (filled after
+                // init via `seed_primes_late`). Harmless when primes were
+                // already set eagerly above — the eager set takes precedence.
+                coord.set_late_prime_cell(coord_late_cell);
                 let initial = coord
                     .init()
                     .map_err(|e| anyhow::anyhow!("DkgCoordinator::init failed: {e}"))?;
@@ -154,15 +238,13 @@ impl DkgHandler {
         .map_err(|e| anyhow::anyhow!("init task panicked: {e}"))??;
 
         let (completion_tx, completion_rx) = oneshot::channel::<DkgResult>();
-        let outgoing = wrap_outgoing(&initial_round_msgs, session_id, &peers);
-        {
-            let mut coords = self
-                .inner
-                .coordinators
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
-            coords.insert(session_id, CoordinatorSlot { coord, peers });
-        }
+        let mut outgoing = wrap_outgoing(&initial_round_msgs, session_id, &peers);
+
+        // Register the completion notifier, then the coordinator, then drain any
+        // EARLY-INBOUND messages buffered before this `initiate` (peer round-1
+        // that raced ahead of us). Lock order is `coordinators` → `pending_inbound`
+        // (same as the dispatch buffering path) so no buffered message is lost
+        // between the coordinator insert and the drain.
         {
             let mut tx = self
                 .inner
@@ -171,6 +253,42 @@ impl DkgHandler {
                 .unwrap_or_else(|p| p.into_inner());
             tx.insert(session_id, completion_tx);
         }
+        let buffered: Vec<DecodedRoundMessage> = {
+            let mut coords = self
+                .inner
+                .coordinators
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            coords.insert(session_id, CoordinatorSlot { coord, peers });
+            self.inner
+                .pending_inbound
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&session_id)
+                .unwrap_or_default()
+        };
+
+        // Replay buffered inbounds through the normal dispatch path. Each call
+        // re-inserts the (advanced) coordinator, so sequential replay is safe;
+        // accumulate any outbound the SM produces so the caller ships it
+        // alongside round-1.
+        if !buffered.is_empty() {
+            debug!(
+                "DkgHandler: replaying {} buffered inbound(s) for session {} after initiate",
+                buffered.len(),
+                hex::encode(session_id.as_bytes())
+            );
+            for msg in buffered {
+                match dispatch_one(self.inner.clone(), msg).await {
+                    Ok(mut more) => outgoing.append(&mut more),
+                    Err(e) => warn!(
+                        "DkgHandler: replay of buffered inbound for session {} failed: {e}",
+                        hex::encode(session_id.as_bytes())
+                    ),
+                }
+            }
+        }
+
         Ok((completion_rx, outgoing))
     }
 
@@ -202,79 +320,139 @@ async fn dispatch_one(
     inbound: DecodedRoundMessage,
 ) -> anyhow::Result<Vec<OutgoingRoundMessage>> {
     let session_id = inbound.round_msg.session_id;
+    let mut all_outgoing: Vec<OutgoingRoundMessage> = Vec::new();
+    // Work queue: the triggering inbound, then any messages drained from the
+    // pending buffer as we make progress (closes the race where a peer message
+    // arrives while the coordinator slot is checked-out for processing).
+    let mut queue: VecDeque<DecodedRoundMessage> = VecDeque::new();
+    queue.push_back(inbound);
 
-    // Take the slot out — process_round is sync-blocking and we don't
-    // want to hold the lock across an await.
-    let slot = {
-        let mut coords = inner.coordinators.lock().unwrap_or_else(|p| p.into_inner());
-        coords.remove(&session_id)
-    };
-    let Some(slot) = slot else {
-        warn!(
-            "DkgHandler: inbound for unknown session_id {} (no coordinator); dropping. \
-             Per-spec lazy init for unsolicited inbounds is a follow-up.",
-            hex::encode(session_id.as_bytes())
-        );
-        return Ok(vec![]);
-    };
-
-    let CoordinatorSlot { mut coord, peers } = slot;
-    let inbound_round_msg = inbound.round_msg;
-
-    let (round_result, coord) = tokio::task::spawn_blocking(move || {
-        let result = coord
-            .process_round(vec![inbound_round_msg])
-            .map_err(|e| anyhow::anyhow!("DkgCoordinator::process_round failed: {e}"))?;
-        Ok::<_, anyhow::Error>((result, coord))
-    })
-    .await
-    .map_err(|e| anyhow::anyhow!("process_round task panicked: {e}"))??;
-
-    match round_result {
-        DkgRoundResult::NextRound(next_msgs) => {
-            let outgoing = wrap_outgoing(&next_msgs, session_id, &peers);
+    while let Some(next) = queue.pop_front() {
+        // Take the slot out — process_round is sync-blocking and we don't want
+        // to hold the lock across an await. If the coordinator is not yet
+        // registered (peer round-1 raced ahead of our own `initiate`), BUFFER
+        // the inbound under the pending map instead of dropping it — `initiate`
+        // (or a later drain below) replays it once the coordinator exists. Lock
+        // order is `coordinators` → `pending_inbound` (same as `initiate`) so a
+        // concurrent register-then-drain cannot lose a message buffered here.
+        let slot = {
             let mut coords = inner.coordinators.lock().unwrap_or_else(|p| p.into_inner());
-            coords.insert(session_id, CoordinatorSlot { coord, peers });
-            drop(coords);
-            debug!(
-                "DkgHandler: session={} round {} produced {} outbound msgs",
-                hex::encode(session_id.as_bytes()),
-                next_msgs.first().map(|m| m.round).unwrap_or(0),
-                next_msgs.len()
-            );
-            Ok(outgoing)
-        }
-        DkgRoundResult::Complete(dkg_result) => {
-            let share_session_hex = dkg_result.session_id.hex();
-            if let Ok(mut storage) = inner.storage.write() {
-                if let Err(e) = storage.store_share(&share_session_hex, &dkg_result.share) {
-                    warn!(
-                        "DkgHandler: failed to persist share for session {share_session_hex}: {e}"
+            match coords.remove(&session_id) {
+                Some(s) => s,
+                None => {
+                    let mut pend = inner
+                        .pending_inbound
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner());
+                    let buf = pend.entry(session_id).or_default();
+                    // `next` first, then any items we'd drained ahead of it, so
+                    // FIFO order is preserved for the eventual replay.
+                    buf.push(next);
+                    buf.extend(queue.drain(..));
+                    debug!(
+                        "DkgHandler: inbound for session {} buffered (coordinator checked-out or \
+                         not yet initiated); will replay",
+                        hex::encode(session_id.as_bytes())
                     );
+                    return Ok(all_outgoing);
                 }
-            } else {
-                warn!("DkgHandler: storage RwLock poisoned; share not persisted");
             }
-            info!(
-                "DkgHandler: ceremony complete — session={} joint_pubkey={}",
-                hex::encode(session_id.as_bytes()),
-                hex::encode(&dkg_result.joint_key.compressed)
-            );
-            let tx = {
-                let mut txs = inner
-                    .completion_tx
+        };
+
+        let CoordinatorSlot { mut coord, peers } = slot;
+        let inbound_round_msg = next.round_msg;
+
+        let (round_result, coord) = tokio::task::spawn_blocking(move || {
+            let result = coord
+                .process_round(vec![inbound_round_msg])
+                .map_err(|e| anyhow::anyhow!("DkgCoordinator::process_round failed: {e}"))?;
+            Ok::<_, anyhow::Error>((result, coord))
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("process_round task panicked: {e}"))??;
+
+        match round_result {
+            DkgRoundResult::NextRound(next_msgs) => {
+                let mut outgoing = wrap_outgoing(&next_msgs, session_id, &peers);
+                {
+                    let mut coords =
+                        inner.coordinators.lock().unwrap_or_else(|p| p.into_inner());
+                    coords.insert(session_id, CoordinatorSlot { coord, peers });
+                }
+                debug!(
+                    "DkgHandler: session={} round {} produced {} outbound msgs",
+                    hex::encode(session_id.as_bytes()),
+                    next_msgs.first().map(|m| m.round).unwrap_or(0),
+                    next_msgs.len()
+                );
+                all_outgoing.append(&mut outgoing);
+                // Drain any messages that buffered while the slot was checked
+                // out (or earlier) and keep processing them in this same call.
+                let drained: Vec<DecodedRoundMessage> = inner
+                    .pending_inbound
                     .lock()
-                    .unwrap_or_else(|p| p.into_inner());
-                txs.remove(&session_id)
-            };
-            if let Some(tx) = tx {
-                let _ = tx.send(dkg_result);
+                    .unwrap_or_else(|p| p.into_inner())
+                    .remove(&session_id)
+                    .unwrap_or_default();
+                queue.extend(drained);
             }
-            // coord dropped here — its SM thread joins.
-            drop(coord);
-            Ok(vec![])
+            DkgRoundResult::Complete(dkg_result) => {
+                return finish_complete(&inner, session_id, coord, dkg_result, all_outgoing);
+            }
         }
     }
+
+    Ok(all_outgoing)
+}
+
+/// Finalize a completed DKG ceremony: persist the share, clean up per-session
+/// state, fire the completion notifier, and drop the coordinator.
+fn finish_complete(
+    inner: &Arc<DkgHandlerInner>,
+    session_id: SessionId,
+    coord: DkgCoordinator,
+    dkg_result: DkgResult,
+    all_outgoing: Vec<OutgoingRoundMessage>,
+) -> anyhow::Result<Vec<OutgoingRoundMessage>> {
+    let share_session_hex = dkg_result.session_id.hex();
+    if let Ok(mut storage) = inner.storage.write() {
+        if let Err(e) = storage.store_share(&share_session_hex, &dkg_result.share) {
+            warn!("DkgHandler: failed to persist share for session {share_session_hex}: {e}");
+        }
+    } else {
+        warn!("DkgHandler: storage RwLock poisoned; share not persisted");
+    }
+    info!(
+        "DkgHandler: ceremony complete — session={} joint_pubkey={}",
+        hex::encode(session_id.as_bytes()),
+        hex::encode(&dkg_result.joint_key.compressed)
+    );
+    // Drop the per-session late-prime cell + pending buffer — primes (if any)
+    // were consumed at the keygen→auxinfo transition; no further inbound is
+    // meaningful after completion.
+    inner
+        .late_prime_cells
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(&session_id);
+    inner
+        .pending_inbound
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(&session_id);
+    let tx = {
+        let mut txs = inner
+            .completion_tx
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        txs.remove(&session_id)
+    };
+    if let Some(tx) = tx {
+        let _ = tx.send(dkg_result);
+    }
+    // coord dropped here — its SM thread joins.
+    drop(coord);
+    Ok(all_outgoing)
 }
 
 /// Wrap one or more `RoundMessage`s as `OutgoingRoundMessage`s

@@ -1,7 +1,7 @@
 # bsv-mpc — Project Status
 
 > What's done, what's open, what's next.
-> Updated: 2026-05-21
+> Updated: 2026-05-23
 
 This file is the short / scannable view. The **authoritative trackers** are:
 
@@ -30,7 +30,7 @@ green at every commit (fmt, clippy `-D warnings`, native test, wasm32 build).
 | Component | URL | Version | Notes |
 |---|---|---|---|
 | Worker (DO) | `bsv-mpc-kss.dev-a3e.workers.dev` | `ff080f61` | authed `/sign-relay`, orphan-cleanup, `/custody/{put,get}-share`, presig pool, DO-SQLite |
-| Container (cosigner, share_A) | `bsv-mpc-service-container.dev-a3e.workers.dev` | `89e52beb` (`standard-1`) | BRC-31 ENFORCED + #9 durable custody auto-enabled |
+| Container (cosigner, share_A) | `bsv-mpc-service-container.dev-a3e.workers.dev` | `c696ae94` (`standard-4`) | BRC-31 ENFORCED + #9 durable custody + #35 cross-(t,n) reshare-relay (phase-A late-prime fix) |
 | Relay | `rust-message-box.dev-a3e.workers.dev` | — | MessageBox / Socket.IO + BRC-103 |
 
 After **any** deploy, run the smoke-test:
@@ -50,6 +50,7 @@ After **any** deploy, run the smoke-test:
 | #7 | Correctness audit (5 latent bugs + findings 1–4) | each finding → regression test, deployed-proven |
 | #9 | Fund-safety: KEK-sealed durable share custody | restart-survival proven vs deployed worker |
 | #12 | Concurrency-stress | parallel ceremonies, distinct keys, no corruption |
+| #35 | Cross-(t,n) address-preserving reshape (2-of-2 → 2-of-3), DEPLOYED + mainnet | spend TXID [`5137b913…`](https://whatsonchain.com/tx/5137b913a80fb4d05d188aa51533f3f0b6c8e3305c22d8b3fe335fb587bd6a0c) under reshared shares; joint pubkey unchanged. Phase-A late-prime ordering fix on container + proxy. |
 
 ### Open
 

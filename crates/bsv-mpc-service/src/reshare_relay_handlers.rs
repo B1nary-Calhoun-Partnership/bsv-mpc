@@ -308,21 +308,22 @@ pub async fn handle_reshare_relay_init(
         .collect();
 
     // ════ PHASE A — throwaway new-set DKG over the relay (this party's aux) ══════
+    //
+    // §06.17 ORDERING FIX (issue: deployed reshare timed out — `party N timed
+    // out awaiting throwaway DKG aux`). Safe-prime generation takes ~30-90s and
+    // is the slowest step. If we generated primes BEFORE subscribing + shipping
+    // round-1 (the previous ordering), this container joined the `mpc-dkg` relay
+    // box ~60-90s after the proxy parties had already shipped their round-1 — so
+    // this party joined LATE and the joint DKG never converged (relay backfill
+    // did NOT recover the late join; reproduced hermetically in
+    // `tests/reshar_phaseA_delayed_party0_e2e.rs`).
+    //
+    // Primes are only consumed at the keygen→auxinfo transition (not at init),
+    // so we now: SUBSCRIBE + initiate + ship keygen round-1 IMMEDIATELY (no late
+    // relay join), then generate primes off the hot path and `seed_primes_late`.
+    // If keygen outruns prime gen, the auxinfo phase falls back to inline
+    // generation (correct, just slower).
     let dkg_handler = DkgHandler::new(new_cfg, body.my_new_index, fresh_storage());
-    let primes = match tokio::task::spawn_blocking(|| {
-        PregeneratedPrimes::<SecurityLevel128>::generate(&mut rand::rngs::OsRng)
-    })
-    .await
-    {
-        Ok(p) => p,
-        Err(e) => {
-            return err_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("prime gen task panicked: {e}"),
-            )
-        }
-    };
-    dkg_handler.seed_primes_for(dkg_session, primes);
 
     let dkg_listener =
         match MessageBoxListener::start(client.clone(), BOX_DKG, dkg_handler.handler_fn()).await {
@@ -354,6 +355,23 @@ pub async fn handle_reshare_relay_init(
             dkg_listener.shutdown().await;
             return err_response(StatusCode::BAD_GATEWAY, format!("ship dkg round-1: {e}"));
         }
+    }
+
+    // Now (round-1 already shipped — we are NOT late on the relay) generate the
+    // slow safe primes off the hot path and late-seed them into the live
+    // coordinator before the keygen→auxinfo transition consumes them.
+    {
+        let seed_handler = dkg_handler.clone();
+        tokio::spawn(async move {
+            match tokio::task::spawn_blocking(|| {
+                PregeneratedPrimes::<SecurityLevel128>::generate(&mut rand::rngs::OsRng)
+            })
+            .await
+            {
+                Ok(primes) => seed_handler.seed_primes_late(dkg_session, primes),
+                Err(e) => warn!("reshare-relay: prime gen task panicked: {e}; auxinfo will generate inline"),
+            }
+        });
     }
 
     // Phase B (PSS) is armed INSIDE the completion task AFTER phase A completes —

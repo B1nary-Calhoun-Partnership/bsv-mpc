@@ -1869,30 +1869,25 @@ impl MpcBridge {
         });
 
         // ════ PHASE A — throwaway 2-of-3 DKG over the relay (proxy parties 1,2) ══
-        // Two safe-prime sets generated in parallel (the slow step).
-        let mut primes: Vec<PregeneratedPrimes<SecurityLevel128>> =
-            tokio::task::spawn_blocking(|| {
-                (0..2)
-                    .map(|_| {
-                        std::thread::spawn(|| {
-                            PregeneratedPrimes::<SecurityLevel128>::generate(&mut rand::rngs::OsRng)
-                        })
-                    })
-                    .collect::<Vec<_>>()
-                    .into_iter()
-                    .map(|h| h.join().expect("prime thread"))
-                    .collect()
-            })
-            .await
-            .map_err(|e| MpcError::Protocol(format!("reshare: prime gen task panicked: {e}")))?;
-
+        //
+        // §06.17 ORDERING FIX (issue: deployed reshare `party N timed out
+        // awaiting throwaway DKG aux`). Safe-prime generation (~30-90s) is the
+        // slowest step and is NOT needed until the keygen→auxinfo transition.
+        // The previous ordering generated primes BEFORE subscribing + shipping
+        // round-1, so whichever node's prime gen was slowest joined the relay
+        // box LATE and the joint DKG never converged (relay backfill did NOT
+        // recover the late join; reproduced in
+        // `bsv-mpc-service/tests/reshar_phaseA_delayed_party0_e2e.rs`).
+        //
+        // Now: SUBSCRIBE + initiate + ship keygen round-1 IMMEDIATELY for both
+        // proxy parties (no late relay join), THEN generate primes off the hot
+        // path and `seed_primes_late` into the live coordinators. The container
+        // (party 0) mirrors this in `/reshare-relay/init`. If keygen outruns
+        // prime gen, the auxinfo phase falls back to inline generation.
         let dkg_handlers: Vec<DkgHandler> = proxy_new_indices
             .iter()
             .map(|&idx| DkgHandler::new(new_cfg, idx, fresh_throwaway_storage()))
             .collect();
-        for h in &dkg_handlers {
-            h.seed_primes_for(dkg_session, primes.remove(0));
-        }
         let mut dkg_listeners: Vec<MessageBoxListener> = Vec::new();
         for (pos, h) in dkg_handlers.iter().enumerate() {
             let l = MessageBoxListener::start(proxy_clients[pos].clone(), BOX_DKG, h.handler_fn())
@@ -1917,6 +1912,43 @@ impl MpcBridge {
                     .await
                     .map_err(proto)?;
             }
+        }
+
+        // Round-1 shipped — generate the two safe-prime sets in parallel off the
+        // hot path and late-seed them into the live coordinators before the
+        // keygen→auxinfo transition.
+        {
+            let seed_handlers: Vec<DkgHandler> = dkg_handlers.clone();
+            tokio::spawn(async move {
+                let primes: Vec<PregeneratedPrimes<SecurityLevel128>> =
+                    match tokio::task::spawn_blocking(|| {
+                        (0..2)
+                            .map(|_| {
+                                std::thread::spawn(|| {
+                                    PregeneratedPrimes::<SecurityLevel128>::generate(
+                                        &mut rand::rngs::OsRng,
+                                    )
+                                })
+                            })
+                            .collect::<Vec<_>>()
+                            .into_iter()
+                            .map(|h| h.join().expect("prime thread"))
+                            .collect()
+                    })
+                    .await
+                    {
+                        Ok(p) => p,
+                        Err(e) => {
+                            tracing::warn!(
+                                "reshare: prime gen task panicked: {e}; auxinfo will generate inline"
+                            );
+                            return;
+                        }
+                    };
+                for (h, p) in seed_handlers.iter().zip(primes) {
+                    h.seed_primes_late(dkg_session, p);
+                }
+            });
         }
 
         // Await phase A (proxy parties' aux), then RELEASE the DKG subscriptions
