@@ -362,3 +362,14 @@ See [DECISIONS.md](DECISIONS.md) for the full Architectural Decision Log (16 ADR
 - How to handle `createAction` with multiple inputs needing different BRC-42 derivation paths?
 - Performance of `num-bigint` in WASM — POC 2 validated compilation but didn't benchmark latency.
 - Should the cggmp24 fork's `set_additive_shift()` be contributed upstream?
+
+## ⚠️ Deployment runtimes — READ before any deploy or MPC-on-CF work
+
+Two deployed cosigner runtimes; targeting the wrong one wastes a session:
+
+- **CF Worker isolate** (`bsv-mpc-kss.dev-a3e.workers.dev`, wasm) — **LIGHT online-sign ONLY** (`issue_partial`). CANNOT run cggmp24 DKG / presig generation (CF per-isolate CPU budget; `/dkg/round` 500s, DKG hangs >120s). §06.20 at-rest variant mainnet-proven (TXID `cac63ea6…`).
+- **CF Container** (`bsv-mpc-service-container.dev-a3e.workers.dev`, **native** bsv-mpc-service, `standard-1`) — **HEAVY MPC: DKG, presign generation, full §06.17.1.** No isolate CPU limit. Full §06.17.1 coordinator-holds-ciphertext mainnet-proven (TXID `8b5b954a…`).
+
+**"CF can't do heavy MPC" is FALSE — that's only the worker isolate. The CONTAINER does everything and is already deployed + mainnet-proven.** Put anything heavy (DKG/presign/refresh) on the container.
+
+Deploy container: `cd poc/cf-container-p2 && eval "$(grep '^export CLOUDFLARE' ~/bsv/mpc/bsv-mpc/secrets.md)" && npx wrangler deploy` (token there has `Containers:Edit`; the `~/bsv/teragun/SECRETS.md` token is Workers-only). Verify live: `GET .../presign-relay/identity` → 200 (404 = stale image).
