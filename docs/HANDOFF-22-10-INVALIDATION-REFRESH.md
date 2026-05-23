@@ -1,5 +1,24 @@
 # Handoff — #22 (presig invalidation triggers) + #10 (key-refresh §18 endpoint + rotation-on-commit)
 
+> **✅ COMPLETED 2026-05-23.** Both #10 and #22 are landed on `main` + mainnet-proven.
+>
+> | Layer | PR | Proof |
+> |---|---|---|
+> | core `RefreshCoordinator` (distributed PSS reshare) | #10b | hermetic: 2-of-2 + 2-of-3 rotate, joint pubkey preserved, refreshed shares sign vs original key; corruption aborts |
+> | service `RefreshHandler` + `/refresh-relay/*` | #10c | live-relay e2e: 2 peers refresh over the deployed MessageBox, rotated shares sign |
+> | proxy refresh coordinator + hot-swap + persist + §06.18 ShareRefresh invalidation | #10d | hermetic w/ real shares (hot-swap, persist round-trip, malformed-share safety) |
+> | §06.17.3 single-use consume + consume-time binding guard | #22a | hermetic incl. 8-thread race (one winner); CVE-2025-66017 mitigation |
+> | all 4 §06.18 triggers + metric + §10 audit record | #22b | hermetic per-trigger purge + audit + counters |
+> | **DEPLOYED refresh + mainnet sign w/ refreshed shares + invalidation-on-refresh** | #10e + #22c | **mainnet TXID `db865f22e2c10b19b5c4f28696f926aab2bcc21f5247dbd1aa268ae2ef658cae`** — vin spends funding `019525d8…05fbd6`, WoC-confirmed; joint addr `1DJwnQXCR22AzUkDfeixVgXoc6AoZ1jQV` unchanged across refresh |
+>
+> **Key fact (verified):** cggmp24 has NO native share-refresh SM (only `aux_info_gen`, across 4 revs) — refresh is distributed PSS on `threshold_reshare`. Aux-info kept; secret share rotated. Commit gated on `verify_reshare`. Refresh-capable container image: `217bffda`.
+>
+> **Follow-ups logged:** #35 (cross-(t,n) reshape 3-of-4→4-of-6, the direction.md endgame — primitives already (t,n)-general); Feldman identifiable-abort + full-proactive aux refresh (on #10); upstream §09/§13.7/§18-rekey firing sites for the 3 non-refresh triggers (on #22); full §10 Merkle/STH anchoring (on #5).
+>
+> ---
+>
+> _Original task brief (now complete) follows:_
+
 > Next task for bsv-mpc, written 2026-05-23 after the full ADR-0030 presig lifecycle landed + was mainnet-proven on BOTH deployed cosigner models.
 > **Canonical repo:** `/Users/johncalhoun/bsv/mpc/bsv-mpc` (NOT bsv-mpc-DEAD-do-not-use). Spec: `~/bsv/mpc/MPC-Spec`.
 
