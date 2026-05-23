@@ -61,7 +61,8 @@ use bsv_mpc_core::presigning::{
     PresigningRoundResult,
 };
 use bsv_mpc_core::types::{
-    EncryptedShare, PolicyId, PresigBundle, RoundMessage, SessionId, ShareIndex,
+    EncryptedShare, InvalidationTrigger, PolicyId, PresigBundle, RoundMessage, SessionId,
+    ShareIndex,
 };
 use bsv_mpc_messagebox::types::{presig_return_box, presign_protocol_box};
 use bsv_mpc_messagebox::DecodedRoundMessage;
@@ -152,6 +153,16 @@ pub enum PresignOutcome {
 /// in-memory implementation; production wires the worker DO / SQLite store.
 pub trait BundleStore: Send + Sync {
     fn persist(&self, bundle: &PresigBundle) -> anyhow::Result<()>;
+
+    /// §06.18 **mandatory invalidation**: delete every stored bundle the
+    /// `trigger` fires on (per [`PresigBundle::invalidated_by`]), best-effort
+    /// **zeroizing** the bytes (overwrite-then-remove). Returns the count purged.
+    ///
+    /// A bundle MUST NOT be consumable across an invalidation boundary, so this
+    /// is called atomically with the trigger event (share refresh, policy update,
+    /// cosigner-subset change, joint-pubkey rekey) before any sign request that
+    /// could use a now-stale bundle.
+    fn invalidate(&self, trigger: &InvalidationTrigger) -> anyhow::Result<u64>;
 }
 
 /// In-memory bundle store (tests / single-process demos). Keyed by `presig_id`.
@@ -191,6 +202,20 @@ impl BundleStore for InMemoryBundleStore {
             .unwrap_or_else(|p| p.into_inner())
             .insert(bundle.presig_id.clone(), bundle.clone());
         Ok(())
+    }
+
+    fn invalidate(&self, trigger: &InvalidationTrigger) -> anyhow::Result<u64> {
+        let mut map = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let doomed: Vec<String> = map
+            .iter()
+            .filter(|(_, b)| b.invalidated_by(trigger))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in &doomed {
+            // In-memory drop is the zeroize analogue (no on-disk bytes to scrub).
+            map.remove(id);
+        }
+        Ok(doomed.len() as u64)
     }
 }
 
@@ -235,6 +260,44 @@ impl FileBundleStore {
         let bytes = std::fs::read(&path).ok()?;
         serde_json::from_slice(&bytes).ok()
     }
+
+    /// All persisted bundles' `(path, bundle)` pairs (skips unreadable / non-JSON
+    /// entries). Used by [`BundleStore::invalidate`] to scan the pool.
+    fn all_bundles(&self) -> Vec<(std::path::PathBuf, PresigBundle)> {
+        let Ok(rd) = std::fs::read_dir(&self.root) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for entry in rd.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            if let Ok(bytes) = std::fs::read(&path) {
+                if let Ok(b) = serde_json::from_slice::<PresigBundle>(&bytes) {
+                    out.push((path, b));
+                }
+            }
+        }
+        out
+    }
+
+    /// Best-effort **zeroizing** delete of a bundle file (§06.18): overwrite the
+    /// bytes with zeros + flush before removing, so the secret-bearing JSON is not
+    /// merely unlinked. Filesystems without erase semantics still get the
+    /// overwrite (the spec's truncate-and-rewrite floor).
+    fn zeroize_and_remove(path: &std::path::Path) -> std::io::Result<()> {
+        use std::io::Write;
+        if let Ok(meta) = std::fs::metadata(path) {
+            if let Ok(mut f) = std::fs::OpenOptions::new().write(true).open(path) {
+                let zeros = vec![0u8; meta.len() as usize];
+                let _ = f.write_all(&zeros);
+                let _ = f.flush();
+                let _ = f.sync_all();
+            }
+        }
+        std::fs::remove_file(path)
+    }
 }
 
 impl BundleStore for FileBundleStore {
@@ -249,6 +312,19 @@ impl BundleStore for FileBundleStore {
         std::fs::rename(&tmp, &path)
             .map_err(|e| anyhow::anyhow!("rename bundle into place {}: {e}", path.display()))?;
         Ok(())
+    }
+
+    fn invalidate(&self, trigger: &InvalidationTrigger) -> anyhow::Result<u64> {
+        let mut purged = 0u64;
+        for (path, bundle) in self.all_bundles() {
+            if bundle.invalidated_by(trigger) {
+                Self::zeroize_and_remove(&path).map_err(|e| {
+                    anyhow::anyhow!("zeroize bundle {}: {e}", path.display())
+                })?;
+                purged += 1;
+            }
+        }
+        Ok(purged)
     }
 }
 
@@ -1070,5 +1146,135 @@ mod tests {
         );
         assert_eq!(bundle.joint_pubkey, jpk.to_vec());
         assert_eq!(bundle.policy_id, PolicyId([0x11; 32]));
+    }
+
+    // ── §06.18 invalidation ──────────────────────────────────────────────
+
+    fn bundle_with(
+        presig_id: &str,
+        policy_id: [u8; 32],
+        joint_pubkey: Vec<u8>,
+        parties: Vec<u16>,
+    ) -> PresigBundle {
+        PresigBundle {
+            presig_id: presig_id.to_string(),
+            presig_bytes: vec![0xaa; 16],
+            cosigner_encrypted_shares: vec![
+                serde_bytes::ByteBuf::from(vec![]),
+                serde_bytes::ByteBuf::from(vec![0x07, 0x08]),
+            ],
+            gamma_hex: "ab".into(),
+            commitments: vec![0x01],
+            policy_id: PolicyId(policy_id),
+            joint_pubkey,
+            parties_at_keygen: parties,
+            generated_at: 1,
+        }
+    }
+
+    #[test]
+    fn in_memory_invalidate_purges_only_matching_bundles() {
+        let store = InMemoryBundleStore::new();
+        // Two bundles for JPK-A, one for JPK-B.
+        store
+            .persist(&bundle_with("a1", [0x11; 32], vec![0x02; 33], vec![0, 1]))
+            .unwrap();
+        store
+            .persist(&bundle_with("a2", [0x11; 32], vec![0x02; 33], vec![0, 1]))
+            .unwrap();
+        store
+            .persist(&bundle_with("b1", [0x11; 32], vec![0x03; 33], vec![0, 1]))
+            .unwrap();
+        assert_eq!(store.len(), 3);
+
+        // ShareRefresh on JPK-A purges exactly a1, a2; b1 survives.
+        let jpk_a = vec![0x02; 33];
+        let purged = store
+            .invalidate(&InvalidationTrigger::ShareRefresh {
+                joint_pubkey: &jpk_a,
+            })
+            .unwrap();
+        assert_eq!(purged, 2, "both JPK-A bundles purged");
+        assert_eq!(store.len(), 1);
+        assert!(store.get("b1").is_some(), "JPK-B bundle survives");
+        assert!(store.get("a1").is_none() && store.get("a2").is_none());
+    }
+
+    #[test]
+    fn file_invalidate_purges_matching_and_zeroizes_on_disk() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = FileBundleStore::new(dir.path()).expect("open");
+
+        // Two policy-bound bundles: one under the CURRENT policy, one stale.
+        let current_policy = [0x55; 32];
+        let stale_policy = [0x66; 32];
+        store
+            .persist(&bundle_with(
+                &"aa".repeat(32),
+                current_policy,
+                vec![0x02; 33],
+                vec![0, 1],
+            ))
+            .unwrap();
+        let stale_id = "bb".repeat(32);
+        store
+            .persist(&bundle_with(&stale_id, stale_policy, vec![0x02; 33], vec![0, 1]))
+            .unwrap();
+        let stale_path = store.path_for(&stale_id);
+        assert!(stale_path.exists());
+
+        // PolicyUpdate(current) MUST purge the stale-policy bundle only.
+        let purged = store
+            .invalidate(&InvalidationTrigger::PolicyUpdate {
+                current_policy_id: PolicyId(current_policy),
+            })
+            .unwrap();
+        assert_eq!(purged, 1, "only the stale-policy bundle is purged");
+        assert!(!stale_path.exists(), "stale bundle file removed (zeroized first)");
+        assert!(
+            store.get(&"aa".repeat(32)).is_some(),
+            "current-policy bundle survives"
+        );
+
+        // The purged bundle is unrecoverable + a stray .json.tmp is not left behind.
+        assert!(store.get(&stale_id).is_none());
+        let leftover_tmp = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .any(|e| e.path().extension().and_then(|x| x.to_str()) == Some("tmp"));
+        assert!(!leftover_tmp, "no temp file left behind");
+    }
+
+    #[test]
+    fn file_invalidate_subset_and_rekey_triggers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = FileBundleStore::new(dir.path()).expect("open");
+        // subset [0,1] vs [0,2]; jpk A vs B.
+        store
+            .persist(&bundle_with(&"11".repeat(32), [0x11; 32], vec![0x02; 33], vec![0, 1]))
+            .unwrap();
+        store
+            .persist(&bundle_with(&"22".repeat(32), [0x11; 32], vec![0x02; 33], vec![0, 2]))
+            .unwrap();
+
+        // CosignerSubsetChange(prior=[0,1]) purges only the [0,1] bundle.
+        let purged = store
+            .invalidate(&InvalidationTrigger::CosignerSubsetChange {
+                prior_subset: &[0, 1],
+            })
+            .unwrap();
+        assert_eq!(purged, 1);
+        assert!(store.get(&"11".repeat(32)).is_none());
+        assert!(store.get(&"22".repeat(32)).is_some());
+
+        // JointPubkeyChange(prior=JPK-A) purges the remaining [0,2] bundle (JPK-A).
+        let jpk_a = vec![0x02; 33];
+        let purged = store
+            .invalidate(&InvalidationTrigger::JointPubkeyChange {
+                prior_joint_pubkey: &jpk_a,
+            })
+            .unwrap();
+        assert_eq!(purged, 1);
+        assert!(store.get(&"22".repeat(32)).is_none(), "pool now empty");
     }
 }
