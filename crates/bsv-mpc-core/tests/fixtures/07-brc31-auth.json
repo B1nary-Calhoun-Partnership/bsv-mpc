@@ -1,0 +1,100 @@
+{
+  "spec_section": "07.11",
+  "spec_title": "BRC-31 mutual-auth conformance vectors (General-message signable payload + signature byte-lock)",
+  "description": "Byte-locks the canonical BRC-104 General-message signable payload (build_request_payload output), the derived signing key_id, and the deterministic RFC-6979 ECDSA signature, all produced FROM the proven in-repo wire in bsv-mpc (crates/bsv-mpc-core/src/brc31_client.rs + tests/conformance_07_brc31_auth.rs). The signature is signed with key = client identity derived via BRC-42 protocol [2, \"auth message signature\"], key_id = \"{request_nonce} {server_session_nonce}\", counterparty = Other(server_identity), over SHA-256(signable_payload). Verification (verify_message_signature) derives the corresponding public key and checks the signature over SHA-256(signable_payload).",
+  "notes": [
+    "ALL inputs are fixed/deterministic test-only values. sender_privkey = 0x11*32, server_privkey = 0x22*32, stranger_privkey = 0x33*32 (raw 32-byte scalars, NOT seed phrases).",
+    "request_id = 0x11*32; request_nonce = base64(0xC3*32); server_session_nonce = base64(0xA1*32). Real deployments MUST use fresh CSPRNG 32-byte nonces.",
+    "BRC-104 signable payload framing (bsv_rs::auth::transports::HttpRequest::to_payload, NO leading version byte): [request_id 32B][method: varint(len)+utf8][path: varint(len)+utf8, or varint(-1) if empty][search: varint(len)+utf8, or varint(-1) if empty][headers: varint(count) + (varint(klen)+key + varint(vlen)+val)*][body: varint(len)+bytes, or varint(-1) if empty].",
+    "varint(-1) (empty path/search/body sentinel) encodes as the 9 bytes 0xFF 0xFF*8 in bsv-rs 0.3.11 — see write_varint(). The empty search field in these vectors is therefore the 9-byte run ffffffffffffffffff in signable_payload_hex.",
+    "Signable headers are filtered to {content-type, authorization, x-bsv-* (excl x-bsv-auth-*)} and sorted alphabetically. These vectors carry exactly one signable header: content-type: application/json (media type only, params stripped).",
+    "For General messages, signing_data() == the signable payload, and key_id == \"{nonce} {your_nonce}\" == \"{request_nonce} {server_session_nonce}\".",
+    "ECDSA is RFC-6979 deterministic (low-s normalized, DER-encoded): the signature_hex is byte-locked and reproduces identically across runs (verified: two consecutive signings byte-equal).",
+    "BYTE-LOCKED: signable_payload_hex, key_id, signature_hex (DER). VERIFY-ONLY in the cross-validator: the signature is verified (not regenerated) against verify_pubkey_hex using plain ECDSA over SHA-256(signable_payload), because reproducing BRC-42-derived-key signing in a second implementation is out of scope for the byte-lock cross-validator.",
+    "verify_pubkey_hex is the BRC-42-derived public key the canonical server verifier reconstructs (counterparty = Other(sender_identity), protocol [2, \"auth message signature\"], key_id as above, for_self=false). It is emitted FROM the proven wire, not hand-computed.",
+    "CROSS-IMPL STATUS: this vector is authored + byte-locked + cross-validated within the Calhoun (bsv-mpc) implementation and the independent Python/Rust byte-lock paths. FINAL cross-impl lock requires the partner implementation (rust-mpc) to consume this vector and reproduce signable_payload_hex byte-for-byte and verify the signature against verify_pubkey_hex. Until then, treat the signature_hex as Calhoun-side-proven, not yet cross-impl-proven."
+  ],
+  "shared_inputs": {
+    "sender_privkey_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+    "sender_identity_hex": "034f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa",
+    "server_privkey_hex": "2222222222222222222222222222222222222222222222222222222222222222",
+    "server_identity_hex": "02466d7fcae563e5cb09a0d1870bb580344804617879a14949cf22285f1bae3f27",
+    "stranger_privkey_hex": "3333333333333333333333333333333333333333333333333333333333333333",
+    "stranger_identity_hex": "023c72addb4fdf09af94f0c94d7fe92a386a7e70cf8a1d85916386bb2535c7b1b1",
+    "auth_protocol_id": [2, "auth message signature"],
+    "content_type": "application/json"
+  },
+  "vectors": [
+    {
+      "name": "valid-general-message",
+      "description": "Canonical client signs a General request; the canonical server verifier accepts it. Signable payload + key_id + signature are byte-locked.",
+      "inputs": {
+        "sender_privkey_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+        "server_identity_hex": "02466d7fcae563e5cb09a0d1870bb580344804617879a14949cf22285f1bae3f27",
+        "request_id_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+        "request_id_b64": "ERERERERERERERERERERERERERERERERERERERERERE=",
+        "request_nonce_b64": "w8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8M=",
+        "server_session_nonce_b64": "oaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaE=",
+        "method": "POST",
+        "path": "/sign/init",
+        "search": "",
+        "body_utf8": "{\"session_id\":\"c07\",\"round\":0}",
+        "body_hex": "7b2273657373696f6e5f6964223a22633037222c22726f756e64223a307d"
+      },
+      "expected": {
+        "key_id": "w8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8M= oaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaE=",
+        "signable_payload_hex": "111111111111111111111111111111111111111111111111111111111111111104504f53540a2f7369676e2f696e6974ffffffffffffffffff010c636f6e74656e742d74797065106170706c69636174696f6e2f6a736f6e1e7b2273657373696f6e5f6964223a22633037222c22726f756e64223a307d",
+        "signing_data_hex": "111111111111111111111111111111111111111111111111111111111111111104504f53540a2f7369676e2f696e6974ffffffffffffffffff010c636f6e74656e742d74797065106170706c69636174696f6e2f6a736f6e1e7b2273657373696f6e5f6964223a22633037222c22726f756e64223a307d",
+        "signature_hex": "30440220440b33fcec1ea8d098d2a15a40c4a6617374f7f65845c0b93e570e0ad7b0a2f202205f4b4c3256d018131f822094ec16b798f75cbeb87614909e6fb6344777d601be",
+        "verify_pubkey_hex": "029fa2b061ae10c1dd9ff845010debce612d9c7ee8f6388abd181d0bc384458e11",
+        "verifies": true
+      }
+    },
+    {
+      "name": "wrong-identity-rejected",
+      "description": "A signature produced by a different identity key (stranger_privkey) over the same payload, but the server session is bound to sender_identity. The canonical verifier MUST reject it.",
+      "inputs": {
+        "actual_signer_privkey_hex": "3333333333333333333333333333333333333333333333333333333333333333",
+        "session_bound_identity_hex": "034f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa",
+        "server_identity_hex": "02466d7fcae563e5cb09a0d1870bb580344804617879a14949cf22285f1bae3f27",
+        "request_id_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+        "request_nonce_b64": "w8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8M=",
+        "server_session_nonce_b64": "oaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaE=",
+        "method": "POST",
+        "path": "/sign/init",
+        "search": "",
+        "body_hex": "7b2273657373696f6e5f6964223a22633037222c22726f756e64223a307d"
+      },
+      "expected": {
+        "signable_payload_hex": "111111111111111111111111111111111111111111111111111111111111111104504f53540a2f7369676e2f696e6974ffffffffffffffffff010c636f6e74656e742d74797065106170706c69636174696f6e2f6a736f6e1e7b2273657373696f6e5f6964223a22633037222c22726f756e64223a307d",
+        "wrong_signature_hex": "3045022100ff6460eaa3050ae293695d43fe4f36186424e2bb7ba66d68f853ea45673d343e02204421d841da6b62b95cac95bfe54110e7f8e202870f197cb72953b526e9ab0a4e",
+        "verify_pubkey_hex": "029fa2b061ae10c1dd9ff845010debce612d9c7ee8f6388abd181d0bc384458e11",
+        "verifies": false,
+        "rejection_reason": "signature was produced by stranger_privkey, but verify_pubkey is derived from the session-bound sender_identity — the curve point does not match, ECDSA verify fails"
+      }
+    },
+    {
+      "name": "tampered-payload-rejected",
+      "description": "The valid signature, but the signed BRC-104 payload's last byte is flipped after signing (0x7d -> 0x82). The canonical verifier MUST reject it (payload binding).",
+      "inputs": {
+        "sender_privkey_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+        "server_identity_hex": "02466d7fcae563e5cb09a0d1870bb580344804617879a14949cf22285f1bae3f27",
+        "request_id_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+        "request_nonce_b64": "w8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8M=",
+        "server_session_nonce_b64": "oaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaGhoaE=",
+        "method": "POST",
+        "path": "/sign/init",
+        "search": "",
+        "body_hex": "7b2273657373696f6e5f6964223a22633037222c22726f756e64223a307d",
+        "original_payload_hex": "111111111111111111111111111111111111111111111111111111111111111104504f53540a2f7369676e2f696e6974ffffffffffffffffff010c636f6e74656e742d74797065106170706c69636174696f6e2f6a736f6e1e7b2273657373696f6e5f6964223a22633037222c22726f756e64223a307d",
+        "tampered_payload_hex": "111111111111111111111111111111111111111111111111111111111111111104504f53540a2f7369676e2f696e6974ffffffffffffffffff010c636f6e74656e742d74797065106170706c69636174696f6e2f6a736f6e1e7b2273657373696f6e5f6964223a22633037222c22726f756e64223a3082"
+      },
+      "expected": {
+        "signature_hex": "30440220440b33fcec1ea8d098d2a15a40c4a6617374f7f65845c0b93e570e0ad7b0a2f202205f4b4c3256d018131f822094ec16b798f75cbeb87614909e6fb6344777d601be",
+        "verify_pubkey_hex": "029fa2b061ae10c1dd9ff845010debce612d9c7ee8f6388abd181d0bc384458e11",
+        "verifies": false,
+        "rejection_reason": "signature is over SHA-256(original_payload); the verifier hashes the tampered_payload, the digests differ, ECDSA verify fails"
+      }
+    }
+  ]
+}

@@ -49,6 +49,7 @@
 // (canonical BRC-104 wire helpers), which is a non-wasm dependency. The worker
 // (wasm32) is a BRC-31 *server* and never constructs this client, so gating the
 // module off wasm keeps the worker's wasm graph unchanged.
+pub mod approval;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod brc31_client;
 pub mod canonical;
@@ -63,6 +64,7 @@ pub mod presig_at_rest;
 pub mod presig_encryption;
 pub mod presigning;
 pub mod proof;
+pub mod recovery;
 pub mod refresh;
 pub mod refresh_coordinator;
 pub mod reshar_coordinator;

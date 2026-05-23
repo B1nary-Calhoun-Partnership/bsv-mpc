@@ -1,0 +1,63 @@
+{
+  "spec_section": "18.5 + ADR-0038",
+  "spec_title": "Recovery KDF Argon2id byte-lock vectors",
+  "description": "Byte-locks the Argon2id parameters and passphrase \u2192 KEK derivation per ADR-0038. Both implementations MUST produce identical 32-byte KEKs for the pinned inputs.",
+  "notes": [
+    "Argon2id (RFC 9106) is REQUIRED; PBKDF2 / plain HMAC are non-conformant.",
+    "profile-server: m=256MiB, t=3, p=1; profile-mobile: m=64MiB, t=4, p=1 (per ADR-0038).",
+    "Salt MUST be per-blob random in production; vectors here use deterministic test-only salts.",
+    "Passphrase MUST be NFC-normalized UTF-8 bytes; the implementation MUST NOT re-normalize to NFD/NFKC.",
+    "Output is the raw Argon2id hash (32 bytes) used directly as the AES-256-GCM key for backup-blob decrypt."
+  ],
+  "vectors": [
+    {
+      "name": "argon2id-profile-server-256MiB",
+      "inputs": {
+        "passphrase_utf8_bytes_hex": "636f727265637420686f727365206261747465727920737461706c65",
+        "passphrase_human": "correct horse battery staple",
+        "salt_hex": "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
+        "memory_cost_kib": 262144,
+        "memory_cost_human": "256 MiB",
+        "time_cost": 3,
+        "parallelism": 1,
+        "hash_len": 32,
+        "algorithm": "Argon2id",
+        "profile": "profile-server"
+      },
+      "expected_kek_hex": "d34a4fa42a1f2930504edaa12e98745a184825e7053abc982133c1c0ae88c6b8"
+    },
+    {
+      "name": "argon2id-profile-mobile-64MiB",
+      "inputs": {
+        "passphrase_utf8_bytes_hex": "616c696365206c6f76657320626f62",
+        "passphrase_human": "alice loves bob",
+        "salt_hex": "2122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f40",
+        "memory_cost_kib": 65536,
+        "memory_cost_human": "64 MiB",
+        "time_cost": 4,
+        "parallelism": 1,
+        "hash_len": 32,
+        "algorithm": "Argon2id",
+        "profile": "profile-mobile"
+      },
+      "expected_kek_hex": "b1bbc1304eef9fe4c1a25ac8e1ecc470b6fe3af104d6f737c2bd6a9ba14805be"
+    },
+    {
+      "name": "argon2id-unicode-stress",
+      "inputs": {
+        "passphrase_utf8_bytes_hex": "436166c3a920536f6369c3a974c3a920ce94cebfcebaceb9cebcceae",
+        "passphrase_human": "Caf\u00e9 Soci\u00e9t\u00e9 \u0394\u03bf\u03ba\u03b9\u03bc\u03ae",
+        "salt_hex": "4142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f60",
+        "memory_cost_kib": 262144,
+        "memory_cost_human": "256 MiB",
+        "time_cost": 3,
+        "parallelism": 1,
+        "hash_len": 32,
+        "algorithm": "Argon2id",
+        "profile": "profile-server",
+        "_unicode_note": "Passphrase MUST be NFC-normalized before encoding to UTF-8. Implementations MUST NOT re-normalize to NFD/NFKC."
+      },
+      "expected_kek_hex": "33e06b10a20eafd0dd05ab5359c42e36c2b565b8074bc9bc67f306cced6e58ef"
+    }
+  ]
+}
