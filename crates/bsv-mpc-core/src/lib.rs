@@ -64,6 +64,7 @@ pub mod presig_encryption;
 pub mod presigning;
 pub mod proof;
 pub mod refresh;
+pub mod refresh_coordinator;
 pub mod share;
 pub mod signing;
 pub mod types;
@@ -71,6 +72,7 @@ pub mod types;
 // Re-export key public types for ergonomic imports.
 pub use error::{MpcError, Result};
 pub use refresh::RefreshResult;
+pub use refresh_coordinator::{RefreshCommit, RefreshCoordinator, RefreshRoundResult};
 pub use types::{
     DkgResult, EncryptedShare, InvalidationTrigger, JointPublicKey, ParticipationProof, PolicyId,
     PresigBinding, PresigBundle, Presignature, RoundMessage, SessionId, ShareIndex, SigningResult,

@@ -160,6 +160,87 @@ pub fn threshold_reshare(
     Ok((new_secret_shares, new_public_shares))
 }
 
+/// One surviving party's **local** PSS refresh contribution (distributed §18.2).
+///
+/// This is the per-party decomposition of [`threshold_reshare`]: where that
+/// function reshares centrally (it takes *every* survivor's secret share at
+/// once), this computes only the calling party's contribution from its OWN
+/// secret share — the form used by [`RefreshCoordinator`](crate::refresh_coordinator::RefreshCoordinator)
+/// so no party ever reveals or aggregates another party's old share.
+///
+/// The party at position `my_subset_pos` within `subset_eval_points` (the
+/// qualified surviving subset, length `new_t`), holding secret `my_secret`,
+/// generates a fresh random degree-`(new_t-1)` polynomial `f` with
+/// `f(0) = λ · my_secret` (`λ` = its Lagrange-at-zero coefficient over the
+/// subset) and evaluates `f` at every new party's eval point. The returned
+/// `evals[j] = f(new_eval_points[j])` are sent **p2p** (one per new party, over
+/// the BRC-78-encrypted envelope §06.3); each new party `j` sums the evals it
+/// receives from all survivors to obtain its rotated share
+/// `x'_j = Σ_k f_k(e'_j)`.
+///
+/// ## Why this is zero-knowledge of the old share
+///
+/// Each recipient `j` learns exactly ONE evaluation of `f`. Recovering `f`
+/// (hence `f(0) = λ·my_secret`, hence `my_secret`) requires `new_t` evaluations.
+/// An adversary controlling up to `new_t - 1` parties therefore cannot recover a
+/// surviving honest party's old secret — the proactive-security property of
+/// §18.1 ("a pre-refresh share leak can't reconstruct"). The construction is the
+/// Herzberg et al. proactive-secret-sharing reshare; cggmp24 does not provide it
+/// natively (it ships only `aux_info_gen`), so this is the canonical primitive
+/// for re-randomizing a threshold (t-of-n) sharing while preserving the joint
+/// public key.
+///
+/// # Errors
+///
+/// `MpcError::Protocol` if the Lagrange coefficient cannot be computed (duplicate
+/// eval points) or `my_subset_pos >= subset_eval_points.len()`.
+pub fn party_reshare_contribution(
+    my_subset_pos: usize,
+    subset_eval_points: &[NonZero<Scalar<Secp256k1>>],
+    my_secret: &Scalar<Secp256k1>,
+    new_eval_points: &[NonZero<Scalar<Secp256k1>>],
+    new_t: usize,
+    rng: &mut impl rand::RngCore,
+) -> Result<Vec<Scalar<Secp256k1>>> {
+    if my_subset_pos >= subset_eval_points.len() {
+        return Err(MpcError::Protocol(format!(
+            "my_subset_pos {my_subset_pos} out of range for subset of {}",
+            subset_eval_points.len()
+        )));
+    }
+    if subset_eval_points.len() < new_t {
+        return Err(MpcError::Protocol(format!(
+            "qualified subset ({}) smaller than new_t ({new_t})",
+            subset_eval_points.len()
+        )));
+    }
+
+    // λ for this party at point 0, over the qualified surviving subset.
+    let lambda = lagrange_coefficient_at_zero(my_subset_pos, &subset_eval_points[..new_t])
+        .ok_or_else(|| {
+            MpcError::Protocol(format!(
+                "Lagrange coefficient computation failed for subset pos {my_subset_pos} (duplicate eval points?)"
+            ))
+        })?;
+
+    // w = λ · my_secret — the constant term of this party's refresh polynomial.
+    let w: Scalar<Secp256k1> = *lambda * *my_secret;
+
+    // Fresh random degree-(new_t-1) polynomial f with f(0) = w.
+    let mut coefs: Vec<Scalar<Secp256k1>> = Vec::with_capacity(new_t);
+    coefs.push(w);
+    for _ in 1..new_t {
+        coefs.push(Scalar::random(rng));
+    }
+    let f = Polynomial::from_coefs(coefs);
+
+    // Evaluate at every new party's eval point.
+    Ok(new_eval_points
+        .iter()
+        .map(|e| f.value::<_, Scalar<Secp256k1>>(e.as_ref()))
+        .collect())
+}
+
 /// Verify that reshared shares reconstruct the original joint public key.
 ///
 /// Uses Lagrange interpolation at x=0 on the first `new_t` public shares
