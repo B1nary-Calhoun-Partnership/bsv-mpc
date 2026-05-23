@@ -35,8 +35,11 @@
 use crate::error::{MpcError, Result};
 use crate::types::JointPublicKey;
 
+use cggmp24::key_share::{
+    DirtyIncompleteKeyShare, DirtyKeyInfo, IncompleteKeyShare, Validate, VssSetup,
+};
 use cggmp24::supported_curves::Secp256k1;
-use generic_ec::{NonZero, Point, Scalar};
+use generic_ec::{NonZero, Point, Scalar, SecretScalar};
 use generic_ec_zkp::polynomial::{lagrange_coefficient_at_zero, Polynomial};
 
 /// New secret shares and their corresponding public shares.
@@ -277,6 +280,87 @@ pub fn verify_reshare(
         .fold(Point::zero(), |acc, p| acc + p);
 
     *original_joint_pubkey == reconstructed
+}
+
+/// Assemble the **new party set's** [`IncompleteKeyShare`]s from a completed
+/// (cross-)reshare (MPC-Spec §18.2 `reshare_change_threshold`).
+///
+/// Given the reshared per-party secret + public shares (from [`threshold_reshare`]
+/// / the distributed [`party_reshare_contribution`] sum) and the new party set's
+/// VSS parameters, this builds one validated `IncompleteKeyShare` per new party —
+/// all bound to the **unchanged** `shared_public_key`. The caller then runs a
+/// fresh `aux_info_gen` across the new `n'` parties and `KeyShare::from_parts`
+/// to obtain signing-ready shares.
+///
+/// `template` supplies the curve identifier, the unchanged `shared_public_key`,
+/// and the `chain_code` (HD support) — taken from any surviving party's share.
+/// A cross-(t,n) reshape REQUIRES fresh aux for the whole new set (the old aux was
+/// generated for the old party indexing), so this returns INCOMPLETE shares; for a
+/// same-party-set routine refresh that keeps aux, use
+/// [`RefreshCoordinator`](crate::refresh_coordinator::RefreshCoordinator) instead.
+///
+/// # Errors
+///
+/// `MpcError::Protocol` if the share/point/eval-point counts disagree, a public
+/// share is the identity, a secret share is zero, or validation fails.
+pub fn build_reshared_incomplete_shares(
+    template: &IncompleteKeyShare<Secp256k1>,
+    new_secret_shares: &[Scalar<Secp256k1>],
+    new_public_shares: &[Point<Secp256k1>],
+    new_eval_points: &[NonZero<Scalar<Secp256k1>>],
+    new_t: u16,
+) -> Result<Vec<IncompleteKeyShare<Secp256k1>>> {
+    let new_n = new_eval_points.len();
+    if new_secret_shares.len() != new_n || new_public_shares.len() != new_n {
+        return Err(MpcError::Protocol(format!(
+            "reshared share counts disagree: secrets={}, publics={}, eval_points={new_n}",
+            new_secret_shares.len(),
+            new_public_shares.len()
+        )));
+    }
+    if new_n < usize::from(new_t) || new_t == 0 {
+        return Err(MpcError::Protocol(format!(
+            "invalid new (t,n): t={new_t}, n={new_n}"
+        )));
+    }
+
+    let dirty_template = template.clone().into_inner();
+    let curve = dirty_template.key_info.curve;
+    let shared_public_key = dirty_template.key_info.shared_public_key;
+    let chain_code = dirty_template.key_info.chain_code;
+
+    let nz_public_shares: Vec<NonZero<Point<Secp256k1>>> = new_public_shares
+        .iter()
+        .map(|p| {
+            NonZero::from_point(*p)
+                .ok_or_else(|| MpcError::Protocol("reshared public share is identity".into()))
+        })
+        .collect::<Result<_>>()?;
+
+    (0..new_n as u16)
+        .map(|i| {
+            let mut share_scalar = new_secret_shares[i as usize];
+            let x = NonZero::from_secret_scalar(SecretScalar::new(&mut share_scalar))
+                .ok_or_else(|| MpcError::Protocol(format!("reshared secret share {i} is zero")))?;
+            let dirty = DirtyIncompleteKeyShare {
+                i,
+                key_info: DirtyKeyInfo {
+                    curve,
+                    shared_public_key,
+                    public_shares: nz_public_shares.clone(),
+                    vss_setup: Some(VssSetup {
+                        min_signers: new_t,
+                        I: new_eval_points.to_vec(),
+                    }),
+                    chain_code,
+                },
+                x,
+            };
+            dirty
+                .validate()
+                .map_err(|e| MpcError::Protocol(format!("reshared share {i} invalid: {e}")))
+        })
+        .collect()
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -899,5 +983,106 @@ mod tests {
             result.unwrap_err().to_string().contains("same length"),
             "should report mismatched lengths"
         );
+    }
+
+    /// Extract `(eval_points, secret_shares)` from a set of IncompleteKeyShares
+    /// (keygen output, no aux yet), in party order.
+    fn extract_incomplete_share_data(
+        shares: &[cggmp24::key_share::IncompleteKeyShare<Secp256k1>],
+    ) -> (Vec<NonZero<Scalar<Secp256k1>>>, Vec<Scalar<Secp256k1>>) {
+        let dirty0 = shares[0].clone().into_inner();
+        let all_eval = dirty0.key_info.vss_setup.as_ref().expect("vss").I.clone();
+        let mut eval_points = Vec::new();
+        let mut secrets = Vec::new();
+        for s in shares {
+            let d = s.clone().into_inner();
+            eval_points.push(all_eval[d.i as usize]);
+            secrets.push(*(*d.x).as_ref());
+        }
+        (eval_points, secrets)
+    }
+
+    /// **CAPSTONE (issue #35): cross-(t,n) address-preserving reshape 3-of-4 →
+    /// 4-of-6.** The endgame's defining mechanism (direction.md §1.1): a quorum
+    /// upgrade with the SAME joint pubkey (address) and 0 sats on-chain.
+    ///
+    /// 3-of-4 keygen → cross-reshare to a 6-party set with t'=4 → fresh
+    /// `aux_info_gen(6)` → complete KeyShares → EVERY 4-of-6 subset signs +
+    /// verifies against the ORIGINAL joint key. Proves the PSS reshare + new-party
+    /// share assembly + fresh aux + signing all compose end-to-end.
+    #[tokio::test]
+    async fn capstone_cross_tn_reshare_3of4_to_4of6_signs() {
+        // ── 3-of-4 keygen (no aux needed for the OLD set — we only need its
+        //    secret shares + eval points to reshare) ──
+        let old_incomplete = run_keygen(4, 3).await;
+        let original_joint = *old_incomplete[0].shared_public_key;
+        let (old_eval_points, old_secrets) = extract_incomplete_share_data(&old_incomplete);
+
+        // ── New 4-of-6 party set: 6 distinct eval points, threshold t'=4 ──
+        let new_t: usize = 4;
+        let new_n: u16 = 6;
+        let new_eval_points: Vec<NonZero<Scalar<Secp256k1>>> = (1..=new_n)
+            .map(|i| NonZero::from_scalar(Scalar::from(i as u64)).expect("nonzero"))
+            .collect();
+
+        // ── Cross-(t,n) PSS reshare: all 4 old parties contribute (need >= new_t
+        //    survivors; 4 >= 4) → 6 new shares on a degree-3 polynomial ──
+        let mut rng = rand::rngs::OsRng;
+        let (new_secrets, new_publics) = threshold_reshare(
+            &old_eval_points,
+            &old_secrets,
+            &new_eval_points,
+            new_t,
+            &mut rng,
+        )
+        .expect("3-of-4 → 4-of-6 reshare");
+        assert_eq!(new_secrets.len(), 6);
+
+        // Joint key preserved (any 4-of-6 subset reconstructs it).
+        assert!(
+            verify_reshare(&original_joint, &new_publics, &new_eval_points, new_t),
+            "§18: joint pubkey MUST be unchanged by the cross-(t,n) reshape"
+        );
+
+        // ── Build the new party set's IncompleteKeyShares (production path) ──
+        let new_incomplete = build_reshared_incomplete_shares(
+            &old_incomplete[0],
+            &new_secrets,
+            &new_publics,
+            &new_eval_points,
+            new_t as u16,
+        )
+        .expect("assemble new 4-of-6 incomplete shares");
+        assert_eq!(new_incomplete.len(), 6);
+
+        // ── Fresh aux for the NEW 6-party set + combine ──
+        let new_aux = run_aux_gen(new_n).await;
+        let new_key_shares: Vec<cggmp24::KeyShare<Secp256k1, SecurityLevel128>> = new_incomplete
+            .into_iter()
+            .zip(new_aux)
+            .map(|(core, aux)| {
+                cggmp24::KeyShare::from_parts((core, aux))
+                    .expect("4-of-6 key share validates with fresh aux")
+            })
+            .collect();
+
+        // ── EVERY relevant 4-of-6 subset signs + verifies vs the ORIGINAL key ──
+        let msg = b"spend the original address under the new 4-of-6 sharing";
+        let data = DataToSign::digest::<Sha256>(msg);
+        // A spread of 4-of-6 subsets: the 4 originals, a mix, and the two new
+        // parties (4,5) with two originals.
+        for subset in &[
+            [0u16, 1, 2, 3],
+            [0, 1, 4, 5],
+            [2, 3, 4, 5],
+            [1, 2, 3, 5],
+        ] {
+            let sig = sign_with_parties(&new_key_shares, subset, &data).await;
+            sig.verify(&original_joint, &data).unwrap_or_else(|_| {
+                panic!(
+                    "4-of-6 subset {subset:?} MUST produce a signature valid under the ORIGINAL joint key"
+                )
+            });
+        }
     }
 }
