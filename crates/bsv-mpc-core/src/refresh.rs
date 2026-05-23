@@ -363,6 +363,70 @@ pub fn build_reshared_incomplete_shares(
         .collect()
 }
 
+/// Build **one** new party's [`IncompleteKeyShare`] from a completed
+/// (cross-)reshare — the **template-free** sibling of
+/// [`build_reshared_incomplete_shares`], used by the distributed
+/// [`ResharCoordinator`](crate::reshar_coordinator::ResharCoordinator) where each
+/// party assembles only its OWN share and a brand-new party has no template (it
+/// knows only the public joint key, learned over the wire).
+///
+/// The curve is `CurveName::new()`; `chain_code` is `None` — bsv-mpc base keys are
+/// non-HD (BRC-42 offset derivation, §03), so there is no cggmp24 chain code to
+/// propagate. `my_secret` is this party's rotated secret share; `all_public_shares`
+/// is the full new-set public-share vector (party order); both come from the PSS
+/// rounds.
+///
+/// # Errors
+/// `MpcError::Protocol` on count mismatch, identity public share, zero secret, or
+/// validation failure.
+pub fn build_reshared_incomplete_share_for(
+    my_index: u16,
+    shared_public_key: NonZero<Point<Secp256k1>>,
+    mut my_secret: Scalar<Secp256k1>,
+    all_public_shares: &[Point<Secp256k1>],
+    new_eval_points: &[NonZero<Scalar<Secp256k1>>],
+    new_t: u16,
+) -> Result<IncompleteKeyShare<Secp256k1>> {
+    let new_n = new_eval_points.len();
+    if all_public_shares.len() != new_n {
+        return Err(MpcError::Protocol(format!(
+            "public shares ({}) != eval points ({new_n})",
+            all_public_shares.len()
+        )));
+    }
+    if usize::from(my_index) >= new_n {
+        return Err(MpcError::Protocol(format!(
+            "my_index {my_index} out of range for {new_n} parties"
+        )));
+    }
+    let nz_public_shares: Vec<NonZero<Point<Secp256k1>>> = all_public_shares
+        .iter()
+        .map(|p| {
+            NonZero::from_point(*p)
+                .ok_or_else(|| MpcError::Protocol("reshared public share is identity".into()))
+        })
+        .collect::<Result<_>>()?;
+    let x = NonZero::from_secret_scalar(SecretScalar::new(&mut my_secret))
+        .ok_or_else(|| MpcError::Protocol("reshared secret share is zero".into()))?;
+    let dirty = DirtyIncompleteKeyShare {
+        i: my_index,
+        key_info: DirtyKeyInfo {
+            curve: generic_ec::serde::CurveName::new(),
+            shared_public_key,
+            public_shares: nz_public_shares,
+            vss_setup: Some(VssSetup {
+                min_signers: new_t,
+                I: new_eval_points.to_vec(),
+            }),
+            chain_code: None,
+        },
+        x,
+    };
+    dirty
+        .validate()
+        .map_err(|e| MpcError::Protocol(format!("reshared share {my_index} invalid: {e}")))
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

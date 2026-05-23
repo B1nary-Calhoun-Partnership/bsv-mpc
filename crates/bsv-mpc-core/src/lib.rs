@@ -65,6 +65,7 @@ pub mod presigning;
 pub mod proof;
 pub mod refresh;
 pub mod refresh_coordinator;
+pub mod reshar_coordinator;
 pub mod share;
 pub mod signing;
 pub mod types;
@@ -73,6 +74,9 @@ pub mod types;
 pub use error::{MpcError, Result};
 pub use refresh::RefreshResult;
 pub use refresh_coordinator::{RefreshCommit, RefreshCoordinator, RefreshRoundResult};
+pub use reshar_coordinator::{
+    ContributorInputs, ResharCommit, ResharConfig, ResharCoordinator, ResharRoundResult,
+};
 pub use types::{
     DkgResult, EncryptedShare, InvalidationTrigger, JointPublicKey, ParticipationProof, PolicyId,
     PresigBinding, PresigBundle, Presignature, RoundMessage, SessionId, ShareIndex, SigningResult,
