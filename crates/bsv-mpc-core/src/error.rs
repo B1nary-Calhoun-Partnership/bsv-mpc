@@ -84,6 +84,12 @@ pub enum MpcError {
         /// Human-readable detail of the violation.
         detail: String,
     },
+
+    /// A PolicyManifest or rule was malformed per MPC-Spec §09 — e.g. an invalid
+    /// `protocol_pattern` glob (leading `*`, multi-segment wildcard), or a
+    /// manifest that failed canonical CBOR (de)serialization at load time.
+    #[error("Policy error: {0}")]
+    Policy(String),
 }
 
 /// A specialized `Result` type for MPC operations.
