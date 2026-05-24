@@ -1069,6 +1069,50 @@ async fn relay_sign(
     sighash: &[u8; 32],
     hmac_offset: Option<[u8; 32]>,
 ) -> std::result::Result<bsv_mpc_core::types::SigningResult, String> {
+    // §1 device-holds-(t−1) (issue #38): when this proxy holds `t−1` shares it
+    // drives `t−1` local parties + ONE external cosigner. It consumes a correlated
+    // presig SET (one per device share) and the external cosigner consumes its
+    // correlated presig from its pool. The single-share deployment falls through
+    // to the original 2-party path below.
+    if state.bridge.is_device_holds() {
+        let pool = state.device_presig_pool.as_ref().ok_or_else(|| {
+            "relay sign: device holds t−1 shares but no device presig-set pool is configured"
+                .to_string()
+        })?;
+        let set = {
+            let mut p = pool.write().await;
+            p.take_set()
+        }
+        .ok_or_else(|| {
+            "relay sign: device presig-set pool empty — provisioning is not keeping up".to_string()
+        })?;
+
+        // The external cosigner is the ONE participant the device does not hold;
+        // its partial carries `from = external_cosigner_index`.
+        let trigger = crate::relay_sign::DoTrigger {
+            url: format!("{}/sign-relay", state.bridge.kss_url()),
+            presig_a_json: vec![],
+            do_index: state.bridge.external_cosigner_index(),
+            agent_id: Some(state.bridge.agent_id().to_string()),
+            auth_headers: vec![],
+            cosigner_encrypted_share: None,
+            // Set by sign_over_relay_device_holds from `hmac_offset`.
+            brc42_offset: None,
+        };
+
+        return state
+            .bridge
+            .sign_over_relay_device_holds(
+                sighash,
+                set,
+                hmac_offset,
+                trigger,
+                std::time::Duration::from_secs(60),
+            )
+            .await
+            .map_err(|e| format!("device-holds relay sign failed: {e}"));
+    }
+
     let raw = {
         let mut mgr = state.presign_manager.write().await;
         mgr.take_raw()
@@ -2534,6 +2578,7 @@ mod tests {
             config,
             bridge,
             presign_manager: Arc::new(RwLock::new(PresignManager::new(20))),
+            device_presig_pool: None,
             fee_injector: FeeInjector::new(0, vec![], None),
             storage: Arc::new(InMemoryBackend::new()),
             http_client: reqwest::Client::new(),

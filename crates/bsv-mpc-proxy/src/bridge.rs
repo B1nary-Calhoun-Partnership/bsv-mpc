@@ -652,6 +652,29 @@ async fn run_dkg_over_http_inner(
 // MpcBridge
 // ============================================================================
 
+/// **§1 device-holds-(t−1) share file (issue #38).** On-disk form for a device
+/// that holds MORE THAN ONE share of a `t`-of-`n` key — the "two mandatory
+/// sides" 4-of-6 scheme where one device possesses `t−1` shares and one external
+/// cosigner completes the threshold. Distinguished from a single-share
+/// [`DkgResult`] by its required `shares` array (a `DkgResult` has `share`).
+///
+/// Loading this is exactly "provision `t−1` shares to device storage": the
+/// device's secure store hands the proxy all the shares it possesses; the proxy
+/// derives the signing subset (`device parties ∪ externals`) and, at sign time,
+/// issues one partial per device share locally + folds in the external
+/// cosigner's over the relay. A 1-element `shares` array is equivalent to a
+/// `DkgResult` (single-share deployment).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeviceShareBundle {
+    /// The joint public key all shares agree on.
+    pub joint_key: JointPublicKey,
+    /// The DKG session id (canonical 64-char hex).
+    pub session_id: SessionId,
+    /// Every share THIS device holds (its `t−1` co-located shares). Order is
+    /// irrelevant on disk — the proxy sorts by share index at load.
+    pub shares: Vec<EncryptedShare>,
+}
+
 /// Bridges BRC-100 wallet calls to MPC threshold signing operations.
 ///
 /// Created once at startup from the proxy configuration. Holds the decrypted
@@ -702,6 +725,16 @@ pub struct MpcBridge {
     /// For 2-of-2: `[0, 1]`. Derived from threshold config at init.
     participants: Vec<u16>,
 
+    /// **§1 device-holds-(t−1) (issue #38).** ALL the shares THIS device holds,
+    /// sorted ascending by share index, INCLUDING the primary [`Self::share`]
+    /// (which is `device_shares[0]`). For the normal single-share deployment this
+    /// is a 1-element vec. In the "two mandatory sides" 4-of-6 scheme the device
+    /// holds `t−1` shares (e.g. parties `[0, 1, 2]`) and one external cosigner
+    /// completes the threshold; `participants` is this set ∪ the externals needed
+    /// to reach `threshold`. The presigned relay sign issues one partial per
+    /// device share locally and folds in the external cosigner's over the relay.
+    device_shares: Vec<EncryptedShare>,
+
     /// Agent identity (hex-encoded compressed joint public key).
     /// Used for BRC-31 auth with the KSS.
     agent_id: String,
@@ -741,8 +774,10 @@ impl MpcBridge {
             anyhow::anyhow!("failed to read share file '{}': {e}", config.share_path)
         })?;
 
-        // 2. Parse DkgResult (optionally decrypt first)
-        let dkg_result: DkgResult = if let Some(ref enc_key_hex) = config.encryption_key {
+        // 2. Decode to plaintext JSON bytes (optionally decrypt first), then
+        //    parse EITHER a multi-share device bundle (§1 device-holds-(t−1),
+        //    issue #38) OR a single-share `DkgResult` (the normal deployment).
+        let plaintext_bytes: Vec<u8> = if let Some(ref enc_key_hex) = config.encryption_key {
             let key_bytes = hex_decode(enc_key_hex)
                 .map_err(|e| anyhow::anyhow!("invalid encryption key hex: {e}"))?;
             if key_bytes.len() != 32 {
@@ -754,38 +789,74 @@ impl MpcBridge {
             let mut key = [0u8; 32];
             key.copy_from_slice(&key_bytes);
 
-            // File is a JSON EncryptedShare envelope wrapping encrypted DkgResult
+            // File is a JSON EncryptedShare envelope wrapping the encrypted
+            // DkgResult / DeviceShareBundle.
             let encrypted: EncryptedShare = serde_json::from_slice(&file_bytes)
                 .map_err(|e| anyhow::anyhow!("failed to parse encrypted share file: {e}"))?;
-            let plaintext = bsv_mpc_core::share::decrypt_share(&encrypted, &key)
-                .map_err(|e| anyhow::anyhow!("failed to decrypt share: {e}"))?;
-            serde_json::from_slice(&plaintext)
-                .map_err(|e| anyhow::anyhow!("failed to parse decrypted DkgResult: {e}"))?
+            bsv_mpc_core::share::decrypt_share(&encrypted, &key)
+                .map_err(|e| anyhow::anyhow!("failed to decrypt share: {e}"))?
         } else {
-            // Plaintext DkgResult JSON
-            serde_json::from_slice(&file_bytes)
-                .map_err(|e| anyhow::anyhow!("failed to parse share file as DkgResult: {e}"))?
+            file_bytes
         };
 
-        // 3. Validate share structure
-        bsv_mpc_core::share::validate_encrypted_share(&dkg_result.share)
-            .map_err(|e| anyhow::anyhow!("share validation failed: {e}"))?;
+        // Try the multi-share device bundle first (its required `shares` array
+        // distinguishes it from a single-share `DkgResult`, which has `share`),
+        // then fall back to the canonical single-share `DkgResult`.
+        let (joint_key, dkg_session_id, mut device_shares): (
+            JointPublicKey,
+            SessionId,
+            Vec<EncryptedShare>,
+        ) = match serde_json::from_slice::<DeviceShareBundle>(&plaintext_bytes) {
+            Ok(bundle) if !bundle.shares.is_empty() => {
+                (bundle.joint_key, bundle.session_id, bundle.shares)
+            }
+            _ => {
+                let dkg_result: DkgResult = serde_json::from_slice(&plaintext_bytes)
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "failed to parse share file as DeviceShareBundle or DkgResult: {e}"
+                        )
+                    })?;
+                (dkg_result.joint_key, dkg_result.session_id, vec![dkg_result.share])
+            }
+        };
 
-        // 4. Determine participants
-        let tc = dkg_result.share.config;
-        let my_index = dkg_result.share.share_index.0;
+        // 3. Sort device shares by index; the PRIMARY (= `share`) is the lowest.
+        device_shares.sort_by_key(|s| s.share_index.0);
+        for s in &device_shares {
+            bsv_mpc_core::share::validate_encrypted_share(s)
+                .map_err(|e| anyhow::anyhow!("share validation failed: {e}"))?;
+        }
+        let primary_share = device_shares[0].clone();
+        let dkg_result = DkgResult {
+            joint_key: joint_key.clone(),
+            share: primary_share.clone(),
+            session_id: dkg_session_id,
+        };
+
+        // 4. Determine participants = the device's party set ∪ the externals
+        //    needed to reach `threshold` (lowest external indices first). For a
+        //    single device share this reduces to the original 2-party behavior.
+        let tc = primary_share.config;
+        let my_index = primary_share.share_index.0;
+        let device_party_indices: Vec<u16> =
+            device_shares.iter().map(|s| s.share_index.0).collect();
         let participants: Vec<u16> = if tc.threshold == tc.parties {
-            // All parties must participate (e.g., 2-of-2)
+            // All parties must participate (e.g., 2-of-2).
             (0..tc.parties).collect()
         } else {
-            // Need `threshold` parties: ourselves + first (threshold-1) others
-            // TODO: For multi-KSS setups, allow configuring which parties to sign with
-            let mut parts: Vec<u16> = (0..tc.parties)
-                .filter(|&i| i != my_index)
-                .take((tc.threshold - 1) as usize)
-                .collect();
-            parts.push(my_index);
+            // Device parties + the lowest-index externals until we have `threshold`.
+            let mut parts: Vec<u16> = device_party_indices.clone();
+            for i in 0..tc.parties {
+                if parts.len() >= tc.threshold as usize {
+                    break;
+                }
+                if !parts.contains(&i) {
+                    parts.push(i);
+                }
+            }
             parts.sort();
+            parts.truncate(tc.threshold as usize);
             parts
         };
 
@@ -906,6 +977,7 @@ impl MpcBridge {
                 client,
                 session_id: dkg_result.session_id,
                 participants,
+                device_shares,
                 agent_id,
                 auth: do_auth,
                 presign_auth: Arc::new(Mutex::new(cosigner_auth)),
@@ -924,6 +996,7 @@ impl MpcBridge {
             client,
             session_id: dkg_result.session_id,
             participants,
+            device_shares,
             agent_id,
             auth: presign_auth.clone(),
             presign_auth,
@@ -2260,6 +2333,106 @@ impl MpcBridge {
         .await
     }
 
+    /// **§1 device-holds-(t−1) relay sign (issue #38).** The N-party analog of
+    /// [`sign_over_relay`](Self::sign_over_relay): this device holds `t−1` shares
+    /// and drives `t−1` local parties + ONE external cosigner over the relay to
+    /// produce a single `t`-of-`n` signature.
+    ///
+    /// `device_presigs` is one correlated presignature per device share, tagged
+    /// `(party_index, presig_box)` — all from ONE presign ceremony (identical
+    /// shared public data). The presig for THIS proxy's primary share index is
+    /// the combiner's own; the rest are issued locally via
+    /// [`SigningCoordinator::add_local_presig_partial`] and never cross the wire.
+    /// The external cosigner (`trigger.do_index` =
+    /// [`external_cosigner_index`](Self::external_cosigner_index)) consumes its
+    /// own correlated presig and relays its partial back, exactly as in the
+    /// 2-party path. `brc42_offset` (§06.20) threads through every signer.
+    pub async fn sign_over_relay_device_holds(
+        &self,
+        sighash: &[u8; 32],
+        device_presigs: Vec<(u16, Box<dyn std::any::Any + Send>)>,
+        brc42_offset: Option<[u8; 32]>,
+        mut trigger: crate::relay_sign::DoTrigger,
+        recv_timeout: std::time::Duration,
+    ) -> bsv_mpc_core::error::Result<SigningResult> {
+        trigger.brc42_offset = brc42_offset.map(|o| hex_encode(&o));
+
+        let identity_priv = {
+            let auth = self
+                .auth
+                .lock()
+                .map_err(|_| MpcError::Protocol("auth mutex poisoned".into()))?;
+            auth.auth_key().clone()
+        };
+        let auth_for_sign = self.auth.clone();
+        let request_signer = move |method: &str,
+                                   path: &str,
+                                   body: &[u8]|
+              -> bsv_mpc_core::error::Result<Vec<(String, String)>> {
+            let guard = auth_for_sign
+                .lock()
+                .map_err(|_| MpcError::Protocol("auth mutex poisoned".into()))?;
+            Ok(guard
+                .auth_header_pairs(method, path, body)?
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect())
+        };
+
+        // Split the device's correlated presigs into the PRIMARY (this proxy's
+        // own share index) and the co-located EXTRAS, mapping each party index to
+        // its signing-time index (position within `participants`).
+        let me = self.current_share().share_index.0;
+        let mut primary: Option<Box<dyn std::any::Any + Send>> = None;
+        let mut extras: Vec<(u16, Box<dyn std::any::Any + Send>)> = Vec::new();
+        for (party_idx, presig_box) in device_presigs {
+            let signing_idx = self
+                .participants
+                .iter()
+                .position(|&p| p == party_idx)
+                .ok_or_else(|| {
+                    MpcError::Signing(format!(
+                        "device presig party {party_idx} not in participants {:?}",
+                        self.participants
+                    ))
+                })? as u16;
+            if party_idx == me {
+                primary = Some(presig_box);
+            } else {
+                extras.push((signing_idx, presig_box));
+            }
+        }
+        let my_presig_box = primary.ok_or_else(|| {
+            MpcError::Signing(format!(
+                "device_presigs missing the proxy's primary party {me}"
+            ))
+        })?;
+
+        let sign_session = {
+            use rand::RngCore;
+            let mut seed = [0u8; 16];
+            rand::rngs::OsRng.fill_bytes(&mut seed);
+            SessionId::from_str_hash(&format!("relay-sign-{}", hex_encode(&seed)))
+        };
+        crate::relay_sign::combine_sign_over_relay_nparty(
+            &self.relay_url,
+            identity_priv,
+            self.current_share(),
+            extras,
+            self.participants.clone(),
+            self.current_share().config,
+            sign_session,
+            sighash,
+            my_presig_box,
+            &self.joint_key,
+            brc42_offset,
+            trigger,
+            Some(&request_signer),
+            recv_timeout,
+        )
+        .await
+    }
+
     /// **#14/#6 provisioning** — POST a serialized `Presignature_A` into the
     /// deployed DO's presignature pool via the authed `/ceremony/ingest-presig`
     /// route, so a subsequent authed `/sign-relay` can consume it (the DO never
@@ -2361,6 +2534,34 @@ impl MpcBridge {
             .unwrap_or(0)
     }
 
+    /// **§1 device-holds-(t−1) (issue #38).** The share indices this device
+    /// holds, sorted ascending (e.g. `[0, 1, 2]` for a 4-of-6 device-holds-3).
+    /// A single-element vec is the normal one-share deployment.
+    pub fn device_party_indices(&self) -> Vec<u16> {
+        self.device_shares.iter().map(|s| s.share_index.0).collect()
+    }
+
+    /// True when this device holds MORE THAN ONE share — the "two mandatory
+    /// sides" topology where the proxy drives `t−1` local parties + one external
+    /// cosigner over the relay.
+    pub fn is_device_holds(&self) -> bool {
+        self.device_shares.len() > 1
+    }
+
+    /// **§1 device-holds-(t−1) (issue #38).** The SINGLE external cosigner's
+    /// party index — the participant NOT held by this device. In the
+    /// device-holds-(t−1) topology exactly one external completes the threshold;
+    /// for the normal single-share deployment this coincides with
+    /// [`cosigner_index`](Self::cosigner_index).
+    pub fn external_cosigner_index(&self) -> u16 {
+        let device: Vec<u16> = self.device_party_indices();
+        self.participants
+            .iter()
+            .copied()
+            .find(|p| !device.contains(p))
+            .unwrap_or_else(|| self.cosigner_index())
+    }
+
     /// Whether relay-mode signing is enabled (config `MPC_RELAY_SIGN`).
     pub fn relay_url(&self) -> &str {
         &self.relay_url
@@ -2374,19 +2575,20 @@ impl MpcBridge {
         let agent_id = hex_encode(&joint_key.compressed);
         let root_pub =
             PublicKey::from_bytes(&joint_key.compressed).expect("test joint key must be valid");
+        let test_share = EncryptedShare {
+            nonce: vec![0u8; 12],
+            ciphertext: vec![0u8; 1],
+            session_id: SessionId::from_str_hash("test"),
+            share_index: ShareIndex(0),
+            config: ThresholdConfig {
+                threshold: 2,
+                parties: 2,
+            },
+            joint_pubkey_compressed: Vec::new(),
+        };
         Self {
             kss_url: "http://localhost:9999".into(),
-            share: Arc::new(RwLock::new(EncryptedShare {
-                nonce: vec![0u8; 12],
-                ciphertext: vec![0u8; 1],
-                session_id: SessionId::from_str_hash("test"),
-                share_index: ShareIndex(0),
-                config: ThresholdConfig {
-                    threshold: 2,
-                    parties: 2,
-                },
-                joint_pubkey_compressed: Vec::new(),
-            })),
+            share: Arc::new(RwLock::new(test_share.clone())),
             joint_key,
             root_pub,
             share_scalar: Arc::new(RwLock::new([0u8; 32])),
@@ -2394,6 +2596,7 @@ impl MpcBridge {
             client: reqwest::Client::new(),
             session_id: SessionId::from_str_hash("test"),
             participants: vec![0, 1],
+            device_shares: vec![test_share],
             agent_id,
             auth: Arc::new(Mutex::new(BridgeAuth::new().expect("test auth key"))),
             presign_auth: Arc::new(Mutex::new(BridgeAuth::new().expect("test auth key"))),

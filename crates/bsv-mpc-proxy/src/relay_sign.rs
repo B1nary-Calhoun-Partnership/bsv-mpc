@@ -130,6 +130,68 @@ pub async fn combine_sign_over_relay(
     request_signer: Option<RelayRequestSigner<'_>>,
     recv_timeout: Duration,
 ) -> Result<SigningResult> {
+    // 2-party is the N-party combine with NO co-located extras (the device holds
+    // exactly its own share; one external cosigner completes it).
+    combine_sign_over_relay_nparty(
+        relay_url,
+        identity_priv,
+        share,
+        Vec::new(),
+        participants,
+        config,
+        session_id,
+        sighash,
+        my_presig_box,
+        joint_key,
+        brc42_offset,
+        trigger,
+        request_signer,
+        recv_timeout,
+    )
+    .await
+}
+
+/// **§1 device-holds-(t−1) N-party relay combiner (issue #38).**
+///
+/// Generalizes [`combine_sign_over_relay`] from 2-party (one device share + one
+/// external cosigner) to the "two mandatory sides" subset: the device holds
+/// `t−1` co-located shares and one external cosigner completes the threshold.
+/// The combiner:
+/// 1. primes the presigned path for its PRIMARY party (`share` + `my_presig_box`),
+/// 2. issues each co-located party's partial LOCALLY from
+///    `extra_local_presigs` (never on the wire) via
+///    [`SigningCoordinator::add_local_presig_partial`],
+/// 3. triggers the ONE external cosigner (`trigger.do_index`) over the relay
+///    exactly as the 2-party path does, and
+/// 4. folds the cosigner's relayed partial in → `process_round` combines all `t`
+///    partials in commitment order.
+///
+/// `extra_local_presigs` is `(party_signing_index, presig_box)` for each
+/// co-located party OTHER than the primary — the boxes are correlated with the
+/// primary's (same presign ceremony, identical shared public data). When empty,
+/// this is byte-for-byte the proven 2-party flow. `brc42_offset` (§06.20) is
+/// applied to the primary, every extra, and the cosigner — all identical bytes.
+///
+/// The KSS `/sign-relay` is unchanged: it issues exactly one party's partial
+/// from `from_index`, agnostic to how many parties exist.
+#[allow(clippy::too_many_arguments)]
+pub async fn combine_sign_over_relay_nparty(
+    relay_url: &str,
+    identity_priv: PrivateKey,
+    share: EncryptedShare,
+    // Co-located parties OTHER than the primary: (signing-time index, presig box).
+    extra_local_presigs: Vec<(u16, Box<dyn std::any::Any + Send>)>,
+    participants: Vec<u16>,
+    config: ThresholdConfig,
+    session_id: SessionId,
+    sighash: &[u8; 32],
+    my_presig_box: Box<dyn std::any::Any + Send>,
+    joint_key: &JointPublicKey,
+    brc42_offset: Option<[u8; 32]>,
+    trigger: DoTrigger,
+    request_signer: Option<RelayRequestSigner<'_>>,
+    recv_timeout: Duration,
+) -> Result<SigningResult> {
     let proto = |e: bsv_mpc_messagebox::error::MessageBoxError| MpcError::Protocol(e.to_string());
 
     // 1. Relay client + subscription — BEFORE triggering the DO so we don't
@@ -141,10 +203,16 @@ pub async fn combine_sign_over_relay(
         .await
         .map_err(proto)?;
 
-    // 2. Prime our coordinator (issues our own partial; holds public data).
+    // 2. Prime our coordinator for the PRIMARY co-located party (issues its
+    //    partial; installs the shared public data), then issue EACH OTHER
+    //    co-located party's partial locally — the device's `t−1` partials never
+    //    cross the wire.
     let my_index = signing_index(&share, &participants)?;
     let mut coord = SigningCoordinator::new(session_id, share, config, participants);
     coord.sign_with_presignature_with_offset(sighash, my_presig_box, brc42_offset)?;
+    for (extra_idx, extra_box) in extra_local_presigs {
+        coord.add_local_presig_partial(extra_idx, extra_box, brc42_offset)?;
+    }
 
     // 3. Trigger the DO to issue + relay its partial to us.
     //    Production: presig is consumed from the DO pool (no `presignature_hex`
