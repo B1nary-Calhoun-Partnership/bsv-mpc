@@ -383,6 +383,89 @@ impl SigningCoordinator {
         }])
     }
 
+    /// **§1 device-holds-(t−1): issue an ADDITIONAL co-located party's partial
+    /// in the presigned 1-round path (issue #38).**
+    ///
+    /// In the "two mandatory sides" 4-of-6 scheme a single device possesses
+    /// `t−1` of the `n` shares (e.g. parties `{0,1,2}` of a 4-of-6) and signs
+    /// with one external cosigner. The combiner is primed for its PRIMARY party
+    /// via [`sign_with_presignature`](Self::sign_with_presignature) /
+    /// [`sign_with_presignature_with_offset`](Self::sign_with_presignature_with_offset);
+    /// this method contributes EACH OTHER co-located party's partial from THAT
+    /// party's correlated presignature (same presign ceremony → identical shared
+    /// `PresignaturePublicData`, already installed by the primary call).
+    ///
+    /// The partial is keyed by `party_signing_index` (the co-located party's
+    /// position within `participants`) and inserted into the local
+    /// `partial_sigs` map — it is **NOT** broadcast (co-located parties never
+    /// cross the wire; only the external cosigner's partial arrives over the
+    /// relay). Once the device's `t−1` partials plus the cosigner's one partial
+    /// are present, [`process_round`](Self::process_round) combines all `t` in
+    /// commitment order (the `BTreeMap` orders by signing index) into the final
+    /// ECDSA signature — no new crypto, just one more `issue_partial_signature`.
+    ///
+    /// `brc42_offset` (§06.20 / issue #26): when `Some`, the SAME additive shift
+    /// the primary applied is applied to THIS party's presig share (the shared
+    /// public data is shifted exactly once, by the primary call — never here).
+    /// All device parties and the external cosigner MUST use identical offset
+    /// bytes; the result verifies under `child_pub = joint + offset·G`.
+    ///
+    /// # Arguments
+    /// * `party_signing_index` — the co-located party's position within
+    ///   `participants` (its signing-time index; distinct from the primary's).
+    /// * `presignature_raw` — that party's boxed `(Presignature,
+    ///   PresignaturePublicData)` from `PresigningManager::take_raw`.
+    /// * `brc42_offset` — optional 32-byte BRC-42 offset (same as the primary).
+    pub fn add_local_presig_partial(
+        &mut self,
+        party_signing_index: u16,
+        presignature_raw: Box<dyn std::any::Any + Send>,
+        brc42_offset: Option<[u8; 32]>,
+    ) -> Result<()> {
+        if self.mode != SigningMode::Presigned {
+            return Err(MpcError::Signing(
+                "add_local_presig_partial() requires the presigned path to be primed first \
+                 (call sign_with_presignature*/sign_from_bundle* for the primary party)"
+                    .into(),
+            ));
+        }
+        if self.partial_sigs.contains_key(&party_signing_index) {
+            return Err(MpcError::Signing(format!(
+                "add_local_presig_partial(): a partial is already present for signing index \
+                 {party_signing_index}"
+            )));
+        }
+        let message_hash = self.message_hash.ok_or_else(|| {
+            MpcError::Signing("message hash not set (internal error in presigned path)".into())
+        })?;
+
+        // The co-located party's presig carries its OWN secret share; the public
+        // data is the shared ceremony data (identical to the primary's, already
+        // installed) — we only need the secret presig here.
+        let (mut presig, _shared_public_data) = *presignature_raw
+            .downcast::<crate::presigning::PresignOutput>()
+            .map_err(|_| {
+                MpcError::Signing(
+                    "presignature_raw is not the expected cggmp24 presignature type".into(),
+                )
+            })?;
+
+        // §06.20: shift this party's presig share by the SAME offset the primary
+        // applied. The shared public data is shifted exactly ONCE (by the primary
+        // call), so we never touch it here.
+        if let Some(off) = brc42_offset {
+            let off_scalar = Scalar::<Secp256k1>::from_be_bytes_mod_order(off);
+            apply_brc42_offset(&mut presig, &off_scalar);
+        }
+
+        let scalar = Scalar::<Secp256k1>::from_be_bytes_mod_order(message_hash);
+        let data_to_sign =
+            PrehashedDataToSign::from_scalar(scalar).insecure_assume_preimage_known();
+        let partial = presig.issue_partial_signature(data_to_sign);
+        self.partial_sigs.insert(party_signing_index, partial);
+        Ok(())
+    }
+
     /// **Durable 1-round presigned signing from a persisted bundle (§06.17.1).**
     ///
     /// The §06.17.1 coordinator does NOT hold the live `(Presignature,

@@ -33,7 +33,7 @@ use tokio::sync::RwLock;
 use crate::bridge::MpcBridge;
 use crate::config::ProxyConfig;
 use crate::fee_injector::FeeInjector;
-use crate::presign_manager::{self, PresignManager};
+use crate::presign_manager::{self, DevicePresigSetPool, PresignManager};
 use crate::storage::{InMemoryBackend, StorageBackend};
 use crate::wallet_api;
 
@@ -57,6 +57,13 @@ pub struct AppState {
     /// Protected by `RwLock` because reads (checking pool size) are much more
     /// frequent than writes (adding/removing presignatures).
     pub presign_manager: Arc<RwLock<PresignManager>>,
+
+    /// **§1 device-holds-(t−1) presig SET pool (issue #38).** Present only when
+    /// this proxy is a device holding `t−1` shares (`bridge.is_device_holds()`).
+    /// `relay_sign` consumes one correlated set per signed input and drives
+    /// `t−1` local parties + one external cosigner over the relay. `None` for the
+    /// normal single-share deployment (which uses `presign_manager`).
+    pub device_presig_pool: Option<Arc<RwLock<DevicePresigSetPool>>>,
 
     /// Fee injector for adding MPC signing fees to transactions.
     pub fee_injector: FeeInjector,
@@ -94,6 +101,7 @@ pub struct ProxyBuilder {
     bridge: Option<MpcBridge>,
     fee_injector: Option<FeeInjector>,
     presign_manager: Option<PresignManager>,
+    device_presig_pool: Option<DevicePresigSetPool>,
     storage: Option<Arc<dyn StorageBackend>>,
     http_client: Option<reqwest::Client>,
 }
@@ -106,6 +114,7 @@ impl ProxyBuilder {
             bridge: None,
             fee_injector: None,
             presign_manager: None,
+            device_presig_pool: None,
             storage: None,
             http_client: None,
         }
@@ -126,6 +135,14 @@ impl ProxyBuilder {
     /// Override the presignature manager.
     pub fn with_presign_manager(mut self, manager: PresignManager) -> Self {
         self.presign_manager = Some(manager);
+        self
+    }
+
+    /// **§1 device-holds-(t−1) (issue #38).** Provide the correlated device
+    /// presig-set pool. Required when the bridge holds `t−1` shares — `relay_sign`
+    /// consumes one set per signed input.
+    pub fn with_device_presig_pool(mut self, pool: DevicePresigSetPool) -> Self {
+        self.device_presig_pool = Some(pool);
         self
     }
 
@@ -177,10 +194,15 @@ impl ProxyBuilder {
                 .build()?,
         };
 
+        let device_presig_pool = self
+            .device_presig_pool
+            .map(|p| Arc::new(RwLock::new(p)));
+
         Ok(Arc::new(AppState {
             config: self.config,
             bridge,
             presign_manager,
+            device_presig_pool,
             fee_injector,
             storage,
             http_client,
@@ -211,6 +233,18 @@ pub async fn run(config: ProxyConfig) -> anyhow::Result<()> {
 
     let presign_manager = Arc::new(RwLock::new(PresignManager::new(config.max_presignatures)));
 
+    // §1 device-holds-(t−1) (issue #38): a device holding `t−1` shares consumes
+    // correlated presig SETS (one per device share) rather than single presigs.
+    // The set pool is provisioned out-of-band (the device's `t−1`-party + cosigner
+    // presign ceremony); background single-presig replenishment does not stock it.
+    let device_presig_pool = if bridge.is_device_holds() {
+        Some(Arc::new(RwLock::new(DevicePresigSetPool::new(
+            config.max_presignatures,
+        ))))
+    } else {
+        None
+    };
+
     let storage: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new());
 
     let http_client = reqwest::Client::builder()
@@ -221,6 +255,7 @@ pub async fn run(config: ProxyConfig) -> anyhow::Result<()> {
         config: config.clone(),
         bridge,
         presign_manager: presign_manager.clone(),
+        device_presig_pool,
         fee_injector,
         storage,
         http_client,

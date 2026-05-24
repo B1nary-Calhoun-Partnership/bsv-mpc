@@ -78,11 +78,11 @@ pub mod wallet_api;
 // These re-exports allow `use bsv_mpc_proxy::AppState` instead of
 // `use bsv_mpc_proxy::server::AppState`.
 
-pub use bridge::MpcBridge;
+pub use bridge::{DeviceShareBundle, MpcBridge};
 pub use config::ProxyConfig;
 pub use error::{ProxyError, ProxyResult};
 pub use fee_injector::{FeeInjectionInfo, FeeInjector};
-pub use presign_manager::PresignManager;
+pub use presign_manager::{DevicePresigSetPool, PresignManager};
 pub use server::{AppState, ProxyBuilder};
 pub use storage::{InMemoryBackend, StorageBackend, WalletInfraBackend};
 pub use utxo_tracker::{TrackedOutput, UtxoTracker};

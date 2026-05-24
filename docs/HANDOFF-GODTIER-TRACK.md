@@ -55,7 +55,10 @@ surface it in UX.
 ## 3. GitHub issue map
 
 - **#37** — umbrella (god-tier product track). Carries the sweep summary + child statuses.
-- **#38** — §1 device-holds-(t−1) 4-of-6. *POC merged (#42); implement open.* `step:implement`
+- **#38** — §1 device-holds-(t−1) 4-of-6. **DONE — N-party relay sign implemented +
+  mainnet-proven.** Real-sats 4-of-6 `createAction` (proxy drove 3 local device
+  parties `{0,1,2}` + 1 deployed cosigner party 3 over the relay), WoC-confirmed:
+  spend TXID `febd2877…` (joint `026b712a…`). ZERO KSS change/redeploy. See §7.
 - **#39** — §4 binding reconciliation. **Closed** (done; MPC-Spec#42).
 - **#43** — §4 policy engine + approval flow + WebAuthn (split from #39). `step:investigate`
 - **#40** — §3 recovery ceremony (keystone confirmed; ceremony build open). `step:implement`
@@ -65,12 +68,21 @@ surface it in UX.
 
 ---
 
-## 4. RECOMMENDED NEXT BUILD: #38 — generalize the relay sign path 2-party → N-party
+## 4. ✅ DONE: #38 — relay sign path 2-party → N-party (device-holds-(t−1))
 
-This is the foundation everything else assumes. The crypto is proven (PR #42); this is
-**orchestration**.
+**Shipped + mainnet-proven (2026-05-24).** The foundation everything else assumes
+is in place: the proxy drives `t−1` local device parties + one external cosigner
+over the relay to produce a single `t`-of-`n` signature. Real-sats 4-of-6
+`createAction` spend, WoC-confirmed: TXID `febd2877…`. See §7 for the full record.
 
-**The lift (from the #38 audit):**
+> **The remaining god-tier builds now rest on this.** The strong next is **#43**
+> (§4 policy engine + approval binding + WebAuthn) — now that the external side
+> can co-sign a `t`-of-`n`, it must *enforce policy* before it does ("two
+> mandatory sides" only matters if the external side actually checks something).
+> Then **#40** (lost-phone recovery ceremony), **#41** (native client), **#44**
+> (zeroize). See §8.
+
+**What was built (the lift, from the #38 audit):**
 1. **Provision t−1 shares to the device's storage.** DKG today stores one share to
    `share_path` (`crates/bsv-mpc-proxy/src/bridge.rs`, `MpcBridge::new` share-load). The
    device side must hold `{0,1,2}` (3 KeyShares) for 4-of-6.
@@ -98,6 +110,10 @@ policy crate → `mpc-policy-shared`; wire RequireApproval→approve()→sign; m
   `793938e3…` (slimmed container §06.17.1). All signing relay-only.
 - **#38 keystone:** PR #42 merged; `poc_4of6_device_holds_3.rs` (run:
   `cargo test -p bsv-mpc-core --test poc_4of6_device_holds_3 -- --ignored --nocapture`, ~197s).
+- **#38 implement:** N-party relay sign + mainnet 4-of-6 spend. Hermetic presigned
+  proof `poc_4of6_device_holds_presig_relay.rs` (base→joint, offset→child, device-alone
+  rejected). Mainnet gate `createaction_4of6_device_holds_relay_mainnet_e2e.rs`
+  (`DEVICE_HOLDS_4OF6_MAINNET=1`). Spend TXID `febd2877…`, joint `026b712a…`.
 - **#39:** MPC-Spec PR #42 merged (§09.5.1 8-field reconcile); `conformance_09` green.
 - **#35:** reshare keystone, mainnet TXID `5137b913…`.
 
@@ -121,4 +137,62 @@ policy crate → `mpc-policy-shared`; wire RequireApproval→approve()→sign; m
 - **Deploy container:** `cd poc/cf-container-p2 && eval "$(grep '^export CLOUDFLARE' ~/bsv/mpc/bsv-mpc/secrets.md)" && npx wrangler deploy` (needs Docker daemon running; image build ~3min). Verify `GET /reshare-relay/identity` → 200.
 - **Gates:** workspace `cargo test`; conformance_* (esp 07/07b/09); `cargo clippy -p bsv-mpc-core -p bsv-mpc-proxy -p bsv-mpc-service -p bsv-mpc-worker --all-targets -- -D warnings`; wasm: `cargo clippy/build -p bsv-mpc-worker --target wasm32-unknown-unknown`. `CARGO_INCREMENTAL=0` to keep the target dir from ballooning (disk filled mid-session once).
 - **No commit/push/deploy without showing the diff + approval** on these partnership repos.
-- **Memory:** `project_godtier_track`, `project_13_retire_legacy_sign`, `reference_wallet_3321_broadcast` (in `~/.claude/projects/-Users-johncalhoun-bsv-mpc/memory/`).
+- **Memory:** `project_godtier_track`, `project_13_retire_legacy_sign`, `reference_wallet_3321_broadcast`, `project_38_nparty_device_holds` (in `~/.claude/projects/-Users-johncalhoun-bsv-mpc/memory/`).
+
+---
+
+## 7. #38 record — N-party device-holds relay sign (2026-05-24)
+
+**What shipped (orchestration, NO new crypto, NO KSS change/redeploy):**
+- **Core primitive** `SigningCoordinator::add_local_presig_partial` — issue an
+  additional co-located party's partial in the presigned path (no broadcast;
+  shared public data reused; §06.20 offset applied to the secret presig only).
+- **N-party combiner** `relay_sign::combine_sign_over_relay_nparty` — primary +
+  `t−1` local extras + ONE external cosigner over the relay. The 2-party
+  `combine_sign_over_relay` now delegates to it (call sites untouched).
+- **Multi-share bridge** — `DeviceShareBundle` share-file format (load `t−1`
+  shares); `participants = device parties ∪ externals`; `sign_over_relay_device_holds`;
+  `is_device_holds`/`device_party_indices`/`external_cosigner_index`.
+- **Device presig-set pool** `DevicePresigSetPool` (FIFO of correlated sets) +
+  `relay_sign` device-holds branch → 4-of-6 flows through BOTH `/createSignature`
+  and `/createAction` (per-input loop unchanged).
+- **KSS is generic** — `handle_prod_sign_relay` issues one party's partial from
+  `from_index`, agnostic to party count; `authz_owner_or_reject` allows a fresh
+  joint key. No worker change, no redeploy.
+
+**Proof:** hermetic `poc_4of6_device_holds_presig_relay` (base→joint, offset→child,
+device-alone {0,1,2} rejected) + mainnet 4-of-6 `createAction` spend TXID
+**`febd287740f603af2cac5e4d73ce7face236fed8e2e3e592f38f7fc6e9552d89`** (joint
+`026b712af9b6d21143e15588b04be2f4831350709106fabc8f92a0027a3f406222`), proxy drove
+device parties `{0,1,2}` + deployed cosigner party 3, WoC-confirmed.
+
+**Follow-on (not blockers):** production device-holds presig REPLENISHMENT (a `t−1`-party
++ cosigner relay presign ceremony to stock `DevicePresigSetPool` automatically) — the
+gate seeds the pool from a local ceremony; background replenish stocks only the
+single-presig `PresignManager` today. Multi-share refresh hot-swap is also single-share.
+
+---
+
+## 8. What's god-tier next
+
+The §1 "two mandatory sides" signing topology is now real on mainnet. The remaining
+big builds (each its own focused session), in dependency order:
+
+1. **#43 — §4 policy engine + approval binding + WebAuthn (STRONG NEXT).** The
+   external cosigner can now co-sign a `t`-of-`n`, but it co-signs *anything*.
+   "Two mandatory sides" only has teeth when the external side **enforces policy**
+   before issuing its partial. Port rust-mpc's policy crate → `mpc-policy-shared`;
+   wire `RequireApproval → approve() → sign`; bind the approved render
+   (`approval.rs` is byte-locked, conformance_09 green) to the partial; mainnet
+   gate. This is what turns 4-of-6 from "math" into a product guarantee.
+2. **#40 — §3 lost-phone recovery ceremony.** Keystone proven (#35 reshare,
+   mainnet `5137b913…`). Build: new device → reshare the `t−1` device shares onto
+   it → same joint address. Plus zeroize (#44).
+3. **#41 — §2/§6 native client.** wasm BRC-100 + wasm-bindgen/UniFFI bindings +
+   enclave wrap-key + WebAuthn-PRF + iOS/Android shells. Realizability confirmed
+   (zero dep on `bsv-wallet-toolbox-rs`).
+4. **#44 — zeroize secret scalars** (cross-cuts #40/#41).
+
+**Smaller hardening surfaced by #38:** device-holds presig replenishment (§7
+follow-on) and multi-share refresh hot-swap — fold into #5 or a dedicated issue
+when device-holds goes to a real deployment.
