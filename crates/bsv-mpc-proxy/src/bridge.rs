@@ -54,7 +54,6 @@ use bsv_mpc_core::ecdh;
 use bsv_mpc_core::error::MpcError;
 use bsv_mpc_core::hd::{compute_invoice, derive_child_pubkey};
 use bsv_mpc_core::presigning::{PresigningManager, PresigningRoundResult};
-use bsv_mpc_core::signing::{SigningCoordinator, SigningRoundResult};
 use bsv_mpc_core::types::*;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex, RwLock};
@@ -62,55 +61,6 @@ use std::sync::{Arc, Mutex, RwLock};
 // ============================================================================
 // KSS HTTP API types (compatible with bsv-mpc-worker::api)
 // ============================================================================
-
-/// Request body for `POST /sign/init`.
-#[derive(Serialize, Deserialize, Debug)]
-struct SignInitRequest {
-    /// BRC-31 identity key of the requesting agent (33-byte hex).
-    agent_id: String,
-    /// The MPC session ID (from DKG completion).
-    session_id: String,
-    /// SHA-256d sighash to sign (32 bytes, hex-encoded).
-    sighash: String,
-    /// Whether to use a presignature for single-round signing.
-    use_presignature: bool,
-    /// Optional BRC-42 HMAC offset for derived key signing (32 bytes, hex).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    hmac_offset: Option<String>,
-}
-
-/// Response from `POST /sign/init`.
-#[derive(Serialize, Deserialize, Debug)]
-struct SignInitResponse {
-    /// Ephemeral signing session identifier.
-    signing_session_id: String,
-    /// KSS's round 1 message.
-    round_message: RoundMessage,
-    /// Whether a presignature was consumed.
-    using_presignature: bool,
-    /// Total rounds expected.
-    total_rounds: u8,
-}
-
-/// Request body for `POST /sign/round`.
-#[derive(Serialize, Deserialize, Debug)]
-struct SignRoundRequest {
-    /// The signing session ID from `/sign/init`.
-    signing_session_id: String,
-    /// The proxy's round message.
-    round_message: RoundMessage,
-}
-
-/// Response from `POST /sign/round`.
-#[derive(Serialize, Deserialize, Debug)]
-struct SignRoundResponse {
-    /// The signing session ID.
-    signing_session_id: String,
-    /// KSS's response message (None when complete).
-    round_message: Option<RoundMessage>,
-    /// Whether signing is now complete.
-    complete: bool,
-}
 
 /// Request body for `POST /presign/init`.
 #[derive(Serialize, Deserialize, Debug)]
@@ -1021,142 +971,6 @@ impl MpcBridge {
             *sc = new_scalar;
         }
         Ok(())
-    }
-
-    /// Sign a 32-byte message hash using 2-party threshold ECDSA.
-    ///
-    /// Creates an ephemeral `SigningCoordinator`, drives it through the 4-round
-    /// interactive protocol by exchanging messages with the KSS over HTTP.
-    ///
-    /// The coordinator runs in `spawn_blocking` because its internal SM bridge
-    /// uses synchronous `mpsc` channels. HTTP requests use `handle.block_on`
-    /// to bridge back to async.
-    ///
-    /// # Arguments
-    ///
-    /// - `message_hash` — The 32-byte SHA-256d sighash to sign.
-    /// - `presignature` — Currently unused (presigned path not yet in coordinator).
-    /// # Arguments
-    ///
-    /// - `message_hash` — The 32-byte SHA-256d sighash to sign.
-    /// - `presignature` — Currently unused (presigned path not yet in coordinator).
-    /// - `hmac_offset` — Optional BRC-42 HMAC offset for derived key signing.
-    ///   When set, the signing produces a signature for `root_pub + G * offset`
-    ///   rather than the root key. Both proxy and KSS must use the same offset.
-    pub async fn sign(
-        &self,
-        message_hash: &[u8; 32],
-        presignature: Option<Presignature>,
-        hmac_offset: Option<[u8; 32]>,
-    ) -> bsv_mpc_core::error::Result<SigningResult> {
-        let share = self.current_share();
-        let session_id = self.session_id;
-        let threshold_config = share.config;
-        let participants = self.participants.clone();
-        let kss_url = self.kss_url.clone();
-        let client = self.client.clone();
-        let agent_id = self.agent_id.clone();
-        let auth = self.auth.clone();
-        let hash = *message_hash;
-
-        let handle = tokio::runtime::Handle::current();
-
-        tokio::task::spawn_blocking(move || {
-            // Create coordinator for this signing operation
-            let mut coord =
-                SigningCoordinator::new(session_id, share, threshold_config, participants);
-
-            // Initialize signing → get proxy's Round 1 messages
-            let proxy_msgs = coord.sign(&hash, presignature, hmac_offset)?;
-
-            tracing::debug!(
-                round = 1,
-                outgoing = proxy_msgs.len(),
-                "signing: initialized, starting KSS session"
-            );
-
-            // Start KSS signing session → get KSS's Round 1 message.
-            // Send the HMAC offset to KSS so it applies the same additive shift.
-            let sign_init_url = format!("{}/sign/init", kss_url);
-            let init_resp: SignInitResponse = kss_post(
-                &handle,
-                &client,
-                &sign_init_url,
-                "/sign/init",
-                &SignInitRequest {
-                    agent_id,
-                    session_id: session_id.hex(),
-                    sighash: hex_encode(&hash),
-                    use_presignature: false,
-                    hmac_offset: hmac_offset.map(|o| hex_encode(&o)),
-                },
-                &auth,
-            )?;
-
-            tracing::debug!(
-                signing_session = %init_resp.signing_session_id,
-                total_rounds = init_resp.total_rounds,
-                "signing: KSS session started"
-            );
-
-            let signing_session_id = init_resp.signing_session_id;
-            let sign_round_url = format!("{}/sign/round", kss_url);
-
-            // Bundle proxy's outgoing messages for KSS transport.
-            // The KSS bundles its responses too — we pass them directly to
-            // the coordinator as single RoundMessages with bundled payloads.
-            // The SM thread handles unbundling internally (JSON array of WireMessages).
-            let mut kss_msg = init_resp.round_message;
-            let mut proxy_bundle = bundle_messages(&proxy_msgs)?;
-
-            loop {
-                // Exchange: send proxy's bundled message to KSS, get KSS's next bundled message
-                let round_resp: SignRoundResponse = kss_post(
-                    &handle,
-                    &client,
-                    &sign_round_url,
-                    "/sign/round",
-                    &SignRoundRequest {
-                        signing_session_id: signing_session_id.clone(),
-                        round_message: proxy_bundle,
-                    },
-                    &auth,
-                )?;
-
-                // Process: feed KSS's bundled message directly to coordinator.
-                // The SM thread handles unbundling the JSON array payload internally.
-                match coord.process_round(vec![kss_msg])? {
-                    SigningRoundResult::NextRound(next_proxy_msgs) => {
-                        tracing::debug!(
-                            round = coord.current_round(),
-                            outgoing = next_proxy_msgs.len(),
-                            kss_complete = round_resp.complete,
-                            "signing: round complete"
-                        );
-
-                        if round_resp.complete {
-                            return Err(MpcError::Signing(
-                                "KSS completed but coordinator has more rounds".into(),
-                            ));
-                        }
-
-                        kss_msg = round_resp.round_message.ok_or_else(|| {
-                            MpcError::Signing(
-                                "KSS returned no round message but signing is not complete".into(),
-                            )
-                        })?;
-
-                        proxy_bundle = bundle_messages(&next_proxy_msgs)?;
-                    }
-                    SigningRoundResult::Complete(result) => {
-                        tracing::info!("signing: complete");
-                        return Ok(result);
-                    }
-                }
-            }
-        })
-        .await
-        .map_err(|e| MpcError::Signing(format!("signing task panicked: {e}")))?
     }
 
     /// Run the presigning protocol, returning the **raw** presignature output
@@ -2641,52 +2455,6 @@ mod tests {
         let encoded = hex_encode(&original);
         let decoded = hex_decode(&encoded).unwrap();
         assert_eq!(decoded, original);
-    }
-
-    #[test]
-    fn sign_init_request_serializes() {
-        let req = SignInitRequest {
-            agent_id: "02abc123".into(),
-            session_id: "sess-1".into(),
-            sighash: "ff".repeat(32),
-            use_presignature: false,
-            hmac_offset: None,
-        };
-        let json = serde_json::to_value(&req).unwrap();
-        assert_eq!(json["agent_id"], "02abc123");
-        assert_eq!(json["session_id"], "sess-1");
-        assert_eq!(json["use_presignature"], false);
-    }
-
-    #[test]
-    fn sign_round_response_deserializes_with_message() {
-        let json = serde_json::json!({
-            "signing_session_id": "sign-1",
-            "round_message": {
-                "session_id": "0000000000000000000000000000000000000000000000000000000000000001",
-                "round": 1,
-                "from": 0,
-                "to": null,
-                "payload": [1, 2, 3]
-            },
-            "complete": false
-        });
-        let resp: SignRoundResponse = serde_json::from_value(json).unwrap();
-        assert_eq!(resp.signing_session_id, "sign-1");
-        assert!(!resp.complete);
-        assert!(resp.round_message.is_some());
-    }
-
-    #[test]
-    fn sign_round_response_deserializes_complete() {
-        let json = serde_json::json!({
-            "signing_session_id": "sign-1",
-            "round_message": null,
-            "complete": true
-        });
-        let resp: SignRoundResponse = serde_json::from_value(json).unwrap();
-        assert!(resp.complete);
-        assert!(resp.round_message.is_none());
     }
 
     #[test]

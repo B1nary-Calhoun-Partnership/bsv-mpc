@@ -245,7 +245,6 @@ struct TestEnv {
     proxy_url: String,
     _kss_url: String,
     joint_key_hex: String,
-    joint_address: String,
     _share_file: tempfile::NamedTempFile,
 }
 
@@ -287,7 +286,6 @@ async fn setup() -> TestEnv {
     let dkg_result_1 = key_share_to_dkg_result(&key_shares[1], 1, 2, 2, &joint_pubkey);
 
     let joint_key_hex = hex::encode(&dkg_result_0.joint_key.compressed);
-    let joint_address = dkg_result_0.joint_key.address.clone();
 
     // ── Real enforced BRC-31 auth (NO dev-mode unauthenticated fallback) ──
     // The e2e must exercise the canonical mutual-auth path end-to-end, not a
@@ -382,7 +380,6 @@ async fn setup() -> TestEnv {
         proxy_url,
         _kss_url: kss_url,
         joint_key_hex,
-        joint_address,
         _share_file: share_file,
     }
 }
@@ -514,81 +511,6 @@ async fn test_key_derivation(env: &TestEnv, client: &Client) {
     // Both must be valid secp256k1 compressed points
     assert!(anyone_key.starts_with("02") || anyone_key.starts_with("03"));
     assert!(self_key.starts_with("02") || self_key.starts_with("03"));
-
-    eprintln!("  PASS\n");
-}
-
-/// Test 3: Signature round-trip (exercises full 2PC MPC signing)
-async fn test_signature_roundtrip(env: &TestEnv, client: &Client) {
-    eprintln!("--- Test 3: Signature Round-Trip ---");
-
-    let base_url = &env.proxy_url;
-    let test_data = hex::encode(b"E2E test message for MPC signing");
-
-    // createSignature — triggers full 4-round 2PC ECDSA with KSS
-    let start = std::time::Instant::now();
-    let resp = post_json(
-        client,
-        &format!("{base_url}/createSignature"),
-        &json!({
-            "data": test_data,
-            "protocolID": [2, "e2e test"],
-            "keyID": "sig-1",
-            "counterparty": "anyone"
-        }),
-    )
-    .await;
-    let elapsed = start.elapsed();
-
-    assert!(
-        resp.get("error").is_none(),
-        "createSignature must succeed (full 4-round 2PC ECDSA over HTTP to the KSS): {resp}"
-    );
-
-    let signature = resp["signature"].as_str().expect("signature hex");
-    assert!(
-        signature.len() >= 128,
-        "DER signature too short: {}",
-        signature.len()
-    );
-    eprintln!(
-        "  Signature: {}... ({:.0}ms)",
-        &signature[..40],
-        elapsed.as_millis()
-    );
-
-    // verifySignature with correct data → valid: true
-    let resp = post_json(
-        client,
-        &format!("{base_url}/verifySignature"),
-        &json!({
-            "data": test_data,
-            "signature": signature,
-            "protocolID": [2, "e2e test"],
-            "keyID": "sig-1",
-            "counterparty": "anyone",
-            "forSelf": true
-        }),
-    )
-    .await;
-    assert_eq!(resp["valid"], true, "signature should verify: {resp}");
-
-    // verifySignature with wrong data → valid: false
-    let wrong_data = hex::encode(b"WRONG data");
-    let resp = post_json(
-        client,
-        &format!("{base_url}/verifySignature"),
-        &json!({
-            "data": wrong_data,
-            "signature": signature,
-            "protocolID": [2, "e2e test"],
-            "keyID": "sig-1",
-            "counterparty": "anyone",
-            "forSelf": true
-        }),
-    )
-    .await;
-    assert_eq!(resp["valid"], false, "wrong data should not verify");
 
     eprintln!("  PASS\n");
 }
@@ -732,347 +654,6 @@ async fn test_hmac_roundtrip(env: &TestEnv, client: &Client) {
     )
     .await;
     assert_eq!(resp["valid"], false, "wrong HMAC should not verify");
-
-    eprintln!("  PASS\n");
-}
-
-/// Test 6: Derived key signing (exercises BRC-42 HMAC offset through full MPC)
-async fn test_derived_key_signing(env: &TestEnv, client: &Client) {
-    eprintln!("--- Test 6: Derived Key Signing ---");
-
-    let base_url = &env.proxy_url;
-
-    // Step 1: Get the derived public key for a specific BRC-42 path
-    let resp = post_json(
-        client,
-        &format!("{base_url}/getPublicKey"),
-        &json!({
-            "protocolID": [2, "e2e derived"],
-            "keyID": "derived-sig-1",
-            "counterparty": "anyone"
-        }),
-    )
-    .await;
-    let derived_key = resp["publicKey"].as_str().expect("publicKey");
-    assert_eq!(derived_key.len(), 66);
-    assert_ne!(
-        derived_key, env.joint_key_hex,
-        "derived key must differ from identity key"
-    );
-    eprintln!("  Derived pubkey: {derived_key}");
-
-    // Step 2: Create a signature using the derived key (BRC-42 HMAC offset)
-    let test_data = hex::encode(b"E2E derived key signing test");
-
-    let start = std::time::Instant::now();
-    let resp = post_json(
-        client,
-        &format!("{base_url}/createSignature"),
-        &json!({
-            "data": test_data,
-            "protocolID": [2, "e2e derived"],
-            "keyID": "derived-sig-1",
-            "counterparty": "anyone"
-        }),
-    )
-    .await;
-    let elapsed = start.elapsed();
-
-    assert!(
-        resp.get("error").is_none(),
-        "derived-key createSignature must succeed (BRC-42 HMAC offset through the full MPC ceremony): {resp}"
-    );
-
-    let signature = resp["signature"].as_str().expect("signature hex");
-    assert!(
-        signature.len() >= 128,
-        "DER signature too short: {}",
-        signature.len()
-    );
-    eprintln!(
-        "  Signature: {}... ({:.0}ms)",
-        &signature[..40],
-        elapsed.as_millis()
-    );
-
-    // Step 3: Verify with SAME protocol params → valid: true
-    let resp = post_json(
-        client,
-        &format!("{base_url}/verifySignature"),
-        &json!({
-            "data": test_data,
-            "signature": signature,
-            "protocolID": [2, "e2e derived"],
-            "keyID": "derived-sig-1",
-            "counterparty": "anyone",
-            "forSelf": true
-        }),
-    )
-    .await;
-    assert_eq!(
-        resp["valid"], true,
-        "derived key signature must verify with same params: {resp}"
-    );
-    eprintln!("  Verified with correct params: valid=true");
-
-    // Step 4: Verify with DIFFERENT keyID → valid: false
-    let resp = post_json(
-        client,
-        &format!("{base_url}/verifySignature"),
-        &json!({
-            "data": test_data,
-            "signature": signature,
-            "protocolID": [2, "e2e derived"],
-            "keyID": "WRONG-key",
-            "counterparty": "anyone",
-            "forSelf": true
-        }),
-    )
-    .await;
-    assert_eq!(
-        resp["valid"], false,
-        "wrong keyID must produce invalid verification"
-    );
-    eprintln!("  Verified with wrong keyID:    valid=false");
-
-    // Step 5: Verify that the derived signature differs from root key signature
-    let resp_root = post_json(
-        client,
-        &format!("{base_url}/createSignature"),
-        &json!({
-            "data": test_data
-        }),
-    )
-    .await;
-    if let Some(root_sig) = resp_root.get("signature").and_then(|v| v.as_str()) {
-        assert_ne!(
-            root_sig, signature,
-            "derived key signature must differ from root key signature"
-        );
-        eprintln!("  Confirmed: derived sig != root sig");
-    }
-
-    eprintln!("  PASS\n");
-}
-
-/// Test 7: internalizeAction + listOutputs + createAction (mainnet!)
-async fn test_mainnet_transaction(env: &TestEnv, client: &Client) {
-    eprintln!("--- Test 7: Mainnet Transaction ---");
-
-    let base_url = &env.proxy_url;
-
-    // Step 1: Fund the MPC address by sending from the local wallet (port 3321)
-    eprintln!("  Funding MPC address {} ...", env.joint_address);
-
-    // Build P2PKH locking script for the MPC address
-    let mpc_pubkey = bsv::PublicKey::from_hex(&env.joint_key_hex).expect("parse joint key");
-    let mpc_pubkey_hash = mpc_pubkey.hash160();
-    let locking_script = format!("76a914{}88ac", hex::encode(mpc_pubkey_hash));
-
-    // Wallet at :3321 requires Origin: http://admin.com and outputDescription
-    let fund_resp = match client
-        .post("http://localhost:3321/createAction")
-        .header("Origin", "http://admin.com")
-        .json(&json!({
-            "description": "Fund MPC E2E test",
-            "outputs": [{
-                "satoshis": 5000,
-                "lockingScript": locking_script,
-                "outputDescription": "Fund MPC E2E test address"
-            }],
-            // Force a SYNCHRONOUS broadcast — the default delayed broadcast queues
-            // the funding tx and it never reaches the network, so the child spend
-            // can never reference it ("Missing inputs").
-            "options": { "acceptDelayedBroadcast": false }
-        }))
-        .send()
-        .await
-    {
-        Ok(r) => r.json::<Value>().await.unwrap_or_default(),
-        Err(e) => {
-            eprintln!("  SKIP: Wallet not reachable: {e}");
-            return;
-        }
-    };
-    if fund_resp.get("txid").is_none() {
-        eprintln!("  SKIP: Could not fund MPC address: {fund_resp}");
-        return;
-    }
-    let fund_txid = fund_resp["txid"].as_str().expect("funding txid");
-    // Wallet returns tx as AtomicBEEF byte array, convert to hex
-    let fund_raw_tx = if let Some(raw) = fund_resp["rawTx"].as_str() {
-        raw.to_string()
-    } else if let Some(arr) = fund_resp["tx"].as_array() {
-        let bytes: Vec<u8> = arr.iter().map(|v| v.as_u64().unwrap_or(0) as u8).collect();
-        hex::encode(&bytes)
-    } else {
-        eprintln!("  SKIP: No rawTx or tx in response: {fund_resp}");
-        return;
-    };
-    eprintln!(
-        "  Funded: txid={fund_txid} ({} bytes)",
-        fund_raw_tx.len() / 2
-    );
-
-    // Wait for the funding tx to be accepted by the network before spending. The
-    // wallet broadcasts via ARC/TAAL (acceptDelayedBroadcast=false above), and
-    // WoC's tx-by-hash does NOT reliably surface unconfirmed mempool txs — so poll
-    // ARC status directly. The child spend chains off this parent in ARC's
-    // mempool. Requires MPC_ARC_API_KEY (the mainnet broadcast gate sets it).
-    let arc_key = std::env::var("MPC_ARC_API_KEY").unwrap_or_default();
-    let arc_url = format!("https://arc.taal.com/v1/tx/{fund_txid}");
-    eprintln!("  Waiting for funding tx to be SEEN_ON_NETWORK (ARC/TAAL)...");
-    let mut last_status = String::new();
-    let mut seen = false;
-    for attempt in 1..=12u64 {
-        tokio::time::sleep(std::time::Duration::from_secs(6)).await;
-        if let Ok(r) = client
-            .get(&arc_url)
-            .header("Authorization", format!("Bearer {arc_key}"))
-            .send()
-            .await
-        {
-            if r.status().is_success() {
-                let j: Value = r.json().await.unwrap_or_default();
-                last_status = j["txStatus"].as_str().unwrap_or("").to_string();
-                eprintln!("  ARC status (attempt {attempt}): {last_status}");
-                if matches!(last_status.as_str(), "SEEN_ON_NETWORK" | "MINED") {
-                    seen = true;
-                    break;
-                }
-            }
-        }
-    }
-    // The child spend chains off this parent: it must be SEEN_ON_NETWORK (network
-    // nodes have it), not merely ANNOUNCED, or the child broadcast races ahead of
-    // a parent the miners haven't accepted yet.
-    assert!(
-        seen,
-        "funding tx {fund_txid} MUST be SEEN_ON_NETWORK before spending (last status: {last_status:?})"
-    );
-    eprintln!("  Funding tx SEEN_ON_NETWORK (status: {last_status})");
-
-    // Step 2: Internalize the funding transaction.
-    // Use auto-scan mode (no "outputs" array) — the handler will scan all outputs
-    // and add any that match our P2PKH script. This handles BEEF/AtomicBEEF and
-    // raw tx formats automatically, and finds the correct vout regardless of the
-    // wallet's output ordering.
-    let internalize_resp = post_json(
-        client,
-        &format!("{base_url}/internalizeAction"),
-        &json!({
-            "tx": fund_raw_tx,
-        }),
-    )
-    .await;
-    if internalize_resp.get("error").is_some() {
-        eprintln!("  internalizeAction error: {internalize_resp}");
-        eprintln!("  FAIL: Could not internalize funding tx");
-        return;
-    }
-    let intern_txid = internalize_resp["txid"].as_str().unwrap_or("unknown");
-    eprintln!("  Internalized: txid={intern_txid}");
-
-    // Step 3: Verify balance via listOutputs
-    let resp = post_json(
-        client,
-        &format!("{base_url}/listOutputs"),
-        &json!({"basket": "default"}),
-    )
-    .await;
-    eprintln!("  listOutputs: {resp}");
-
-    // Step 4: Create a transaction (send back to wallet)
-    // Get wallet's public key for the return address
-    let wallet_pk_resp = client
-        .post("http://localhost:3321/getPublicKey")
-        .header("Origin", "http://admin.com")
-        .json(&json!({"identityKey": true}))
-        .send()
-        .await
-        .expect("wallet getPublicKey")
-        .json::<Value>()
-        .await
-        .unwrap_or_default();
-    let wallet_pk_hex = wallet_pk_resp["publicKey"]
-        .as_str()
-        .unwrap_or("02000000000000000000000000000000000000000000000000000000000000000001");
-    let wallet_pk = bsv::PublicKey::from_hex(wallet_pk_hex).expect("wallet pubkey");
-    let wallet_hash = wallet_pk.hash160();
-    let return_script = format!("76a914{}88ac", hex::encode(wallet_hash));
-
-    eprintln!("  Creating MPC-signed transaction...");
-    let start = std::time::Instant::now();
-    let resp = post_json(
-        client,
-        &format!("{base_url}/createAction"),
-        &json!({
-            "description": "E2E test return",
-            "outputs": [{
-                "satoshis": 3000,
-                "lockingScript": return_script
-            }]
-        }),
-    )
-    .await;
-    let elapsed = start.elapsed();
-
-    assert!(
-        resp.get("error").is_none(),
-        "createAction MUST succeed on mainnet. Error: {}",
-        resp
-    );
-
-    let txid = resp["txid"].as_str().expect("txid must be in response");
-    eprintln!(
-        "  Transaction broadcast! txid={txid} ({:.0}ms)",
-        elapsed.as_millis()
-    );
-    eprintln!("  View: https://whatsonchain.com/tx/{txid}");
-
-    // Step 5: Verify UTXO tracker updated (change output should exist)
-    let resp = post_json(
-        client,
-        &format!("{base_url}/listOutputs"),
-        &json!({"basket": "default"}),
-    )
-    .await;
-    let total = resp["totalOutputs"].as_u64().unwrap_or(0);
-    eprintln!("  listOutputs after spend: {resp}");
-    // Should have 1 change output (the 5000 - 3000 - fee remaining)
-    assert!(
-        total >= 1,
-        "should have at least 1 change output after spend"
-    );
-
-    // Step 6: Verify transaction on WhatsOnChain (may take a few seconds to index)
-    eprintln!("  Verifying on WhatsOnChain...");
-    let mut verified = false;
-    for attempt in 1..=10 {
-        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-        let woc_url = format!("https://api.whatsonchain.com/v1/bsv/main/tx/{txid}");
-        match client.get(&woc_url).send().await {
-            Ok(r) if r.status().is_success() => {
-                let woc: Value = r.json().await.unwrap_or_default();
-                if woc.get("txid").is_some() {
-                    eprintln!(
-                        "  Verified on WoC (attempt {attempt}): confirmations={}",
-                        woc.get("confirmations")
-                            .and_then(|v| v.as_i64())
-                            .unwrap_or(-1)
-                    );
-                    verified = true;
-                    break;
-                }
-            }
-            _ => {
-                eprintln!("  WoC not indexed yet (attempt {attempt}/10)...");
-            }
-        }
-    }
-    if !verified {
-        eprintln!("  WARNING: tx not yet indexed by WoC — this is normal for fresh txs");
-    }
 
     eprintln!("  PASS\n");
 }
@@ -1397,22 +978,21 @@ async fn e2e_mpc_signing_proxy() {
         .build()
         .unwrap();
 
-    // Non-mainnet tests (exercise full MPC protocol over HTTP)
+    // Local-only scenarios (health/derive/encrypt/hmac + the all-endpoints
+    // no-panic sweep). #13 retired the legacy 4-round HTTP sign path, so the
+    // former signing scenarios (`test_signature_roundtrip`, `test_derived_key_signing`,
+    // `test_mainnet_transaction`) — which drove `bridge.sign` over local HTTP with
+    // no relay — were removed. Relay-only signing has ZERO 4-round fallback and
+    // requires a live relay + provisioned presig pools, which this in-process
+    // harness does not stand up; that coverage lives in the deployed relay mainnet
+    // gates (five+ TXIDs) and the hermetic relay tests. The no-panic sweep still
+    // exercises `createSignature`/`createAction` end-to-end (they return a clear
+    // error JSON when the relay pool is empty — never a 500).
     test_health_and_identity(&env, &client).await;
     test_key_derivation(&env, &client).await;
-    test_signature_roundtrip(&env, &client).await;
     test_encrypt_decrypt(&env, &client).await;
     test_hmac_roundtrip(&env, &client).await;
     test_all_endpoints_no_panic(&env, &client).await;
-    test_derived_key_signing(&env, &client).await;
-
-    // Mainnet test (conditional — requires wallet at localhost:3321)
-    if std::env::var("E2E_MAINNET").is_ok() {
-        test_mainnet_transaction(&env, &client).await;
-    } else {
-        eprintln!("--- Test 7: Mainnet Transaction ---");
-        eprintln!("  SKIP (set E2E_MAINNET=1 to enable)\n");
-    }
 
     eprintln!("═══════════════════════════════════════════════");
     eprintln!("  All E2E tests passed!");

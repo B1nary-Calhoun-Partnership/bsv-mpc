@@ -15,7 +15,8 @@
 //!    - **stranger** (valid BRC-31 session, different identity) → **403** (§08.1).
 //!    - **owner** (the DKG identity) → **200** + a partial ECDH point.
 //!
-//!    Plus a spot-check that `/sign/init` + `/presign/init` reject the stranger.
+//!    Plus a spot-check that `/presign/init` rejects the stranger (unauthed 401,
+//!    stranger 403). (#13 retired the legacy 4-round `/sign/init`.)
 //!
 //! Gated on `SERVICE_AUTHZ_E2E=1` (a real DKG generates Paillier primes inline
 //! → ~2 min):
@@ -203,24 +204,9 @@ async fn service_enforces_owner_authz() {
         "owner ECDH MUST return a 33-byte compressed partial point, got {partial:?}"
     );
 
-    // ── 4. Spot-check: stranger is also rejected on /sign/init + /presign/init. ──
-    let sign_resp = post_authed(
-        &svc_url,
-        "/sign/init",
-        serde_json::json!({
-            "agent_id": joint_hex,
-            "session_id": dkg.session_id.hex(),
-            "sighash": hex::encode([7u8; 32]),
-            "use_presignature": false,
-        }),
-        &stranger,
-    )
-    .await;
-    assert_eq!(
-        sign_resp.status().as_u16(),
-        403,
-        "stranger MUST be forbidden from /sign/init (§08.1)"
-    );
+    // ── 4. Spot-check: stranger is also rejected on /presign/init. ──
+    // (#13 retired the legacy 4-round `/sign/init`; `/presign/init` is the live
+    // authed funded-boundary route that exercises the same §08.1 owner-authz.)
     let presign_resp = post_authed(
         &svc_url,
         "/presign/init",
@@ -238,22 +224,21 @@ async fn service_enforces_owner_authz() {
         "stranger MUST be forbidden from /presign/init (§08.1)"
     );
 
-    // Negative control: unauthed /sign/init → 401.
-    let unauthed_sign = reqwest::Client::new()
-        .post(format!("{svc_url}/sign/init"))
+    // Negative control: unauthed /presign/init → 401 (§07.6).
+    let unauthed_presign = reqwest::Client::new()
+        .post(format!("{svc_url}/presign/init"))
         .json(&serde_json::json!({
             "agent_id": joint_hex,
             "session_id": dkg.session_id.hex(),
-            "sighash": hex::encode([7u8; 32]),
-            "use_presignature": false,
+            "count": 1,
         }))
         .send()
         .await
         .unwrap();
     assert_eq!(
-        unauthed_sign.status().as_u16(),
+        unauthed_presign.status().as_u16(),
         401,
-        "unauthenticated /sign/init MUST be rejected (§07.6)"
+        "unauthenticated /presign/init MUST be rejected (§07.6)"
     );
 
     server.abort();

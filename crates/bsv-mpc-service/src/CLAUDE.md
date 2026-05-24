@@ -73,8 +73,6 @@ Mirror the types in `bsv-mpc-worker::api`. Could be extracted to a shared crate 
 |------|----------|
 | `DkgInitRequest` / `DkgInitResponse` | `POST /dkg/init` |
 | `DkgRoundRequest` / `DkgRoundResponse` | `POST /dkg/round` |
-| `SignInitRequest` / `SignInitResponse` | `POST /sign/init` |
-| `SignRoundRequest` / `SignRoundResponse` | `POST /sign/round` |
 | `PresignInitRequest` / `PresignInitResponse` | `POST /presign/init` |
 | `PresignRoundRequest` / `PresignRoundResponse` | `POST /presign/round` |
 | `EcdhRequest` / `EcdhResponse` | `POST /ecdh` |
@@ -88,8 +86,6 @@ Mirror the types in `bsv-mpc-worker::api`. Could be extracted to a shared crate 
 |--------|------|---------|------|--------|
 | POST | `/dkg/init` | `handle_dkg_init` | BRC-31 (TODO) | **Implemented** |
 | POST | `/dkg/round` | `handle_dkg_round` | BRC-31 (TODO) | **Implemented** |
-| POST | `/sign/init` | `handle_sign_init` | BRC-31 (TODO) | **Implemented** |
-| POST | `/sign/round` | `handle_sign_round` | BRC-31 (TODO) | **Implemented** |
 | POST | `/ecdh` | `handle_ecdh` | BRC-31 (TODO) | **Implemented** |
 | POST | `/presign/init` | `handle_presign_init` | BRC-31 (TODO) | **Implemented** |
 | POST | `/presign/round` | `handle_presign_round` | BRC-31 (TODO) | **Implemented** |
@@ -101,7 +97,7 @@ Mirror the types in `bsv-mpc-worker::api`. Could be extracted to a shared crate 
 
 **DKG** (`handle_dkg_init`, `handle_dkg_round`): Creates `DkgCoordinator` with `ShareIndex(0)`, runs 4-round CGGMP'24 protocol. On completion, stores the resulting share via `storage.store_share()` keyed by `dkg_result.session_id` (not agent_id) and removes the coordinator from `COORDINATOR_STORE`. Note: `DkgInitRequest.agent_id` is received but not currently used as the storage key — the DKG session ID is used instead. This means share retrieval for signing/ECDH must use the session ID as the agent lookup key.
 
-**Signing** (`handle_sign_init`, `handle_sign_round`): Loads agent's share from storage, creates `SigningCoordinator` with all parties as participants (`0..config.parties`). The coordinator is created with the DKG `session_id` (from the request body) but stored in `COORDINATOR_STORE` under a newly generated `signing_session_id` — subsequent round calls use the signing session ID. Supports optional `hmac_offset` field (32-byte hex) for BRC-42 derived key signing via `set_additive_shift()`. On completion, returns `SigningResult` and cleans up coordinator. `handle_sign_round` returns `round_message: None` when the coordinator produces an empty message vec (can happen in certain protocol transitions).
+**Signing** (relay-only since #13): the legacy 4-round HTTP `/sign/{init,round}` handlers were retired. Online signing runs over the MessageBox relay via `relay_handlers::handle_sign_relay` (`/sign-relay`) — the cosigner consumes a correlated `Presignature_A` and issues its partial, which the proxy combines. `SigningCoordinator::sign` itself is retained (used by the MessageBox interactive `SigningHandler` in `signing_handler.rs`, and `sign_with_presignature*`/`sign_from_bundle*` by the relay combiner).
 
 **ECDH** (`handle_ecdh`): Computes partial ECDH for BRC-42 key derivation. Parses counterparty public key (33-byte compressed hex), loads agent's share, extracts scalar via `bsv_mpc_core::ecdh::parse_share_scalar()`, computes `counterparty_pub * share_scalar` via `compute_partial_ecdh_point()`. Returns compressed point as hex.
 

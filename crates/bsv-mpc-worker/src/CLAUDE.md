@@ -31,10 +31,6 @@ This crate implements the remote Key Share Service (KSS) as a Cloudflare Worker 
 | `DkgInitResponse` | Response | `POST /dkg/init` |
 | `DkgRoundRequest` | Request | `POST /dkg/round` |
 | `DkgRoundResponse` | Response | `POST /dkg/round` |
-| `SignInitRequest` | Request | `POST /sign/init` |
-| `SignInitResponse` | Response | `POST /sign/init` |
-| `SignRoundRequest` | Request | `POST /sign/round` |
-| `SignRoundResponse` | Response | `POST /sign/round` |
 | `PresignInitRequest` | Request | `POST /presign/init` |
 | `PresignInitResponse` | Response | `POST /presign/init` |
 | `PresignRoundRequest` | Request | `POST /presign/round` |
@@ -51,8 +47,6 @@ All handlers are **fully implemented** — they create/lookup coordinators, call
 |----------|----------|------|-------------|
 | `handle_dkg_init()` | `POST /dkg/init` | BRC-31 | Creates DKG coordinator (party 0), returns round 1 messages |
 | `handle_dkg_round()` | `POST /dkg/round` | BRC-31 | Processes DKG round, stores share on completion |
-| `handle_sign_init()` | `POST /sign/init` | BRC-31 | Loads share, creates signing coordinator, returns round 1 |
-| `handle_sign_round()` | `POST /sign/round` | BRC-31 | Processes signing round, returns ECDSA signature on completion |
 | `handle_presign_init()` | `POST /presign/init` | BRC-31 | Creates presigning manager (count 1-100), returns round 1 |
 | `handle_presign_round()` | `POST /presign/round` | BRC-31 | Processes presigning round, stores presignatures on completion |
 | `handle_ecdh()` | `POST /ecdh` | BRC-31 | Computes partial ECDH: `counterparty_pub * share_A` |
@@ -156,11 +150,13 @@ In-memory storage using `HashMap`/`VecDeque` behind a global `LazyLock<Mutex<Inn
 3. Proxy sends 3 more `POST /dkg/round` requests, each with the previous round's message
 4. On final round: Worker stores encrypted share via `ShareStorage`, cleans up coordinator, returns `JointPublicKey`
 
-### Signing (4 rounds without presignature)
-1. Proxy sends `POST /sign/init` with `agent_id`, `session_id`, `sighash` (32-byte hex)
-2. Worker loads share, creates `SigningCoordinator` for party 0, returns round 1 message
-3. Proxy sends up to 3 more `POST /sign/round` requests
-4. On completion: Worker returns ECDSA `SigningResult`, cleans up coordinator
+### Signing (relay-only since #13)
+The legacy 4-round HTTP `/sign/{init,round}` path was retired. Online signing
+runs over the MessageBox relay: the cosigner consumes a correlated
+`Presignature_A` from its DO pool and issues its partial over the authed
+`/sign-relay` route (`poc.rs::handle_prod_sign_relay`), which the proxy combines
+into the final ECDSA signature. The DKG share is only used during presig
+generation; online signing consumes presigs.
 
 ### Presigning (3 offline rounds)
 1. Proxy sends `POST /presign/init` with `agent_id`, `session_id`, `count` (1-100)

@@ -33,8 +33,6 @@
 //! | OPTIONS | `*`               | none   | CORS preflight                       |
 //! | POST    | `/dkg/init`       | BRC-31 | Start DKG ceremony                   |
 //! | POST    | `/dkg/round`      | BRC-31 | Process DKG round                    |
-//! | POST    | `/sign/init`      | BRC-31 | Start signing                        |
-//! | POST    | `/sign/round`     | BRC-31 | Process signing round                |
 //! | POST    | `/presign/init`   | BRC-31 | Start presigning protocol            |
 //! | POST    | `/presign/round`  | BRC-31 | Process presigning round             |
 //! | GET     | `/health`         | none   | Liveness check + share count         |
@@ -118,12 +116,8 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         .post_async("/dkg/round", |req, ctx| async move {
             poc::forward_to_cosigner_do(req, &ctx.env).await
         })
-        .post_async("/sign/init", |req, ctx| async move {
-            poc::forward_to_cosigner_do(req, &ctx.env).await
-        })
-        .post_async("/sign/round", |req, ctx| async move {
-            poc::forward_to_cosigner_do(req, &ctx.env).await
-        })
+        // Signing is relay-only (#13): the legacy 4-round HTTP `/sign/{init,round}`
+        // routes were retired; online signing runs over the relay (`/sign-relay`).
         .post_async("/presign/init", |req, ctx| async move {
             poc::forward_to_cosigner_do(req, &ctx.env).await
         })

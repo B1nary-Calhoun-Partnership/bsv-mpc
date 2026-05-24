@@ -22,7 +22,7 @@
 //!
 //! 1. DKG-init captures the authenticated caller; DKG-complete records it as the
 //!    share's `owner_identity` (§08.1).
-//! 2. `/sign/init`, `/presign/init`, `/ecdh` verify BRC-31 and reject any caller
+//! 2. `/presign/init`, `/ecdh`, `/sign-relay` verify BRC-31 and reject any caller
 //!    that is not the recorded owner (403) — checked BEFORE share material is
 //!    loaded or used.
 //!
@@ -627,7 +627,7 @@ mod tests {
     fn dev_mode_allows_unauthenticated() {
         let auth = AuthState::dev();
         assert!(auth.allow_unauthenticated());
-        let id = verify_or_allow("POST", "/sign/init", &HeaderMap::new(), b"{}", &auth)
+        let id = verify_or_allow("POST", "/presign/init", &HeaderMap::new(), b"{}", &auth)
             .expect("dev allows no-auth");
         assert!(id.as_opt().is_none());
     }
@@ -644,7 +644,7 @@ mod tests {
             axum::http::HeaderName::from_static(super::headers::SIGNATURE),
             "deadbeef".parse().unwrap(),
         );
-        let id = verify_or_allow("POST", "/sign/init", &headers, b"{}", &auth)
+        let id = verify_or_allow("POST", "/presign/init", &headers, b"{}", &auth)
             .expect("dev allows even with headers");
         assert!(id.as_opt().is_none());
     }
@@ -653,7 +653,7 @@ mod tests {
     fn enforced_mode_rejects_unauthenticated() {
         let auth = AuthState::with_key(key(7));
         assert!(!auth.allow_unauthenticated());
-        let err = verify_or_allow("POST", "/sign/init", &HeaderMap::new(), b"{}", &auth)
+        let err = verify_or_allow("POST", "/presign/init", &HeaderMap::new(), b"{}", &auth)
             .expect_err("enforced rejects no-auth");
         assert_eq!(err.0, StatusCode::UNAUTHORIZED);
     }
@@ -678,8 +678,8 @@ mod tests {
     fn handshake_then_authed_request_verifies() {
         let (auth, client) = handshook(0x11, 0x22);
         let body = br#"{"session_id":"c07"}"#;
-        let req_headers = headers_of(client.request_headers("POST", "/sign/init", body).unwrap());
-        let id = verify_or_allow("POST", "/sign/init", &req_headers, body, &auth)
+        let req_headers = headers_of(client.request_headers("POST", "/presign/init", body).unwrap());
+        let id = verify_or_allow("POST", "/presign/init", &req_headers, body, &auth)
             .expect("authed request verifies");
         assert_eq!(id.identity_key, key(0x22).public_key().to_hex());
     }
@@ -688,9 +688,9 @@ mod tests {
     fn tampered_body_rejected() {
         let (auth, client) = handshook(0x11, 0x22);
         let body = br#"{"session_id":"c07"}"#;
-        let req_headers = headers_of(client.request_headers("POST", "/sign/init", body).unwrap());
+        let req_headers = headers_of(client.request_headers("POST", "/presign/init", body).unwrap());
         // Verify over a DIFFERENT body than was signed → must fail.
-        let err = verify_or_allow("POST", "/sign/init", &req_headers, b"{}", &auth)
+        let err = verify_or_allow("POST", "/presign/init", &req_headers, b"{}", &auth)
             .expect_err("tampered body rejected");
         assert_eq!(err.0, StatusCode::UNAUTHORIZED);
     }
@@ -699,14 +699,14 @@ mod tests {
     fn tampered_signature_rejected() {
         let (auth, client) = handshook(0x11, 0x22);
         let body = br#"{"x":1}"#;
-        let mut pairs = client.request_headers("POST", "/sign/init", body).unwrap();
+        let mut pairs = client.request_headers("POST", "/presign/init", body).unwrap();
         for p in pairs.iter_mut() {
             if p.0 == super::headers::SIGNATURE {
                 p.1 = "3006020100020100".to_string();
             }
         }
         let req_headers = headers_of(pairs);
-        let err = verify_or_allow("POST", "/sign/init", &req_headers, body, &auth)
+        let err = verify_or_allow("POST", "/presign/init", &req_headers, body, &auth)
             .expect_err("tampered sig rejected");
         assert_eq!(err.0, StatusCode::UNAUTHORIZED);
     }
@@ -718,8 +718,8 @@ mod tests {
         let server_nonce = base64::engine::general_purpose::STANDARD.encode([0xEEu8; 32]);
         assert!(client.complete_handshake(key(0x11).public_key().to_hex(), server_nonce));
         let body = b"{}";
-        let req_headers = headers_of(client.request_headers("POST", "/sign/init", body).unwrap());
-        let err = verify_or_allow("POST", "/sign/init", &req_headers, body, &auth)
+        let req_headers = headers_of(client.request_headers("POST", "/presign/init", body).unwrap());
+        let err = verify_or_allow("POST", "/presign/init", &req_headers, body, &auth)
             .expect_err("unknown session rejected");
         assert_eq!(err.0, StatusCode::UNAUTHORIZED);
     }
@@ -730,13 +730,13 @@ mod tests {
         // (same headers, same body, same per-request nonce) is rejected.
         let (auth, client) = handshook(0x11, 0x22);
         let body = br#"{"session_id":"replay"}"#;
-        let pairs = client.request_headers("POST", "/sign/init", body).unwrap();
+        let pairs = client.request_headers("POST", "/presign/init", body).unwrap();
         let req_headers = headers_of(pairs.clone());
         // First time → accepted.
-        verify_or_allow("POST", "/sign/init", &req_headers, body, &auth)
+        verify_or_allow("POST", "/presign/init", &req_headers, body, &auth)
             .expect("first authed request verifies");
         // Identical replay → rejected.
-        let err = verify_or_allow("POST", "/sign/init", &req_headers, body, &auth)
+        let err = verify_or_allow("POST", "/presign/init", &req_headers, body, &auth)
             .expect_err("replay must be rejected");
         assert_eq!(err.0, StatusCode::UNAUTHORIZED);
     }

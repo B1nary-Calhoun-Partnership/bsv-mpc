@@ -52,8 +52,6 @@ fn is_authed_path(path: &str) -> bool {
         path,
         "/dkg/init"
             | "/dkg/round"
-            | "/sign/init"
-            | "/sign/round"
             | "/presign/init"
             | "/presign/round"
             | "/ecdh"
@@ -133,11 +131,6 @@ impl DurableObject for CosignerSessionDo {
                 let store = self.kss_store()?;
                 crate::api::handle_dkg_round(req, &store).await
             }
-            "/sign/init" => {
-                let store = self.kss_store()?;
-                crate::api::handle_sign_init(req, &store).await
-            }
-            "/sign/round" => crate::api::handle_sign_round(req).await,
             "/ceremony/seed-primes" => self.handle_seed_primes(req).await,
             "/ceremony/ingest-presig" => self.handle_ingest_presig(req).await,
             // #9 durable share custody — KEK-wrapped share_A persisted by the

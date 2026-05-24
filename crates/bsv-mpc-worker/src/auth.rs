@@ -29,7 +29,7 @@
 //!     │── POST /.well-known/auth ────────────►│  InitialRequest → InitialResponse
 //!     │◄── 200 + BRC-104 headers ────────────│  (canonical handshake, session saved)
 //!     │                                       │
-//!     │── POST /sign/init (General, signed) ─►│  verify canonical signature over
+//!     │── POST /presign/init (General, signed)►│  verify canonical signature over
 //!     │   x-bsv-auth-* + signed BRC-104 body  │  (method, path, headers, body)
 //!     │◄── 200 ──────────────────────────────│  dispatch with verified caller
 //! ```
@@ -474,7 +474,7 @@ mod tests {
             &server.identity_key(),
             &ssn,
             "POST",
-            "/sign/init",
+            "/presign/init",
             br#"{"agent_id":"02abc","session_id":"c07","sighash":"00"}"#,
         );
         let session = server_session(&ssn, &client.identity_key().to_hex());
@@ -506,7 +506,7 @@ mod tests {
             &server.identity_key(),
             &ssn,
             "POST",
-            "/sign/init",
+            "/presign/init",
             br#"{"agent_id":"02abc"}"#,
         );
         // Session (and thus the middleware-reported context identity) is bound to
@@ -547,7 +547,7 @@ mod tests {
             &server.identity_key(),
             &ssn,
             "POST",
-            "/sign/init",
+            "/presign/init",
             br#"{"agent_id":"02abc"}"#,
         );
         let p = msg.payload.as_mut().expect("payload");

@@ -25,7 +25,6 @@ use axum::{
 };
 use bsv_mpc_core::dkg::{DkgCoordinator, DkgRoundResult};
 use bsv_mpc_core::presigning::{PresigningManager, PresigningRoundResult};
-use bsv_mpc_core::signing::{SigningCoordinator, SigningRoundResult};
 use bsv_mpc_core::types::{RoundMessage, SessionId, ShareIndex, ThresholdConfig};
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
@@ -50,7 +49,6 @@ struct DkgSession {
 /// In production, these could be stored in AppState or use a session manager.
 struct CoordinatorStore {
     dkg: HashMap<String, DkgSession>,
-    signing: HashMap<String, SigningCoordinator>,
     presigning: HashMap<String, PresigningManager>,
     /// presign_session_id → joint-key `agent_id`, so on completion we ship
     /// `Presignature_A` to the DO pool keyed by the right joint key (#7).
@@ -61,7 +59,6 @@ static COORDINATOR_STORE: std::sync::LazyLock<Mutex<CoordinatorStore>> =
     std::sync::LazyLock::new(|| {
         Mutex::new(CoordinatorStore {
             dkg: HashMap::new(),
-            signing: HashMap::new(),
             presigning: HashMap::new(),
             presign_agent: HashMap::new(),
         })
@@ -112,50 +109,6 @@ pub struct DkgRoundResponse {
     pub round_message: Option<RoundMessage>,
     pub complete: bool,
     pub joint_pubkey: Option<bsv_mpc_core::types::JointPublicKey>,
-}
-
-/// Request body for `POST /sign/init`.
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-pub struct SignInitRequest {
-    /// Agent requesting signing.
-    pub agent_id: String,
-    /// MPC session ID from DKG.
-    pub session_id: String,
-    /// Sighash to sign (32 bytes, hex).
-    pub sighash: String,
-    /// Whether to consume a presignature for single-round signing.
-    pub use_presignature: bool,
-    /// Optional BRC-42 HMAC offset for derived key signing (32 bytes, hex).
-    /// When set, the signing produces a signature for the derived child key
-    /// (root_pub + G * offset) rather than the root key.
-    #[serde(default)]
-    pub hmac_offset: Option<String>,
-}
-
-/// Response from `POST /sign/init`.
-#[derive(Debug, Serialize)]
-pub struct SignInitResponse {
-    pub signing_session_id: String,
-    pub round_message: RoundMessage,
-    pub using_presignature: bool,
-    pub total_rounds: u8,
-}
-
-/// Request body for `POST /sign/round`.
-#[derive(Debug, Deserialize)]
-pub struct SignRoundRequest {
-    pub signing_session_id: String,
-    pub round_message: RoundMessage,
-}
-
-/// Response from `POST /sign/round`.
-#[derive(Debug, Serialize)]
-pub struct SignRoundResponse {
-    pub signing_session_id: String,
-    pub round_message: Option<RoundMessage>,
-    pub complete: bool,
-    pub signature: Option<bsv_mpc_core::types::SigningResult>,
 }
 
 /// Request body for `POST /presign/init`.
@@ -512,7 +465,7 @@ pub async fn handle_dkg_round(
         }
         DkgRoundResult::Complete(dkg_result) => {
             // Store share_A keyed by the JOINT KEY (agent_id) — the stable
-            // identifier that /presign/init and /sign/init look it up by
+            // identifier that /presign/init and /sign-relay look it up by
             // (matches the worker DO's keying). Keying by session_id.hex() would
             // make the share unfindable for the subsequent presign ceremony.
             let agent_id = hex::encode(&dkg_result.joint_key.compressed);
@@ -562,220 +515,6 @@ pub async fn handle_dkg_round(
                         round_message: None,
                         complete: true,
                         joint_pubkey: Some(dkg_result.joint_key),
-                    })
-                    .unwrap_or_default(),
-                ),
-            )
-        }
-    }
-}
-
-/// `POST /sign/init` — Start a threshold signing ceremony.
-pub async fn handle_sign_init(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    raw: Bytes,
-) -> impl IntoResponse {
-    // §07: authenticate over the RAW body. Then recover the share (+owner) from
-    // durable custody on a cold-cache miss (#9) BEFORE the §08.1 owner check, so
-    // post-restart the authz sees the restored owner binding — never a wide-open
-    // share.
-    let caller =
-        match crate::auth::verify_or_allow("POST", "/sign/init", &headers, &raw, &state.auth) {
-            Ok(id) => id,
-            Err(resp) => return resp,
-        };
-    let body: SignInitRequest = match parse_body(&raw) {
-        Ok(b) => b,
-        Err(resp) => return resp,
-    };
-    let share = match load_share_or_recover(&state, &body.agent_id).await {
-        Ok(s) => s,
-        Err(resp) => return resp,
-    };
-    if let Some(resp) = authz_owner(&state, &caller, &body.agent_id) {
-        return resp;
-    }
-
-    let sighash_bytes = match hex::decode(&body.sighash) {
-        Ok(b) => b,
-        Err(e) => {
-            return err_response(StatusCode::BAD_REQUEST, format!("invalid sighash hex: {e}"))
-        }
-    };
-    if sighash_bytes.len() != 32 {
-        return err_response(
-            StatusCode::BAD_REQUEST,
-            format!("sighash must be 32 bytes, got {}", sighash_bytes.len()),
-        );
-    }
-    let mut sighash = [0u8; 32];
-    sighash.copy_from_slice(&sighash_bytes);
-
-    let signing_session_id = match generate_session_id("sign") {
-        Ok(id) => id,
-        Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e),
-    };
-
-    // Parse optional BRC-42 HMAC offset for derived key signing
-    let hmac_offset: Option<[u8; 32]> = match &body.hmac_offset {
-        Some(hex_str) => {
-            let bytes = match hex::decode(hex_str) {
-                Ok(b) => b,
-                Err(e) => {
-                    return err_response(
-                        StatusCode::BAD_REQUEST,
-                        format!("invalid hmac_offset hex: {e}"),
-                    )
-                }
-            };
-            if bytes.len() != 32 {
-                return err_response(
-                    StatusCode::BAD_REQUEST,
-                    format!("hmac_offset must be 32 bytes, got {}", bytes.len()),
-                );
-            }
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(&bytes);
-            Some(arr)
-        }
-        None => None,
-    };
-
-    // The proxy sends the canonical session_id as 64-char hex; reconstruct the
-    // SAME SessionId via from_hex. HARD-ERROR on malformed hex (mirror of the
-    // presign handler): the previous `from_str_hash` fallback silently RE-HASHED
-    // the hex into a *different* SessionId → a divergent cggmp24 ExecutionId →
-    // the 2PC ceremony aborted at round 2 with a confusing "signing protocol
-    // failed" far from the real cause. A non-hex session_id here is a caller bug;
-    // fail loudly at the boundary.
-    let session_id = match SessionId::from_hex(&body.session_id) {
-        Ok(id) => id,
-        Err(e) => {
-            return err_response(
-                StatusCode::BAD_REQUEST,
-                format!(
-                    "session_id must be the canonical 64-char hex SessionId (got malformed: {e})"
-                ),
-            )
-        }
-    };
-    let config = share.config;
-    let participants: Vec<u16> = (0..config.parties).collect();
-    let mut coordinator = SigningCoordinator::new(session_id, share, config, participants);
-
-    let messages = match coordinator.sign(&sighash, None, hmac_offset) {
-        Ok(msgs) => msgs,
-        Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e),
-    };
-
-    let round_message = match bundle_outgoing_messages(&messages) {
-        Ok(rm) => rm,
-        Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e),
-    };
-
-    if let Ok(mut store) = COORDINATOR_STORE.lock() {
-        store
-            .signing
-            .insert(signing_session_id.clone(), coordinator);
-    }
-
-    (
-        StatusCode::OK,
-        Json(
-            serde_json::to_value(SignInitResponse {
-                signing_session_id,
-                round_message,
-                using_presignature: false,
-                total_rounds: 4,
-            })
-            .unwrap_or_default(),
-        ),
-    )
-}
-
-/// `POST /sign/round` — Process a signing round message.
-pub async fn handle_sign_round(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    raw: Bytes,
-) -> impl IntoResponse {
-    // §07.6 defense-in-depth: require a valid BRC-31 session (dev mode allows).
-    if let Err(resp) =
-        crate::auth::verify_or_allow("POST", "/sign/round", &headers, &raw, &state.auth)
-    {
-        return resp;
-    }
-    let body: SignRoundRequest = match parse_body(&raw) {
-        Ok(b) => b,
-        Err(resp) => return resp,
-    };
-    // Pass the bundled message directly to the coordinator — the SM thread
-    // handles unbundling JSON array payloads internally via VecDeque buffer.
-    let incoming = vec![body.round_message];
-
-    let result = {
-        let mut store = match COORDINATOR_STORE.lock() {
-            Ok(s) => s,
-            Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e),
-        };
-
-        let outcome = match store.signing.get_mut(&body.signing_session_id) {
-            Some(c) => c.process_round(incoming),
-            None => {
-                return err_response(
-                    StatusCode::NOT_FOUND,
-                    format!("Signing session not found: {}", body.signing_session_id),
-                )
-            }
-        };
-
-        match outcome {
-            Ok(r) => r,
-            Err(e) => {
-                // Remove the orphaned coordinator on a mid-ceremony error so a
-                // failed sign doesn't block retry / leak (#7 finding #3).
-                store.signing.remove(&body.signing_session_id);
-                return err_response(StatusCode::INTERNAL_SERVER_ERROR, e);
-            }
-        }
-    };
-
-    match result {
-        SigningRoundResult::NextRound(messages) => {
-            let round_message = if messages.is_empty() {
-                None
-            } else {
-                Some(bundle_outgoing_messages(&messages).unwrap_or_else(|e| {
-                    tracing::warn!("bundle error (non-fatal): {e}");
-                    messages.into_iter().next().unwrap()
-                }))
-            };
-            (
-                StatusCode::OK,
-                Json(
-                    serde_json::to_value(SignRoundResponse {
-                        signing_session_id: body.signing_session_id,
-                        round_message,
-                        complete: false,
-                        signature: None,
-                    })
-                    .unwrap_or_default(),
-                ),
-            )
-        }
-        SigningRoundResult::Complete(signing_result) => {
-            if let Ok(mut store) = COORDINATOR_STORE.lock() {
-                store.signing.remove(&body.signing_session_id);
-            }
-            (
-                StatusCode::OK,
-                Json(
-                    serde_json::to_value(SignRoundResponse {
-                        signing_session_id: body.signing_session_id,
-                        round_message: None,
-                        complete: true,
-                        signature: Some(signing_result),
                     })
                     .unwrap_or_default(),
                 ),

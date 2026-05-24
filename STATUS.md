@@ -30,7 +30,7 @@ green at every commit (fmt, clippy `-D warnings`, native test, wasm32 build).
 | Component | URL | Version | Notes |
 |---|---|---|---|
 | Worker (DO) | `bsv-mpc-kss.dev-a3e.workers.dev` | `ff080f61` | authed `/sign-relay`, orphan-cleanup, `/custody/{put,get}-share`, presig pool, DO-SQLite |
-| Container (cosigner, share_A) | `bsv-mpc-service-container.dev-a3e.workers.dev` | `c696ae94` (`standard-4`) | BRC-31 ENFORCED + #9 durable custody + #35 cross-(t,n) reshare-relay (phase-A late-prime fix) |
+| Container (cosigner, share_A) | `bsv-mpc-service-container.dev-a3e.workers.dev` | `b804dbfd` (`standard-4`) | BRC-31 ENFORCED + #9 durable custody + #35 cross-(t,n) reshare-relay; **#13: legacy `/sign/{init,round}` removed (relay-only)** |
 | Relay | `rust-message-box.dev-a3e.workers.dev` | — | MessageBox / Socket.IO + BRC-103 |
 
 After **any** deploy, run the smoke-test:
@@ -51,6 +51,7 @@ After **any** deploy, run the smoke-test:
 | #9 | Fund-safety: KEK-sealed durable share custody | restart-survival proven vs deployed worker |
 | #12 | Concurrency-stress | parallel ceremonies, distinct keys, no corruption |
 | #35 | Cross-(t,n) address-preserving reshape (2-of-2 → 2-of-3), DEPLOYED + mainnet | spend TXID [`5137b913…`](https://whatsonchain.com/tx/5137b913a80fb4d05d188aa51533f3f0b6c8e3305c22d8b3fe335fb587bd6a0c) under reshared shares; joint pubkey unchanged. Phase-A late-prime ordering fix on container + proxy. |
+| #13 | Retire legacy 4-round HTTP sign path (relay-only) | Deleted `bridge.sign` ↔ KSS `/sign/{init,round}` (proxy+service+worker; routes/handlers/wire-types); `createSignature`/`createAction` relay-only, **no 4-round fallback** (provisioning is the mitigation; relay-empty → clear error). NEW multi-input createAction-over-relay TXID [`14c8189f…`](https://whatsonchain.com/tx/14c8189f2b31397101e9a66c36ec34b40ec0a685be7d0c0b82944d4d6fc05722) (≥2 vin, WoC-confirmed). Slimmed container redeployed (`/sign/init`→404) + base-key relay sign re-proven TXID [`793938e3…`](https://whatsonchain.com/tx/793938e3d23a634a865cb8a57fb320818ccec50811f951fccd4a0200723d9073). `SigningCoordinator::sign`/`init_round` retained (still used by `signing_handler` MessageBox sign). conformance_07/07b untouched. |
 
 ### Open
 
@@ -61,7 +62,6 @@ After **any** deploy, run the smoke-test:
 | #2 | v1.0 CF-native cosigner umbrella | tracks the above |
 | #10 | Distributed key-refresh | **blocked** — fund-critical multi-round PSS + atomic commit; needs §18 wire spec + Binary coordination |
 | #11 | §06 / §09 / §18 conformance | **blocked** — §06 on Ishaan byte-locking `06-presig-bundle-encryption.json` (MPC-Spec #9) |
-| #13 | OQ-I1: retire legacy HTTP sign path | **blocked** — needs relay-mode HD-key support (offset-baked presigs) |
 
 Related: **MPC-Spec #37** (rust-mpc `build_invoice_number` must add the §03
 invoice-number validation the canonical fix introduced).
