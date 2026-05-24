@@ -173,6 +173,216 @@ pub fn request_view_hash(
     RequestViewHash { hash, preimage }
 }
 
+// ===========================================================================
+// Approval signature + quorum collection (§09.5.1 steps 3-5, issue #43)
+// ===========================================================================
+
+use crate::error::{MpcError, Result};
+use crate::policy::ApprovalQuorum;
+use bsv::primitives::ec::{PrivateKey, PublicKey};
+
+/// Domain-separation tag for the approval-signature preimage (§09.5.1 step 3).
+/// **15 bytes** (`b"mpc-approval-v1"`), so the preimage is `32 + 15 + 32 = 79`
+/// bytes — built from this literal, never a hardcoded length.
+pub const APPROVAL_DOMAIN_TAG: &[u8] = b"mpc-approval-v1";
+
+/// Build the approval-signature preimage (§09.5.1 step 3):
+/// `request_view_hash ‖ "mpc-approval-v1" ‖ session_id` — binary concatenation,
+/// no separators. The approver signs THIS (via BRC-77), binding their approval
+/// to the exact rendered transaction view (`request_view_hash`, see
+/// [`request_view_hash`]) AND this ceremony's `session_id` — closing the
+/// approve-`policy_id`-alone replay/injection gap.
+pub fn approval_preimage(request_view_hash: &[u8; 32], session_id: &[u8; 32]) -> Vec<u8> {
+    let mut m = Vec::with_capacity(32 + APPROVAL_DOMAIN_TAG.len() + 32);
+    m.extend_from_slice(request_view_hash);
+    m.extend_from_slice(APPROVAL_DOMAIN_TAG);
+    m.extend_from_slice(session_id);
+    m
+}
+
+/// Sign an approval over the §09.5.1 preimage using **BRC-77** (anyone-verifier
+/// mode), with the approver's BRC-31 identity key. A valid signature is an
+/// **Allow** vote — signing the view hash == approving the rendered view. Uses
+/// `bsv-rs`' BRC-77 `messages::sign` (the same SDK the rest of bsv-mpc uses; NOT
+/// rust-mpc's `bsv-sdk`).
+pub fn sign_approval(
+    request_view_hash: &[u8; 32],
+    session_id: &[u8; 32],
+    approver: &PrivateKey,
+) -> Result<Vec<u8>> {
+    let preimage = approval_preimage(request_view_hash, session_id);
+    bsv::messages::sign(&preimage, approver, None)
+        .map_err(|e| MpcError::Protocol(format!("BRC-77 approval sign: {e}")))
+}
+
+/// Verify a BRC-77 approval signature over the §09.5.1 preimage and, on success,
+/// return the **signer's** compressed identity pubkey (parsed from the BRC-77
+/// wire format `[version:4][sender:33][recipient:1|33][keyID:32][sig:DER]`). A
+/// valid signature cryptographically binds that signer to this exact
+/// `(request_view_hash, session_id)`. Returns `None` if the signature is invalid
+/// or malformed. The caller checks the returned signer against the quorum's
+/// `eligible` set ([`ApprovalCollector::record_vote`]).
+pub fn verify_approval(
+    request_view_hash: &[u8; 32],
+    session_id: &[u8; 32],
+    sig: &[u8],
+) -> Option<Vec<u8>> {
+    let preimage = approval_preimage(request_view_hash, session_id);
+    // Anyone-verifier mode (signed with verifier=None ⇒ verify with recipient=None).
+    match bsv::messages::verify(&preimage, sig, None) {
+        Ok(true) => {
+            // BRC-77 wire: sender pubkey is the 33 bytes after the 4-byte version.
+            if sig.len() < 4 + 33 {
+                return None;
+            }
+            let sender = &sig[4..4 + 33];
+            // Sanity: it must parse as a valid compressed point.
+            PublicKey::from_bytes(sender).ok()?;
+            Some(sender.to_vec())
+        }
+        _ => None,
+    }
+}
+
+/// An approver's decision (§09.5.1 step 4). An `Allow` is carried by a valid
+/// approval signature; a `Deny` is carried in the BRC-31-authenticated response
+/// envelope (the §09.5.1 signed preimage has no decision field — the envelope's
+/// outer auth binds the deny to its sender).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalDecision {
+    /// Approve the rendered view.
+    Allow,
+    /// Reject the rendered view.
+    Deny,
+}
+
+/// The real-time approval status surfaced to the requester (§09.5.1 step 5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApprovalStatus {
+    /// Still collecting. `collected` Allow votes of `total` (= `k`) required.
+    Pending {
+        /// Allow votes collected so far.
+        collected: u32,
+        /// Required Allow votes (`quorum.k`).
+        total: u32,
+        /// Milliseconds remaining until the deadline.
+        deadline_ms_remaining: u64,
+        /// Eligible approvers (compressed pubkeys) who have voted (allow or deny).
+        eligible_responded: Vec<Vec<u8>>,
+    },
+    /// `k` Allow votes collected — proceed to sign.
+    Approved,
+    /// `k` Deny votes collected — abort.
+    Denied,
+    /// Deadline elapsed before reaching `k` — abort (deny by silence).
+    Expired,
+}
+
+/// Collects approver votes for a `RequireApproval` verdict until `k`-Allow
+/// (Approved), `k`-Deny (Denied), or the deadline (Expired) — §09.5.1 step 4-5.
+///
+/// Pure state machine: time is supplied as `now_ms` (epoch-ms) by the caller (no
+/// wall-clock read inside — deterministic + wasm-safe, same discipline as the
+/// policy engine). Votes are deduplicated per signer (the first vote from an
+/// eligible approver counts; later votes from the same signer are ignored).
+#[derive(Debug, Clone)]
+pub struct ApprovalCollector {
+    quorum: ApprovalQuorum,
+    request_view_hash: [u8; 32],
+    session_id: [u8; 32],
+    /// Absolute deadline (epoch-ms).
+    deadline_ms: u64,
+    /// Eligible signers (compressed pubkeys) who voted Allow (deduped).
+    allows: Vec<Vec<u8>>,
+    /// Eligible signers who voted Deny (deduped).
+    denies: Vec<Vec<u8>>,
+}
+
+impl ApprovalCollector {
+    /// Create a collector for a `RequireApproval` quorum. `deadline_ms` is the
+    /// ABSOLUTE epoch-ms deadline (caller computes it from `now + ttl`).
+    pub fn new(
+        quorum: ApprovalQuorum,
+        request_view_hash: [u8; 32],
+        session_id: [u8; 32],
+        deadline_ms: u64,
+    ) -> Self {
+        Self {
+            quorum,
+            request_view_hash,
+            session_id,
+            deadline_ms,
+            allows: Vec::new(),
+            denies: Vec::new(),
+        }
+    }
+
+    /// The exact preimage approvers must sign for this collection.
+    pub fn preimage(&self) -> Vec<u8> {
+        approval_preimage(&self.request_view_hash, &self.session_id)
+    }
+
+    /// Record a vote whose `sig` is a BRC-77 approval signature over this
+    /// collection's preimage. Verifies the signature, confirms the signer is in
+    /// the quorum's `eligible` set, deduplicates, and tallies per `decision`.
+    /// Returns the post-vote [`ApprovalStatus`] (`now_ms` for the deadline view).
+    ///
+    /// Errors if the signature is invalid/malformed or the signer is not
+    /// eligible — a relay-injected or non-approver message is rejected, never
+    /// silently counted.
+    pub fn record_vote(
+        &mut self,
+        sig: &[u8],
+        decision: ApprovalDecision,
+        now_ms: u64,
+    ) -> Result<ApprovalStatus> {
+        let signer = verify_approval(&self.request_view_hash, &self.session_id, sig)
+            .ok_or_else(|| MpcError::Protocol("invalid BRC-77 approval signature".into()))?;
+        if !self.quorum.eligible.contains(&signer) {
+            return Err(MpcError::Protocol(
+                "approval signer is not in the quorum's eligible set".into(),
+            ));
+        }
+        // Dedup: a signer's first vote (allow or deny) is final.
+        let already = self.allows.contains(&signer) || self.denies.contains(&signer);
+        if !already {
+            match decision {
+                ApprovalDecision::Allow => self.allows.push(signer),
+                ApprovalDecision::Deny => self.denies.push(signer),
+            }
+        }
+        Ok(self.status(now_ms))
+    }
+
+    /// Current status (§09.5.1 step 5). `k`-Allow → Approved; `k`-Deny → Denied;
+    /// else past-deadline → Expired, otherwise Pending.
+    pub fn status(&self, now_ms: u64) -> ApprovalStatus {
+        let k = self.quorum.k;
+        if self.allows.len() as u32 >= k {
+            return ApprovalStatus::Approved;
+        }
+        if self.denies.len() as u32 >= k {
+            return ApprovalStatus::Denied;
+        }
+        if now_ms >= self.deadline_ms {
+            return ApprovalStatus::Expired;
+        }
+        let mut eligible_responded: Vec<Vec<u8>> = self.allows.clone();
+        eligible_responded.extend(self.denies.iter().cloned());
+        ApprovalStatus::Pending {
+            collected: self.allows.len() as u32,
+            total: k,
+            deadline_ms_remaining: self.deadline_ms.saturating_sub(now_ms),
+            eligible_responded,
+        }
+    }
+
+    /// Whether the quorum is satisfied (`k` Allow votes) — proceed-to-sign gate.
+    pub fn is_approved(&self) -> bool {
+        self.allows.len() as u32 >= self.quorum.k
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -277,5 +487,115 @@ mod tests {
             "r",
         );
         assert_eq!(zero.preimage[2], 0x00);
+    }
+
+    // ── Approval signature + quorum collector (§09.5.1) ──────────────────────
+
+    use bsv::primitives::ec::PrivateKey;
+
+    fn quorum(k: u32, eligible: &[&PrivateKey]) -> ApprovalQuorum {
+        ApprovalQuorum {
+            k,
+            eligible: eligible
+                .iter()
+                .map(|p| p.public_key().to_compressed().to_vec())
+                .collect(),
+            deadline_secs: None,
+        }
+    }
+
+    #[test]
+    fn approval_preimage_is_79_bytes_view_tag_session() {
+        let vh = [0x11u8; 32];
+        let sid = [0x22u8; 32];
+        let m = approval_preimage(&vh, &sid);
+        // 32 (view hash) + 15 ("mpc-approval-v1") + 32 (session_id) = 79.
+        assert_eq!(APPROVAL_DOMAIN_TAG.len(), 15);
+        assert_eq!(m.len(), 79);
+        assert_eq!(&m[0..32], &vh);
+        assert_eq!(&m[32..47], b"mpc-approval-v1");
+        assert_eq!(&m[47..79], &sid);
+    }
+
+    #[test]
+    fn sign_then_verify_returns_signer() {
+        let approver = PrivateKey::random();
+        let vh = [0x42u8; 32];
+        let sid = [0x07u8; 32];
+        let sig = sign_approval(&vh, &sid, &approver).expect("sign");
+        let signer = verify_approval(&vh, &sid, &sig).expect("verify returns signer");
+        assert_eq!(signer, approver.public_key().to_compressed().to_vec());
+    }
+
+    #[test]
+    fn verify_rejects_wrong_view_hash_or_session() {
+        let approver = PrivateKey::random();
+        let sig = sign_approval(&[0x42u8; 32], &[0x07u8; 32], &approver).expect("sign");
+        // Different view hash → no signer.
+        assert!(verify_approval(&[0x43u8; 32], &[0x07u8; 32], &sig).is_none());
+        // Different session id → no signer.
+        assert!(verify_approval(&[0x42u8; 32], &[0x08u8; 32], &sig).is_none());
+    }
+
+    #[test]
+    fn collector_k_allow_approves() {
+        let (a, b) = (PrivateKey::random(), PrivateKey::random());
+        let vh = [0x42u8; 32];
+        let sid = [0x07u8; 32];
+        let mut c = ApprovalCollector::new(quorum(2, &[&a, &b]), vh, sid, 10_000);
+        let sig_a = sign_approval(&vh, &sid, &a).unwrap();
+        let sig_b = sign_approval(&vh, &sid, &b).unwrap();
+        // One allow → still pending.
+        let st = c.record_vote(&sig_a, ApprovalDecision::Allow, 0).unwrap();
+        assert!(matches!(st, ApprovalStatus::Pending { collected: 1, total: 2, .. }));
+        assert!(!c.is_approved());
+        // Second allow → approved.
+        let st = c.record_vote(&sig_b, ApprovalDecision::Allow, 1).unwrap();
+        assert_eq!(st, ApprovalStatus::Approved);
+        assert!(c.is_approved());
+    }
+
+    #[test]
+    fn collector_dedups_same_signer() {
+        let a = PrivateKey::random();
+        let vh = [0x42u8; 32];
+        let sid = [0x07u8; 32];
+        let mut c = ApprovalCollector::new(quorum(2, &[&a]), vh, sid, 10_000);
+        let sig_a = sign_approval(&vh, &sid, &a).unwrap();
+        c.record_vote(&sig_a, ApprovalDecision::Allow, 0).unwrap();
+        // Same signer again — must NOT count twice toward k=2.
+        let st = c.record_vote(&sig_a, ApprovalDecision::Allow, 1).unwrap();
+        assert!(matches!(st, ApprovalStatus::Pending { collected: 1, .. }));
+    }
+
+    #[test]
+    fn collector_rejects_non_eligible_signer() {
+        let (eligible, outsider) = (PrivateKey::random(), PrivateKey::random());
+        let vh = [0x42u8; 32];
+        let sid = [0x07u8; 32];
+        let mut c = ApprovalCollector::new(quorum(1, &[&eligible]), vh, sid, 10_000);
+        let sig_out = sign_approval(&vh, &sid, &outsider).unwrap();
+        let err = c.record_vote(&sig_out, ApprovalDecision::Allow, 0).unwrap_err();
+        assert!(format!("{err}").contains("not in the quorum"));
+    }
+
+    #[test]
+    fn collector_k_deny_denies_and_deadline_expires() {
+        let (a, b) = (PrivateKey::random(), PrivateKey::random());
+        let vh = [0x42u8; 32];
+        let sid = [0x07u8; 32];
+        // k-deny → Denied.
+        let mut c = ApprovalCollector::new(quorum(2, &[&a, &b]), vh, sid, 10_000);
+        c.record_vote(&sign_approval(&vh, &sid, &a).unwrap(), ApprovalDecision::Deny, 0)
+            .unwrap();
+        let st = c
+            .record_vote(&sign_approval(&vh, &sid, &b).unwrap(), ApprovalDecision::Deny, 1)
+            .unwrap();
+        assert_eq!(st, ApprovalStatus::Denied);
+        // deadline → Expired (fresh collector, one allow, past the deadline).
+        let mut c2 = ApprovalCollector::new(quorum(2, &[&a, &b]), vh, sid, 5_000);
+        c2.record_vote(&sign_approval(&vh, &sid, &a).unwrap(), ApprovalDecision::Allow, 0)
+            .unwrap();
+        assert_eq!(c2.status(6_000), ApprovalStatus::Expired);
     }
 }
