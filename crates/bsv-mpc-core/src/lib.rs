@@ -60,6 +60,7 @@ pub mod envelope;
 pub mod error;
 pub mod hd;
 pub mod paillier_pool;
+pub mod policy;
 pub mod presig_at_rest;
 pub mod presig_encryption;
 pub mod presigning;
