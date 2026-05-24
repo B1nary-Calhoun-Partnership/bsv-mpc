@@ -137,17 +137,23 @@ async fn find_utxo_on_woc(
 }
 
 async fn broadcast_via_arc(http: &reqwest::Client, raw_tx_hex: &str) -> bool {
-    for arc in &["https://arc.taal.com", "https://arc.gorillapool.io"] {
+    // TAAL ARC needs a Bearer token (else 401); GorillaPool is keyless. Token from
+    // env `TAAL_ARC_TOKEN`, else the known mainnet key in secrets.md. (The bare
+    // tokenless broadcaster 401s on TAAL — burned a real-sats run during #26.)
+    let taal_token = std::env::var("TAAL_ARC_TOKEN")
+        .unwrap_or_else(|_| "mainnet_9596de07e92300c6287e4393594ae39c".to_string());
+    for arc in &["https://arc.gorillapool.io", "https://arc.taal.com"] {
         let url = format!("{arc}/v1/tx");
         eprintln!("  broadcast via {url}");
-        let Ok(resp) = http
+        let mut req = http
             .post(&url)
             .header("Content-Type", "application/json")
             .header("XDeployment-ID", "bsv-mpc-sec0617-container")
-            .json(&serde_json::json!({ "rawTx": raw_tx_hex }))
-            .send()
-            .await
-        else {
+            .json(&serde_json::json!({ "rawTx": raw_tx_hex }));
+        if arc.contains("taal") {
+            req = req.header("Authorization", format!("Bearer {taal_token}"));
+        }
+        let Ok(resp) = req.send().await else {
             continue;
         };
         let status = resp.status();
@@ -165,13 +171,20 @@ async fn broadcast_via_arc(http: &reqwest::Client, raw_tx_hex: &str) -> bool {
     false
 }
 
-fn raw_tx_hex_from_create_action(resp: &serde_json::Value) -> Option<String> {
+/// BEEF V1 hex (ancestry-bearing, ARC-acceptable) from a wallet `createAction`
+/// response (`tx` is AtomicBEEF). Falls back to bare raw tx hex if V1 can't be
+/// built (unconfirmed parent without included source). ARC's `rawTx` accepts
+/// BEEF V1 but 460s on a bare raw tx whose parent isn't already known.
+fn broadcast_hex_from_create_action(resp: &serde_json::Value) -> Option<String> {
     let arr = resp.get("tx")?.as_array()?;
     let beef: Vec<u8> = arr.iter().map(|v| v.as_u64().unwrap_or(0) as u8).collect();
     let tx = bsv::Transaction::from_atomic_beef(&beef)
         .or_else(|_| bsv::Transaction::from_beef(&beef, None))
         .ok()?;
-    Some(tx.to_hex())
+    match tx.to_beef_v1(false) {
+        Ok(b) => Some(hex::encode(b)),
+        Err(_) => Some(tx.to_hex()),
+    }
 }
 
 #[tokio::test]
@@ -268,36 +281,48 @@ async fn container_sec0617_self_presign_deployed_real_mainnet_tx() {
         .expect("bundle reloads from disk");
 
     // ── 4. Fund the joint P2PKH on mainnet via wallet:3321 ─────────────────────
+    // The wallet returns a txid but does not reliably propagate, and its coin
+    // selection sometimes picks unconfirmed change (no on-chain ancestry → ARC
+    // 460). Self-broadcast the BEEF V1 and RETRY with a fresh createAction (new
+    // coin selection) until one lands (SEEN_ON_NETWORK).
     let funding_amount: u64 = 1500;
-    let fund_resp = http
-        .post("http://localhost:3321/createAction")
-        .header("Origin", "http://admin.com")
-        .header("Content-Type", "application/json")
-        .json(&serde_json::json!({
-            "description": "bsv-mpc §06.17.1 container self-presign gate",
-            "outputs": [{
-                "satoshis": funding_amount,
-                "lockingScript": hex::encode(&joint_locking),
-                "outputDescription": "MPC joint P2PKH"
-            }]
-        }))
-        .send()
-        .await
-        .expect("wallet:3321 reachable");
-    let fund_status = fund_resp.status();
-    let fund_text = fund_resp.text().await.unwrap_or_default();
-    assert!(
-        fund_status.is_success(),
-        "wallet createAction failed ({fund_status}): {fund_text}"
-    );
-    let fund_json: serde_json::Value = serde_json::from_str(&fund_text).expect("fund JSON");
-    let fund_txid = fund_json["txid"].as_str().expect("createAction txid").to_string();
-    eprintln!("✔ funded joint address: txid={fund_txid}");
-    // Self-broadcast the funding tx via ARC (wallet broadcast may not propagate).
-    if let Some(raw) = raw_tx_hex_from_create_action(&fund_json) {
-        eprintln!("  self-broadcasting funding tx via ARC to guarantee propagation...");
-        let _ = broadcast_via_arc(&http, &raw).await;
+    let mut fund_txid = String::new();
+    for attempt in 1..=8 {
+        let fund_text = http
+            .post("http://localhost:3321/createAction")
+            .header("Origin", "http://admin.com")
+            .header("Content-Type", "application/json")
+            .json(&serde_json::json!({
+                "description": format!("bsv-mpc §06.17.1 container self-presign gate (attempt {attempt})"),
+                "outputs": [{
+                    "satoshis": funding_amount,
+                    "lockingScript": hex::encode(&joint_locking),
+                    "outputDescription": "MPC joint P2PKH"
+                }]
+            }))
+            .send()
+            .await
+            .expect("wallet:3321 reachable")
+            .text()
+            .await
+            .unwrap_or_default();
+        let fund_json: serde_json::Value =
+            serde_json::from_str(&fund_text).unwrap_or_else(|_| panic!("fund JSON: {fund_text}"));
+        let txid = fund_json["txid"].as_str().expect("createAction txid").to_string();
+        if let Some(beef_hex) = broadcast_hex_from_create_action(&fund_json) {
+            if broadcast_via_arc(&http, &beef_hex).await {
+                eprintln!("✔ funded joint address: txid={txid} (broadcast BEEF v1, attempt {attempt})");
+                fund_txid = txid;
+                break;
+            }
+        }
+        eprintln!("  funding attempt {attempt} ({txid}) did NOT broadcast (unconfirmed parent); retrying");
+        tokio::time::sleep(Duration::from_secs(2)).await;
     }
+    assert!(
+        !fund_txid.is_empty(),
+        "could not get a funding tx to broadcast after 8 attempts"
+    );
 
     // ── 5. Find the UTXO + build the BIP-143 sighash (drain back to wallet) ────
     let locking_hex = hex::encode(&joint_locking);

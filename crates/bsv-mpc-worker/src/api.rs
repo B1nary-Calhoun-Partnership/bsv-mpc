@@ -21,20 +21,13 @@
 //!     │◄── { joint_pubkey } ───────────│  Return joint public key
 //! ```
 //!
-//! ## Protocol Flow: Signing (without presignature, 4 rounds)
+//! ## Protocol Flow: Signing (relay-only since #13)
 //!
-//! ```text
-//! Proxy (share_B)                  Worker (share_A)
-//!     │                                │
-//!     │── POST /sign/init { hash } ────►│  Load share, start full signing
-//!     │◄── { round_1_msg } ────────────│  Return round 1
-//!     │                                │
-//!     │── POST /sign/round { r1 } ─────►│  Process round 1
-//!     │◄── { round_2_msg } ────────────│  Return round 2
-//!     │                                │
-//!     │── ... (up to 4 rounds) ... ────►│
-//!     │◄── { signature } ──────────────│  Return complete signature
-//! ```
+//! The legacy 4-round HTTP `/sign/{init,round}` path was retired in #13. Online
+//! signing now runs over the MessageBox relay: the cosigner consumes a correlated
+//! `Presignature_A` from its DO pool and issues its partial over the authed
+//! `/sign-relay` route, which the proxy combines into the final ECDSA signature.
+//! See `poc.rs::handle_prod_sign_relay` (worker) and `relay_sign.rs` (proxy).
 //!
 //! ## Message Bundling
 //!
@@ -49,7 +42,6 @@ use std::sync::{LazyLock, Mutex};
 
 use bsv_mpc_core::dkg::{DkgCoordinator, DkgRoundResult};
 use bsv_mpc_core::presigning::{PresigningManager, PresigningRoundResult};
-use bsv_mpc_core::signing::{SigningCoordinator, SigningRoundResult};
 use bsv_mpc_core::types::{RoundMessage, SessionId, ShareIndex, ThresholdConfig};
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
@@ -80,10 +72,6 @@ struct DkgSession {
 
 /// Live DKG ceremonies, keyed by DKG session ID.
 static DKG_SESSIONS: LazyLock<Mutex<HashMap<String, DkgSession>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-
-/// Live signing coordinators, keyed by signing session ID.
-static SIGNING_SESSIONS: LazyLock<Mutex<HashMap<String, SigningCoordinator>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Live presigning managers, keyed by presigning session ID.
@@ -135,56 +123,6 @@ pub struct DkgRoundResponse {
     pub complete: bool,
     /// The joint public key (only present when `complete` is true).
     pub joint_pubkey: Option<bsv_mpc_core::types::JointPublicKey>,
-}
-
-/// Request body for `POST /sign/init`.
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)] // fields used by serde + future presignature support
-pub struct SignInitRequest {
-    /// The agent requesting signing (must own the share).
-    pub agent_id: String,
-    /// The MPC session ID (from DKG completion).
-    pub session_id: String,
-    /// SHA-256 double hash of the BSV sighash to sign (32 bytes, hex).
-    pub sighash: String,
-    /// Whether to use a presignature for single-round signing.
-    /// If true and no presignature is available, falls back to full protocol.
-    pub use_presignature: bool,
-}
-
-/// Response from `POST /sign/init`.
-#[derive(Debug, Serialize)]
-pub struct SignInitResponse {
-    /// Signing session identifier (ephemeral, distinct from the DKG session).
-    pub signing_session_id: String,
-    /// This party's round 1 message for the signing protocol.
-    pub round_message: RoundMessage,
-    /// Whether a presignature was consumed (single-round path).
-    pub using_presignature: bool,
-    /// Total rounds expected (1 if using presignature, up to 4 otherwise).
-    pub total_rounds: u8,
-}
-
-/// Request body for `POST /sign/round`.
-#[derive(Debug, Deserialize)]
-pub struct SignRoundRequest {
-    /// The signing session ID from `/sign/init`.
-    pub signing_session_id: String,
-    /// The incoming round message from the other party.
-    pub round_message: RoundMessage,
-}
-
-/// Response from `POST /sign/round`.
-#[derive(Debug, Serialize)]
-pub struct SignRoundResponse {
-    /// The signing session ID.
-    pub signing_session_id: String,
-    /// This party's response message, if more rounds remain.
-    pub round_message: Option<RoundMessage>,
-    /// Whether signing is now complete.
-    pub complete: bool,
-    /// The resulting signature (only present when `complete` is true).
-    pub signature: Option<bsv_mpc_core::types::SigningResult>,
 }
 
 /// Request body for `POST /presign/init`.
@@ -515,148 +453,6 @@ pub async fn handle_dkg_round(mut req: Request, store: &dyn MpcStore) -> Result<
                 round_message: None,
                 complete: true,
                 joint_pubkey: Some(dkg_result.joint_key),
-            };
-            Response::from_json(&response)
-        }
-    }
-}
-
-/// Handle `POST /sign/init` — start a threshold signing ceremony.
-///
-/// 1. Parse the signing init request (agent_id, session_id, sighash).
-/// 2. Load the agent's encrypted share from storage.
-/// 3. Parse and validate the sighash (must be exactly 32 bytes hex).
-/// 4. Create a SigningCoordinator for party 0 with participants [0, 1].
-/// 5. Call `coordinator.sign()` to generate round 1 messages.
-/// 6. Store the live coordinator for subsequent rounds.
-/// 7. Return the bundled round 1 message.
-pub async fn handle_sign_init(mut req: Request, store: &dyn MpcStore) -> Result<Response> {
-    let caller = caller_identity(&req);
-    let body: SignInitRequest = req.json().await?;
-
-    // §08.1 / #5: only the share's owner may sign with it — checked BEFORE the
-    // share is loaded/used.
-    if let Some(resp) = authz_owner_or_reject(caller.as_deref(), store, &body.agent_id)? {
-        return Ok(resp);
-    }
-
-    // Load the agent's share
-    let share = store
-        .get_share(&body.agent_id)
-        .map_err(Error::from)?
-        .ok_or_else(|| Error::from(format!("No share found for agent: {}", body.agent_id)))?;
-
-    // Parse and validate the sighash (32 bytes, hex-encoded)
-    let sighash_bytes =
-        hex::decode(&body.sighash).map_err(|e| Error::from(format!("invalid sighash hex: {e}")))?;
-    if sighash_bytes.len() != 32 {
-        return Response::error(
-            format!("sighash must be 32 bytes, got {}", sighash_bytes.len()),
-            400,
-        );
-    }
-    let mut sighash = [0u8; 32];
-    sighash.copy_from_slice(&sighash_bytes);
-
-    // Generate a signing session ID (distinct from the DKG session)
-    let signing_session_id = generate_session_id("sign").map_err(Error::from)?;
-
-    // Create signing coordinator for party 0
-    // KSS is party 0, proxy is party 1 — standard 2-of-2 participants.
-    // Reconstruct the SAME SessionId the proxy sent (canonical 64-char hex) via
-    // from_hex. `from_str_hash` would RE-HASH the hex into a *different*
-    // SessionId → a divergent cggmp24 ExecutionId → the ceremony aborts mid-round.
-    let session_id = SessionId::from_hex(&body.session_id)
-        .map_err(|e| Error::from(format!("session_id must be canonical 64-char hex: {e}")))?;
-    let config = share.config;
-    let participants: Vec<u16> = (0..config.parties).collect();
-
-    let mut coordinator = SigningCoordinator::new(session_id, share, config, participants);
-
-    // Start signing — produces round 1 messages
-    // Note: presignature support is future work (requires cggmp24 feature flag)
-    let messages = coordinator
-        .sign(&sighash, None, None)
-        .map_err(|e| Error::from(e.to_string()))?;
-
-    let round_message = bundle_outgoing_messages(&messages).map_err(Error::from)?;
-
-    // Store the live coordinator
-    SIGNING_SESSIONS
-        .lock()
-        .map_err(|e| Error::from(e.to_string()))?
-        .insert(signing_session_id.clone(), coordinator);
-
-    let response = SignInitResponse {
-        signing_session_id,
-        round_message,
-        using_presignature: false, // presigned path not yet implemented
-        total_rounds: 4,
-    };
-
-    Response::from_json(&response)
-}
-
-/// Handle `POST /sign/round` — process a signing round and return the next.
-///
-/// 1. Parse the signing round request (signing_session_id, round_message).
-/// 2. Look up the live signing coordinator.
-/// 3. Unbundle incoming messages and feed to the coordinator.
-/// 4. If more rounds remain: return the next round's messages.
-/// 5. If signing is complete: clean up, return the ECDSA signature.
-pub async fn handle_sign_round(mut req: Request) -> Result<Response> {
-    // BRC-31 is verified at the DO entrypoint (poc.rs `is_authed_path`) before
-    // dispatch — the DO is only reachable via that gate (§07.5/§07.6).
-    let body: SignRoundRequest = req.json().await?;
-
-    let incoming = unbundle_incoming_message(&body.round_message).map_err(Error::from)?;
-
-    let result = {
-        let mut sessions = SIGNING_SESSIONS
-            .lock()
-            .map_err(|e| Error::from(e.to_string()))?;
-
-        let coordinator = sessions.get_mut(&body.signing_session_id).ok_or_else(|| {
-            Error::from(format!(
-                "Signing session not found: {}",
-                body.signing_session_id
-            ))
-        })?;
-
-        match coordinator.process_round(incoming) {
-            Ok(r) => r,
-            Err(e) => {
-                // Remove the orphaned coordinator on a mid-ceremony error so a
-                // failed sign doesn't block retry / leak (#7 finding #3).
-                sessions.remove(&body.signing_session_id);
-                return Err(Error::from(e.to_string()));
-            }
-        }
-    };
-
-    match result {
-        SigningRoundResult::NextRound(messages) => {
-            let round_message = bundle_outgoing_messages(&messages).map_err(Error::from)?;
-            let response = SignRoundResponse {
-                signing_session_id: body.signing_session_id,
-                round_message: Some(round_message),
-                complete: false,
-                signature: None,
-            };
-            Response::from_json(&response)
-        }
-        SigningRoundResult::Complete(signing_result) => {
-            // Clean up the live coordinator
-            SIGNING_SESSIONS
-                .lock()
-                .map_err(|e| Error::from(e.to_string()))?
-                .remove(&body.signing_session_id);
-
-            let response = SignRoundResponse {
-                signing_session_id: body.signing_session_id,
-                round_message: None,
-                complete: true,
-                signature: Some(signing_result),
             };
             Response::from_json(&response)
         }

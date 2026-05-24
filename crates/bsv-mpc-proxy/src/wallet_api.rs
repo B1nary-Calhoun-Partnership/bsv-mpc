@@ -101,9 +101,10 @@ async fn derive_symmetric_key(
 
 /// Compute the BRC-42 HMAC offset scalar for derived key signing.
 ///
-/// This offset is passed to `bridge.sign()` so cggmp24's `set_additive_shift()`
-/// shifts the signing key share by the HMAC value. The resulting signature
-/// validates against the BRC-42 derived public key.
+/// This offset is passed to the relay sign path so cggmp24's `set_additive_shift()`
+/// shifts the signing key share by the HMAC value (applied combiner-side and
+/// shipped to the cosigner). The resulting signature validates against the
+/// BRC-42 derived public key.
 ///
 /// For "anyone" counterparty: fully local (0 KSS round-trips).
 ///   shared_secret = root_pub (because anyone_priv = 1)
@@ -1045,9 +1046,9 @@ pub async fn get_public_key(
 ///
 /// ## MPC flow
 ///
-/// 1. Check presignature pool — if available, use single-round online signing.
-/// 2. Otherwise, run the full 4-round interactive protocol with the KSS.
-/// 3. Return the DER-encoded ECDSA signature.
+/// 1. Consume one presignature from the pool and single-round online-sign over
+///    the relay (relay-only since #13 — the legacy 4-round HTTP path is retired).
+/// 2. Return the DER-encoded ECDSA signature.
 ///
 /// Sign a sighash through the **ADR-018 relay combiner** — the deployed
 /// cosigner (`share_A`) issues its partial over the MessageBox relay and this
@@ -1106,7 +1107,7 @@ async fn relay_sign(
         .map_err(|e| format!("relay sign failed: {e}"))
 }
 
-/// Presignature signing takes ~50-100ms. Full protocol takes ~300-500ms.
+/// Relay online signing takes ~50-100ms (one presig consumed per sighash).
 /// Library-callable version of `create_signature`. Accepts parsed state and request body directly.
 pub async fn create_signature_impl(state: &AppState, body: Value) -> Value {
     // Parse the data to sign
@@ -1185,29 +1186,16 @@ pub async fn create_signature_impl(state: &AppState, body: Value) -> Value {
         None
     };
 
-    // ADR-018 relay mode: route signing through the deployed cosigner over the
-    // relay. Both base-key AND BRC-42 HD-derived (hmac_offset) signing now work
-    // over the relay (MPC-Spec §06.20, issue #26): the offset is applied at
-    // consume-time on both the combiner and cosigner sides, so HD signing no
-    // longer requires the legacy 4-round HTTP path.
-    let signing_result = if state.config.relay_sign {
-        match relay_sign(state, &msg_hash, hmac_offset).await {
-            Ok(result) => result,
-            Err(e) => return json!({ "error": format!("MPC signing failed: {}", e) }),
-        }
-    } else {
-        // Legacy HTTP path. In relay mode, never consume a relay-correlated
-        // presig here (it would desync the proxy/DO pools); pass None.
-        let presig = if state.config.relay_sign {
-            None
-        } else {
-            let mut mgr = state.presign_manager.write().await;
-            mgr.take()
-        };
-        match state.bridge.sign(&msg_hash, presig, hmac_offset).await {
-            Ok(result) => result,
-            Err(e) => return json!({ "error": format!("MPC signing failed: {}", e) }),
-        }
+    // ADR-018 relay-only signing (#13): route ALL signing through the deployed
+    // cosigner over the relay. Both base-key AND BRC-42 HD-derived (hmac_offset)
+    // signing run over the relay (MPC-Spec §06.20, issue #26): the offset is
+    // applied at consume-time on both the combiner and cosigner sides. The
+    // legacy 4-round HTTP path has been retired — there is no on-demand fallback;
+    // presig provisioning is the mitigation and a relay-empty pool returns a
+    // clear error.
+    let signing_result = match relay_sign(state, &msg_hash, hmac_offset).await {
+        Ok(result) => result,
+        Err(e) => return json!({ "error": format!("MPC signing failed: {}", e) }),
     };
 
     // Return DER-encoded signature as hex
@@ -1504,28 +1492,15 @@ pub async fn create_action_impl(state: &AppState, body: Value) -> Value {
             sighash_type,
         });
 
-        // MPC sign via bridge. All tracked UTXOs are locked to the root key, so
-        // offset=None → relay mode is eligible. In relay mode, the deployed
-        // cosigner co-signs over the relay; otherwise the legacy 4-round HTTP
-        // path runs. (BRC-42-derived-key inputs would compute an offset and stay
-        // on the HTTP path; not yet supported here.)
-        let signing_result = if state.config.relay_sign {
-            // createAction inputs spend the root-key P2PKH address → base-key
-            // sign (no BRC-42 offset). HD-derived `createSignature` uses the
-            // offset-carrying relay path (issue #26).
-            match relay_sign(state, &sighash, None).await {
-                Ok(result) => result,
-                Err(e) => return json!({"error": format!("signing input {} failed: {}", i, e)}),
-            }
-        } else {
-            let presig = {
-                let mut mgr = state.presign_manager.write().await;
-                mgr.take()
-            };
-            match state.bridge.sign(&sighash, presig, None).await {
-                Ok(result) => result,
-                Err(e) => return json!({"error": format!("signing input {} failed: {}", i, e)}),
-            }
+        // MPC sign via the relay (#13, relay-only). All tracked UTXOs are locked
+        // to the root key, so each input is a base-key sign (offset=None). The
+        // deployed cosigner co-signs over the relay from its presig pool; the
+        // legacy 4-round HTTP path has been retired (no on-demand fallback).
+        // HD-derived `createSignature` uses the offset-carrying relay path (#26);
+        // createAction inputs are root-key only here (unchanged by #13).
+        let signing_result = match relay_sign(state, &sighash, None).await {
+            Ok(result) => result,
+            Err(e) => return json!({"error": format!("signing input {} failed: {}", i, e)}),
         };
 
         // PRE-FLIGHT (fail-closed): verify the MPC signature under the root key

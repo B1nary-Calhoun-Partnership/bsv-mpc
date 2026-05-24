@@ -279,8 +279,7 @@ All 28 BRC-100 endpoints are routed in `server.rs`:
 |--------|------|------|-------------|
 | POST | `/dkg/init` | BRC-31 | Start DKG ceremony |
 | POST | `/dkg/round` | BRC-31 | Process DKG round |
-| POST | `/sign/init` | BRC-31 | Start signing |
-| POST | `/sign/round` | BRC-31 | Process signing round |
+| POST | `/sign-relay` | BRC-31 | Relay-only online signing (#13 retired the legacy 4-round `/sign/{init,round}`) |
 | POST | `/presign/init` | BRC-31 | Start presigning |
 | POST | `/presign/round` | BRC-31 | Process presigning round |
 | GET | `/health` | none | Liveness check |

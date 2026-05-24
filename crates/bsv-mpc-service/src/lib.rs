@@ -90,9 +90,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // DKG protocol
         .route("/dkg/init", post(handlers::handle_dkg_init))
         .route("/dkg/round", post(handlers::handle_dkg_round))
-        // Signing protocol
-        .route("/sign/init", post(handlers::handle_sign_init))
-        .route("/sign/round", post(handlers::handle_sign_round))
+        // Signing: relay-only (#13). The legacy 4-round HTTP `/sign/{init,round}`
+        // routes were retired; online signing runs over the relay (`/sign-relay`).
         // Partial ECDH (for BRC-42 key derivation)
         .route("/ecdh", post(handlers::handle_ecdh))
         // Presigning protocol

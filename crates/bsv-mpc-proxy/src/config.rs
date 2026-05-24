@@ -103,12 +103,12 @@ pub struct ProxyConfig {
     /// `message-box-server` it dials. Default: the live Calhoun relay.
     pub relay_url: String,
 
-    /// Route `createSignature` / `createAction` signing through the ADR-018
-    /// **relay combiner** (the deployed cosigner over the MessageBox relay)
-    /// instead of the legacy 4-round HTTP `bridge.rs::sign`. Default `false`
-    /// (legacy path) until provisioning automation keeps the proxy + DO pools
-    /// stocked with correlated pairs; flipped on once relay-mode is the default
-    /// and the HTTP path is retired (OQ-I1). Env: `MPC_RELAY_SIGN=1`.
+    /// **Vestigial since #13** — retained for source/test compatibility only.
+    /// `createSignature` / `createAction` now sign **relay-only** (the ADR-018
+    /// relay combiner against the deployed cosigner); the legacy 4-round HTTP
+    /// `bridge.rs::sign` path has been deleted, so this flag no longer selects a
+    /// signing path. The handlers ignore its value. Still parsed from
+    /// `MPC_RELAY_SIGN` so existing env/config keeps loading. Env: `MPC_RELAY_SIGN=1`.
     pub relay_sign: bool,
 
     /// URL of the **heavy-compute cosigner** (`bsv-mpc-service` / CF Container,

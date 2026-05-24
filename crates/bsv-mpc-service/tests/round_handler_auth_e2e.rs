@@ -1,5 +1,5 @@
 //! **#8 round-handler defense-in-depth gate** — the service's round handlers
-//! (`/dkg/round`, `/sign/round`, `/presign/round`) require a valid BRC-31
+//! (`/dkg/round`, `/presign/round`) require a valid BRC-31
 //! session in enforced mode (§07.6), not just an unguessable session id.
 //!
 //! Proves: unauthed round → **401**; an AUTHED session (valid BRC-31, unknown

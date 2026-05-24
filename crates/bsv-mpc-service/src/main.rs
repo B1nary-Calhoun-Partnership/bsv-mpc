@@ -36,8 +36,6 @@
 //! |--------|-------------------|----------------------------------------------|
 //! | POST   | `/dkg/init`       | Start DKG ceremony, return round 1 message   |
 //! | POST   | `/dkg/round`      | Process DKG round, return next or complete    |
-//! | POST   | `/sign/init`      | Start signing, return round 1 message         |
-//! | POST   | `/sign/round`     | Process signing round, return sig or next     |
 //! | POST   | `/presign/init`   | Start presigning protocol                     |
 //! | POST   | `/presign/round`  | Process presigning round                      |
 //! | GET    | `/health`         | Liveness check + share count                  |
