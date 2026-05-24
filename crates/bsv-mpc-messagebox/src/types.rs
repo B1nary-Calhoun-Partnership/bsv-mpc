@@ -147,6 +147,10 @@ pub const BOX_PRESIGN: &str = "mpc-presign";
 pub const BOX_ECDH: &str = "mpc-ecdh";
 /// Box name for Refresh ceremony envelopes.
 pub const BOX_REFRESH: &str = "mpc-refresh";
+/// Box name for approval-request / approval-response envelopes (§09.5.1 / #43).
+/// The coordinator emits an approval-request to each eligible approver here and
+/// collects their signed responses on the same box.
+pub const BOX_APPROVAL: &str = "mpc-approval";
 
 // ---------------------------------------------------------------------------
 // Per-session presign mailboxes (MPC-Spec §06.17.2)

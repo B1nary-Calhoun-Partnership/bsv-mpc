@@ -1379,6 +1379,128 @@ pub async fn verify_signature(
 /// 7. **Broadcast**: Submit the signed transaction to the BSV network.
 /// 8. **UTXO update**: Mark spent inputs, add new outputs to the local tracker.
 ///
+/// **§4 policy + approval gate (issue #43).** Run the policy `check_signing` hook
+/// for this action; on `RequireApproval`, collect a k-of-m approval over the
+/// relay and proceed only on `Approved`. Returns `Ok(())` to proceed, or
+/// `Err(reason)` to refuse the spend. A `None` policy engine = no gate (Ok).
+///
+/// `dry_run` manifests (§09.10) compute the verdict but never block — the verdict
+/// is logged and the spend proceeds (shadow mode).
+async fn enforce_policy_and_approval(
+    state: &AppState,
+    amount_sats: u64,
+    recipient_hex: &str,
+    protocol_id: &str,
+) -> std::result::Result<(), String> {
+    use bsv_mpc_core::approval::{request_view_hash, Recipient};
+    use bsv_mpc_core::policy::{SigningCheck, Verdict};
+
+    let Some(engine) = state.policy_engine.as_ref() else {
+        return Ok(()); // no policy configured → unconditional (prior behavior)
+    };
+
+    // Evaluate the policy (sync; lock not held across the await below).
+    let (verdict, policy_id_hex, dry_run) = {
+        let mut eng = engine
+            .lock()
+            .map_err(|_| "policy engine mutex poisoned".to_string())?;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let verdict = eng.check_signing(
+            &SigningCheck {
+                protocol_id: protocol_id.to_string(),
+                amount_sats,
+                fee_sats: 0,
+                counterparty: None,
+            },
+            now_ms,
+        );
+        (verdict, eng.manifest().policy_id.hex(), eng.is_dry_run())
+    };
+
+    match verdict {
+        Verdict::Allow => Ok(()),
+        Verdict::Deny(reason) => {
+            if dry_run {
+                tracing::warn!(%reason, "policy DENY (dry-run: not enforced)");
+                Ok(())
+            } else {
+                Err(format!("policy denied: {reason}"))
+            }
+        }
+        Verdict::RateLimited { retry_after_secs } => {
+            if dry_run {
+                tracing::warn!(retry_after_secs, "policy RATE-LIMITED (dry-run: not enforced)");
+                Ok(())
+            } else {
+                Err(format!("policy rate-limited; retry after {retry_after_secs}s"))
+            }
+        }
+        Verdict::RequireApproval(quorum) => {
+            // Compute request_view_hash (§09.5.1 step 1) over the rendered action.
+            let session = bsv_mpc_core::types::SessionId::from_str_hash(&format!(
+                "approval-{}-{}-{}",
+                protocol_id, amount_sats, recipient_hex
+            ));
+            let rendered_text = format!("Send {amount_sats} sats to {recipient_hex}");
+            let rvh = request_view_hash(
+                amount_sats,
+                &Recipient::Single(recipient_hex.to_string()),
+                &"00".repeat(32), // action-level sighash placeholder (multi-input)
+                &session.hex(),
+                &policy_id_hex,
+                &"00".repeat(64), // manifest_ack placeholder (no user ack in this path)
+                "en-US",
+                &rendered_text,
+            );
+            let joint = {
+                let c = &state.bridge.joint_public_key().compressed;
+                let mut a = [0u8; 33];
+                if c.len() == 33 {
+                    a.copy_from_slice(c);
+                }
+                a
+            };
+            let coordinator_priv = state
+                .bridge
+                .relay_identity_priv()
+                .map_err(|e| format!("approval coordinator identity: {e}"))?;
+
+            tracing::info!(
+                k = quorum.k,
+                eligible = quorum.eligible.len(),
+                "policy RequireApproval — collecting approval over the relay"
+            );
+            let status = crate::relay_approval::collect_approval_over_relay(
+                state.bridge.relay_url(),
+                coordinator_priv,
+                quorum,
+                rvh.hash,
+                session,
+                joint,
+                &rendered_text,
+                std::time::Duration::from_secs(60),
+            )
+            .await
+            .map_err(|e| format!("approval collection failed: {e}"))?;
+
+            match status {
+                bsv_mpc_core::approval::ApprovalStatus::Approved => {
+                    tracing::info!("approval quorum reached — proceeding to sign");
+                    Ok(())
+                }
+                other if dry_run => {
+                    tracing::warn!(?other, "approval NOT reached (dry-run: not enforced)");
+                    Ok(())
+                }
+                other => Err(format!("approval not granted: {other:?}")),
+            }
+        }
+    }
+}
+
 /// Library-callable version of `create_action`. Accepts parsed state and request body directly.
 pub async fn create_action_impl(state: &AppState, body: Value) -> Value {
     // ── 1. Parse request ─────────────────────────────────────────────────
@@ -1508,6 +1630,21 @@ pub async fn create_action_impl(state: &AppState, body: Value) -> Value {
         txid_bytes.copy_from_slice(&decoded);
         txid_bytes.reverse(); // display → internal byte order
         input_tuples.push((txid_bytes, utxo.vout, 0xFFFFFFFF));
+    }
+
+    // ── 8.5 Policy + approval gate (§4, issue #43) ───────────────────────
+    // Run the policy engine for this action BEFORE consuming any presig /
+    // signing material; a RequireApproval verdict collects a k-of-m approval
+    // over the relay and the spend proceeds only on Approved. No policy engine
+    // configured → no gate.
+    let recipient_hex = outputs
+        .first()
+        .map(|(_, script)| hex::encode(script))
+        .unwrap_or_default();
+    if let Err(reason) =
+        enforce_policy_and_approval(state, total_user_output, &recipient_hex, "createaction").await
+    {
+        return json!({ "error": format!("policy/approval gate refused the spend: {reason}") });
     }
 
     // ── 9. Sign each input ───────────────────────────────────────────────
@@ -2579,6 +2716,7 @@ mod tests {
             bridge,
             presign_manager: Arc::new(RwLock::new(PresignManager::new(20))),
             device_presig_pool: None,
+            policy_engine: None,
             fee_injector: FeeInjector::new(0, vec![], None),
             storage: Arc::new(InMemoryBackend::new()),
             http_client: reqwest::Client::new(),

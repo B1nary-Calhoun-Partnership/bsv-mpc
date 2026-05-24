@@ -65,6 +65,15 @@ pub struct AppState {
     /// normal single-share deployment (which uses `presign_manager`).
     pub device_presig_pool: Option<Arc<RwLock<DevicePresigSetPool>>>,
 
+    /// **§4 policy engine (issue #43).** When present, `createAction` runs the
+    /// policy `check_signing` hook before signing; a `RequireApproval` verdict
+    /// triggers an approval collection over the relay
+    /// ([`crate::relay_approval`]) and the spend proceeds only on `Approved`.
+    /// `None` = no policy gate (signing proceeds unconditionally — the prior
+    /// behavior). `std::sync::Mutex` because `check_signing` is sync and the lock
+    /// is never held across an `.await`.
+    pub policy_engine: Option<Arc<std::sync::Mutex<bsv_mpc_core::policy::PolicyEngine>>>,
+
     /// Fee injector for adding MPC signing fees to transactions.
     pub fee_injector: FeeInjector,
 
@@ -102,6 +111,7 @@ pub struct ProxyBuilder {
     fee_injector: Option<FeeInjector>,
     presign_manager: Option<PresignManager>,
     device_presig_pool: Option<DevicePresigSetPool>,
+    policy_engine: Option<bsv_mpc_core::policy::PolicyEngine>,
     storage: Option<Arc<dyn StorageBackend>>,
     http_client: Option<reqwest::Client>,
 }
@@ -115,6 +125,7 @@ impl ProxyBuilder {
             fee_injector: None,
             presign_manager: None,
             device_presig_pool: None,
+            policy_engine: None,
             storage: None,
             http_client: None,
         }
@@ -143,6 +154,14 @@ impl ProxyBuilder {
     /// consumes one set per signed input.
     pub fn with_device_presig_pool(mut self, pool: DevicePresigSetPool) -> Self {
         self.device_presig_pool = Some(pool);
+        self
+    }
+
+    /// **§4 policy engine (issue #43).** Provide a `PolicyEngine`; `createAction`
+    /// then gates each spend through `check_signing` (and an approval collection
+    /// over the relay on `RequireApproval`) before signing.
+    pub fn with_policy_engine(mut self, engine: bsv_mpc_core::policy::PolicyEngine) -> Self {
+        self.policy_engine = Some(engine);
         self
     }
 
@@ -198,11 +217,16 @@ impl ProxyBuilder {
             .device_presig_pool
             .map(|p| Arc::new(RwLock::new(p)));
 
+        let policy_engine = self
+            .policy_engine
+            .map(|e| Arc::new(std::sync::Mutex::new(e)));
+
         Ok(Arc::new(AppState {
             config: self.config,
             bridge,
             presign_manager,
             device_presig_pool,
+            policy_engine,
             fee_injector,
             storage,
             http_client,
@@ -256,6 +280,10 @@ pub async fn run(config: ProxyConfig) -> anyhow::Result<()> {
         bridge,
         presign_manager: presign_manager.clone(),
         device_presig_pool,
+        // Policy gating is opt-in via the library ProxyBuilder; the env-driven
+        // server entry point runs without a policy engine for now (#43 follow-on:
+        // load the manifest from config / the cosigner cert).
+        policy_engine: None,
         fee_injector,
         storage,
         http_client,
