@@ -178,13 +178,35 @@ single-presig `PresignManager` today. Multi-share refresh hot-swap is also singl
 The §1 "two mandatory sides" signing topology is now real on mainnet. The remaining
 big builds (each its own focused session), in dependency order:
 
-1. **#43 — §4 policy engine + approval binding + WebAuthn (STRONG NEXT).** The
+1. **#43 — §4 policy engine + approval flow + WebAuthn (IN PROGRESS).** The
    external cosigner can now co-sign a `t`-of-`n`, but it co-signs *anything*.
    "Two mandatory sides" only has teeth when the external side **enforces policy**
-   before issuing its partial. Port rust-mpc's policy crate → `mpc-policy-shared`;
-   wire `RequireApproval → approve() → sign`; bind the approved render
-   (`approval.rs` is byte-locked, conformance_09 green) to the partial; mainnet
-   gate. This is what turns 4-of-6 from "math" into a product guarantee.
+   before issuing its partial. Progress (2026-05-24):
+   - ✅ **investigate gate** — `docs/AUDIT-43-policy-engine.md` (port decision:
+     bsv-rs only, build-to-spec-CBOR, engine in `bsv-mpc-core`, NOT rust-mpc's
+     `bsv-sdk`/JSON; two flagged spec-reconciliation items).
+   - ✅ **policy engine** (PR #47) — `bsv-mpc-core/src/policy.rs`: PolicyManifest
+     CBOR + `compute_policy_id` + §09.7 matcher + 3-hook eval (presigning ACTUALLY
+     gates) + sliding-rate + dry-run. 28 lib + 7 `conformance_09b` tests.
+   - ✅ **approval core** (PR #48) — `approval.rs`: BRC-77 `sign_approval`/
+     `verify_approval` (79-byte preimage `request_view_hash ‖ "mpc-approval-v1"
+     (15B) ‖ session_id`) + `ApprovalCollector` quorum SM (k-Allow/k-Deny/
+     deadline, dedup, eligibility). 14 lib tests.
+   - ⏳ **increment 2b (remaining — a #38-relay-sized effort, fresh session):**
+     (a) RELAY WIRING — emit the approval-request envelope to each `eligible`
+     approver over MessageBox (`bsv-mpc-messagebox` + `envelope.rs` BRC-78/BRC-31,
+     the SAME substrate as the device-holds sign), collect responses into
+     `ApprovalCollector`. (b) PROXY INTEGRATION — run `check_signing` before the
+     device-holds relay sign; on `RequireApproval` compute `request_view_hash`,
+     collect to k-Allow, THEN sign; on Deny/Expired refuse. (c) SDK
+     `mpc.approve()` (ADR-0035) + requester status surface. (d) WebAuthn
+     `clientDataJSON.challenge == request_view_hash` verifier (§08.11; full passkey
+     with #41 shells). (e) **MAINNET GATE** — real-sats spend that hit
+     `RequireApproval`, collected an Allow over the relay, then signed (device-
+     holds path) + WoC-confirmed.
+   - **MPC-Spec issue to open:** lock the `policy_id` field-set + nested-key
+     convention + the §09-policy CBOR vector before §09.15 cross-impl CI.
+   This is what turns 4-of-6 from "math" into a product guarantee.
 2. **#40 — §3 lost-phone recovery ceremony.** Keystone proven (#35 reshare,
    mainnet `5137b913…`). Build: new device → reshare the `t−1` device shares onto
    it → same joint address. Plus zeroize (#44).
