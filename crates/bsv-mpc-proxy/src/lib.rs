@@ -64,6 +64,7 @@ pub mod config;
 pub mod error;
 pub mod fee_injector;
 pub mod presign_manager;
+pub mod relay_approval;
 pub mod relay_presign;
 pub mod relay_refresh;
 pub mod relay_reshare;

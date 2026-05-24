@@ -2567,6 +2567,18 @@ impl MpcBridge {
         &self.relay_url
     }
 
+    /// The proxy's stable BRC-31 / relay identity private key (§07.4). The same
+    /// key signs BRC-31 auth, the §05 relay-sign envelopes, AND — for #43 — the
+    /// approval-request envelopes the coordinator emits over the relay. Cloned
+    /// out for [`crate::relay_approval::collect_approval_over_relay`].
+    pub fn relay_identity_priv(&self) -> bsv_mpc_core::error::Result<PrivateKey> {
+        let auth = self
+            .auth
+            .lock()
+            .map_err(|_| MpcError::Protocol("auth mutex poisoned".into()))?;
+        Ok(auth.auth_key().clone())
+    }
+
     /// Create a bridge with a known joint key for testing.
     /// No KSS connection is established — only `joint_public_key()` and local
     /// derivation methods are usable. Partial ECDH (requiring KSS) will fail.

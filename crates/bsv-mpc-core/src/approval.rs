@@ -383,6 +383,59 @@ impl ApprovalCollector {
     }
 }
 
+/// **WebAuthn binding verification (§08.11, issue #43).** A WebAuthn-bound
+/// approver MUST bind the passkey assertion to the rendered transaction view:
+/// the `clientDataJSON.challenge` MUST equal the `request_view_hash`, AND the
+/// assertion MUST have been made with `userVerification=required` (the UV flag in
+/// `authenticatorData`). This closes the gap where a passkey gesture is harvested
+/// for a DIFFERENT transaction than the one rendered.
+///
+/// This verifies the BINDING (challenge == view hash + UV flag set); the WebAuthn
+/// assertion *signature* itself is verified by the platform passkey stack at the
+/// client (full ceremony wiring lands with the #41 native shells). Given the raw
+/// `clientDataJSON` bytes and the 37+-byte `authenticator_data`:
+/// 1. parse `clientDataJSON`, require `type == "webauthn.get"`,
+/// 2. base64url-decode (no padding) its `challenge` and require it to equal
+///    `request_view_hash` (32 bytes),
+/// 3. require the UV bit (0x04) set in `authenticator_data[32]` (flags).
+pub fn verify_webauthn_approval(
+    client_data_json: &[u8],
+    authenticator_data: &[u8],
+    request_view_hash: &[u8; 32],
+) -> Result<()> {
+    use base64::Engine;
+
+    let cd: serde_json::Value = serde_json::from_slice(client_data_json)
+        .map_err(|e| MpcError::Protocol(format!("clientDataJSON parse: {e}")))?;
+    if cd.get("type").and_then(|t| t.as_str()) != Some("webauthn.get") {
+        return Err(MpcError::Protocol(
+            "WebAuthn clientDataJSON.type must be \"webauthn.get\"".into(),
+        ));
+    }
+    let challenge_b64 = cd
+        .get("challenge")
+        .and_then(|c| c.as_str())
+        .ok_or_else(|| MpcError::Protocol("WebAuthn clientDataJSON.challenge missing".into()))?;
+    let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(challenge_b64)
+        .map_err(|e| MpcError::Protocol(format!("WebAuthn challenge base64url: {e}")))?;
+    if challenge != request_view_hash {
+        return Err(MpcError::Protocol(
+            "WebAuthn challenge does not equal request_view_hash (§08.11 binding)".into(),
+        ));
+    }
+    // authenticatorData: [0..32]=rpIdHash, [32]=flags. UV is bit 2 (0x04).
+    let flags = authenticator_data
+        .get(32)
+        .ok_or_else(|| MpcError::Protocol("authenticatorData too short (no flags byte)".into()))?;
+    if flags & 0x04 == 0 {
+        return Err(MpcError::Protocol(
+            "WebAuthn userVerification not performed (UV flag clear; §08.11 requires it)".into(),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -597,5 +650,57 @@ mod tests {
         c2.record_vote(&sign_approval(&vh, &sid, &a).unwrap(), ApprovalDecision::Allow, 0)
             .unwrap();
         assert_eq!(c2.status(6_000), ApprovalStatus::Expired);
+    }
+
+    // ── WebAuthn binding (§08.11) ────────────────────────────────────────────
+
+    use base64::Engine;
+
+    /// Build a `clientDataJSON` for `webauthn.get` with `challenge` = base64url of
+    /// `view_hash`, and `authenticator_data` with the UV flag set/clear.
+    fn webauthn_inputs(view_hash: &[u8; 32], uv: bool) -> (Vec<u8>, Vec<u8>) {
+        let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(view_hash);
+        let cdj = format!(
+            r#"{{"type":"webauthn.get","challenge":"{challenge}","origin":"https://wallet.example"}}"#
+        );
+        let mut auth_data = vec![0u8; 37];
+        auth_data[32] = if uv { 0x05 } else { 0x01 }; // UP always; UV (0x04) iff uv
+        (cdj.into_bytes(), auth_data)
+    }
+
+    #[test]
+    fn webauthn_binding_accepts_matching_challenge_with_uv() {
+        let vh = [0x42u8; 32];
+        let (cdj, ad) = webauthn_inputs(&vh, true);
+        assert!(verify_webauthn_approval(&cdj, &ad, &vh).is_ok());
+    }
+
+    #[test]
+    fn webauthn_binding_rejects_wrong_challenge() {
+        let vh = [0x42u8; 32];
+        let (cdj, ad) = webauthn_inputs(&[0x99u8; 32], true); // challenge ≠ vh
+        let err = verify_webauthn_approval(&cdj, &ad, &vh).unwrap_err();
+        assert!(format!("{err}").contains("request_view_hash"));
+    }
+
+    #[test]
+    fn webauthn_binding_rejects_missing_user_verification() {
+        let vh = [0x42u8; 32];
+        let (cdj, ad) = webauthn_inputs(&vh, false); // UV flag clear
+        let err = verify_webauthn_approval(&cdj, &ad, &vh).unwrap_err();
+        assert!(format!("{err}").contains("userVerification"));
+    }
+
+    #[test]
+    fn webauthn_binding_rejects_wrong_type() {
+        let vh = [0x42u8; 32];
+        let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(vh);
+        let cdj = format!(r#"{{"type":"webauthn.create","challenge":"{challenge}"}}"#).into_bytes();
+        let ad = {
+            let mut a = vec![0u8; 37];
+            a[32] = 0x05;
+            a
+        };
+        assert!(verify_webauthn_approval(&cdj, &ad, &vh).is_err());
     }
 }
