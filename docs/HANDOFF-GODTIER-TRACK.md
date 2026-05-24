@@ -175,13 +175,18 @@ single-presig `PresignManager` today. Multi-share refresh hot-swap is also singl
 
 ## 8. What's god-tier next
 
-The §1 "two mandatory sides" signing topology is now real on mainnet. The remaining
-big builds (each its own focused session), in dependency order:
+The §1 "two mandatory sides" signing topology AND the §4 policy/approval gate are
+now real on mainnet (#38, #43). **The strong next is #40 (lost-phone recovery
+ceremony)** — then #41 (native client) and #44 (zeroize). In dependency order:
 
-1. **#43 — §4 policy engine + approval flow + WebAuthn (IN PROGRESS).** The
-   external cosigner can now co-sign a `t`-of-`n`, but it co-signs *anything*.
-   "Two mandatory sides" only has teeth when the external side **enforces policy**
-   before issuing its partial. Progress (2026-05-24):
+1. **#43 — §4 policy engine + approval flow + WebAuthn ✅ DONE + mainnet-proven
+   (2026-05-24).** "Two mandatory sides" now has teeth: the external side
+   **enforces policy before it signs**. Real-sats `createAction` → policy
+   `RequireApproval{k:1}` → approval-request emitted over the LIVE relay →
+   approver signed `BRC-77(request_view_hash ‖ "mpc-approval-v1" ‖ session_id)` +
+   replied → proxy collected the Allow → THEN signed over the relay with the
+   deployed cosigner → broadcast. Spend TXID `7ada3f9d…` (joint `0371bc3f…`),
+   WoC-confirmed; the spend could not proceed without the approval. Shipped:
    - ✅ **investigate gate** — `docs/AUDIT-43-policy-engine.md` (port decision:
      bsv-rs only, build-to-spec-CBOR, engine in `bsv-mpc-core`, NOT rust-mpc's
      `bsv-sdk`/JSON; two flagged spec-reconciliation items).
@@ -191,22 +196,18 @@ big builds (each its own focused session), in dependency order:
    - ✅ **approval core** (PR #48) — `approval.rs`: BRC-77 `sign_approval`/
      `verify_approval` (79-byte preimage `request_view_hash ‖ "mpc-approval-v1"
      (15B) ‖ session_id`) + `ApprovalCollector` quorum SM (k-Allow/k-Deny/
-     deadline, dedup, eligibility). 14 lib tests.
-   - ⏳ **increment 2b (remaining — a #38-relay-sized effort, fresh session):**
-     (a) RELAY WIRING — emit the approval-request envelope to each `eligible`
-     approver over MessageBox (`bsv-mpc-messagebox` + `envelope.rs` BRC-78/BRC-31,
-     the SAME substrate as the device-holds sign), collect responses into
-     `ApprovalCollector`. (b) PROXY INTEGRATION — run `check_signing` before the
-     device-holds relay sign; on `RequireApproval` compute `request_view_hash`,
-     collect to k-Allow, THEN sign; on Deny/Expired refuse. (c) SDK
-     `mpc.approve()` (ADR-0035) + requester status surface. (d) WebAuthn
-     `clientDataJSON.challenge == request_view_hash` verifier (§08.11; full passkey
-     with #41 shells). (e) **MAINNET GATE** — real-sats spend that hit
-     `RequireApproval`, collected an Allow over the relay, then signed (device-
-     holds path) + WoC-confirmed.
-   - **MPC-Spec issue to open:** lock the `policy_id` field-set + nested-key
+     deadline, dedup, eligibility).
+   - ✅ **approval flow + proxy gate + WebAuthn** (PR #50) — `relay_approval.rs`
+     (`collect_approval_over_relay` + `serve_one_approval` = the `mpc.approve()`
+     core, on the BOX_APPROVAL MessageBox box); `AppState.policy_engine` +
+     `enforce_policy_and_approval` wired into `create_action_impl` BEFORE signing
+     material is consumed; `verify_webauthn_approval` (§08.11). + the mainnet gate.
+   - **MPC-Spec#43 OPENED** — lock the `policy_id` field-set + nested-key
      convention + the §09-policy CBOR vector before §09.15 cross-impl CI.
-   This is what turns 4-of-6 from "math" into a product guarantee.
+   - **Follow-on (not blockers):** production manifest loading from the cosigner
+     cert in `server::run` (env path; the library `ProxyBuilder::with_policy_engine`
+     is the wired path today).
+   This turned 4-of-6 from "math" into a product guarantee.
 2. **#40 — §3 lost-phone recovery ceremony.** Keystone proven (#35 reshare,
    mainnet `5137b913…`). Build: new device → reshare the `t−1` device shares onto
    it → same joint address. Plus zeroize (#44).
