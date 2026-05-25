@@ -393,6 +393,19 @@ async fn recovery_spend_deployed_real_mainnet() {
         .expect("the RECOVERED device holds new party 2");
     eprintln!("✔ recovery reshare committed — fresh device P2″ provisioned, address UNCHANGED");
 
+    // Same §06.17 single-identity settle as after reshare #1 (above): the
+    // container commits reshare #2 + shuts down its `mpc-refresh` PSS relay
+    // listener in a completion task that runs AFTER its `/reshare-relay/init` HTTP
+    // response. The container has ONE relay identity, so the presign cosigner's
+    // `mpc_{sid}` subscription must NOT overlap reshare #2's lingering listener —
+    // otherwise the two-subscription split race drops the presign round messages
+    // and the coordinator times out "awaiting PresigBundle assembly" (observed
+    // deterministically: the recovery presign failed here while the standalone
+    // sec0617 presign — no prior ceremony on the identity — passed). Settle so the
+    // container fully releases reshare #2 before the presign arms.
+    eprintln!("  settling 60s so the container commits + releases reshare #2 (single-identity §06.17)");
+    tokio::time::sleep(Duration::from_secs(60)).await;
+
     // ── 6. Spend {0,2} over the relay: recovered device P2″ + surviving container ─
     eprintln!("(6) presign + sign {{0,2}} over the relay — recovered device + container cosign");
     let recovered_session = SessionId::from_str_hash("recovery-p2dprime");

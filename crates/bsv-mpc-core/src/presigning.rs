@@ -273,6 +273,36 @@ impl PresigningManager {
                 .map_err(|e| MpcError::Protocol(format!("failed to deserialize key share: {e}")))?;
         let participants_owned = self.participants.clone();
 
+        // Presign-topology diagnostic (`presign_index_diverge` target). Surfaces
+        // the cggmp24 KeyShare's INTERNAL party index `i`, its VSS eval-point set
+        // `I`, the `public_shares` length, the computed signing position, and the
+        // participants subset `S` — exactly the values `cggmp24::signing(eid, i,
+        // S, key_share)` reconciles via `utils::subset(S, …)`. A non-contiguous
+        // subset (e.g. {0,2}) is correct iff `I`/`public_shares` are full-length-n
+        // and absolutely indexed; a reshared share is verified to carry the SAME
+        // topology as a fresh-DKG share here (see
+        // `presign_noncontiguous_02_reshared_realrelay_e2e`). Emitted at trace so
+        // it is silent by default; enable with `RUST_LOG=presign_index_diverge=trace`.
+        if tracing::enabled!(target: "presign_index_diverge", tracing::Level::TRACE) {
+            let dirty = &key_share.core;
+            let vss = dirty.key_info.vss_setup.as_ref();
+            let vss_i_hex: Vec<String> = vss
+                .map(|v| v.I.iter().map(|p| hex::encode(p.as_ref().to_be_bytes())).collect())
+                .unwrap_or_default();
+            tracing::trace!(
+                target: "presign_index_diverge",
+                share_index = self.share.share_index.0,
+                keyshare_internal_i = dirty.i,
+                signing_index = my_signing_index,
+                participants = ?participants_owned,
+                vss_min_signers = vss.map(|v| v.min_signers).unwrap_or(0),
+                vss_i_len = vss.map(|v| v.I.len()).unwrap_or(0),
+                public_shares_len = dirty.key_info.public_shares.len(),
+                vss_I = ?vss_i_hex,
+                "presign init_generate: cggmp24 KeyShare index topology"
+            );
+        }
+
         let sm: PresigningSm = Box::new(round_based::state_machine::wrap_protocol(
             move |party| async move {
                 let eid = ExecutionId::new(&eid_bytes);

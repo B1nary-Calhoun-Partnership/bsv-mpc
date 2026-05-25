@@ -33,12 +33,16 @@ use std::time::Instant;
 
 use bsv::auth::transports::socketio::codec::{EngineIoPacket, SocketIoPacket};
 use bsv::auth::{SocketIoFrameSource, SocketIoSink};
+use std::net::{IpAddr, SocketAddr};
+use std::time::Duration;
+
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
+use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_tungstenite::{
-    connect_async, tungstenite::protocol::Message, MaybeTlsStream, WebSocketStream,
+    client_async_tls, tungstenite::protocol::Message, MaybeTlsStream, WebSocketStream,
 };
 
 /// Parsed Engine.IO `Open` handshake payload, returned by the server on
@@ -113,6 +117,66 @@ fn ws_upgrade_url(relay_url: &str, sid: &str) -> String {
     format!("{ws_base}/socket.io/?EIO=4&transport=websocket&sid={sid}")
 }
 
+/// Per-address TCP connect timeout (happy-eyeballs-lite). Short so a dead address
+/// is abandoned quickly and the next is tried.
+const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// Extract `(host, port)` from a `ws://`/`wss://` URL (default 80/443).
+fn ws_host_port(ws_url: &str) -> std::result::Result<(String, u16), String> {
+    let (default_port, after) = if let Some(r) = ws_url.strip_prefix("wss://") {
+        (443u16, r)
+    } else if let Some(r) = ws_url.strip_prefix("ws://") {
+        (80u16, r)
+    } else {
+        return Err(format!("not a ws(s) url: {ws_url}"));
+    };
+    let authority = after.split('/').next().unwrap_or(after);
+    match authority.rsplit_once(':') {
+        Some((h, p)) => {
+            let port = p
+                .parse::<u16>()
+                .map_err(|_| format!("bad port in {ws_url}"))?;
+            Ok((h.to_string(), port))
+        }
+        None => Ok((authority.to_string(), default_port)),
+    }
+}
+
+/// Resolve `host:port` and connect TCP, **preferring IPv4** and bounding each
+/// attempt by [`TCP_CONNECT_TIMEOUT`].
+///
+/// `tokio_tungstenite::connect_async` uses tokio's plain sequential connect with
+/// NO per-address timeout, so if the host resolves to an IPv6 address first and
+/// that route black-holes (observed: a CF container's egress completes plain HTTPS
+/// — reqwest/hyper does happy-eyeballs + falls back to IPv4 — but the WS upgrade's
+/// IPv6 connect hangs forever), the whole reshare stalls. We resolve ourselves,
+/// try IPv4 addresses first (then IPv6), each bounded, and hand the live stream to
+/// `client_async_tls`. This keeps the fast WebSocket transport working on egress
+/// paths where only IPv4 is viable.
+async fn connect_tcp_prefer_ipv4(host: &str, port: u16) -> std::result::Result<TcpStream, String> {
+    let mut addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|e| format!("dns lookup {host}:{port}: {e}"))?
+        .collect();
+    // IPv4 first, then IPv6.
+    addrs.sort_by_key(|a| match a.ip() {
+        IpAddr::V4(_) => 0u8,
+        IpAddr::V6(_) => 1u8,
+    });
+    if addrs.is_empty() {
+        return Err(format!("no addresses resolved for {host}:{port}"));
+    }
+    let mut last_err = String::from("no connect attempted");
+    for addr in addrs {
+        match tokio::time::timeout(TCP_CONNECT_TIMEOUT, TcpStream::connect(addr)).await {
+            Ok(Ok(s)) => return Ok(s),
+            Ok(Err(e)) => last_err = format!("connect {addr}: {e}"),
+            Err(_) => last_err = format!("connect {addr} timed out after {TCP_CONNECT_TIMEOUT:?}"),
+        }
+    }
+    Err(format!("all addresses failed for {host}:{port}: {last_err}"))
+}
+
 type NativeWsStream = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
 /// Send-only half of a [`WsHandle`]. Cheap to clone (holds an
@@ -173,9 +237,14 @@ impl WsHandle {
     pub async fn open_and_upgrade(relay_url: &str, sid: &str) -> std::result::Result<Self, String> {
         let url = ws_upgrade_url(relay_url, sid);
 
-        let (mut ws_stream, _resp) = connect_async(&url)
+        // Connect the TCP ourselves (IPv4-preferred, bounded) rather than letting
+        // `connect_async` do a plain sequential connect that can hang on IPv6, then
+        // run TLS + the WS handshake over that stream.
+        let (host, port) = ws_host_port(&url)?;
+        let tcp = connect_tcp_prefer_ipv4(&host, port).await?;
+        let (mut ws_stream, _resp) = client_async_tls(url.as_str(), tcp)
             .await
-            .map_err(|e| format!("connect_async({url}): {e}"))?;
+            .map_err(|e| format!("client_async_tls({url}): {e}"))?;
 
         // ── Probe dance on the un-split stream ──
         let t_probe = Instant::now();

@@ -108,6 +108,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/presign-relay/init",
             post(relay_handlers::handle_presign_relay_init),
         )
+        .route(
+            "/presign-relay/debug",
+            get(relay_handlers::handle_presign_relay_debug),
+        )
         .route("/sign-relay", post(relay_handlers::handle_sign_relay))
         // §18.2 container key-refresh over the relay (#10, CONTAINER target):
         // arm the container as a refresh peer + rotate-on-commit (purges presigs
@@ -131,6 +135,17 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/reshare-relay/init",
             post(reshare_relay_handlers::handle_reshare_relay_init),
+        )
+        // #58 diagnostic: in-memory checkpoint trail of the LAST reshare arm, so a
+        // hang inside the (synchronous) init path is observable over HTTP even when
+        // container stdout is not surfaced by `wrangler tail`.
+        .route(
+            "/reshare-relay/debug",
+            get(reshare_relay_handlers::handle_reshare_relay_debug),
+        )
+        .route(
+            "/reshare-relay/egress-test",
+            get(reshare_relay_handlers::handle_reshare_relay_egress_test),
         )
         // Read-only
         .route("/health", get(handlers::handle_health))

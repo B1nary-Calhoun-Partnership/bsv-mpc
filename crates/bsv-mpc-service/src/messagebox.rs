@@ -43,6 +43,7 @@
 //! - On shutdown, the inner `RoundMessageSubscription::shutdown` runs
 //!   the §06.4 graceful `leaveRoom` path before closing the WS.
 
+use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -190,6 +191,15 @@ async fn run_loop<F>(
 ) where
     F: Fn(DecodedRoundMessage) -> HandlerFuture + Send + Sync + 'static,
 {
+    // §06.17 reliability: the relay's `/listMessages` is non-destructive and we
+    // deliberately re-drain backfill (initial subscribe + every reconnect, and the
+    // post-join window drain in `subscribe`), so the SAME message can arrive more
+    // than once (backfill ∩ live-push ∩ re-drain). Feeding a duplicate round
+    // message to a cggmp24 SM would error and abort the ceremony, so we dedup by
+    // the relay's unique `message_id` here — at-least-once transport + dedup =
+    // exactly-once delivery to the handler. Scope is this listener (one ceremony
+    // phase), so the set stays small and is dropped when the phase ends.
+    let mut seen_message_ids: HashSet<String> = HashSet::new();
     loop {
         tokio::select! {
             biased;
@@ -209,6 +219,18 @@ async fn run_loop<F>(
                         continue;
                     }
                 };
+                // Drop duplicates (re-drained / re-pushed) before they reach the SM.
+                if !inbound.message_id.is_empty()
+                    && !seen_message_ids.insert(inbound.message_id.clone())
+                {
+                    debug!(
+                        "skipping duplicate inbound message_id={} (session={} round={})",
+                        inbound.message_id,
+                        hex::encode(inbound.round_msg.session_id.as_bytes()),
+                        inbound.round_msg.round,
+                    );
+                    continue;
+                }
                 let inbound_summary = format!(
                     "session={} round={} from_party={} via={:?} message_box={}",
                     hex::encode(inbound.round_msg.session_id.as_bytes()),

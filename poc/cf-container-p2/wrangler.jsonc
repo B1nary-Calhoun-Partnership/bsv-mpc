@@ -16,7 +16,14 @@
       // CPU-bound. "standard-1" is only 1/2 vCPU, on which a single DKG round can
       // exceed the proxy's per-request timeout (observed: >600s, deployed real-sats
       // blocked). "standard-4" = 4 vCPU (8x) brings a round well under the budget.
-      "instance_type": "standard-4"
+      "instance_type": "standard-4",
+      // #58: with max_instances=1 a rolling deploy waits a grace period before
+      // replacing the ACTIVE instance — and steady debug/test traffic kept the old
+      // instance "active", so a new image never took over (the in-memory checkpoint
+      // trail survived a redeploy → same process → stale code). A 0s grace lets
+      // `--containers-rollout=immediate` SIGTERM the old instance at once so the new
+      // image actually serves.
+      "rollout_active_grace_period": 0
     }
   ],
   // Surface the container's stdout in `wrangler tail` / Workers Logs (off by
