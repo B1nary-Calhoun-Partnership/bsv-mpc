@@ -66,6 +66,7 @@ pub mod presig_encryption;
 pub mod presigning;
 pub mod proof;
 pub mod recovery;
+pub mod recovery_health;
 pub mod refresh;
 pub mod refresh_coordinator;
 pub mod reshar_coordinator;
@@ -77,6 +78,10 @@ pub mod types;
 pub use error::{MpcError, Result};
 pub use refresh::RefreshResult;
 pub use refresh_coordinator::{RefreshCommit, RefreshCoordinator, RefreshRoundResult};
+pub use recovery_health::{
+    authorize_recovery, min_survivors_to_recover, survivor_quorum_ok, RecoveryCooldown,
+    RecoveryGuardError, RecoveryHealth, RecoveryStatus, TrusteesReachable,
+};
 pub use reshar_coordinator::{
     combine_reshared_with_aux, ContributorInputs, ResharCommit, ResharConfig, ResharCoordinator,
     ResharRoundResult,

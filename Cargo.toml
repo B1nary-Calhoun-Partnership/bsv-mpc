@@ -117,6 +117,10 @@ hmac = "0.12"
 rand = "0.8"
 aes-gcm = "0.10"
 base64 = "0.22"
+# #44: cryptographically wipe secret share material before it is overwritten /
+# dropped (in-memory zeroization on rotate; the at-rest equivalent of the worker's
+# overwrite-then-delete in do_storage). `derive` brings the ZeroizeOnDrop macro.
+zeroize = { version = "1", features = ["derive"] }
 
 # Async utilities
 futures = "0.3"
