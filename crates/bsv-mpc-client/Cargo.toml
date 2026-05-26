@@ -64,6 +64,8 @@ round-based = { workspace = true, features = ["sim"] }
 futures.workspace = true
 pin-project.workspace = true
 bsv = { workspace = true }
+# Mainnet capstone E2E (gated E2E_MAINNET=1): fund via wallet:3321, broadcast via ARC, confirm on WoC.
+reqwest = { version = "0.12", features = ["json"] }
 
 # wasm-bindgen skin (web client). wasm32-only — the native build never sees it,
 # so no feature flag is needed; the `wasm` module is `cfg(target_arch="wasm32")`.

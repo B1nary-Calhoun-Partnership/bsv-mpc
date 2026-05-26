@@ -406,6 +406,7 @@ dependencies = [
  "hex",
  "pin-project",
  "rand 0.8.5",
+ "reqwest",
  "round-based",
  "serde",
  "serde_json",
