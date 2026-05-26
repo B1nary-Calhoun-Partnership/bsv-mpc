@@ -587,8 +587,8 @@ impl PresignHandler {
         // position-space, so buffered messages MUST be replayed via `drive_protocol`
         // (not `dispatch_one`) to avoid a double translation.
         let pak = &self.inner.parties_at_keygen;
-        match pak.iter().position(|&p| p == inbound.round_msg.from.0) {
-            Some(pos) => inbound.round_msg.from = ShareIndex(pos as u16),
+        match crate::index::abs_to_pos(pak, inbound.round_msg.from.0) {
+            Some(pos) => inbound.round_msg.from = ShareIndex(pos),
             None => {
                 warn!(
                     "PresignHandler: inbound from absolute index {} not in subset {:?}; dropping",
@@ -598,8 +598,8 @@ impl PresignHandler {
             }
         }
         if let Some(ShareIndex(abs)) = inbound.round_msg.to {
-            if let Some(pos) = pak.iter().position(|&p| p == abs) {
-                inbound.round_msg.to = Some(ShareIndex(pos as u16));
+            if let Some(pos) = crate::index::abs_to_pos(pak, abs) {
+                inbound.round_msg.to = Some(ShareIndex(pos));
             }
         }
 
@@ -995,7 +995,8 @@ fn wrap_protocol(
 ) -> Vec<OutgoingRoundMessage> {
     let prefix = presign_eid_prefix(session_id, joint_pubkey);
     let box_name = presign_protocol_box(&session_id.hex());
-    let pos_to_abs = |pos: u16| -> Option<u16> { parties_at_keygen.get(pos as usize).copied() };
+    // §05.4.6 / ADR-0051 SM-position → absolute keygen index (shared helper).
+    let pos_to_abs = |pos: u16| -> Option<u16> { crate::index::pos_to_abs(parties_at_keygen, pos) };
 
     let mut out = Vec::new();
     for rm in round_msgs {

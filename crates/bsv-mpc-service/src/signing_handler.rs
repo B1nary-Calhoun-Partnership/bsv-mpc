@@ -39,7 +39,7 @@ use std::sync::{Arc, Mutex};
 use bsv_mpc_core::canonical::{canonical_execution_id, ExecutionParams, PhaseTag};
 use bsv_mpc_core::envelope::WrapParams;
 use bsv_mpc_core::signing::{SigningCoordinator, SigningRoundResult};
-use bsv_mpc_core::types::{RoundMessage, SessionId, SigningResult, ThresholdConfig};
+use bsv_mpc_core::types::{RoundMessage, SessionId, ShareIndex, SigningResult, ThresholdConfig};
 use bsv_mpc_messagebox::DecodedRoundMessage;
 use tokio::sync::oneshot;
 use tracing::{debug, info, warn};
@@ -179,6 +179,7 @@ impl SigningHandler {
             joint_pubkey,
             peer_pub_hex,
             peer_party_index,
+            &self.inner.participants,
         );
         Ok((completion_rx, outgoing))
     }
@@ -207,9 +208,31 @@ impl SigningHandler {
 
 async fn dispatch_one(
     inner: Arc<SigningHandlerInner>,
-    inbound: DecodedRoundMessage,
+    mut inbound: DecodedRoundMessage,
 ) -> anyhow::Result<Vec<OutgoingRoundMessage>> {
     let session_id = inbound.round_msg.session_id;
+
+    // §05.4.6 / ADR-0051: the wire carries ABSOLUTE keygen indices; the cggmp24
+    // SM works in subset-POSITION space. Translate absolute → position before
+    // feeding the SM (inverse of `wrap_outgoing`'s send-side translation; a
+    // no-op for a contiguous subset). Done BEFORE checking out the coordinator
+    // slot so an out-of-subset message is dropped without consuming the ceremony.
+    let pak = &inner.participants;
+    match crate::index::abs_to_pos(pak, inbound.round_msg.from.0) {
+        Some(pos) => inbound.round_msg.from = ShareIndex(pos),
+        None => {
+            warn!(
+                "SigningHandler: inbound from absolute index {} not in subset {:?}; dropping",
+                inbound.round_msg.from.0, pak
+            );
+            return Ok(vec![]);
+        }
+    }
+    if let Some(ShareIndex(abs)) = inbound.round_msg.to {
+        if let Some(pos) = crate::index::abs_to_pos(pak, abs) {
+            inbound.round_msg.to = Some(ShareIndex(pos));
+        }
+    }
 
     let slot = {
         let mut coords = inner.coordinators.lock().unwrap_or_else(|p| p.into_inner());
@@ -265,6 +288,7 @@ async fn dispatch_one(
                 joint_pubkey,
                 peer_pub_hex,
                 peer_party_index,
+                &inner.participants,
             ))
         }
         SigningRoundResult::Complete(sig_result) => {
@@ -292,12 +316,22 @@ async fn dispatch_one(
 /// Wrap signing-round outbound messages. Per §05.4.3 the signing phase
 /// uses the REAL joint pubkey (unlike DKG's all-zero carve-out).
 /// Canonical execution_id is computed with `PhaseTag::Sign`.
+///
+/// **Index translation (§05.4.6 / ADR-0051).** The cggmp24 SM addresses peers
+/// by their 0-based POSITION in the signing subset; the wire `from_party`/
+/// `to_party` and `peer_party_index` are ABSOLUTE keygen indices (entries of
+/// `participants`). We translate position → absolute here before emitting, so a
+/// NON-CONTIGUOUS subset (e.g. `{0,2}`: party 2 is SM-position 1) routes
+/// correctly. The receive side ([`dispatch_one`]) performs the inverse
+/// absolute → position translation. For a contiguous subset (`{0,1}`) the
+/// translation is the identity. Mirrors `presign_handler.rs::wrap_protocol`.
 fn wrap_outgoing(
     round_msgs: &[RoundMessage],
     session_id: SessionId,
     joint_pubkey: [u8; 33],
     peer_pub_hex: String,
     peer_party_index: u16,
+    participants: &[u16],
 ) -> Vec<OutgoingRoundMessage> {
     let eid = canonical_execution_id(&ExecutionParams::new_v1(
         PhaseTag::Sign,
@@ -307,12 +341,38 @@ fn wrap_outgoing(
     let mut prefix = [0u8; 8];
     prefix.copy_from_slice(&eid[..8]);
 
-    round_msgs
-        .iter()
-        .map(|rm| OutgoingRoundMessage {
+    let mut out = Vec::new();
+    for rm in round_msgs {
+        // `from` is THIS party's SM position → its absolute keygen index.
+        let Some(from_abs) = crate::index::pos_to_abs(participants, rm.from.0) else {
+            warn!(
+                "SigningHandler: outgoing from SM-position {} outside subset {:?}; dropping",
+                rm.from.0, participants
+            );
+            continue;
+        };
+        // Decide whether this message is for our single peer, and resolve the
+        // absolute `to` for the wire.
+        let (emit, to_abs): (bool, Option<u16>) = match rm.to {
+            // Broadcast → always goes to the peer; wire `to` stays None.
+            None => (true, None),
+            // p2p → emit only when addressed to THIS peer (absolute index).
+            Some(ShareIndex(pos)) => match crate::index::pos_to_abs(participants, pos) {
+                Some(abs) => (abs == peer_party_index, Some(abs)),
+                None => (false, None),
+            },
+        };
+        if !emit {
+            continue;
+        }
+        // Emit with ABSOLUTE from/to on the wire (§05.4.6).
+        let mut wire_msg = rm.clone();
+        wire_msg.from = ShareIndex(from_abs);
+        wire_msg.to = to_abs.map(ShareIndex);
+        out.push(OutgoingRoundMessage {
             recipient_pub_hex: peer_pub_hex.clone(),
             message_box: bsv_mpc_messagebox::types::BOX_SIGN.to_string(),
-            round_msg: rm.clone(),
+            round_msg: wire_msg,
             params: WrapParams {
                 to_party: peer_party_index,
                 joint_pubkey,
@@ -321,8 +381,9 @@ fn wrap_outgoing(
                 correlation_id: None,
                 traceparent: None,
             },
-        })
-        .collect()
+        });
+    }
+    out
 }
 
 #[cfg(test)]
@@ -376,6 +437,7 @@ mod tests {
             jp,
             "02deadbeef".into(),
             1,
+            &[0, 1],
         );
         assert_eq!(out[0].params.phase, "sign", "phase MUST be 'sign'");
         assert_eq!(
@@ -393,6 +455,7 @@ mod tests {
             jp,
             "02deadbeef".into(),
             1,
+            &[0, 1],
         );
         assert_eq!(
             out[0].params.execution_id_prefix,
@@ -407,11 +470,82 @@ mod tests {
             jp_other,
             "02deadbeef".into(),
             1,
+            &[0, 1],
         );
         assert_ne!(
             out[0].params.execution_id_prefix,
             out3[0].params.execution_id_prefix,
             "different joint_pubkey MUST produce different EID prefix (binds signing ceremony to key)"
         );
+    }
+
+    /// **#17 regression — latent same-class bug as the PR #59 presign fix.** A
+    /// NON-CONTIGUOUS subset must route p2p by ABSOLUTE keygen index, not the
+    /// cggmp24 SM position. In subset `[0,2]` party 2 is SM-position 1; a p2p
+    /// message the SM addresses to position 1 MUST reach the peer whose absolute
+    /// index is 2, and the emitted wire `to`/`from` MUST be absolute (§05.4.6 /
+    /// ADR-0051). Mirrors `presign_handler.rs`'s
+    /// `wrap_protocol_routes_noncontiguous_subset_by_absolute_index`.
+    #[test]
+    fn wrap_outgoing_routes_noncontiguous_subset_by_absolute_index() {
+        let sid = SessionId([0x99; 32]);
+        let mut jp = [0u8; 33];
+        jp[0] = 0x02;
+        // This party is absolute 0 = position 0; the peer is absolute 2 = position 1.
+        let participants = [0u16, 2u16];
+
+        // SM emits a p2p message from position 0 to position 1 (the "other signer").
+        let p2p = RoundMessage {
+            session_id: sid,
+            round: 1,
+            from: ShareIndex(0),
+            to: Some(ShareIndex(1)), // SM POSITION of party 2
+            payload: vec![9, 9, 9],
+        };
+        let out = wrap_outgoing(
+            std::slice::from_ref(&p2p),
+            sid,
+            jp,
+            "02cafe".into(),
+            2, // peer's ABSOLUTE keygen index
+            &participants,
+        );
+        assert_eq!(
+            out.len(),
+            1,
+            "p2p MUST route to the absolute-index-2 peer (not dropped)"
+        );
+        assert_eq!(out[0].recipient_pub_hex, "02cafe");
+        assert_eq!(
+            out[0].params.to_party, 2,
+            "envelope to_party = absolute index 2"
+        );
+        // Wire carries ABSOLUTE indices (§05.4.6): from 0→0, to position 1→absolute 2.
+        assert_eq!(out[0].round_msg.from, ShareIndex(0));
+        assert_eq!(out[0].round_msg.to, Some(ShareIndex(2)));
+
+        // And the inverse: a broadcast from position 1 (party 2) emits absolute from=2.
+        let bcast = RoundMessage {
+            session_id: sid,
+            round: 1,
+            from: ShareIndex(1), // SM position of party 2
+            to: None,
+            payload: vec![1],
+        };
+        let out2 = wrap_outgoing(
+            std::slice::from_ref(&bcast),
+            sid,
+            jp,
+            "02cafe".into(),
+            2,
+            &participants,
+        );
+        assert_eq!(out2.len(), 1, "broadcast always reaches the peer");
+        assert_eq!(
+            out2[0].round_msg.from,
+            ShareIndex(2),
+            "broadcast from = absolute index 2"
+        );
+        assert_eq!(out2[0].round_msg.to, None);
     }
 }

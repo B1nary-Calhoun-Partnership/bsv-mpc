@@ -7,6 +7,9 @@ pub mod auth;
 pub mod custody;
 pub mod dkg_handler;
 pub mod handlers;
+/// §05.4.6 / ADR-0051 SM-position ↔ absolute-keygen-index translation, shared
+/// by the presign + interactive-signing relay handlers (anti-drift).
+mod index;
 pub mod messagebox;
 pub mod presign_handler;
 pub mod provision;
