@@ -124,10 +124,17 @@ pub async fn coordinate_presign_over_relay(
         }
     };
 
-    // 4. Initiate the coordinator's own SM (init_generate) — registers the
-    //    ceremony slot — and ship round-1 to the cosigner. The cosigner's listener
-    //    isn't armed yet; the relay backfills its round-1 once the cosigner
-    //    subscribes (step 5), so the coordinator's round-1 is not lost.
+    // 4. Initiate the coordinator's own SM (init_generate) — this REGISTERS the
+    //    ceremony slot but does NOT ship round-1 yet. The cosigner isn't
+    //    subscribed at this point, so shipping now could only reach it via the
+    //    HTTP `/listMessages` backfill — which is unreliable from a CF container
+    //    (it deterministically stalls; that is exactly why the deployed presign
+    //    timed out "awaiting PresigBundle assembly"). We ship round-1 AFTER the
+    //    cosigner has joined (step 6) so it rides the BRC-103 WS live-push, never
+    //    the backfill — the §06.17 ordering invariant the reshare path already
+    //    follows. The coordinator's slot existing first also lets it accept the
+    //    cosigner's round-1 (shipped during arm) immediately; `PresignHandler`
+    //    additionally buffers any early/out-of-order inbound.
     let peers = vec![(cosigner_party, cosigner_pub_hex.clone())];
     let (rx, round1_out) = match handler.initiate(session_id, share, peers).await {
         Ok(v) => v,
@@ -136,24 +143,13 @@ pub async fn coordinate_presign_over_relay(
             return Err(MpcError::Protocol(format!("coord initiate: {e}")));
         }
     };
-    for out in &round1_out {
-        if let Err(e) = coord_client
-            .send_round_message(
-                &out.recipient_pub_hex,
-                &out.message_box,
-                &out.round_msg,
-                out.params.clone(),
-            )
-            .await
-        {
-            listener.shutdown().await;
-            return Err(MpcError::Protocol(format!("ship coord round-1: {e}")));
-        }
-    }
 
-    // 5. Arm the cosigner — it subscribes (backfilling the coordinator's round-1),
-    //    runs init_generate, and ships its OWN round-1 to the coordinator (whose
-    //    slot now exists). Verify its relay identity matches what we fetched.
+    // 5. Arm the cosigner — it subscribes (joining its protocol box), runs
+    //    init_generate, and ships its OWN round-1 to the coordinator (whose slot
+    //    now exists and which subscribed in step 2, so that round-1 arrives via
+    //    live-push). `/presign-relay/init` returns 200 only AFTER the cosigner has
+    //    subscribed, so on return we know it is live on the relay. Verify its
+    //    relay identity matches what we fetched.
     let armed_pub_hex = match arm_cosigner(
         &arm,
         &session_id,
@@ -179,7 +175,26 @@ pub async fn coordinate_presign_over_relay(
         )));
     }
 
-    // 5. Await bundle assembly.
+    // 6. NOW ship the coordinator's round-1 — the cosigner has joined its box, so
+    //    the relay delivers this by WS live-push (NOT the unreliable HTTP
+    //    backfill). The cosigner's SM buffers it in order even if the
+    //    coordinator's round-2 (produced from the cosigner's round-1) races ahead.
+    for out in &round1_out {
+        if let Err(e) = coord_client
+            .send_round_message(
+                &out.recipient_pub_hex,
+                &out.message_box,
+                &out.round_msg,
+                out.params.clone(),
+            )
+            .await
+        {
+            listener.shutdown().await;
+            return Err(MpcError::Protocol(format!("ship coord round-1: {e}")));
+        }
+    }
+
+    // 7. Await bundle assembly.
     let outcome = match tokio::time::timeout(timeout, rx).await {
         Ok(Ok(o)) => o,
         Ok(Err(e)) => {

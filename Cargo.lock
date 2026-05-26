@@ -401,6 +401,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "zeroize",
 ]
 
 [[package]]
@@ -494,8 +495,7 @@ dependencies = [
 [[package]]
 name = "bsv-rs"
 version = "0.3.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "87fdd93dac5c9d01379b326e36ad671524b2f4ec9bbcfc272221af5c9cf57e58"
+source = "git+https://github.com/Calhooon/bsv-rs.git?rev=382282d86c1f69e867493937dde24c651f713c2e#382282d86c1f69e867493937dde24c651f713c2e"
 dependencies = [
  "aes",
  "aes-gcm",

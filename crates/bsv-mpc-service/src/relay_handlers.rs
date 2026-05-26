@@ -68,6 +68,56 @@ fn err_response(
     (status, Json(serde_json::json!({"error": msg.to_string()})))
 }
 
+// ── presign-arm checkpoint trail (mirrors reshare_relay_handlers) ──────────────
+// Captures WHAT SHARE the container actually loads for a presign + the arm params,
+// so a deployed presign stall can be diagnosed without container stdout access
+// (`wrangler tail` only surfaces the Worker's HTTP events, not the container's
+// `tracing`). Query `GET /presign-relay/debug` after a presign arm.
+static PRESIGN_CHECKPOINTS: std::sync::LazyLock<Mutex<Vec<(u64, String)>>> =
+    std::sync::LazyLock::new(|| Mutex::new(Vec::new()));
+
+fn presign_now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn presign_checkpoint(label: impl Into<String>, reset: bool) {
+    if let Ok(mut cps) = PRESIGN_CHECKPOINTS.lock() {
+        if reset {
+            cps.clear();
+        }
+        cps.push((presign_now_millis(), label.into()));
+        if cps.len() > 256 {
+            let n = cps.len() - 256;
+            cps.drain(0..n);
+        }
+    }
+}
+
+/// `GET /presign-relay/debug` — diagnostic trail of the last presign-cosigner arm.
+pub async fn handle_presign_relay_debug() -> impl IntoResponse {
+    let cps = PRESIGN_CHECKPOINTS
+        .lock()
+        .map(|c| c.clone())
+        .unwrap_or_default();
+    let now = presign_now_millis();
+    let start = cps.first().map(|(t, _)| *t).unwrap_or(now);
+    let steps: Vec<serde_json::Value> = cps
+        .iter()
+        .map(|(t, l)| {
+            serde_json::json!({"t_ms": t, "since_start_ms": t.saturating_sub(start), "label": l})
+        })
+        .collect();
+    Json(serde_json::json!({
+        "now_ms": now,
+        "count": cps.len(),
+        "last_age_ms": cps.last().map(|(t, _)| now.saturating_sub(*t)),
+        "steps": steps,
+    }))
+}
+
 // ── /presign-relay/identity ─────────────────────────────────────────────────
 
 /// `GET /presign-relay/identity` — the container's relay / BRC-2 identity-key
@@ -199,6 +249,37 @@ pub async fn handle_presign_relay_init(
     let sid_hex = session_id.hex();
 
     let parties_at_keygen = body.parties_at_keygen.clone().unwrap_or_else(|| vec![0, 1]);
+
+    // DIAGNOSTIC: record EXACTLY what share the container loaded for this presign +
+    // the arm's binding params, so a deployed stall reveals whether the container
+    // holds a stale/wrong share or a mismatched index (queryable at
+    // `GET /presign-relay/debug`).
+    {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(&share.ciphertext);
+        let ct_fp = hex::encode(&h.finalize()[..8]);
+        let mut hj = Sha256::new();
+        hj.update(&share.joint_pubkey_compressed);
+        let jpk_fp = hex::encode(&hj.finalize()[..6]);
+        presign_checkpoint(
+            format!(
+                "arm:share_loaded stored_share_index={} cfg={}of{} jpk={} jpk_fp={} ct_fp={} \
+                 | arm my_party_index={} coordinator_party={} parties_at_keygen={:?}",
+                share.share_index.0,
+                share.config.threshold,
+                share.config.parties,
+                hex::encode(share.joint_pubkey_compressed.get(..6).unwrap_or(&[])),
+                jpk_fp,
+                ct_fp,
+                body.my_party_index,
+                body.coordinator_party,
+                parties_at_keygen,
+            ),
+            true,
+        );
+    }
+
     let policy_id = match &body.policy_id_hex {
         Some(h) => match hex::decode(h) {
             Ok(b) if b.len() == 32 => {
@@ -284,6 +365,10 @@ pub async fn handle_presign_relay_init(
         store.listeners.insert(sid_hex.clone(), listener);
     }
 
+    presign_checkpoint(
+        format!("arm:round1_shipped count={} returning_200", round1_out.len()),
+        false,
+    );
     tracing::info!(
         session_id = %sid_hex,
         my_party_index = body.my_party_index,

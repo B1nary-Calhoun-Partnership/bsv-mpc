@@ -36,6 +36,15 @@ USER app
 EXPOSE 8080
 ENV MPC_SERVICE_PORT=8080
 ENV MPC_DATA_DIR=/data
+# #40/#58 OOM guard: cap glibc's per-thread malloc arenas. The default
+# (8 × nCPU = 32 on standard-4's 4 vCPU) lets num-bigint's many transient
+# allocations during back-to-back 2048-bit Paillier safe-prime generation
+# (DKG + 2 reshares + presign) bloat RSS across arenas and never return it to
+# the OS → the 12 GiB / no-swap instance is OOM-killed mid-ceremony, wiping the
+# in-memory MPC coordinator state. ARENA_MAX=2 forces glibc to release freed
+# memory between sequential generations (paired with the process-global
+# prime-gen gate in paillier_pool.rs that keeps generation serial).
+ENV MALLOC_ARENA_MAX=2
 # #4 self-stocking: ship each generated Presignature_A to the cosigner DO pool.
 # MPC_WORKER_URL is the (public) DO worker base URL — not a secret. The BRC-31
 # auth identity is ephemeral (generated at startup) unless MPC_SERVICE_AUTH_KEY

@@ -38,6 +38,9 @@ anyhow.workspace = true
 # build the NEW eval points and extract the proxy's OLD secret/eval from its share.
 cggmp24.workspace = true
 generic-ec = { workspace = true }
+# #44: zeroize the proxy's in-memory secret share scalar + KeyShare bytes before
+# they are overwritten on a reshare/refresh rotation (and on drop).
+zeroize.workspace = true
 
 [dev-dependencies]
 # §06.17.1 CONTAINER-target hermetic gate (#30): generate real 2-of-2 key shares

@@ -117,6 +117,10 @@ hmac = "0.12"
 rand = "0.8"
 aes-gcm = "0.10"
 base64 = "0.22"
+# #44: cryptographically wipe secret share material before it is overwritten /
+# dropped (in-memory zeroization on rotate; the at-rest equivalent of the worker's
+# overwrite-then-delete in do_storage). `derive` brings the ZeroizeOnDrop macro.
+zeroize = { version = "1", features = ["derive"] }
 
 # Async utilities
 futures = "0.3"
@@ -147,10 +151,18 @@ tempfile = "3"
 # upstream first. Tracked as follow-up.
 glass_pumpkin = "=1.9.0"
 
-# For local bsv-rs development, add to ~/.cargo/config.toml or an untracked
-# Cargo.toml override:
-#   [patch.crates-io]
-#   bsv-rs = { path = "../bsv-rs" }
+# Override bsv-rs with the Calhooon fork that bounds the BRC-104
+# `SimplifiedFetchTransport` reqwest client (request + connect timeouts +
+# `pool_max_idle_per_host(0)`). Without this, an egress-NAT'd host (the
+# deployed CF Container cosigner) reuses an idle keep-alive socket the NAT
+# silently dropped and the BRC-104 General POST (`/sendMessage`) hangs
+# indefinitely — wedging the throwaway-DKG round-1 ship in reshare-over-relay
+# (issue #58). Pinned by `rev` for reproducibility; remove when published to
+# crates.io (>0.3.12). The build context (Docker, has git) fetches this rev.
+#
+# For local bsv-rs development instead, point this at { path = "../bsv-rs" }.
+[patch.crates-io]
+bsv-rs = { git = "https://github.com/Calhooon/bsv-rs.git", rev = "382282d86c1f69e867493937dde24c651f713c2e" }
 
 # Override cggmp24 with the upstream PR #200 branch on the PUBLIC Calhooon
 # fork that exposes set_additive_shift() for BRC-42-derived key signing.

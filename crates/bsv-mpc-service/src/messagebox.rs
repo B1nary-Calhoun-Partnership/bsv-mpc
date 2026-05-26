@@ -43,6 +43,7 @@
 //! - On shutdown, the inner `RoundMessageSubscription::shutdown` runs
 //!   the §06.4 graceful `leaveRoom` path before closing the WS.
 
+use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -182,6 +183,22 @@ impl Drop for MessageBoxListener {
     }
 }
 
+/// Best-effort `acknowledgeMessage` (the canonical drain — see the TS
+/// `message-box-client`/`-server`: read → process → acknowledge → server
+/// DELETEs). Without this, every relayed round message persists in the box
+/// forever; a long-lived cosigner identity's box then grows until the relay
+/// (a 128 MB CF Worker) OOMs `/listMessages` and breaks reshare-over-relay.
+/// Failure is non-fatal: the message is already consumed (the dedup set below
+/// blocks reprocessing) and the relay's own GC is the backstop.
+async fn ack_best_effort(client: &MessageBoxClient, message_id: &str) {
+    if message_id.is_empty() {
+        return;
+    }
+    if let Err(e) = client.acknowledge(&[message_id.to_string()]).await {
+        debug!("acknowledge(message_id={message_id}) failed (best-effort): {e}");
+    }
+}
+
 async fn run_loop<F>(
     client: MessageBoxClient,
     mut sub: bsv_mpc_messagebox::RoundMessageSubscription,
@@ -190,6 +207,15 @@ async fn run_loop<F>(
 ) where
     F: Fn(DecodedRoundMessage) -> HandlerFuture + Send + Sync + 'static,
 {
+    // §06.17 reliability: the relay's `/listMessages` is non-destructive and we
+    // deliberately re-drain backfill (initial subscribe + every reconnect, and the
+    // post-join window drain in `subscribe`), so the SAME message can arrive more
+    // than once (backfill ∩ live-push ∩ re-drain). Feeding a duplicate round
+    // message to a cggmp24 SM would error and abort the ceremony, so we dedup by
+    // the relay's unique `message_id` here — at-least-once transport + dedup =
+    // exactly-once delivery to the handler. Scope is this listener (one ceremony
+    // phase), so the set stays small and is dropped when the phase ends.
+    let mut seen_message_ids: HashSet<String> = HashSet::new();
     loop {
         tokio::select! {
             biased;
@@ -209,6 +235,20 @@ async fn run_loop<F>(
                         continue;
                     }
                 };
+                // Drop duplicates (re-drained / re-pushed) before they reach the SM.
+                if !inbound.message_id.is_empty()
+                    && !seen_message_ids.insert(inbound.message_id.clone())
+                {
+                    debug!(
+                        "skipping duplicate inbound message_id={} (session={} round={})",
+                        inbound.message_id,
+                        hex::encode(inbound.round_msg.session_id.as_bytes()),
+                        inbound.round_msg.round,
+                    );
+                    // Already consumed on first delivery — drain the duplicate too.
+                    ack_best_effort(&client, &inbound.message_id).await;
+                    continue;
+                }
                 let inbound_summary = format!(
                     "session={} round={} from_party={} via={:?} message_box={}",
                     hex::encode(inbound.round_msg.session_id.as_bytes()),
@@ -218,8 +258,13 @@ async fn run_loop<F>(
                     inbound.message_box,
                 );
                 debug!("dispatching inbound: {inbound_summary}");
-                let fut = (handler)(inbound);
-                let outgoing = match fut.await {
+                let message_id = inbound.message_id.clone();
+                let result = (handler)(inbound).await;
+                // Drain regardless of Ok/Err: the SM has seen it and the dedup
+                // set blocks reprocessing, so retaining it on the relay only
+                // bloats the box (the canonical read→process→acknowledge cycle).
+                ack_best_effort(&client, &message_id).await;
+                let outgoing = match result {
                     Ok(o) => o,
                     Err(e) => {
                         warn!("handler returned error ({inbound_summary}): {e:#}");

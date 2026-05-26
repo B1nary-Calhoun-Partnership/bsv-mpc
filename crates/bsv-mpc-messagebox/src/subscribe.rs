@@ -69,6 +69,36 @@ const TO_PEER_TIMEOUT_MS: u64 = 20_000;
 /// event) from which we learn the server identity.
 const SERVER_ID_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Max wait for ONE `connect_and_join` (the Engine.IO polling handshake, WS
+/// upgrade, probe dance, joinRoom, and server-id learn). The underlying
+/// `reqwest::get` / `connect_async` have NO timeout of their own, so without this
+/// an outbound WS that hangs (observed deployed: a CF container's egress WS to the
+/// relay hung indefinitely, stalling the entire reshare with no error) blocks
+/// forever.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Initial-subscribe WS connect attempts before falling back to HTTP polling.
+/// A hung WS upgrade fails fast on `CONNECT_TIMEOUT`; a couple of fresh attempts
+/// cover a transient stall, after which we switch to the always-available HTTP
+/// `/listMessages` polling path (see [`run_loop_polling`]).
+const CONNECT_ATTEMPTS: u32 = 2;
+
+/// Backoff between initial-subscribe connect attempts.
+const CONNECT_RETRY_BACKOFF: Duration = Duration::from_secs(2);
+
+/// Max wait for a `drain_backfill` pass. Backfill uses the BRC-104
+/// `SimplifiedFetchTransport` authed `POST /listMessages` — a DIFFERENT auth than
+/// the BRC-103 WS subscribe. If that authed HTTP path stalls (observed deployed: a
+/// CF container's BRC-104 auth handshake to the relay hung indefinitely while
+/// plain HTTPS + the WS path were fine), backfill MUST NOT block the live WS
+/// subscribe. We bound each pass and treat the initial backfill as best-effort.
+const BACKFILL_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// HTTP-polling receive interval (fallback transport). Round messages are small
+/// and a ceremony's per-round budget is seconds, so a short poll keeps the
+/// ceremony converging without hammering the relay.
+const POLL_INTERVAL: Duration = Duration::from_secs(2);
+
 /// Max wait for a `leftRoom`-equivalent on graceful shutdown — best
 /// effort; we proceed to close regardless.
 const LEAVE_TIMEOUT_MS: u64 = 1_000;
@@ -155,21 +185,85 @@ pub async fn subscribe(auth: Arc<MessageBoxAuth>, boxes: Vec<String>) -> Result<
 
     // First-attempt backfill + connect + join, inline. If this fails the
     // caller sees the error rather than a silently-reconnecting task.
-    if !drain_backfill(&auth, &boxes, &inbound_tx).await {
-        return Err(MessageBoxError::Protocol(
-            "subscriber dropped during initial backfill".into(),
-        ));
+    //
+    // RELIABILITY (§06.17): the WS upgrade (`connect_async` / Engine.IO handshake)
+    // has no timeout of its own, and on some egress paths it HANGS rather than
+    // erroring — observed deployed: a CF container's outbound WS to the relay hung
+    // indefinitely (pinpointed via the `/reshare-relay/debug` checkpoint trail
+    // freezing at `dkg_listener_starting`), so `/reshare-relay/init` never returned
+    // and the whole reshare timed out "awaiting throwaway DKG aux". We therefore
+    // bound each connect by `CONNECT_TIMEOUT` and retry a hung/failed connect a few
+    // times — a fresh attempt reliably succeeds (the relay WS is healthy; the
+    // in-process path connects every time).
+    // Initial backfill is BEST-EFFORT + bounded: the BRC-104 authed /listMessages
+    // is a separate auth from the BRC-103 WS subscribe below, and a stalled authed
+    // HTTP path must not block the live subscribe. Anything missed here is caught
+    // by the post-join re-drain (also best-effort) + live WS push.
+    match tokio::time::timeout(BACKFILL_TIMEOUT, drain_backfill(&auth, &boxes, &inbound_tx)).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(MessageBoxError::Protocol(
+                "subscriber dropped during initial backfill".into(),
+            ));
+        }
+        Err(_) => warn!(
+            "initial backfill timed out after {BACKFILL_TIMEOUT:?} (authed /listMessages); \
+             proceeding to WS subscribe — live push + post-join re-drain will deliver"
+        ),
     }
-    let conn = connect_and_join(&auth, &identity_hex, &boxes, &inbound_tx).await?;
 
-    let handle = tokio::spawn(run_loop_with_conn(
-        auth,
-        identity_hex,
-        boxes,
-        conn,
-        inbound_tx,
-        shutdown_rx,
-    ));
+    let mut conn = None;
+    let mut last_err = String::from("no attempt made");
+    for attempt in 1..=CONNECT_ATTEMPTS {
+        match tokio::time::timeout(
+            CONNECT_TIMEOUT,
+            connect_and_join(&auth, &identity_hex, &boxes, &inbound_tx),
+        )
+        .await
+        {
+            Ok(Ok(c)) => {
+                conn = Some(c);
+                break;
+            }
+            Ok(Err(e)) => {
+                last_err = format!("{e}");
+                warn!(attempt, "subscribe connect/join failed: {last_err}");
+            }
+            Err(_) => {
+                last_err = format!("connect/join timed out after {CONNECT_TIMEOUT:?}");
+                warn!(attempt, "subscribe connect/join hung: {last_err}");
+            }
+        }
+        if attempt < CONNECT_ATTEMPTS {
+            tokio::time::sleep(CONNECT_RETRY_BACKOFF).await;
+        }
+    }
+
+    // FALLBACK (§06.17): if the WS upgrade never connects, run over HTTP polling
+    // instead of failing. Some egress paths (observed deployed: a CF container's
+    // outbound WS to the relay Worker) complete plain HTTPS but HANG the WebSocket
+    // upgrade indefinitely. Sending already uses HTTP (`POST /sendMessage`), so
+    // receiving via periodic `/listMessages` (the same call `drain_backfill` makes,
+    // deduped by `message_id` at the consumer) makes the transport fully functional
+    // without a WS. Local/hermetic paths connect WS on the first attempt and never
+    // reach here.
+    let handle = match conn {
+        Some(conn) => tokio::spawn(run_loop_with_conn(
+            auth,
+            identity_hex,
+            boxes,
+            conn,
+            inbound_tx,
+            shutdown_rx,
+        )),
+        None => {
+            warn!(
+                "subscribe: WS connect failed {CONNECT_ATTEMPTS}× ({last_err}); falling back to \
+                 HTTP /listMessages polling every {POLL_INTERVAL:?}"
+            );
+            tokio::spawn(run_loop_polling(auth, boxes, inbound_tx, shutdown_rx))
+        }
+    };
 
     Ok(WsSubscription {
         inbound: inbound_rx,
@@ -429,6 +523,32 @@ async fn graceful_leave(conn: &LiveConn, identity_hex: &str, boxes: &[String]) {
     }
 }
 
+/// HTTP-polling receive loop — the WebSocket fallback (§06.17). Repeatedly drains
+/// `/listMessages` for every subscribed box and forwards new rows to the inbound
+/// channel; `/listMessages` is non-destructive and the consumer dedups by
+/// `message_id`, so re-listing the same rows each tick is harmless. Used when the
+/// outbound WS upgrade cannot connect (observed: a CF container's egress hangs the
+/// WS upgrade while plain HTTPS works). Sending stays on `POST /sendMessage`, so
+/// this completes a fully-functional HTTP-only transport. Runs until shutdown or
+/// the consumer drops.
+async fn run_loop_polling(
+    auth: Arc<MessageBoxAuth>,
+    boxes: Vec<String>,
+    inbound: mpsc::Sender<Result<InboundEnvelopeEvent>>,
+    mut shutdown: oneshot::Receiver<()>,
+) {
+    loop {
+        if !drain_backfill(&auth, &boxes, &inbound).await {
+            return; // consumer gone
+        }
+        tokio::select! {
+            biased;
+            _ = &mut shutdown => return,
+            _ = tokio::time::sleep(POLL_INTERVAL) => {}
+        }
+    }
+}
+
 /// Drive the initial live connection, then fall into the reconnect loop
 /// on disconnect. Mirrors the former `ws.rs::run_loop_with_socket`.
 async fn run_loop_with_conn(
@@ -439,6 +559,30 @@ async fn run_loop_with_conn(
     inbound: mpsc::Sender<Result<InboundEnvelopeEvent>>,
     mut shutdown: oneshot::Receiver<()>,
 ) {
+    // §06.17 reliability: recover any message a peer `POST`ed in the window between
+    // the pre-join backfill drain and `joinRoom` completing — it's not in the
+    // (already-drained) backfill and wasn't live-pushed (room not joined when it
+    // landed), so without this it sits undelivered and stalls the ceremony into a
+    // timeout. `/listMessages` is non-destructive + consumers dedup by `message_id`,
+    // so re-draining here is safe.
+    //
+    // CRITICAL: this re-drain MUST be bounded. It runs SEQUENTIALLY before `pump`
+    // (the WS live-push forwarder) below, so if the BRC-104 `/listMessages` hangs
+    // — which it does, with no timeout, from a CF container (issue #58) — `pump`
+    // NEVER STARTS and NO live WS message is forwarded to the handler. The
+    // container receives a peer's round over the WebSocket but never delivers it,
+    // stalling the ceremony. (Reshare's large per-phase budget hid this; presign's
+    // tight single budget did not — the deployed presign timed out here.) Bound it
+    // best-effort like the initial backfill so the WS pump starts promptly; live
+    // push + the reconnect re-drain recover anything this pass missed.
+    match tokio::time::timeout(BACKFILL_TIMEOUT, drain_backfill(&auth, &boxes, &inbound)).await {
+        Ok(true) => {}
+        Ok(false) => return, // consumer gone
+        Err(_) => warn!(
+            "post-join re-drain timed out after {BACKFILL_TIMEOUT:?} (authed /listMessages); \
+             starting WS pump anyway — live push delivers"
+        ),
+    }
     match pump(&mut conn, &identity_hex, &boxes, &inbound, &mut shutdown).await {
         PumpExit::Shutdown => return,
         PumpExit::Disconnected(reason) => {
@@ -464,12 +608,28 @@ async fn run_loop(
             return;
         }
         // Backfill-first so the consumer never sees a live push before a
-        // backfill row from the same gap.
-        if !drain_backfill(&auth, &boxes, &inbound).await {
-            return; // consumer gone
+        // backfill row from the same gap. Bounded best-effort (same reason as the
+        // post-join re-drain above): a hung BRC-104 `/listMessages` must not block
+        // the reconnect's `pump` from re-establishing WS live-push.
+        match tokio::time::timeout(BACKFILL_TIMEOUT, drain_backfill(&auth, &boxes, &inbound)).await {
+            Ok(true) => {}
+            Ok(false) => return, // consumer gone
+            Err(_) => warn!(
+                "reconnect re-drain timed out after {BACKFILL_TIMEOUT:?}; reconnecting WS anyway"
+            ),
         }
 
-        match connect_and_join(&auth, &identity_hex, &boxes, &inbound).await {
+        let connect = tokio::time::timeout(
+            CONNECT_TIMEOUT,
+            connect_and_join(&auth, &identity_hex, &boxes, &inbound),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(MessageBoxError::WsTimeout(format!(
+                "reconnect connect/join hung > {CONNECT_TIMEOUT:?}"
+            )))
+        });
+        match connect {
             Ok(mut conn) => {
                 backoff = RECONNECT_BACKOFF_INITIAL; // healthy — reset.
                 match pump(&mut conn, &identity_hex, &boxes, &inbound, &mut shutdown).await {

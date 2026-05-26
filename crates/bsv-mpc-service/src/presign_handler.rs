@@ -48,7 +48,7 @@
 //! 4. Inbound protocol messages drive the SM; on `Complete` the role-specific
 //!    path above runs.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use bsv::primitives::ec::PrivateKey;
@@ -138,6 +138,20 @@ struct PresignHandlerInner {
     ceremonies: Mutex<HashMap<SessionId, CeremonySlot>>,
     collections: Mutex<HashMap<SessionId, CollectionSlot>>,
     completion_tx: Mutex<HashMap<SessionId, oneshot::Sender<PresignOutcome>>>,
+    /// **Early-inbound / out-of-order buffer** (mirrors [`crate::dkg_handler`] and
+    /// [`crate::reshar_handler`], the §06.17 ordering discipline). With the
+    /// WS-live-push ordering — every party subscribes BEFORE any party ships
+    /// round-1 (see `relay_presign::coordinate_presign_over_relay` /
+    /// [`crate::relay_handlers::handle_presign_relay_init`]) — a peer's protocol
+    /// round message can still be delivered (live OR via backfill) to a party
+    /// whose `CeremonySlot` is momentarily checked-out for processing, or before
+    /// `initiate` has registered it. Dropping such a message stalls the presign:
+    /// the relay does not re-deliver, the cosigner never advances, and the
+    /// coordinator times out "awaiting PresigBundle assembly". So we BUFFER here,
+    /// keyed by session, and replay the moment the slot is (re)registered. The
+    /// cggmp24 presigning SM already buffers out-of-order rounds internally
+    /// (`presigning.rs` `wire_buffer`), so replay order across rounds is safe.
+    pending_inbound: Mutex<HashMap<SessionId, Vec<DecodedRoundMessage>>>,
 }
 
 /// What a party's completion receiver yields.
@@ -434,6 +448,7 @@ impl PresignHandler {
                 ceremonies: Mutex::new(HashMap::new()),
                 collections: Mutex::new(HashMap::new()),
                 completion_tx: Mutex::new(HashMap::new()),
+                pending_inbound: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -470,8 +485,22 @@ impl PresignHandler {
         .map_err(|e| anyhow::anyhow!("init_generate task panicked: {e}"))??;
 
         let (tx, rx) = oneshot::channel::<PresignOutcome>();
-        let outgoing = wrap_protocol(&initial, session_id, joint_pubkey, &peers);
+        let mut outgoing =
+            wrap_protocol(&initial, session_id, joint_pubkey, &peers, &self.inner.parties_at_keygen);
         {
+            let mut t = self
+                .inner
+                .completion_tx
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            t.insert(session_id, tx);
+        }
+        // Register the slot, then drain any EARLY-INBOUND buffered before this
+        // `initiate` (a peer round-1 that raced ahead of us under WS live-push).
+        // Hold the `ceremonies` lock across the `pending_inbound` drain so no
+        // buffered message is lost between the insert and the drain (same lock
+        // discipline as `DkgHandler::initiate`).
+        let buffered: Vec<DecodedRoundMessage> = {
             let mut c = self.inner.ceremonies.lock().unwrap_or_else(|p| p.into_inner());
             c.insert(
                 session_id,
@@ -481,14 +510,33 @@ impl PresignHandler {
                     peers,
                 },
             );
-        }
-        {
-            let mut t = self
-                .inner
-                .completion_tx
+            self.inner
+                .pending_inbound
                 .lock()
-                .unwrap_or_else(|p| p.into_inner());
-            t.insert(session_id, tx);
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&session_id)
+                .unwrap_or_default()
+        };
+        // Replay buffered inbounds through the normal dispatch path; accumulate
+        // any outbound the SM produces so the caller ships it alongside round-1.
+        if !buffered.is_empty() {
+            debug!(
+                "PresignHandler: replaying {} buffered inbound(s) for session {} after initiate",
+                buffered.len(),
+                session_id.hex()
+            );
+            for msg in buffered {
+                // Buffered messages are already position-space (translated in
+                // `dispatch_one` before they were buffered), so replay via
+                // `drive_protocol` — NOT `dispatch_one`, which would translate again.
+                match self.drive_protocol(msg).await {
+                    Ok(mut more) => outgoing.append(&mut more),
+                    Err(e) => warn!(
+                        "PresignHandler: replay of buffered inbound for session {} failed: {e}",
+                        session_id.hex()
+                    ),
+                }
+            }
         }
         Ok((rx, outgoing))
     }
@@ -517,15 +565,42 @@ impl PresignHandler {
 
     async fn dispatch_one(
         &self,
-        inbound: DecodedRoundMessage,
+        mut inbound: DecodedRoundMessage,
     ) -> anyhow::Result<Vec<OutgoingRoundMessage>> {
         // Route by the in-RoundMessage sentinel, NOT message_box: the relay
         // delivers by identity and a single connection subscribes to both
         // `mpc_{sid}` and `presig_return_{sid}`, so message_box can't tell them
         // apart. A return ciphertext is marked by round == RETURN_SHARE_ROUND.
+        // The return channel uses ABSOLUTE indices end-to-end (see
+        // `collect_return_share`), so it is NOT index-translated.
         if inbound.round_msg.round == RETURN_SHARE_ROUND {
             self.collect_return_share(inbound).await?;
             return Ok(vec![]);
+        }
+
+        // Protocol traffic: the wire carries ABSOLUTE keygen indices (§05.4.6,
+        // see `wrap_protocol`), but the cggmp24 SM works in subset-POSITION space.
+        // Translate from/to absolute → position so the SM sees exactly the
+        // positions it emitted (inverse of `wrap_protocol`'s send-side translation;
+        // a no-op for a contiguous subset). All downstream state — `drive_protocol`,
+        // the `pending_inbound` buffer, and the `initiate` replay — is therefore
+        // position-space, so buffered messages MUST be replayed via `drive_protocol`
+        // (not `dispatch_one`) to avoid a double translation.
+        let pak = &self.inner.parties_at_keygen;
+        match pak.iter().position(|&p| p == inbound.round_msg.from.0) {
+            Some(pos) => inbound.round_msg.from = ShareIndex(pos as u16),
+            None => {
+                warn!(
+                    "PresignHandler: inbound from absolute index {} not in subset {:?}; dropping",
+                    inbound.round_msg.from.0, pak
+                );
+                return Ok(vec![]);
+            }
+        }
+        if let Some(ShareIndex(abs)) = inbound.round_msg.to {
+            if let Some(pos) = pak.iter().position(|&p| p == abs) {
+                inbound.round_msg.to = Some(ShareIndex(pos as u16));
+            }
         }
 
         // Otherwise it's protocol traffic for the SM.
@@ -537,62 +612,116 @@ impl PresignHandler {
         inbound: DecodedRoundMessage,
     ) -> anyhow::Result<Vec<OutgoingRoundMessage>> {
         let session_id = inbound.round_msg.session_id;
+        let mut all_outgoing: Vec<OutgoingRoundMessage> = Vec::new();
+        // Work queue: the triggering inbound, then any messages drained from the
+        // pending buffer as the SM advances (closes the race where a peer message
+        // arrives while the slot is checked out for processing).
+        let mut queue: VecDeque<DecodedRoundMessage> = VecDeque::new();
+        queue.push_back(inbound);
 
-        let slot = {
-            let mut c = self.inner.ceremonies.lock().unwrap_or_else(|p| p.into_inner());
-            c.remove(&session_id)
-        };
-        let Some(slot) = slot else {
-            warn!(
-                "PresignHandler: protocol inbound for unknown session_id {} (no manager); dropping",
-                session_id.hex()
-            );
-            return Ok(vec![]);
-        };
-
-        let CeremonySlot {
-            mut mgr,
-            joint_pubkey,
-            peers,
-        } = slot;
-        let inbound_round_msg = inbound.round_msg;
-
-        let (result, mgr) = tokio::task::spawn_blocking(move || {
-            let r = mgr
-                .process_generate_round(vec![inbound_round_msg])
-                .map_err(|e| anyhow::anyhow!("PresigningManager::process_generate_round: {e}"));
-            (r, mgr)
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!("process_generate_round task panicked: {e}"))?;
-
-        let result = result?;
-
-        match result {
-            PresigningRoundResult::NextRound(next_msgs) => {
-                let outgoing = wrap_protocol(&next_msgs, session_id, joint_pubkey, &peers);
+        while let Some(next) = queue.pop_front() {
+            // Take the slot out — `process_generate_round` is sync-blocking and we
+            // don't hold the lock across the await. If the slot is not registered
+            // (peer round raced ahead of `initiate`, or it is checked-out for a
+            // concurrent step), BUFFER the inbound instead of DROPPING it — the
+            // relay never re-delivers, so a drop deadlocks the presign. `initiate`
+            // (or the post-advance drain below) replays it once the slot exists.
+            // Lock order `ceremonies` → `pending_inbound` matches `initiate`.
+            let slot = {
                 let mut c = self.inner.ceremonies.lock().unwrap_or_else(|p| p.into_inner());
-                c.insert(
-                    session_id,
-                    CeremonySlot {
-                        mgr,
+                match c.remove(&session_id) {
+                    Some(s) => s,
+                    None => {
+                        let mut pend =
+                            self.inner.pending_inbound.lock().unwrap_or_else(|p| p.into_inner());
+                        let buf = pend.entry(session_id).or_default();
+                        buf.push(next);
+                        buf.extend(queue.drain(..));
+                        debug!(
+                            "PresignHandler: protocol inbound for session {} buffered (slot \
+                             checked-out or not yet initiated); will replay",
+                            session_id.hex()
+                        );
+                        return Ok(all_outgoing);
+                    }
+                }
+            };
+
+            let CeremonySlot {
+                mut mgr,
+                joint_pubkey,
+                peers,
+            } = slot;
+            let inbound_round_msg = next.round_msg;
+
+            let (result, mgr) = tokio::task::spawn_blocking(move || {
+                let r = mgr
+                    .process_generate_round(vec![inbound_round_msg])
+                    .map_err(|e| anyhow::anyhow!("PresigningManager::process_generate_round: {e}"));
+                (r, mgr)
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("process_generate_round task panicked: {e}"))?;
+
+            let result = result?;
+
+            match result {
+                PresigningRoundResult::NextRound(next_msgs) => {
+                    let mut outgoing = wrap_protocol(
+                        &next_msgs,
+                        session_id,
                         joint_pubkey,
-                        peers,
-                    },
-                );
-                drop(c);
-                debug!(
-                    "PresignHandler: session={} produced {} outbound",
-                    session_id.hex(),
-                    outgoing.len()
-                );
-                Ok(outgoing)
-            }
-            PresigningRoundResult::Complete => {
-                self.on_presign_complete(session_id, joint_pubkey, peers, mgr)
-                    .await
+                        &peers,
+                        &self.inner.parties_at_keygen,
+                    );
+                    {
+                        let mut c =
+                            self.inner.ceremonies.lock().unwrap_or_else(|p| p.into_inner());
+                        c.insert(
+                            session_id,
+                            CeremonySlot {
+                                mgr,
+                                joint_pubkey,
+                                peers,
+                            },
+                        );
+                    }
+                    debug!(
+                        "PresignHandler: session={} produced {} outbound",
+                        session_id.hex(),
+                        outgoing.len()
+                    );
+                    all_outgoing.append(&mut outgoing);
+                    // Drain anything buffered while the slot was checked out and
+                    // keep processing it in this same call.
+                    let drained: Vec<DecodedRoundMessage> = self
+                        .inner
+                        .pending_inbound
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .remove(&session_id)
+                        .unwrap_or_default();
+                    queue.extend(drained);
+                }
+                PresigningRoundResult::Complete => {
+                    let mut more = self
+                        .on_presign_complete(session_id, joint_pubkey, peers, mgr)
+                        .await?;
+                    all_outgoing.append(&mut more);
+                    // Ceremony slot is consumed (the coordinator's moves to a
+                    // collection slot; the cosigner shipped its return). Drop any
+                    // late protocol buffer for this session — nothing more to drive.
+                    self.inner
+                        .pending_inbound
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .remove(&session_id);
+                    return Ok(all_outgoing);
+                }
             }
         }
+
+        Ok(all_outgoing)
     }
 
     /// Round-3 complete (§06.16): extract this party's presig share and run the
@@ -843,34 +972,67 @@ impl PresignHandler {
 /// Compute the canonical presign execution_id_prefix (§02, phase=Presign) and
 /// wrap protocol-traffic round messages addressed to peers (broadcast → all,
 /// p2p → matching peer).
+///
+/// **Index spaces (MPC-Spec §05.4.6).** The cggmp24 presigning/signing SM
+/// identifies parties by their 0-based POSITION within the signing subset
+/// (`[0, t)`), so the `RoundMessage.{from,to}` produced by [`drive_inline`] carry
+/// positions. But `peers` and the canonical wire `from_party`/`to_party` are
+/// keyed by the ABSOLUTE keygen party index (the entries of `parties_at_keygen`,
+/// which a BRC-52 cert lookup keys on). `parties_at_keygen[pos] == absolute`, so
+/// we translate position → absolute here before routing + emitting. Without this,
+/// a NON-CONTIGUOUS subset (e.g. `{0,2}`: party 2 is SM-position 1) mis-addresses
+/// every p2p message — `wrap_protocol` finds no peer with absolute index 1, drops
+/// it, and the ceremony deadlocks ("awaiting PresigBundle assembly"). A CONTIGUOUS
+/// subset (`{0,1}`) is unaffected because position == absolute. The receive side
+/// ([`PresignHandler::dispatch_one`]) performs the inverse absolute → position
+/// translation, so the SM only ever sees positions.
 fn wrap_protocol(
     round_msgs: &[RoundMessage],
     session_id: SessionId,
     joint_pubkey: [u8; 33],
     peers: &[(u16, String)],
+    parties_at_keygen: &[u16],
 ) -> Vec<OutgoingRoundMessage> {
     let prefix = presign_eid_prefix(session_id, joint_pubkey);
     let box_name = presign_protocol_box(&session_id.hex());
+    let pos_to_abs = |pos: u16| -> Option<u16> { parties_at_keygen.get(pos as usize).copied() };
 
     let mut out = Vec::new();
     for rm in round_msgs {
-        let targets: Vec<&(u16, String)> = match rm.to {
-            None => peers.iter().collect(),
-            Some(ShareIndex(idx)) => peers.iter().filter(|(p, _)| *p == idx).collect(),
+        // `from` is THIS party's SM position → its absolute keygen index.
+        let Some(from_abs) = pos_to_abs(rm.from.0) else {
+            warn!(
+                "PresignHandler: outgoing from SM-position {} outside subset {:?}; dropping",
+                rm.from.0, parties_at_keygen
+            );
+            continue;
+        };
+        // Resolve targets (by absolute index) + the absolute `to` for the wire.
+        let (targets, to_abs): (Vec<&(u16, String)>, Option<u16>) = match rm.to {
+            None => (peers.iter().collect(), None),
+            Some(ShareIndex(pos)) => match pos_to_abs(pos) {
+                Some(abs) => (peers.iter().filter(|(p, _)| *p == abs).collect(), Some(abs)),
+                None => (Vec::new(), None),
+            },
         };
         if targets.is_empty() {
             warn!(
-                "PresignHandler: outgoing p2p to party {:?} not in peers {:?}; dropping",
+                "PresignHandler: outgoing p2p to SM-position {:?} (abs {:?}) not in peers {:?}; dropping",
                 rm.to,
+                to_abs,
                 peers.iter().map(|(p, _)| *p).collect::<Vec<_>>()
             );
             continue;
         }
+        // Emit with ABSOLUTE from/to on the wire (§05.4.6).
+        let mut wire_msg = rm.clone();
+        wire_msg.from = ShareIndex(from_abs);
+        wire_msg.to = to_abs.map(ShareIndex);
         for (idx, hex) in targets {
             out.push(OutgoingRoundMessage {
                 recipient_pub_hex: hex.clone(),
                 message_box: box_name.clone(),
-                round_msg: rm.clone(),
+                round_msg: wire_msg.clone(),
                 params: WrapParams {
                     to_party: *idx,
                     joint_pubkey,
@@ -1035,6 +1197,7 @@ mod tests {
             sid,
             jpk,
             &[(1u16, "02deadbeef".to_string())],
+            &[0u16, 1u16],
         );
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].params.phase, "presign");
@@ -1042,6 +1205,50 @@ mod tests {
         assert_eq!(out[0].params.to_party, 1);
         // §06.17.2 spelling: mpc_{session_id_hex}
         assert_eq!(out[0].message_box, format!("mpc_{}", sid.hex()));
+    }
+
+    /// **Regression for the deterministic `{0,2}` presign-over-relay timeout.** A
+    /// NON-CONTIGUOUS subset must route p2p by ABSOLUTE keygen index, not the
+    /// cggmp24 SM position. Party 2 is SM-position 1 in subset `[0,2]`; a p2p
+    /// message the SM addresses to position 1 MUST reach the peer whose absolute
+    /// index is 2, and the emitted wire `to`/`from` MUST be absolute (§05.4.6).
+    /// Before the fix this dropped (no peer with absolute index 1) → deadlock.
+    #[test]
+    fn wrap_protocol_routes_noncontiguous_subset_by_absolute_index() {
+        let sid = SessionId([0x99; 32]);
+        let mut jpk = [0u8; 33];
+        jpk[0] = 0x02;
+        // This party is absolute 0 = position 0; the peer is absolute 2 = position 1.
+        let parties_at_keygen = [0u16, 2u16];
+        let peers = [(2u16, "02cafe".to_string())];
+        // SM emits a p2p message from position 0 to position 1 (the "other signer").
+        let rm = RoundMessage {
+            session_id: sid,
+            round: 1,
+            from: ShareIndex(0),
+            to: Some(ShareIndex(1)), // SM POSITION of party 2
+            payload: vec![9, 9, 9],
+        };
+        let out = wrap_protocol(std::slice::from_ref(&rm), sid, jpk, &peers, &parties_at_keygen);
+        assert_eq!(out.len(), 1, "p2p MUST route to the absolute-index-2 peer (not dropped)");
+        assert_eq!(out[0].recipient_pub_hex, "02cafe");
+        assert_eq!(out[0].params.to_party, 2, "envelope to_party = absolute index 2");
+        // Wire carries ABSOLUTE indices (§05.4.6): from 0→0, to position 1→absolute 2.
+        assert_eq!(out[0].round_msg.from, ShareIndex(0));
+        assert_eq!(out[0].round_msg.to, Some(ShareIndex(2)));
+
+        // And the inverse: a broadcast from position 1 (party 2) emits absolute from=2.
+        let bcast = RoundMessage {
+            session_id: sid,
+            round: 1,
+            from: ShareIndex(1), // SM position of party 2
+            to: None,
+            payload: vec![1],
+        };
+        let out2 = wrap_protocol(std::slice::from_ref(&bcast), sid, jpk, &peers, &parties_at_keygen);
+        assert_eq!(out2.len(), 1);
+        assert_eq!(out2[0].round_msg.from, ShareIndex(2), "broadcast from = absolute index 2");
+        assert_eq!(out2[0].round_msg.to, None);
     }
 
     #[test]

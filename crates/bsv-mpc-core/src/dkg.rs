@@ -702,9 +702,10 @@ impl DkgCoordinator {
                         party = my_index,
                         "generating Paillier safe primes (this may take 30-60s)..."
                     );
-                    cggmp24::PregeneratedPrimes::<SecurityLevel128>::generate(
-                        &mut rand::rngs::OsRng,
-                    )
+                    // Serialized process-wide so concurrent ceremonies on one
+                    // (memory-capped) host never spike RSS in parallel → OOM
+                    // (the #40/#58 CF Container instability).
+                    crate::paillier_pool::generate_serialized(&mut rand::rngs::OsRng)
                 }
             };
             cggmp24::aux_info_gen(eid, my_index, n, primes)

@@ -27,6 +27,37 @@ export class BsvMpcServiceContainer extends Container {
     const key = env?.MPC_SERVER_PRIVATE_KEY;
     this.envVars = key ? { MPC_SERVER_PRIVATE_KEY: key } : {};
   }
+
+  // Readiness barrier (#40/#58). The base Container.fetch() auto-STARTS the
+  // instance but does NOT await port-readiness, so the first request after a
+  // cold start — OR after an OOM restart — races the native process coming up
+  // and fails with "container is not running". Block on startAndWaitForPorts
+  // before forwarding so every request lands on a process that is actually
+  // listening. portReadyTimeoutMS:30000 covers the slow native cold start
+  // (release binary + glibc init); the heavy MPC work happens AFTER this.
+  async fetch(request) {
+    await this.startAndWaitForPorts({
+      ports: [this.defaultPort],
+      cancellationOptions: { portReadyTimeoutMS: 30000 },
+    });
+    return this.containerFetch(request, this.defaultPort);
+  }
+
+  // Lifecycle hooks run in the Worker/DO context (NOT container stdout), so
+  // they DO surface in `wrangler tail`. onStop with a non-zero exitCode and
+  // reason "runtime_signal" is the signature of an OOM kill — this is how we
+  // CONFIRM (vs. merely suspect) the #40/#58 instability is memory, not code.
+  onStart() {
+    console.log("[container] onStart: bsv-mpc-service instance started");
+  }
+
+  onStop({ exitCode, reason }) {
+    console.log(`[container] onStop: exitCode=${exitCode} reason=${reason}`);
+  }
+
+  onError(error) {
+    console.error(`[container] onError: ${error}`);
+  }
 }
 
 export default {

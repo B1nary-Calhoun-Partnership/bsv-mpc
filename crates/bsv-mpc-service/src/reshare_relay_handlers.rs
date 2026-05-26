@@ -37,7 +37,7 @@ use bsv_mpc_messagebox::types::{BOX_DKG, BOX_REFRESH};
 use bsv_mpc_messagebox::MessageBoxClient;
 use cggmp24::security_level::SecurityLevel128;
 use cggmp24::supported_curves::Secp256k1;
-use cggmp24::{KeyShare, PregeneratedPrimes};
+use cggmp24::KeyShare;
 use generic_ec::{NonZero, Scalar, SecretScalar};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
@@ -52,6 +52,203 @@ fn err_response(
     msg: impl std::fmt::Display,
 ) -> (StatusCode, Json<serde_json::Value>) {
     (status, Json(serde_json::json!({"error": msg.to_string()})))
+}
+
+// ── #58 diagnostic: reshare-arm checkpoint trail ───────────────────────────────
+//
+// The reshare arm (`/reshare-relay/init`) does real work SYNCHRONOUSLY before it
+// returns 200 (subscribe to the relay, initiate the throwaway DKG, ship round-1),
+// then spawns a completion task for phase B. When the deployed gate failed we saw
+// the proxy's POST to this route end in `Canceled` — i.e. it never returned — but
+// `wrangler tail` does not surface the container's internal `tracing`, so we
+// couldn't see WHERE it stalled. This records a timestamped checkpoint at every
+// step into an in-memory trail, exposed over HTTP at `/reshare-relay/debug`: query
+// it during a hang and the LAST checkpoint pinpoints the stuck step.
+static RESHARE_CHECKPOINTS: std::sync::LazyLock<std::sync::Mutex<Vec<(u64, String)>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
+
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Record a reshare-arm checkpoint. `reset` clears the trail (call at arm start).
+fn checkpoint(label: &str, reset: bool) {
+    if let Ok(mut cps) = RESHARE_CHECKPOINTS.lock() {
+        if reset {
+            cps.clear();
+        }
+        cps.push((now_millis(), label.to_string()));
+        // Bound the trail so a long-lived container can't grow it unboundedly.
+        if cps.len() > 256 {
+            let drop_n = cps.len() - 256;
+            cps.drain(0..drop_n);
+        }
+    }
+    info!(checkpoint = label, "reshare-relay: checkpoint");
+}
+
+/// `GET /reshare-relay/egress-test` — #58 diagnostic: directly measure whether
+/// THIS container can reach the relay over the network (HTTP Engine.IO handshake +
+/// DNS resolution + per-address-family TCP connect timing). Pinpoints whether the
+/// reshare-arm hang is container→relay connectivity (and which address family),
+/// without burning a real-sats reshare.
+pub async fn handle_reshare_relay_egress_test(
+    State(_state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    use std::time::{Duration, Instant};
+    let relay = relay_url();
+    let base = relay.trim_end_matches('/');
+    let mut out = serde_json::Map::new();
+    out.insert("relay".into(), serde_json::json!(base));
+
+    // 1. HTTP Engine.IO polling handshake (what `polling_handshake` does).
+    let url = format!("{base}/socket.io/?EIO=4&transport=polling&t=egress");
+    let t = Instant::now();
+    let http = match tokio::time::timeout(Duration::from_secs(15), reqwest::get(&url)).await {
+        Ok(Ok(r)) => serde_json::json!({"status": r.status().as_u16(), "ms": t.elapsed().as_millis() as u64}),
+        Ok(Err(e)) => serde_json::json!({"error": e.to_string(), "ms": t.elapsed().as_millis() as u64}),
+        Err(_) => serde_json::json!({"error": "timeout>15s"}),
+    };
+    out.insert("http_handshake".into(), http);
+
+    // 2. DNS resolve + per-address TCP connect to :443 (IPv4 + IPv6).
+    let host = base
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .to_string();
+    match tokio::net::lookup_host((host.as_str(), 443u16)).await {
+        Ok(addrs) => {
+            let mut probes = Vec::new();
+            for addr in addrs {
+                let family = if addr.is_ipv4() { "v4" } else { "v6" };
+                let t = Instant::now();
+                let res = match tokio::time::timeout(
+                    Duration::from_secs(8),
+                    tokio::net::TcpStream::connect(addr),
+                )
+                .await
+                {
+                    Ok(Ok(_)) => serde_json::json!({"addr": addr.to_string(), "family": family, "ok": true, "ms": t.elapsed().as_millis() as u64}),
+                    Ok(Err(e)) => serde_json::json!({"addr": addr.to_string(), "family": family, "error": e.to_string(), "ms": t.elapsed().as_millis() as u64}),
+                    Err(_) => serde_json::json!({"addr": addr.to_string(), "family": family, "error": "timeout>8s"}),
+                };
+                probes.push(res);
+            }
+            out.insert("tcp_probes".into(), serde_json::json!(probes));
+        }
+        Err(e) => {
+            out.insert("dns_error".into(), serde_json::json!(e.to_string()));
+        }
+    }
+
+    // 2b. Direct POST /.well-known/auth (the BRC-104 handshake endpoint) — bare
+    //     reqwest, no Peer. Isolates whether the AUTH ENDPOINT itself responds from
+    //     the container (fast non-2xx is fine — proves reachable) vs the hang being
+    //     in the Peer's handshake *logic* (crypto/session await), not the HTTP.
+    {
+        let auth_url = format!("{base}/.well-known/auth");
+        let t = Instant::now();
+        let body = serde_json::json!({"version":"0.1","messageType":"initialRequest","identityKey":"02deadbeef","nonce":"AAAA"});
+        let probe = tokio::time::timeout(
+            Duration::from_secs(12),
+            reqwest::Client::new().post(&auth_url).json(&body).send(),
+        )
+        .await;
+        out.insert(
+            "auth_endpoint_post".into(),
+            match probe {
+                Ok(Ok(r)) => serde_json::json!({"status": r.status().as_u16(), "ms": t.elapsed().as_millis() as u64}),
+                Ok(Err(e)) => serde_json::json!({"error": e.to_string(), "ms": t.elapsed().as_millis() as u64}),
+                Err(_) => serde_json::json!({"error": "timeout>12s"}),
+            },
+        );
+    }
+
+    // 3. The REAL authed relay-subscribe path the reshare arm uses (the same one
+    //    the proven §06.17.1 presign / §18.2 refresh flows use): BRC-31 identity →
+    //    `MessageBoxClient::new` → `subscribe_round_messages(mpc-dkg)` (auth
+    //    handshake + /listMessages backfill + WS upgrade). Each step timed + the
+    //    whole subscribe bounded by a timeout so a hang is observable, not fatal.
+    match crate::auth::server_identity_priv_from_env() {
+        Ok(id) => {
+            let t = Instant::now();
+            match MessageBoxClient::new(&relay, id) {
+                Ok(client) => {
+                    out.insert("client_new_ms".into(), serde_json::json!(t.elapsed().as_millis() as u64));
+                    let t = Instant::now();
+                    let idh = tokio::time::timeout(Duration::from_secs(10), client.identity_hex()).await;
+                    out.insert(
+                        "identity_hex".into(),
+                        match idh {
+                            Ok(Ok(_)) => serde_json::json!({"ok": true, "ms": t.elapsed().as_millis() as u64}),
+                            Ok(Err(e)) => serde_json::json!({"error": e.to_string(), "ms": t.elapsed().as_millis() as u64}),
+                            Err(_) => serde_json::json!({"error": "timeout>10s"}),
+                        },
+                    );
+                    let t = Instant::now();
+                    let sub = tokio::time::timeout(
+                        Duration::from_secs(25),
+                        client.subscribe_round_messages(BOX_DKG),
+                    )
+                    .await;
+                    out.insert(
+                        "subscribe_round_messages".into(),
+                        match sub {
+                            Ok(Ok(_s)) => serde_json::json!({"ok": true, "ms": t.elapsed().as_millis() as u64}),
+                            Ok(Err(e)) => serde_json::json!({"error": e.to_string(), "ms": t.elapsed().as_millis() as u64}),
+                            Err(_) => serde_json::json!({"error": "TIMEOUT>25s — this is the reshare-arm hang reproduced"}),
+                        },
+                    );
+                }
+                Err(e) => {
+                    out.insert("client_new_error".into(), serde_json::json!(e.to_string()));
+                }
+            }
+        }
+        Err(e) => {
+            out.insert("server_identity".into(), serde_json::json!(format!("none: {e}")));
+        }
+    }
+
+    (StatusCode::OK, Json(serde_json::Value::Object(out)))
+}
+
+/// `GET /reshare-relay/debug` — the in-memory checkpoint trail of the most recent
+/// reshare arm (+ per-step deltas), so a synchronous hang is observable over HTTP.
+pub async fn handle_reshare_relay_debug(
+    State(_state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    let cps = RESHARE_CHECKPOINTS
+        .lock()
+        .map(|c| c.clone())
+        .unwrap_or_default();
+    let first = cps.first().map(|(t, _)| *t).unwrap_or(0);
+    let steps: Vec<serde_json::Value> = cps
+        .iter()
+        .map(|(t, label)| {
+            serde_json::json!({
+                "t_ms": t,
+                "since_start_ms": t.saturating_sub(first),
+                "label": label,
+            })
+        })
+        .collect();
+    let now = now_millis();
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "now_ms": now,
+            "last_checkpoint_age_ms": cps.last().map(|(t, _)| now.saturating_sub(*t)),
+            "count": cps.len(),
+            "steps": steps,
+        })),
+    )
 }
 
 // ── /reshare-relay/identity ────────────────────────────────────────────────────
@@ -129,6 +326,7 @@ pub async fn handle_reshare_relay_init(
     headers: HeaderMap,
     raw: Bytes,
 ) -> impl IntoResponse {
+    checkpoint("init:start", true);
     // §07 auth over the RAW body, then §08.1 owner-authz on the share.
     let caller = match crate::auth::verify_or_allow(
         "POST",
@@ -140,6 +338,7 @@ pub async fn handle_reshare_relay_init(
         Ok(id) => id,
         Err(resp) => return resp,
     };
+    checkpoint("init:authed", false);
     let body: ReshareRelayInitRequest = match crate::handlers::parse_body_pub(&raw) {
         Ok(b) => b,
         Err(resp) => return resp,
@@ -157,6 +356,7 @@ pub async fn handle_reshare_relay_init(
 
     // Load the container's OLD share (+ custody recover on cold miss) BEFORE the
     // owner check (same as refresh).
+    checkpoint("init:body_parsed", false);
     let mut old_share = match crate::handlers::load_share_or_recover_pub(&state, &body.agent_id).await
     {
         Ok(s) => s,
@@ -165,6 +365,7 @@ pub async fn handle_reshare_relay_init(
     if let Some(resp) = crate::handlers::authz_owner_pub(&state, &caller, &body.agent_id) {
         return resp;
     }
+    checkpoint("init:share_loaded", false);
 
     // The OLD share is keyed by the joint pubkey hex = agent_id; ensure it carries
     // the 33-byte joint pubkey (the reshare invariant K).
@@ -291,15 +492,18 @@ pub async fn handle_reshare_relay_init(
     };
 
     // Relay client + this container's relay identity.
+    checkpoint("init:eval_decoded", false);
     let relay_url = relay_url();
     let client = match MessageBoxClient::new(&relay_url, identity_priv.clone()) {
         Ok(c) => c,
         Err(e) => return err_response(StatusCode::BAD_GATEWAY, format!("relay client: {e}")),
     };
+    checkpoint("init:relay_client", false);
     let peer_pub_hex = match client.identity_hex().await {
         Ok(h) => h,
         Err(e) => return err_response(StatusCode::BAD_GATEWAY, format!("relay identity: {e}")),
     };
+    checkpoint("init:relay_identity", false);
 
     let peers: Vec<(u16, String)> = body
         .peers
@@ -325,6 +529,7 @@ pub async fn handle_reshare_relay_init(
     // generation (correct, just slower).
     let dkg_handler = DkgHandler::new(new_cfg, body.my_new_index, fresh_storage());
 
+    checkpoint("init:dkg_listener_starting", false);
     let dkg_listener =
         match MessageBoxListener::start(client.clone(), BOX_DKG, dkg_handler.handler_fn()).await {
             Ok(l) => l,
@@ -332,6 +537,7 @@ pub async fn handle_reshare_relay_init(
                 return err_response(StatusCode::BAD_GATEWAY, format!("dkg listener start: {e}"))
             }
         };
+    checkpoint("init:dkg_listener_started", false);
     let (dkg_rx, dkg_round1) = match dkg_handler.initiate(dkg_session, peers.clone()).await {
         Ok(v) => v,
         Err(e) => {
@@ -342,6 +548,7 @@ pub async fn handle_reshare_relay_init(
             );
         }
     };
+    checkpoint("init:dkg_initiated", false);
     for out in &dkg_round1 {
         if let Err(e) = client
             .send_round_message(
@@ -356,6 +563,7 @@ pub async fn handle_reshare_relay_init(
             return err_response(StatusCode::BAD_GATEWAY, format!("ship dkg round-1: {e}"));
         }
     }
+    checkpoint("init:round1_shipped", false);
 
     // Now (round-1 already shipped — we are NOT late on the relay) generate the
     // slow safe primes off the hot path and late-seed them into the live
@@ -364,7 +572,9 @@ pub async fn handle_reshare_relay_init(
         let seed_handler = dkg_handler.clone();
         tokio::spawn(async move {
             match tokio::task::spawn_blocking(|| {
-                PregeneratedPrimes::<SecurityLevel128>::generate(&mut rand::rngs::OsRng)
+                // Process-global gate: one safe-prime gen's RSS peak live at a
+                // time so back-to-back DKG + reshares can't OOM the container.
+                bsv_mpc_core::paillier_pool::generate_serialized(&mut rand::rngs::OsRng)
             })
             .await
             {
@@ -412,6 +622,7 @@ pub async fn handle_reshare_relay_init(
                 return;
             }
         };
+        checkpoint("taskA:aux_received", false);
         dkg_listener.shutdown().await;
 
         // ── Phase B: now (and only now) subscribe + run the PSS reshare ──
@@ -429,6 +640,7 @@ pub async fn handle_reshare_relay_init(
                 return;
             }
         };
+        checkpoint("taskB:pss_listener_started", false);
         let (pss_rx, pss_round1) = match reshar_handler.initiate(reshar_config, peers).await {
             Ok(v) => v,
             Err(e) => {
@@ -447,6 +659,7 @@ pub async fn handle_reshare_relay_init(
                 return;
             }
         }
+        checkpoint("taskB:pss_round1_shipped", false);
         let commit = match pss_rx.await {
             Ok(c) => c,
             Err(_) => {
@@ -455,6 +668,7 @@ pub async fn handle_reshare_relay_init(
                 return;
             }
         };
+        checkpoint("taskB:pss_commit", false);
         pss_listener.shutdown().await;
 
         // ── Combine (PSS reshare of K + throwaway aux) + store the rotated share ──
@@ -471,11 +685,13 @@ pub async fn handle_reshare_relay_init(
                     joint_pubkey_compressed: jpk_bytes.clone(),
                 };
                 rotate_on_commit(&state_for_commit, &agent_id, &rotated);
+                checkpoint("taskB:rotated", false);
             }
             Err(e) => warn!(session = %task_session, "reshare-relay: combine failed: {e}; NOT rotated"),
         }
     });
 
+    checkpoint("init:returning_200", false);
     info!(
         session = %reshare_session_hex,
         my_new_index,

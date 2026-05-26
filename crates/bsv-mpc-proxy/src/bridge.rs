@@ -759,6 +759,17 @@ pub struct MpcBridge {
     presign_url: String,
 }
 
+/// #44: on teardown, cryptographically wipe the proxy's in-memory secret share
+/// material (the cggmp24 KeyShare JSON, which carries the secret, and the derived
+/// share scalar) rather than letting freed heap linger. Sound because `MpcBridge`
+/// is not `Clone` and its methods clone the share *value* out — never the `Arc`s —
+/// so on drop these locks have no other live holders.
+impl Drop for MpcBridge {
+    fn drop(&mut self) {
+        self.zeroize_secret_material();
+    }
+}
+
 impl MpcBridge {
     /// Initialize the MPC bridge.
     ///
@@ -1027,23 +1038,49 @@ impl MpcBridge {
     /// KeyShare. Returns an error (leaving the live share untouched) if the
     /// rotated share is malformed.
     pub fn apply_refreshed_share(&self, rotated: &EncryptedShare) -> bsv_mpc_core::error::Result<()> {
+        use zeroize::Zeroize;
         // Re-derive the local share scalar from the rotated KeyShare JSON.
-        let new_scalar = bsv_mpc_core::ecdh::parse_share_scalar(&rotated.ciphertext)
+        let mut new_scalar = bsv_mpc_core::ecdh::parse_share_scalar(&rotated.ciphertext)
             .map_err(|e| MpcError::Protocol(format!("refresh hot-swap: bad rotated share: {e}")))?;
         // Carry the invariant joint pubkey forward if the rotated share omitted it.
         let mut next = rotated.clone();
         if next.joint_pubkey_compressed.is_empty() {
             next.joint_pubkey_compressed = self.joint_key.compressed.clone();
         }
+        // #44: wipe the OLD secret material BEFORE overwrite — the rotated share is
+        // on a fresh polynomial, so the old KeyShare bytes + scalar are dead, but
+        // they must not linger in freed heap. (In-memory analogue of the worker's
+        // overwrite-then-delete in do_storage; mirrors the §06.18 zeroize intent.)
         {
             let mut s = self.share.write().unwrap_or_else(|p| p.into_inner());
+            s.ciphertext.zeroize(); // the old cggmp24 KeyShare JSON (carries the secret)
+            s.nonce.zeroize();
             *s = next;
         }
         {
             let mut sc = self.share_scalar.write().unwrap_or_else(|p| p.into_inner());
+            sc.zeroize(); // the old secret scalar
             *sc = new_scalar;
         }
+        // The transient copy of the new scalar on the stack is no longer needed.
+        new_scalar.zeroize();
         Ok(())
+    }
+
+    /// #44: cryptographically wipe the in-memory secret share material — the
+    /// cggmp24 `KeyShare` JSON (which carries the secret share) and the derived
+    /// share scalar. Called on [`Drop`]; the rotate path
+    /// ([`apply_refreshed_share`](Self::apply_refreshed_share)) performs the
+    /// equivalent wipe atomically under its overwrite lock.
+    fn zeroize_secret_material(&self) {
+        use zeroize::Zeroize;
+        if let Ok(mut s) = self.share.write() {
+            s.ciphertext.zeroize();
+            s.nonce.zeroize();
+        }
+        if let Ok(mut sc) = self.share_scalar.write() {
+            sc.zeroize();
+        }
     }
 
     /// Run the presigning protocol, returning the **raw** presignature output
@@ -2629,6 +2666,44 @@ mod tests {
     #[test]
     fn hex_encode_empty() {
         assert_eq!(hex_encode(&[]), "");
+    }
+
+    /// #44: the secret-material wipe actually zeroizes the in-memory KeyShare
+    /// bytes + nonce + derived share scalar (the wipe `Drop` and the rotate path
+    /// both perform). Seeds known non-zero secret bytes, runs the wipe, asserts
+    /// every secret byte is now zero.
+    #[test]
+    fn zeroize_secret_material_wipes_share_and_scalar() {
+        let jk = JointPublicKey {
+            compressed: vec![
+                0x02, 0x79, 0xBE, 0x66, 0x7E, 0xF9, 0xDC, 0xBB, 0xAC, 0x55, 0xA0, 0x62, 0x95, 0xCE,
+                0x87, 0x0B, 0x07, 0x02, 0x9B, 0xFC, 0xDB, 0x2D, 0xCE, 0x28, 0xD9, 0x59, 0xF2, 0x81,
+                0x5B, 0x16, 0xF8, 0x17, 0x98,
+            ],
+            address: "1BitcoinEaterAddressDontSendf59kuE".into(),
+        };
+        let bridge = MpcBridge::new_for_test(jk);
+        // Seed known non-zero secret material (private fields — same module).
+        {
+            let mut s = bridge.share.write().unwrap();
+            s.ciphertext = vec![0xAB; 96];
+            s.nonce = vec![0xCD; 12];
+        }
+        *bridge.share_scalar.write().unwrap() = [0xEF; 32];
+
+        bridge.zeroize_secret_material();
+
+        let s = bridge.share.read().unwrap();
+        assert!(
+            s.ciphertext.iter().all(|&b| b == 0),
+            "#44: KeyShare ciphertext (the secret) MUST be zeroized"
+        );
+        assert!(s.nonce.iter().all(|&b| b == 0), "#44: nonce MUST be zeroized");
+        assert_eq!(
+            *bridge.share_scalar.read().unwrap(),
+            [0u8; 32],
+            "#44: derived secret scalar MUST be zeroized"
+        );
     }
 
     #[test]
