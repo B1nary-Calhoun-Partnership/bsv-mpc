@@ -557,6 +557,38 @@ impl DkgCoordinator {
         }
     }
 
+    /// Joint/group public key (33-byte compressed), available the instant the
+    /// KEYGEN phase completes — BEFORE the slow aux-info phase finishes.
+    /// `None` while in `not_started`/`keygen`; `Some(_)` in `aux_info` and
+    /// `complete`.
+    ///
+    /// **Display-only.** A keygen-only artifact is an `IncompleteKeyShare`
+    /// (no Paillier/ring-Pedersen params), so it CANNOT sign — loading it into
+    /// `SigningCoordinator` fails. Use this for instant-signup UX
+    /// (`getPublicKey`/address display) before aux-info finishes.
+    ///
+    /// Byte-identical to the eventual [`DkgResult`](crate::types::DkgResult)
+    /// `joint_key.compressed`: aux-info attaches params but never changes the
+    /// shared public key (see `assemble_dkg_result`, which reads
+    /// `shared_public_key` from the same stashed `IncompleteKeyShare`).
+    pub fn keygen_joint_pubkey(&self) -> Option<[u8; 33]> {
+        self.keygen_joint_pubkey
+    }
+
+    /// Convenience over [`keygen_joint_pubkey`](Self::keygen_joint_pubkey):
+    /// the keygen-phase joint key as a [`JointPublicKey`](crate::types::JointPublicKey)
+    /// (compressed bytes + BSV P2PKH address), with the address derived by the
+    /// SAME `derive_p2pkh_address` used in `assemble_dkg_result` — so it equals
+    /// the eventual `DkgResult.joint_key` byte-for-byte. Display-only (see the
+    /// caveat on `keygen_joint_pubkey`).
+    pub fn keygen_joint_key(&self) -> Option<crate::types::JointPublicKey> {
+        self.keygen_joint_pubkey
+            .map(|jpk| crate::types::JointPublicKey {
+                compressed: jpk.to_vec(),
+                address: derive_p2pkh_address(&jpk),
+            })
+    }
+
     // -----------------------------------------------------------------------
     // Internal: inline SM drive helpers
     // -----------------------------------------------------------------------
@@ -1390,6 +1422,14 @@ mod tests {
         assert_eq!(coord1.phase(), "keygen");
         assert!(coord0.current_round() >= 1);
 
+        // #55: the keygen-only joint pubkey accessor is None until keygen
+        // completes (we're still in the "keygen" phase here).
+        assert!(
+            coord0.keygen_joint_pubkey().is_none(),
+            "keygen_joint_pubkey() MUST be None before keygen completes"
+        );
+        assert!(coord0.keygen_joint_key().is_none());
+
         // Verify message structure
         for msg in &msgs0 {
             assert_eq!(msg.from, ShareIndex(0));
@@ -1405,11 +1445,28 @@ mod tests {
         let mut outgoing0 = msgs0;
         let mut outgoing1 = msgs1;
 
+        // #55: capture the keygen-phase joint key the first time coord0 enters
+        // aux_info — i.e. BEFORE the slow aux-info phase finishes. We assert at
+        // Complete that it is byte-identical (pubkey + address) to the final
+        // DkgResult.joint_key.
+        let mut captured_keygen_key: Option<([u8; 33], String)> = None;
+
         for round in 0..20 {
             // Feed coord1's messages to coord0
             let result0 = coord0.process_round(outgoing1.clone());
             // Feed coord0's messages to coord1
             let result1 = coord1.process_round(outgoing0.clone());
+
+            if captured_keygen_key.is_none() && coord0.phase() == "aux_info" {
+                let jpk = coord0
+                    .keygen_joint_pubkey()
+                    .expect("keygen_joint_pubkey() MUST be Some once aux_info begins");
+                let jk = coord0
+                    .keygen_joint_key()
+                    .expect("keygen_joint_key() MUST be Some once aux_info begins");
+                assert_eq!(jpk.to_vec(), jk.compressed, "the two accessors must agree");
+                captured_keygen_key = Some((jpk, jk.address));
+            }
 
             match (result0, result1) {
                 (Ok(DkgRoundResult::NextRound(new0)), Ok(DkgRoundResult::NextRound(new1))) => {
@@ -1434,6 +1491,23 @@ mod tests {
                     // Verify shares have correct metadata
                     assert_eq!(r0.share.share_index, ShareIndex(0));
                     assert_eq!(r1.share.share_index, ShareIndex(1));
+
+                    // #55: the keygen-phase joint key captured during aux_info
+                    // is byte-identical (pubkey + address) to the final result —
+                    // aux-info attaches Paillier params but never moves the key.
+                    let (kp, kaddr) = captured_keygen_key
+                        .expect("should have captured keygen_joint_key during aux_info");
+                    assert_eq!(
+                        kp.to_vec(),
+                        r0.joint_key.compressed,
+                        "keygen-phase pubkey == final DkgResult joint key (compressed)"
+                    );
+                    assert_eq!(
+                        kaddr, r0.joint_key.address,
+                        "keygen-phase address == final DkgResult joint key address"
+                    );
+                    // Still populated after the ceremony completes.
+                    assert_eq!(coord0.keygen_joint_pubkey(), Some(kp));
 
                     return; // Test passed!
                 }
