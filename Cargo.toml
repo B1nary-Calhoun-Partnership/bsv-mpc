@@ -15,6 +15,7 @@ members = [
     "crates/bsv-mpc-worker",
     "crates/bsv-mpc-service",
     "crates/bsv-mpc-overlay",
+    "crates/bsv-mpc-client",
     "poc/poc16-sm-inline",
 ]
 exclude = []

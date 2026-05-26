@@ -284,6 +284,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "bsv-mpc-client"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bsv-mpc-core",
+ "hex",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "zeroize",
+]
+
+[[package]]
 name = "bsv-mpc-core"
 version = "0.1.0"
 dependencies = [

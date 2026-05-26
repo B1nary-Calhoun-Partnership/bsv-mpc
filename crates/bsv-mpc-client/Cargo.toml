@@ -1,0 +1,34 @@
+[package]
+name = "bsv-mpc-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Greenfield native (iOS/Android via UniFFI) + web (wasm-bindgen) client for bsv-mpc threshold signing. Wraps bsv-mpc-core; zero rust-mpc / 100cash dependency (issue #41)."
+
+# Phase 1 is the target-agnostic core: 3 injected traits + WalletClient + InMemoryKeyStore,
+# building on BOTH native and wasm32. The UniFFI / wasm-bindgen FFI skins, the per-target
+# bsv-rs split, and the optional native (sqlx/reqwest) impls land in Phases 2-4 — see
+# docs/41-CLIENT-PLAN.md. Until then crate-type stays "lib" (cdylib/staticlib added with FFI).
+[lib]
+crate-type = ["lib"]
+
+[dependencies]
+# The one allowed in-workspace dependency — the wasm-safe MPC primitives we wrap.
+bsv-mpc-core = { path = "../bsv-mpc-core" }
+
+# Unsealed secrets are held only as Zeroizing<T> (wiped on drop). Matches the
+# core accessors (decrypt_share / derive_share_encryption_key) hardened this cycle.
+zeroize.workspace = true
+
+# `?Send` async traits — host callbacks (wasm JS closures / UniFFI foreign traits) are !Send.
+async-trait = "0.1"
+
+serde.workspace = true
+serde_json.workspace = true
+hex.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+# Native-only test executor for the async trait round-trips (not in the wasm lib build).
+tokio = { version = "1", default-features = false, features = ["rt", "macros"] }

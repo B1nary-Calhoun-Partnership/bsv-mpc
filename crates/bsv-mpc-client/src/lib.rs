@@ -1,0 +1,27 @@
+//! `bsv-mpc-client` — greenfield native (iOS/Android via UniFFI) + web
+//! (wasm-bindgen) client wrapping `bsv-mpc-core` threshold signing.
+//!
+//! 100% Calhoun-solo, **zero `rust-mpc` / `100cash` dependency** (issue #41):
+//! platform patterns (Secure-Enclave wrap-key, UniFFI shell) are reimplemented
+//! fresh, never depended on. Build plan: `docs/41-CLIENT-PLAN.md`.
+//!
+//! ## Shape
+//! One target-agnostic [`WalletClient`] core over three host-**injected** seams —
+//! [`WalletStorage`], [`ChainServices`], [`KeyStore`] — so the host owns all I/O
+//! and secrets stay [`zeroize::Zeroizing`] end-to-end. The UniFFI / wasm-bindgen
+//! FFI skins (Phase 4) are thin wrappers over this core.
+//!
+//! Phase 1 (this) is the target-agnostic core: it compiles on both native and
+//! `wasm32-unknown-unknown`.
+
+mod chain;
+mod client;
+mod error;
+mod keystore;
+mod storage;
+
+pub use chain::{BroadcastResult, ChainServices, Utxo};
+pub use client::WalletClient;
+pub use error::ClientError;
+pub use keystore::{InMemoryKeyStore, KeyStore};
+pub use storage::{StoredShare, WalletStorage};
