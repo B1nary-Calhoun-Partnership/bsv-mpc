@@ -101,12 +101,27 @@ impl ResharHandler {
         // `pending_inbound` (same as the dispatch buffering path) so no buffered
         // message is lost between the coordinator insert and the drain.
         {
-            let mut tx = self.inner.completion_tx.lock().unwrap_or_else(|p| p.into_inner());
+            let mut tx = self
+                .inner
+                .completion_tx
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
             tx.insert(session_id, completion_tx);
         }
         let buffered: Vec<DecodedRoundMessage> = {
-            let mut coords = self.inner.coordinators.lock().unwrap_or_else(|p| p.into_inner());
-            coords.insert(session_id, CoordinatorSlot { coord, peers, joint_pubkey });
+            let mut coords = self
+                .inner
+                .coordinators
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            coords.insert(
+                session_id,
+                CoordinatorSlot {
+                    coord,
+                    peers,
+                    joint_pubkey,
+                },
+            );
             self.inner
                 .pending_inbound
                 .lock()
@@ -148,7 +163,11 @@ impl ResharHandler {
     }
 
     pub fn live_session_count(&self) -> usize {
-        self.inner.coordinators.lock().unwrap_or_else(|p| p.into_inner()).len()
+        self.inner
+            .coordinators
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .len()
     }
 }
 
@@ -230,7 +249,10 @@ async fn dispatch_one(
                     hex::encode(&commit.joint_pubkey_compressed)
                 );
                 let tx = {
-                    let mut txs = inner.completion_tx.lock().unwrap_or_else(|p| p.into_inner());
+                    let mut txs = inner
+                        .completion_tx
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner());
                     txs.remove(&session_id)
                 };
                 if let Some(tx) = tx {
@@ -267,7 +289,10 @@ fn wrap_outgoing(
             Some(ShareIndex(idx)) => peers.iter().filter(|(p, _)| *p == idx).collect(),
         };
         if targets.is_empty() {
-            warn!("ResharHandler: outgoing to party {:?} not in peer set; dropping", rm.to);
+            warn!(
+                "ResharHandler: outgoing to party {:?} not in peer set; dropping",
+                rm.to
+            );
             continue;
         }
         for (idx, hex) in targets {

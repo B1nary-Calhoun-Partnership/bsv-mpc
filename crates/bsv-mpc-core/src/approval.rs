@@ -600,7 +600,14 @@ mod tests {
         let sig_b = sign_approval(&vh, &sid, &b).unwrap();
         // One allow → still pending.
         let st = c.record_vote(&sig_a, ApprovalDecision::Allow, 0).unwrap();
-        assert!(matches!(st, ApprovalStatus::Pending { collected: 1, total: 2, .. }));
+        assert!(matches!(
+            st,
+            ApprovalStatus::Pending {
+                collected: 1,
+                total: 2,
+                ..
+            }
+        ));
         assert!(!c.is_approved());
         // Second allow → approved.
         let st = c.record_vote(&sig_b, ApprovalDecision::Allow, 1).unwrap();
@@ -628,7 +635,9 @@ mod tests {
         let sid = [0x07u8; 32];
         let mut c = ApprovalCollector::new(quorum(1, &[&eligible]), vh, sid, 10_000);
         let sig_out = sign_approval(&vh, &sid, &outsider).unwrap();
-        let err = c.record_vote(&sig_out, ApprovalDecision::Allow, 0).unwrap_err();
+        let err = c
+            .record_vote(&sig_out, ApprovalDecision::Allow, 0)
+            .unwrap_err();
         assert!(format!("{err}").contains("not in the quorum"));
     }
 
@@ -639,16 +648,28 @@ mod tests {
         let sid = [0x07u8; 32];
         // k-deny → Denied.
         let mut c = ApprovalCollector::new(quorum(2, &[&a, &b]), vh, sid, 10_000);
-        c.record_vote(&sign_approval(&vh, &sid, &a).unwrap(), ApprovalDecision::Deny, 0)
-            .unwrap();
+        c.record_vote(
+            &sign_approval(&vh, &sid, &a).unwrap(),
+            ApprovalDecision::Deny,
+            0,
+        )
+        .unwrap();
         let st = c
-            .record_vote(&sign_approval(&vh, &sid, &b).unwrap(), ApprovalDecision::Deny, 1)
+            .record_vote(
+                &sign_approval(&vh, &sid, &b).unwrap(),
+                ApprovalDecision::Deny,
+                1,
+            )
             .unwrap();
         assert_eq!(st, ApprovalStatus::Denied);
         // deadline → Expired (fresh collector, one allow, past the deadline).
         let mut c2 = ApprovalCollector::new(quorum(2, &[&a, &b]), vh, sid, 5_000);
-        c2.record_vote(&sign_approval(&vh, &sid, &a).unwrap(), ApprovalDecision::Allow, 0)
-            .unwrap();
+        c2.record_vote(
+            &sign_approval(&vh, &sid, &a).unwrap(),
+            ApprovalDecision::Allow,
+            0,
+        )
+        .unwrap();
         assert_eq!(c2.status(6_000), ApprovalStatus::Expired);
     }
 

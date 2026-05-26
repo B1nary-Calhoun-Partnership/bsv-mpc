@@ -765,9 +765,10 @@ impl CosignerSessionDo {
         .map_err(|e| Error::RustError(format!("§06.20 decrypt presig: {e}")))?;
         let round_trip_matches = recovered == presig_bytes;
 
-        let partial_json =
-            bsv_mpc_core::signing::issue_partial_signature_json(&recovered, &sighash)
-                .map_err(|e| Error::RustError(format!("issue_partial from consumed presig: {e}")))?;
+        let partial_json = bsv_mpc_core::signing::issue_partial_signature_json(
+            &recovered, &sighash,
+        )
+        .map_err(|e| Error::RustError(format!("issue_partial from consumed presig: {e}")))?;
 
         Response::from_json(&serde_json::json!({
             "route": "poc/presig-pool",
@@ -1088,7 +1089,7 @@ impl CosignerSessionDo {
             hex::encode(rnd)
         );
         let agent_id = presig_id.clone(); // unique per-call pool slot (isolation)
-        // §06.20: self-encrypt at ingest, decrypt at sign (same as production).
+                                          // §06.20: self-encrypt at ingest, decrypt at sign (same as production).
         let wallet = self.presig_wallet()?;
         let ciphertext = bsv_mpc_core::presig_encryption::encrypt_presig_share(
             &wallet,
@@ -1387,8 +1388,8 @@ impl CosignerSessionDo {
         // malformed hex / wrong length with 400 (mirrors the sighash decode).
         let brc42_offset = match &body.brc42_offset {
             Some(h) => {
-                let b = hex::decode(h)
-                    .map_err(|e| Error::RustError(format!("brc42_offset: {e}")))?;
+                let b =
+                    hex::decode(h).map_err(|e| Error::RustError(format!("brc42_offset: {e}")))?;
                 if b.len() != 32 {
                     return Response::error("brc42_offset must be 32 bytes", 400);
                 }
@@ -1437,9 +1438,8 @@ impl CosignerSessionDo {
         // key/run (#7 finding 5).
         let (ciphertext, presig_id) = match &body.cosigner_encrypted_share {
             Some(ct_hex) => {
-                let ct = hex::decode(ct_hex).map_err(|e| {
-                    Error::RustError(format!("cosigner_encrypted_share hex: {e}"))
-                })?;
+                let ct = hex::decode(ct_hex)
+                    .map_err(|e| Error::RustError(format!("cosigner_encrypted_share hex: {e}")))?;
                 if ct.is_empty() {
                     return Response::error("cosigner_encrypted_share is empty", 400);
                 }

@@ -219,7 +219,10 @@ async fn container_hd_child_key_signs_over_relay_deployed_real_mainnet() {
 
     // ── 2. MpcBridge from share_B, presign_url = the container ─────────────────
     let dir = std::env::temp_dir();
-    let share_path = dir.join(format!("hd_relay_container_share_{}.json", std::process::id()));
+    let share_path = dir.join(format!(
+        "hd_relay_container_share_{}.json",
+        std::process::id()
+    ));
     tokio::fs::write(&share_path, serde_json::to_vec(&dkg_b).unwrap())
         .await
         .expect("write share file");
@@ -284,7 +287,10 @@ async fn container_hd_child_key_signs_over_relay_deployed_real_mainnet() {
         "wallet createAction failed ({fund_status}): {fund_text}"
     );
     let fund_json: serde_json::Value = serde_json::from_str(&fund_text).expect("fund JSON");
-    let fund_txid = fund_json["txid"].as_str().expect("createAction txid").to_string();
+    let fund_txid = fund_json["txid"]
+        .as_str()
+        .expect("createAction txid")
+        .to_string();
     eprintln!("✔ funded child address: txid={fund_txid}");
     if let Some(raw) = raw_tx_hex_from_create_action(&fund_json) {
         eprintln!("  self-broadcasting funding tx via ARC...");
@@ -318,8 +324,11 @@ async fn container_hd_child_key_signs_over_relay_deployed_real_mainnet() {
         .as_str()
         .expect("publicKey")
         .to_string();
-    let change_script =
-        p2pkh_locking_script(&PublicKey::from_hex(&wallet_pub_hex).expect("wallet pub").hash160());
+    let change_script = p2pkh_locking_script(
+        &PublicKey::from_hex(&wallet_pub_hex)
+            .expect("wallet pub")
+            .hash160(),
+    );
 
     let scope = SIGHASH_ALL | SIGHASH_FORKID;
     let sighash = compute_sighash_for_signing(&SighashParams {
@@ -355,7 +364,10 @@ async fn container_hd_child_key_signs_over_relay_deployed_real_mainnet() {
         )
         .await
         .expect("§06.20 HD sign from bundle over relay (offset applied both sides)");
-    eprintln!("✔ co-signed via §06.20 HD relay path: DER {} bytes", sig.signature.len());
+    eprintln!(
+        "✔ co-signed via §06.20 HD relay path: DER {} bytes",
+        sig.signature.len()
+    );
 
     // ── 7. PRE-FLIGHT verify under the CHILD key — fail-closed BEFORE broadcast ─
     let mut r = [0u8; 32];
@@ -372,7 +384,9 @@ async fn container_hd_child_key_signs_over_relay_deployed_real_mainnet() {
         !joint_pub.verify(&sighash, &bsv_sig),
         "HD signature MUST NOT verify under the base joint key (offset must have taken effect)"
     );
-    eprintln!("✔ pre-flight: verifies under CHILD key, rejects under base key — offset took effect");
+    eprintln!(
+        "✔ pre-flight: verifies under CHILD key, rejects under base key — offset took effect"
+    );
 
     // ── 8. Assemble + broadcast (unlock with the CHILD pubkey) ─────────────────
     let tx_sig = TransactionSignature::new(bsv_sig, scope);
@@ -391,7 +405,10 @@ async fn container_hd_child_key_signs_over_relay_deployed_real_mainnet() {
 
     let ok = broadcast_via_arc(&http, &raw_tx_hex).await;
     let _ = tokio::fs::remove_file(&share_path).await;
-    assert!(ok, "ARC broadcast MUST succeed — TXID={txid_hex} rawTx={raw_tx_hex}");
+    assert!(
+        ok,
+        "ARC broadcast MUST succeed — TXID={txid_hex} rawTx={raw_tx_hex}"
+    );
 
     eprintln!();
     eprintln!("╔══════════════════════════════════════════════════════════════╗");

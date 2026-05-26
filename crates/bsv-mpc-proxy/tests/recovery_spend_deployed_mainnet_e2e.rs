@@ -198,12 +198,18 @@ async fn find_utxo_on_woc(
     for attempt in 1..=20 {
         eprintln!("  WoC attempt {attempt}: waiting 15s for indexing...");
         tokio::time::sleep(Duration::from_secs(15)).await;
-        let Ok(resp) = http.get(&url).send().await else { continue };
+        let Ok(resp) = http.get(&url).send().await else {
+            continue;
+        };
         if !resp.status().is_success() {
             continue;
         }
-        let Ok(json) = resp.json::<serde_json::Value>().await else { continue };
-        let Some(vouts) = json["vout"].as_array() else { continue };
+        let Ok(json) = resp.json::<serde_json::Value>().await else {
+            continue;
+        };
+        let Some(vouts) = json["vout"].as_array() else {
+            continue;
+        };
         for vout in vouts {
             if vout["scriptPubKey"]["hex"].as_str().unwrap_or("") == expected_locking_hex {
                 let n = vout["n"].as_u64().unwrap_or(0) as u32;
@@ -239,7 +245,12 @@ fn dkg_result_for(
 
 /// Build a `ProxyConfig` for a 2-of-3 bridge whose share is at `share_path`, with
 /// the container as the heavy-MPC peer (reshare + presign).
-fn proxy_config_2of3(port: u16, share_path: &str, container_url: &str, relay_url: &str) -> ProxyConfig {
+fn proxy_config_2of3(
+    port: u16,
+    share_path: &str,
+    container_url: &str,
+    relay_url: &str,
+) -> ProxyConfig {
     ProxyConfig {
         port,
         kss_url: container_url.to_string(),
@@ -279,7 +290,10 @@ async fn recovery_spend_deployed_real_mainnet() {
     let pid = std::process::id();
 
     let proxy_identity = PrivateKey::from_bytes(&[0x40u8; 32]).expect("proxy identity key");
-    std::env::set_var("MPC_PROXY_IDENTITY_KEY", hex::encode(proxy_identity.to_bytes()));
+    std::env::set_var(
+        "MPC_PROXY_IDENTITY_KEY",
+        hex::encode(proxy_identity.to_bytes()),
+    );
 
     // ── 1. Real distributed authed 2-of-2 DKG against the deployed container ───
     eprintln!("(1) real distributed 2-of-2 DKG against the deployed container — minutes");
@@ -312,7 +326,12 @@ async fn recovery_spend_deployed_real_mainnet() {
         .expect("write share_B");
     let cfg1 = ProxyConfig {
         threshold_configs: vec!["2-of-2".to_string()],
-        ..proxy_config_2of3(3340, &share_path1.to_string_lossy(), &container_url, &relay_url)
+        ..proxy_config_2of3(
+            3340,
+            &share_path1.to_string_lossy(),
+            &container_url,
+            &relay_url,
+        )
     };
     let summary1 = {
         let bridge1 = MpcBridge::new(&cfg1)
@@ -324,7 +343,10 @@ async fn recovery_spend_deployed_real_mainnet() {
             .expect("reshare #1 (2-of-2 → 2-of-3)")
         // bridge1 dropped here → #44 zeroizes its in-memory secret material.
     };
-    assert_eq!(summary1.joint_pubkey_hex, joint_hex, "§18: address UNCHANGED by reshare #1");
+    assert_eq!(
+        summary1.joint_pubkey_hex, joint_hex,
+        "§18: address UNCHANGED by reshare #1"
+    );
     assert_eq!((summary1.new_threshold, summary1.new_parties), (2, 3));
     let p1_prime = summary1
         .proxy_key_shares_json
@@ -347,7 +369,9 @@ async fn recovery_spend_deployed_real_mainnet() {
     // that same identity must NOT overlap reshare #1's lingering one (the §06.17
     // two-subscription split race → reshare #2 PSS messages get lost → timeout).
     // Settle so the container fully commits + releases reshare #1 before reshare #2.
-    eprintln!("  settling 60s so the container commits + releases reshare #1 (single-identity §06.17)");
+    eprintln!(
+        "  settling 60s so the container commits + releases reshare #1 (single-identity §06.17)"
+    );
     tokio::time::sleep(Duration::from_secs(60)).await;
 
     // ── 4. LOSE the phone (P2′). Survivors {container P0′, proxy P1′} = 2 = t. ──
@@ -363,7 +387,9 @@ async fn recovery_spend_deployed_real_mainnet() {
     let mut cooldown = RecoveryCooldown::new(86_400);
     authorize_recovery(2, 2, 3, &mut cooldown, now_secs)
         .expect("recovery authorized: survivor quorum cleared + cooldown permits");
-    eprintln!("✔ LOST the phone (P2′); recovery AUTHORIZED — survivors {{P0′,P1′}} = 2 = t (§18.4a)");
+    eprintln!(
+        "✔ LOST the phone (P2′); recovery AUTHORIZED — survivors {{P0′,P1′}} = 2 = t (§18.4a)"
+    );
 
     // ── 5. Reshare #2 (the recovery): survivors {0,1} reshare onto fresh P2″ ────
     eprintln!("(5) reshare #2 (RECOVERY) survivors 2-of-3 → 2-of-3 onto a fresh device — minutes");
@@ -373,7 +399,12 @@ async fn recovery_spend_deployed_real_mainnet() {
     tokio::fs::write(&share_path2, serde_json::to_vec(&dkg_p1).unwrap())
         .await
         .expect("write surviving P1′");
-    let cfg2b = proxy_config_2of3(3341, &share_path2.to_string_lossy(), &container_url, &relay_url);
+    let cfg2b = proxy_config_2of3(
+        3341,
+        &share_path2.to_string_lossy(),
+        &container_url,
+        &relay_url,
+    );
     let summary2 = {
         let bridge2 = MpcBridge::new(&cfg2b)
             .await
@@ -384,7 +415,10 @@ async fn recovery_spend_deployed_real_mainnet() {
             .expect("reshare #2 (recovery, survivors 2-of-3 → 2-of-3)")
         // bridge2 dropped → #44 zeroizes the surviving-share secret material.
     };
-    assert_eq!(summary2.joint_pubkey_hex, joint_hex, "§18: address UNCHANGED by recovery reshare");
+    assert_eq!(
+        summary2.joint_pubkey_hex, joint_hex,
+        "§18: address UNCHANGED by recovery reshare"
+    );
     let p2_dprime = summary2
         .proxy_key_shares_json
         .iter()
@@ -403,7 +437,9 @@ async fn recovery_spend_deployed_real_mainnet() {
     // deterministically: the recovery presign failed here while the standalone
     // sec0617 presign — no prior ceremony on the identity — passed). Settle so the
     // container fully releases reshare #2 before the presign arms.
-    eprintln!("  settling 60s so the container commits + releases reshare #2 (single-identity §06.17)");
+    eprintln!(
+        "  settling 60s so the container commits + releases reshare #2 (single-identity §06.17)"
+    );
     tokio::time::sleep(Duration::from_secs(60)).await;
 
     // ── 6. Spend {0,2} over the relay: recovered device P2″ + surviving container ─
@@ -414,7 +450,12 @@ async fn recovery_spend_deployed_real_mainnet() {
     tokio::fs::write(&share_path3, serde_json::to_vec(&dkg_p2).unwrap())
         .await
         .expect("write recovered P2″");
-    let cfg3 = proxy_config_2of3(3342, &share_path3.to_string_lossy(), &container_url, &relay_url);
+    let cfg3 = proxy_config_2of3(
+        3342,
+        &share_path3.to_string_lossy(),
+        &container_url,
+        &relay_url,
+    );
     let bridge3 = MpcBridge::new(&cfg3)
         .await
         .expect("bridge3 handshake (recovered device P2″)");
@@ -462,8 +503,11 @@ async fn recovery_spend_deployed_real_mainnet() {
         .as_str()
         .expect("publicKey")
         .to_string();
-    let change_script =
-        p2pkh_locking_script(&PublicKey::from_hex(&wallet_pub_hex).expect("wallet pub").hash160());
+    let change_script = p2pkh_locking_script(
+        &PublicKey::from_hex(&wallet_pub_hex)
+            .expect("wallet pub")
+            .hash160(),
+    );
     let scope = SIGHASH_ALL | SIGHASH_FORKID;
     let sighash = compute_sighash_for_signing(&SighashParams {
         version: 1,
@@ -487,7 +531,13 @@ async fn recovery_spend_deployed_real_mainnet() {
 
     // Sign from the bundle over the relay: container cosigns with its rotated P0″.
     let sig = bridge3
-        .sign_from_bundle_over_relay(&sighash, &bundle, at_rest_root, Duration::from_secs(60), None)
+        .sign_from_bundle_over_relay(
+            &sighash,
+            &bundle,
+            at_rest_root,
+            Duration::from_secs(60),
+            None,
+        )
         .await
         .expect("sign {0,2} from bundle over relay (recovered device + container)");
     let mut r = [0u8; 32];
@@ -497,7 +547,10 @@ async fn recovery_spend_deployed_real_mainnet() {
     let bsv_sig = Signature::new(r, s);
 
     // PRE-FLIGHT: low-s + verify under the UNCHANGED joint pubkey — fail closed.
-    assert!(bsv_sig.is_low_s(), "recovery signature MUST be low-s (BIP-62)");
+    assert!(
+        bsv_sig.is_low_s(),
+        "recovery signature MUST be low-s (BIP-62)"
+    );
     assert!(
         joint_pub.verify(&sighash, &bsv_sig),
         "PRE-FLIGHT: recovered-device signature MUST verify under the UNCHANGED joint pubkey K"
@@ -506,7 +559,8 @@ async fn recovery_spend_deployed_real_mainnet() {
 
     // Assemble + broadcast.
     let tx_sig = TransactionSignature::new(bsv_sig, scope);
-    let unlocking = p2pkh_unlocking_script(&tx_sig.to_checksig_format(), &joint_pub.to_compressed());
+    let unlocking =
+        p2pkh_unlocking_script(&tx_sig.to_checksig_format(), &joint_pub.to_compressed());
     let raw_tx = serialize_transaction(
         1,
         &[(prev_txid, vout, unlocking, 0xFFFFFFFF)],
@@ -517,7 +571,10 @@ async fn recovery_spend_deployed_real_mainnet() {
     txid.reverse();
     let txid_hex = hex::encode(txid);
     let raw_tx_hex = hex::encode(&raw_tx);
-    eprintln!("✔ assembled recovery spend {} bytes — TXID={txid_hex}", raw_tx.len());
+    eprintln!(
+        "✔ assembled recovery spend {} bytes — TXID={txid_hex}",
+        raw_tx.len()
+    );
 
     let ok = broadcast_via_arc(&http, &raw_tx_hex).await;
     // Clean up share files (also drops bridge3 → #44 zeroize).
@@ -525,7 +582,10 @@ async fn recovery_spend_deployed_real_mainnet() {
     for p in [&share_path1, &share_path2, &share_path3] {
         let _ = tokio::fs::remove_file(p).await;
     }
-    assert!(ok, "ARC broadcast MUST succeed — TXID={txid_hex} rawTx={raw_tx_hex}");
+    assert!(
+        ok,
+        "ARC broadcast MUST succeed — TXID={txid_hex} rawTx={raw_tx_hex}"
+    );
 
     // ── 7. Independently confirm the spend on WhatsOnChain ─────────────────────
     let woc = format!("https://api.whatsonchain.com/v1/bsv/main/tx/hash/{txid_hex}");
@@ -541,8 +601,8 @@ async fn recovery_spend_deployed_real_mainnet() {
             }
         }
     }
-    let tx_json =
-        confirmed.unwrap_or_else(|| panic!("recovery spend {txid_hex} MUST be found on WhatsOnChain"));
+    let tx_json = confirmed
+        .unwrap_or_else(|| panic!("recovery spend {txid_hex} MUST be found on WhatsOnChain"));
     let spent_prev: Vec<&str> = tx_json["vin"]
         .as_array()
         .expect("vin array")
@@ -561,7 +621,9 @@ async fn recovery_spend_deployed_real_mainnet() {
     eprintln!("  joint_pubkey:     {joint_hex} (UNCHANGED across DKG → 2 reshares)");
     eprintln!("  joint_address:    {}", joint.address);
     eprintln!("  funding_txid:     {fund_txid}:{vout} ({value} sats)");
-    eprintln!("  lost device:      P2′ (the phone); survivors {{container P0′, proxy P1′}} = 2 = t");
+    eprintln!(
+        "  lost device:      P2′ (the phone); survivors {{container P0′, proxy P1′}} = 2 = t"
+    );
     eprintln!("  recovered device: P2″ (brand-new party from the recovery reshare)");
     eprintln!("  recovery_spend:   {txid_hex}  (recovered device + container cosign over relay)");
     eprintln!("  old 2-of-2 share_B: invalidated (off the rotated polynomial; presigs purged)");

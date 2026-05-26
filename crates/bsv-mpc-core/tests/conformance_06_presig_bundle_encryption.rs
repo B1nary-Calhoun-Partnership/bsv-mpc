@@ -43,7 +43,9 @@ fn root() -> Value {
 }
 
 fn s<'a>(v: &'a Value, key: &str) -> &'a str {
-    v[key].as_str().unwrap_or_else(|| panic!("missing string field {key}"))
+    v[key]
+        .as_str()
+        .unwrap_or_else(|| panic!("missing string field {key}"))
 }
 
 /// Tier 1 — the locked intermediates reproduce through bsv-mpc-core's `hd` path.
@@ -90,9 +92,7 @@ fn intermediate_values_reproduce_byte_for_byte() {
         );
 
         // (c) Self_ ECDH shared secret = root_priv * root_pub (§03.6), compressed.
-        let shared_secret = priv_key
-            .derive_shared_secret(&pub_key)
-            .expect("self ECDH");
+        let shared_secret = priv_key.derive_shared_secret(&pub_key).expect("self ECDH");
         assert_eq!(
             shared_secret.to_hex(),
             s(locked, "shared_secret_compressed_hex"),
@@ -202,6 +202,9 @@ fn ciphertext_byte_lock() {
         // Round-trip through the canonical decrypt path — proves the deterministic
         // seam derived the SAME BRC-2 key the production wallet path uses.
         let pt = decrypt_presig_share(&wallet, presig_id, &ct).unwrap();
-        assert_eq!(pt, plaintext, "{name}: round-trip decrypt under canonical path");
+        assert_eq!(
+            pt, plaintext,
+            "{name}: round-trip decrypt under canonical path"
+        );
     }
 }

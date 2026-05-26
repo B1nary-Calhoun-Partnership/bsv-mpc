@@ -1135,12 +1135,7 @@ mod tests {
         let data = DataToSign::digest::<Sha256>(msg);
         // A spread of 4-of-6 subsets: the 4 originals, a mix, and the two new
         // parties (4,5) with two originals.
-        for subset in &[
-            [0u16, 1, 2, 3],
-            [0, 1, 4, 5],
-            [2, 3, 4, 5],
-            [1, 2, 3, 5],
-        ] {
+        for subset in &[[0u16, 1, 2, 3], [0, 1, 4, 5], [2, 3, 4, 5], [1, 2, 3, 5]] {
             let sig = sign_with_parties(&new_key_shares, subset, &data).await;
             sig.verify(&original_joint, &data).unwrap_or_else(|_| {
                 panic!(

@@ -718,7 +718,9 @@ impl PolicyEngine {
         // counterparty_allowlist — a miss denies (an unknown counterparty also
         // misses an allowlist and is therefore denied).
         if let Some(allow) = &rule.counterparty_allowlist {
-            let permitted = req.counterparty.is_some_and(|cp| allow.iter().any(|a| a == cp));
+            let permitted = req
+                .counterparty
+                .is_some_and(|cp| allow.iter().any(|a| a == cp));
             if !permitted {
                 return Verdict::Deny("counterparty not on allowlist".to_string());
             }
@@ -748,7 +750,10 @@ impl PolicyEngine {
         // violation, return the seconds until the OLDEST in-window event ages
         // out (when budget frees).
         if let Some(cap) = rule.max_per_hour {
-            let events = self.rate_state.entry(rule.protocol_pattern.clone()).or_default();
+            let events = self
+                .rate_state
+                .entry(rule.protocol_pattern.clone())
+                .or_default();
             // Record this attempt, then drop everything older than the window.
             events.push(now_ms);
             let window_start = now_ms.saturating_sub(ONE_HOUR_MS);
@@ -1025,7 +1030,10 @@ mod tests {
         let m = manifest_with(vec![r], DefaultAction::Deny);
         let mut eng = PolicyEngine::new(m).unwrap();
         // two are allowed within the window
-        assert_eq!(eng.check_signing(&signing("agent/pay", 1, 1, None), 0), Verdict::Allow);
+        assert_eq!(
+            eng.check_signing(&signing("agent/pay", 1, 1, None), 0),
+            Verdict::Allow
+        );
         assert_eq!(
             eng.check_signing(&signing("agent/pay", 1, 1, None), 1000),
             Verdict::Allow
@@ -1062,7 +1070,9 @@ mod tests {
             }
             other => panic!("expected RequireApproval, got {other:?}"),
         }
-        assert!(eng.check_signing(&signing("treasury/move", 1, 1, None), 0).requires_approval());
+        assert!(eng
+            .check_signing(&signing("treasury/move", 1, 1, None), 0)
+            .requires_approval());
     }
 
     #[test]
@@ -1130,7 +1140,10 @@ mod tests {
             },
             0,
         );
-        assert!(matches!(v, Verdict::Deny(_)), "presigning must gate, got {v:?}");
+        assert!(
+            matches!(v, Verdict::Deny(_)),
+            "presigning must gate, got {v:?}"
+        );
 
         // amount cap also gates presigning
         let mut r = rule("agent/*");

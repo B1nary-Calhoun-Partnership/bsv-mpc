@@ -6,8 +6,8 @@
 //! §04.9 forbidden-input (zero nonce) check on the spec data itself.
 
 use bsv_mpc_core::canonical::{
-    canonical_session_id, payload_digest_dkg, payload_digest_presign, CeremonyKind,
-    SessionParams, SESSION_ID_DOMAIN,
+    canonical_session_id, payload_digest_dkg, payload_digest_presign, CeremonyKind, SessionParams,
+    SESSION_ID_DOMAIN,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -117,15 +117,12 @@ fn sha256(parts: &[&[u8]]) -> [u8; 32] {
 #[test]
 fn presign_session_id_matches_section_04_5_presign_row() {
     // The §04.10 test identities (NOT valid curve points — byte-mechanics only).
-    let p1 = from_hex_arr::<33>(
-        "020000000000000000000000000000000000000000000000000000000000000001",
-    );
-    let p2 = from_hex_arr::<33>(
-        "020000000000000000000000000000000000000000000000000000000000000002",
-    );
-    let pool_id: [u8; 32] = from_hex_arr::<32>(
-        "1111111111111111111111111111111111111111111111111111111111111111",
-    );
+    let p1 =
+        from_hex_arr::<33>("020000000000000000000000000000000000000000000000000000000000000001");
+    let p2 =
+        from_hex_arr::<33>("020000000000000000000000000000000000000000000000000000000000000002");
+    let pool_id: [u8; 32] =
+        from_hex_arr::<32>("1111111111111111111111111111111111111111111111111111111111111111");
     let nonce = sha256(&[b"presign-nonce-A"]);
 
     // §04.5 Presign row: payload_digest = SHA-256("presig-pool" || pool_id_32B).

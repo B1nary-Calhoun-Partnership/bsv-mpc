@@ -678,7 +678,11 @@ mod tests {
     fn handshake_then_authed_request_verifies() {
         let (auth, client) = handshook(0x11, 0x22);
         let body = br#"{"session_id":"c07"}"#;
-        let req_headers = headers_of(client.request_headers("POST", "/presign/init", body).unwrap());
+        let req_headers = headers_of(
+            client
+                .request_headers("POST", "/presign/init", body)
+                .unwrap(),
+        );
         let id = verify_or_allow("POST", "/presign/init", &req_headers, body, &auth)
             .expect("authed request verifies");
         assert_eq!(id.identity_key, key(0x22).public_key().to_hex());
@@ -688,7 +692,11 @@ mod tests {
     fn tampered_body_rejected() {
         let (auth, client) = handshook(0x11, 0x22);
         let body = br#"{"session_id":"c07"}"#;
-        let req_headers = headers_of(client.request_headers("POST", "/presign/init", body).unwrap());
+        let req_headers = headers_of(
+            client
+                .request_headers("POST", "/presign/init", body)
+                .unwrap(),
+        );
         // Verify over a DIFFERENT body than was signed → must fail.
         let err = verify_or_allow("POST", "/presign/init", &req_headers, b"{}", &auth)
             .expect_err("tampered body rejected");
@@ -699,7 +707,9 @@ mod tests {
     fn tampered_signature_rejected() {
         let (auth, client) = handshook(0x11, 0x22);
         let body = br#"{"x":1}"#;
-        let mut pairs = client.request_headers("POST", "/presign/init", body).unwrap();
+        let mut pairs = client
+            .request_headers("POST", "/presign/init", body)
+            .unwrap();
         for p in pairs.iter_mut() {
             if p.0 == super::headers::SIGNATURE {
                 p.1 = "3006020100020100".to_string();
@@ -718,7 +728,11 @@ mod tests {
         let server_nonce = base64::engine::general_purpose::STANDARD.encode([0xEEu8; 32]);
         assert!(client.complete_handshake(key(0x11).public_key().to_hex(), server_nonce));
         let body = b"{}";
-        let req_headers = headers_of(client.request_headers("POST", "/presign/init", body).unwrap());
+        let req_headers = headers_of(
+            client
+                .request_headers("POST", "/presign/init", body)
+                .unwrap(),
+        );
         let err = verify_or_allow("POST", "/presign/init", &req_headers, body, &auth)
             .expect_err("unknown session rejected");
         assert_eq!(err.0, StatusCode::UNAUTHORIZED);
@@ -730,7 +744,9 @@ mod tests {
         // (same headers, same body, same per-request nonce) is rejected.
         let (auth, client) = handshook(0x11, 0x22);
         let body = br#"{"session_id":"replay"}"#;
-        let pairs = client.request_headers("POST", "/presign/init", body).unwrap();
+        let pairs = client
+            .request_headers("POST", "/presign/init", body)
+            .unwrap();
         let req_headers = headers_of(pairs.clone());
         // First time → accepted.
         verify_or_allow("POST", "/presign/init", &req_headers, body, &auth)

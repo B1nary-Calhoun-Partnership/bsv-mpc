@@ -332,13 +332,16 @@ pub async fn handle_presign_relay_init(
         }
     };
 
-    let listener =
-        match MessageBoxListener::start(client.clone(), &protocol_box, handler.handler_fn()).await {
-            Ok(l) => l,
-            Err(e) => {
-                return err_response(StatusCode::BAD_GATEWAY, format!("listener start: {e}"))
-            }
-        };
+    let listener = match MessageBoxListener::start(
+        client.clone(),
+        &protocol_box,
+        handler.handler_fn(),
+    )
+    .await
+    {
+        Ok(l) => l,
+        Err(e) => return err_response(StatusCode::BAD_GATEWAY, format!("listener start: {e}")),
+    };
 
     // Ship our round-1 to the coordinator (its only peer).
     for out in &round1_out {
@@ -366,7 +369,10 @@ pub async fn handle_presign_relay_init(
     }
 
     presign_checkpoint(
-        format!("arm:round1_shipped count={} returning_200", round1_out.len()),
+        format!(
+            "arm:round1_shipped count={} returning_200",
+            round1_out.len()
+        ),
         false,
     );
     tracing::info!(
@@ -488,9 +494,7 @@ pub async fn handle_sign_relay(
     let session_id = match &body.session_id_hex {
         Some(h) => match SessionId::from_hex(h) {
             Ok(id) => id,
-            Err(e) => {
-                return err_response(StatusCode::BAD_REQUEST, format!("session_id_hex: {e}"))
-            }
+            Err(e) => return err_response(StatusCode::BAD_REQUEST, format!("session_id_hex: {e}")),
         },
         None => SessionId::from_str_hash("mpc-sign-relay"),
     };
@@ -498,10 +502,7 @@ pub async fn handle_sign_relay(
     // session_id hex (the key_id the presign handler sealed under), which is the
     // bundle's `presig_id` — DISTINCT from the per-sign relay-correlation
     // `session_id`. Fall back to `session_id` hex when the caller omits it.
-    let presig_id = body
-        .presig_id
-        .clone()
-        .unwrap_or_else(|| session_id.hex());
+    let presig_id = body.presig_id.clone().unwrap_or_else(|| session_id.hex());
 
     // §06.20 / issue #26: optional BRC-42 offset (hex of 32 bytes). Reuse the
     // 32-byte decode helper; reject malformed hex/length with 400.

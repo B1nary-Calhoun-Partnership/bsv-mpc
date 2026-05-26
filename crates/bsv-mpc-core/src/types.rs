@@ -310,9 +310,10 @@ impl Serialize for PolicyId {
 impl<'de> Deserialize<'de> for PolicyId {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
         let bytes: Vec<u8> = serde_bytes::deserialize(deserializer)?;
-        let arr: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
-            serde::de::Error::invalid_length(bytes.len(), &"32-byte policy_id")
-        })?;
+        let arr: [u8; 32] = bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| serde::de::Error::invalid_length(bytes.len(), &"32-byte policy_id"))?;
         Ok(Self(arr))
     }
 }
@@ -455,8 +456,9 @@ impl PresigBundle {
     /// stability property §13.7 relies on.
     pub fn to_cbor(&self) -> crate::Result<Vec<u8>> {
         let mut buf = Vec::new();
-        ciborium::ser::into_writer(self, &mut buf)
-            .map_err(|e| crate::MpcError::Serialization(format!("PresigBundle CBOR encode: {e}")))?;
+        ciborium::ser::into_writer(self, &mut buf).map_err(|e| {
+            crate::MpcError::Serialization(format!("PresigBundle CBOR encode: {e}"))
+        })?;
         Ok(buf)
     }
 
@@ -594,12 +596,16 @@ mod tests {
         }));
 
         // Subset change — bound to the prior subset → invalidated; other subset → not.
-        assert!(b.invalidated_by(&InvalidationTrigger::CosignerSubsetChange {
-            prior_subset: &[0, 1, 2],
-        }));
-        assert!(!b.invalidated_by(&InvalidationTrigger::CosignerSubsetChange {
-            prior_subset: &[0, 1, 3],
-        }));
+        assert!(
+            b.invalidated_by(&InvalidationTrigger::CosignerSubsetChange {
+                prior_subset: &[0, 1, 2],
+            })
+        );
+        assert!(
+            !b.invalidated_by(&InvalidationTrigger::CosignerSubsetChange {
+                prior_subset: &[0, 1, 3],
+            })
+        );
 
         // Policy update — invalidated when the current policy DIFFERS from the
         // bundle's bound policy; NOT invalidated when it still matches.
@@ -632,25 +638,37 @@ mod tests {
         ];
 
         // Policy update to 0x11 → only D (policy 0x77) is purged.
-        let trig = InvalidationTrigger::PolicyUpdate { current_policy_id: PolicyId([0x11; 32]) };
+        let trig = InvalidationTrigger::PolicyUpdate {
+            current_policy_id: PolicyId([0x11; 32]),
+        };
         let survivors: Vec<_> = pool.iter().filter(|b| !b.invalidated_by(&trig)).collect();
         assert_eq!(survivors.len(), 3);
-        assert!(survivors.iter().all(|b| b.policy_id == PolicyId([0x11; 32])));
+        assert!(survivors
+            .iter()
+            .all(|b| b.policy_id == PolicyId([0x11; 32])));
 
         // Subset change away from [0,1,3] → only B is purged.
-        let trig = InvalidationTrigger::CosignerSubsetChange { prior_subset: &[0, 1, 3] };
+        let trig = InvalidationTrigger::CosignerSubsetChange {
+            prior_subset: &[0, 1, 3],
+        };
         let survivors: Vec<_> = pool.iter().filter(|b| !b.invalidated_by(&trig)).collect();
         assert_eq!(survivors.len(), 3);
-        assert!(survivors.iter().all(|b| b.parties_at_keygen != [0u16, 1, 3]));
+        assert!(survivors
+            .iter()
+            .all(|b| b.parties_at_keygen != [0u16, 1, 3]));
 
         // Joint-pubkey change from 0x03 → only C is purged.
-        let trig = InvalidationTrigger::JointPubkeyChange { prior_joint_pubkey: &[0x03; 33] };
+        let trig = InvalidationTrigger::JointPubkeyChange {
+            prior_joint_pubkey: &[0x03; 33],
+        };
         let survivors: Vec<_> = pool.iter().filter(|b| !b.invalidated_by(&trig)).collect();
         assert_eq!(survivors.len(), 3);
         assert!(survivors.iter().all(|b| b.joint_pubkey != [0x03u8; 33]));
 
         // Share refresh of 0x02 → A, B, D all purged (3 of 4); only C survives.
-        let trig = InvalidationTrigger::ShareRefresh { joint_pubkey: &[0x02; 33] };
+        let trig = InvalidationTrigger::ShareRefresh {
+            joint_pubkey: &[0x02; 33],
+        };
         let survivors: Vec<_> = pool.iter().filter(|b| !b.invalidated_by(&trig)).collect();
         assert_eq!(survivors.len(), 1);
         assert_eq!(survivors[0].joint_pubkey, [0x03u8; 33]);
@@ -683,7 +701,10 @@ mod tests {
         // Axis 2: joint_pubkey differs.
         let mut m = base.clone();
         m.joint_pubkey = vec![0x03; 33];
-        assert!(!b.matches_binding(&m), "joint_pubkey mismatch must invalidate");
+        assert!(
+            !b.matches_binding(&m),
+            "joint_pubkey mismatch must invalidate"
+        );
 
         // Axis 3: cosigner subset differs (membership).
         let mut m = base.clone();

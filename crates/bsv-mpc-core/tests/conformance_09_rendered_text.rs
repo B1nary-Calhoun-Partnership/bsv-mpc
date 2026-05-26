@@ -43,7 +43,11 @@ fn recipient(v: &Value) -> Recipient {
     } else if let Some(arr) = v.as_array() {
         Recipient::Multi(
             arr.iter()
-                .map(|item| item.as_str().expect("recipient array item is text").to_string())
+                .map(|item| {
+                    item.as_str()
+                        .expect("recipient array item is text")
+                        .to_string()
+                })
                 .collect(),
         )
     } else {
@@ -61,9 +65,9 @@ fn request_view_hash_reproduces_locked_vectors_byte_for_byte() {
         let name = s(v, "name");
         let bi = &v["binding_inputs"];
 
-        let amount = bi["amount"].as_u64().unwrap_or_else(|| {
-            panic!("{name}: binding_inputs.amount must be an unsigned integer")
-        });
+        let amount = bi["amount"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("{name}: binding_inputs.amount must be an unsigned integer"));
         let recip = recipient(&bi["recipient"]);
 
         let result = request_view_hash(

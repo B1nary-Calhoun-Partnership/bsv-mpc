@@ -64,10 +64,13 @@ pub async fn coordinate_refresh_over_relay(
     let coord_pub_hex = client.identity_hex().await.map_err(proto)?;
 
     let handler = RefreshHandler::new(my_party, parties_at_keygen.clone());
-    let listener =
-        MessageBoxListener::start(client.clone(), bsv_mpc_messagebox::types::BOX_REFRESH, handler.handler_fn())
-            .await
-            .map_err(|e| MpcError::Protocol(format!("coord refresh listener: {e}")))?;
+    let listener = MessageBoxListener::start(
+        client.clone(),
+        bsv_mpc_messagebox::types::BOX_REFRESH,
+        handler.handler_fn(),
+    )
+    .await
+    .map_err(|e| MpcError::Protocol(format!("coord refresh listener: {e}")))?;
 
     // 2. Fetch the container's relay identity FIRST (§06.17 ordering invariant:
     //    register our slot + ship round-1 before the peer ships).
@@ -90,11 +93,18 @@ pub async fn coordinate_refresh_over_relay(
     };
     for out in &round1_out {
         if let Err(e) = client
-            .send_round_message(&out.recipient_pub_hex, &out.message_box, &out.round_msg, out.params.clone())
+            .send_round_message(
+                &out.recipient_pub_hex,
+                &out.message_box,
+                &out.round_msg,
+                out.params.clone(),
+            )
             .await
         {
             listener.shutdown().await;
-            return Err(MpcError::Protocol(format!("ship coord refresh round-1: {e}")));
+            return Err(MpcError::Protocol(format!(
+                "ship coord refresh round-1: {e}"
+            )));
         }
     }
 
@@ -150,7 +160,9 @@ async fn fetch_peer_identity(arm: &PeerArm) -> Result<String> {
     struct IdResponse {
         peer_pub_hex: String,
     }
-    let url = arm.url.replace("/refresh-relay/init", "/refresh-relay/identity");
+    let url = arm
+        .url
+        .replace("/refresh-relay/init", "/refresh-relay/identity");
     let resp = reqwest::Client::new()
         .get(&url)
         .send()

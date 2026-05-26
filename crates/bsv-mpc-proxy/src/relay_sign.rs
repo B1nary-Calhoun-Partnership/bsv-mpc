@@ -388,8 +388,8 @@ pub async fn combine_sign_from_bundle_over_relay(
     // the SAME offset below. None = base key.
     let offset_bytes: Option<[u8; 32]> = match &trigger.brc42_offset {
         Some(h) => {
-            let v = hex::decode(h)
-                .map_err(|e| MpcError::Protocol(format!("brc42_offset hex: {e}")))?;
+            let v =
+                hex::decode(h).map_err(|e| MpcError::Protocol(format!("brc42_offset hex: {e}")))?;
             let arr: [u8; 32] = v
                 .try_into()
                 .map_err(|_| MpcError::Protocol("brc42_offset must be 32 bytes".into()))?;
@@ -462,7 +462,9 @@ pub async fn combine_sign_from_bundle_over_relay(
             })?;
         let decoded = tokio::time::timeout(remaining, sub.next())
             .await
-            .map_err(|_| MpcError::Protocol("timed out awaiting cosigner partial over relay".into()))?
+            .map_err(|_| {
+                MpcError::Protocol("timed out awaiting cosigner partial over relay".into())
+            })?
             .ok_or_else(|| MpcError::Protocol("relay subscription closed before partial".into()))?
             .map_err(proto)?;
         let rm = decoded.round_msg;

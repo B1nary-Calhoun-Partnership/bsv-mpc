@@ -168,8 +168,16 @@ fn policy_id_is_stable_across_constructions() {
         eligible: vec![key(0xcc)],
     });
 
-    let a = manifest(vec![empty_rule("agent/*"), r.clone()], DefaultAction::EscalateToHuman, false);
-    let b = manifest(vec![empty_rule("agent/*"), r], DefaultAction::EscalateToHuman, false);
+    let a = manifest(
+        vec![empty_rule("agent/*"), r.clone()],
+        DefaultAction::EscalateToHuman,
+        false,
+    );
+    let b = manifest(
+        vec![empty_rule("agent/*"), r],
+        DefaultAction::EscalateToHuman,
+        false,
+    );
 
     assert_eq!(a.compute_policy_id(), b.compute_policy_id());
     // and the stored id equals the recomputed id

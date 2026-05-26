@@ -108,8 +108,12 @@ pub async fn handle_reshare_relay_egress_test(
     let url = format!("{base}/socket.io/?EIO=4&transport=polling&t=egress");
     let t = Instant::now();
     let http = match tokio::time::timeout(Duration::from_secs(15), reqwest::get(&url)).await {
-        Ok(Ok(r)) => serde_json::json!({"status": r.status().as_u16(), "ms": t.elapsed().as_millis() as u64}),
-        Ok(Err(e)) => serde_json::json!({"error": e.to_string(), "ms": t.elapsed().as_millis() as u64}),
+        Ok(Ok(r)) => {
+            serde_json::json!({"status": r.status().as_u16(), "ms": t.elapsed().as_millis() as u64})
+        }
+        Ok(Err(e)) => {
+            serde_json::json!({"error": e.to_string(), "ms": t.elapsed().as_millis() as u64})
+        }
         Err(_) => serde_json::json!({"error": "timeout>15s"}),
     };
     out.insert("http_handshake".into(), http);
@@ -134,9 +138,15 @@ pub async fn handle_reshare_relay_egress_test(
                 )
                 .await
                 {
-                    Ok(Ok(_)) => serde_json::json!({"addr": addr.to_string(), "family": family, "ok": true, "ms": t.elapsed().as_millis() as u64}),
-                    Ok(Err(e)) => serde_json::json!({"addr": addr.to_string(), "family": family, "error": e.to_string(), "ms": t.elapsed().as_millis() as u64}),
-                    Err(_) => serde_json::json!({"addr": addr.to_string(), "family": family, "error": "timeout>8s"}),
+                    Ok(Ok(_)) => {
+                        serde_json::json!({"addr": addr.to_string(), "family": family, "ok": true, "ms": t.elapsed().as_millis() as u64})
+                    }
+                    Ok(Err(e)) => {
+                        serde_json::json!({"addr": addr.to_string(), "family": family, "error": e.to_string(), "ms": t.elapsed().as_millis() as u64})
+                    }
+                    Err(_) => {
+                        serde_json::json!({"addr": addr.to_string(), "family": family, "error": "timeout>8s"})
+                    }
                 };
                 probes.push(res);
             }
@@ -180,9 +190,13 @@ pub async fn handle_reshare_relay_egress_test(
             let t = Instant::now();
             match MessageBoxClient::new(&relay, id) {
                 Ok(client) => {
-                    out.insert("client_new_ms".into(), serde_json::json!(t.elapsed().as_millis() as u64));
+                    out.insert(
+                        "client_new_ms".into(),
+                        serde_json::json!(t.elapsed().as_millis() as u64),
+                    );
                     let t = Instant::now();
-                    let idh = tokio::time::timeout(Duration::from_secs(10), client.identity_hex()).await;
+                    let idh =
+                        tokio::time::timeout(Duration::from_secs(10), client.identity_hex()).await;
                     out.insert(
                         "identity_hex".into(),
                         match idh {
@@ -212,7 +226,10 @@ pub async fn handle_reshare_relay_egress_test(
             }
         }
         Err(e) => {
-            out.insert("server_identity".into(), serde_json::json!(format!("none: {e}")));
+            out.insert(
+                "server_identity".into(),
+                serde_json::json!(format!("none: {e}")),
+            );
         }
     }
 
@@ -221,9 +238,7 @@ pub async fn handle_reshare_relay_egress_test(
 
 /// `GET /reshare-relay/debug` — the in-memory checkpoint trail of the most recent
 /// reshare arm (+ per-step deltas), so a synchronous hang is observable over HTTP.
-pub async fn handle_reshare_relay_debug(
-    State(_state): State<Arc<AppState>>,
-) -> impl IntoResponse {
+pub async fn handle_reshare_relay_debug(State(_state): State<Arc<AppState>>) -> impl IntoResponse {
     let cps = RESHARE_CHECKPOINTS
         .lock()
         .map(|c| c.clone())
@@ -357,11 +372,11 @@ pub async fn handle_reshare_relay_init(
     // Load the container's OLD share (+ custody recover on cold miss) BEFORE the
     // owner check (same as refresh).
     checkpoint("init:body_parsed", false);
-    let mut old_share = match crate::handlers::load_share_or_recover_pub(&state, &body.agent_id).await
-    {
-        Ok(s) => s,
-        Err(resp) => return resp,
-    };
+    let mut old_share =
+        match crate::handlers::load_share_or_recover_pub(&state, &body.agent_id).await {
+            Ok(s) => s,
+            Err(resp) => return resp,
+        };
     if let Some(resp) = crate::handlers::authz_owner_pub(&state, &caller, &body.agent_id) {
         return resp;
     }
@@ -397,20 +412,16 @@ pub async fn handle_reshare_relay_init(
             }
         };
     let old_index: u16 = old_keyshare.core.i;
-    let old_eval: Vec<NonZero<Scalar<Secp256k1>>> = match old_keyshare
-        .core
-        .key_info
-        .vss_setup
-        .as_ref()
-    {
-        Some(v) => v.I.clone(),
-        None => {
-            return err_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "reshare: old key share has no VSS setup",
-            )
-        }
-    };
+    let old_eval: Vec<NonZero<Scalar<Secp256k1>>> =
+        match old_keyshare.core.key_info.vss_setup.as_ref() {
+            Some(v) => v.I.clone(),
+            None => {
+                return err_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "reshare: old key share has no VSS setup",
+                )
+            }
+        };
     let old_secret: Scalar<Secp256k1> =
         *<SecretScalar<Secp256k1> as AsRef<Scalar<Secp256k1>>>::as_ref(&old_keyshare.core.x);
 
@@ -431,15 +442,11 @@ pub async fn handle_reshare_relay_init(
             arr.copy_from_slice(&bytes);
             let s = match Scalar::<Secp256k1>::from_be_bytes(arr) {
                 Ok(s) => s,
-                Err(_) => {
-                    return err_response(StatusCode::BAD_REQUEST, "invalid new eval scalar")
-                }
+                Err(_) => return err_response(StatusCode::BAD_REQUEST, "invalid new eval scalar"),
             };
             match NonZero::from_scalar(s) {
                 Some(nz) => v.push(nz),
-                None => {
-                    return err_response(StatusCode::BAD_REQUEST, "new eval point is zero")
-                }
+                None => return err_response(StatusCode::BAD_REQUEST, "new eval point is zero"),
             }
         }
         v
@@ -579,7 +586,9 @@ pub async fn handle_reshare_relay_init(
             .await
             {
                 Ok(primes) => seed_handler.seed_primes_late(dkg_session, primes),
-                Err(e) => warn!("reshare-relay: prime gen task panicked: {e}; auxinfo will generate inline"),
+                Err(e) => warn!(
+                    "reshare-relay: prime gen task panicked: {e}; auxinfo will generate inline"
+                ),
             }
         });
     }
@@ -651,7 +660,12 @@ pub async fn handle_reshare_relay_init(
         };
         for out in &pss_round1 {
             if let Err(e) = task_client
-                .send_round_message(&out.recipient_pub_hex, &out.message_box, &out.round_msg, out.params.clone())
+                .send_round_message(
+                    &out.recipient_pub_hex,
+                    &out.message_box,
+                    &out.round_msg,
+                    out.params.clone(),
+                )
                 .await
             {
                 warn!(session = %task_session, "reshare-relay: ship pss round-1: {e}");
@@ -687,7 +701,9 @@ pub async fn handle_reshare_relay_init(
                 rotate_on_commit(&state_for_commit, &agent_id, &rotated);
                 checkpoint("taskB:rotated", false);
             }
-            Err(e) => warn!(session = %task_session, "reshare-relay: combine failed: {e}; NOT rotated"),
+            Err(e) => {
+                warn!(session = %task_session, "reshare-relay: combine failed: {e}; NOT rotated")
+            }
         }
     });
 
@@ -701,10 +717,7 @@ pub async fn handle_reshare_relay_init(
 
     (
         StatusCode::OK,
-        Json(
-            serde_json::to_value(ReshareRelayInitResponse { peer_pub_hex })
-                .unwrap_or_default(),
-        ),
+        Json(serde_json::to_value(ReshareRelayInitResponse { peer_pub_hex }).unwrap_or_default()),
     )
 }
 
@@ -719,7 +732,9 @@ fn rotate_on_commit(state: &Arc<AppState>, agent_id: &str, rotated: &EncryptedSh
                 warn!("reshare-relay: failed to rotate share for {agent_id}: {e}");
                 return;
             }
-            let purged = storage.delete_presignatures_for_agent(agent_id).unwrap_or(0);
+            let purged = storage
+                .delete_presignatures_for_agent(agent_id)
+                .unwrap_or(0);
             info!(
                 agent_id = %agent_id,
                 purged_presigs = purged,

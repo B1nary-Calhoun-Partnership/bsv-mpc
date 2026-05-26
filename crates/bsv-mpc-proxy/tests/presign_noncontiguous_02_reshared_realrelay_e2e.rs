@@ -41,7 +41,9 @@ use bsv::primitives::ec::PrivateKey;
 use bsv_mpc_core::reshar_coordinator::{
     ContributorInputs, ResharCommit, ResharConfig, ResharCoordinator, ResharRoundResult,
 };
-use bsv_mpc_core::types::{EncryptedShare, PolicyId, RoundMessage, SessionId, ShareIndex, ThresholdConfig};
+use bsv_mpc_core::types::{
+    EncryptedShare, PolicyId, RoundMessage, SessionId, ShareIndex, ThresholdConfig,
+};
 use bsv_mpc_proxy::relay_presign::{coordinate_presign_over_relay, CosignerArm};
 use bsv_mpc_service::{build_router, AppState, AuthState, FileBundleStore, SqliteShareStorage};
 use cggmp24::key_share::IncompleteKeyShare;
@@ -138,7 +140,9 @@ fn generate_blum_prime(rng: &mut impl rand::RngCore, bits: u32) -> cggmp24::back
         }
     }
 }
-fn test_primes(rng: &mut impl rand::RngCore) -> cggmp24::key_refresh::PregeneratedPrimes<SecurityLevel128> {
+fn test_primes(
+    rng: &mut impl rand::RngCore,
+) -> cggmp24::key_refresh::PregeneratedPrimes<SecurityLevel128> {
     use cggmp24::security_level::SecurityLevel;
     let b = SecurityLevel128::RSA_PRIME_BITLEN;
     cggmp24::key_refresh::PregeneratedPrimes::try_from([
@@ -181,7 +185,11 @@ fn aux_gen(n: u16) -> Vec<cggmp24::key_share::AuxInfo<SecurityLevel128>> {
         let party = buffer_outgoing(party);
         let mut r = rand::rngs::OsRng;
         let pre = primes[usize::from(i)].clone();
-        async move { cggmp24::aux_info_gen(eid, i, n, pre).start(&mut r, party).await }
+        async move {
+            cggmp24::aux_info_gen(eid, i, n, pre)
+                .start(&mut r, party)
+                .await
+        }
     })
     .unwrap()
     .expect_ok()
@@ -338,8 +346,12 @@ async fn run_reshared_presign_over_relay(label: &str) -> bool {
 
     let dkg_session = SessionId::from_str_hash(&format!("dkg-{agent_id}"));
     // Cosigner = party 0 (share_index 0, matches my_party_index 0); coordinator = party 2.
-    let cosigner_share =
-        wrap_key_share(&key_shares[cosigner_party as usize], cosigner_party, config, dkg_session);
+    let cosigner_share = wrap_key_share(
+        &key_shares[cosigner_party as usize],
+        cosigner_party,
+        config,
+        dkg_session,
+    );
     let coord_share = wrap_key_share(
         &key_shares[coordinator_party as usize],
         coordinator_party,
@@ -349,13 +361,15 @@ async fn run_reshared_presign_over_relay(label: &str) -> bool {
 
     // Container/service stable relay identity.
     let container_identity = fresh_priv();
-    std::env::set_var("MPC_SERVER_PRIVATE_KEY", hex::encode(container_identity.to_bytes()));
+    std::env::set_var(
+        "MPC_SERVER_PRIVATE_KEY",
+        hex::encode(container_identity.to_bytes()),
+    );
     std::env::set_var("MESSAGEBOX_RELAY_URL", &relay_url);
 
     // Boot the in-process bsv-mpc-service with the cosigner share seeded.
     let data_dir = tempfile::tempdir().expect("tempdir");
-    let mut storage =
-        SqliteShareStorage::open(data_dir.path().to_str().unwrap()).expect("storage");
+    let mut storage = SqliteShareStorage::open(data_dir.path().to_str().unwrap()).expect("storage");
     storage
         .store_share_with_owner(&agent_id, &cosigner_share, "")
         .expect("seed cosigner share");
@@ -368,11 +382,15 @@ async fn run_reshared_presign_over_relay(label: &str) -> bool {
         custody: None,
     });
     let app = build_router(state);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
     let svc_addr = listener.local_addr().unwrap();
     let svc_url = format!("http://{svc_addr}");
     tokio::spawn(async move {
-        axum::serve(listener, app.into_make_service()).await.unwrap();
+        axum::serve(listener, app.into_make_service())
+            .await
+            .unwrap();
     });
     let http = reqwest::Client::new();
     for _ in 0..50 {
@@ -396,10 +414,11 @@ async fn run_reshared_presign_over_relay(label: &str) -> bool {
     let at_rest_root = [0x42u8; 32];
     let presign_session = SessionId::from_str_hash(&format!("presig-{agent_id}-{label}"));
 
-    let no_auth_signer = move |_m: &str,
-                               _p: &str,
-                               _b: &[u8]|
-          -> bsv_mpc_core::error::Result<Vec<(String, String)>> { Ok(vec![]) };
+    let no_auth_signer =
+        move |_m: &str,
+              _p: &str,
+              _b: &[u8]|
+              -> bsv_mpc_core::error::Result<Vec<(String, String)>> { Ok(vec![]) };
 
     let result = coordinate_presign_over_relay(
         &relay_url,
@@ -429,8 +448,14 @@ async fn run_reshared_presign_over_relay(label: &str) -> bool {
                 bundle.parties_at_keygen,
                 bundle.cosigner_encrypted_shares.len()
             );
-            assert_eq!(bundle.joint_pubkey, joint_pubkey, "[{label}] joint_pubkey binding");
-            assert_eq!(bundle.parties_at_keygen, parties_at_keygen, "[{label}] subset binding");
+            assert_eq!(
+                bundle.joint_pubkey, joint_pubkey,
+                "[{label}] joint_pubkey binding"
+            );
+            assert_eq!(
+                bundle.parties_at_keygen, parties_at_keygen,
+                "[{label}] subset binding"
+            );
             true
         }
         Err(e) => {

@@ -230,7 +230,9 @@ async fn fund_joint(
                 return txid;
             }
         }
-        eprintln!("  funding attempt {attempt} ({txid}) did NOT broadcast (unconfirmed parent); retrying");
+        eprintln!(
+            "  funding attempt {attempt} ({txid}) did NOT broadcast (unconfirmed parent); retrying"
+        );
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
     panic!("could not get a funding tx to broadcast after 8 attempts — wallet has no confirmed-parent UTXOs available");
@@ -292,17 +294,35 @@ To run (BURNS REAL SATS): MULTI_INPUT_RELAY_MAINNET=1 cargo test -p bsv-mpc-prox
     let joint_pub = PublicKey::from_bytes(&joint_arr).expect("joint pubkey");
     let joint_locking = p2pkh_locking_script(&joint_pub.hash160());
     let joint_locking_hex = hex::encode(&joint_locking);
-    eprintln!("✔ joint pubkey {} / {}", hex::encode(joint_arr), joint.address);
+    eprintln!(
+        "✔ joint pubkey {} / {}",
+        hex::encode(joint_arr),
+        joint.address
+    );
 
-    let (a0_json, b0, box_b0) = gen_presig_pair(share0.clone(), share1.clone(), "multi-ca-presig-0");
-    let (a1_json, b1, box_b1) = gen_presig_pair(share0.clone(), share1.clone(), "multi-ca-presig-1");
+    let (a0_json, b0, box_b0) =
+        gen_presig_pair(share0.clone(), share1.clone(), "multi-ca-presig-0");
+    let (a1_json, b1, box_b1) =
+        gen_presig_pair(share0.clone(), share1.clone(), "multi-ca-presig-1");
     eprintln!("✔ generated 2 correlated presig pairs");
 
     // ── 2. Fund TWO UTXOs to the joint P2PKH via wallet:3321 ────────────────
     let fund_amount: u64 = 2000;
-    let fund_txid_0 = fund_joint(&http, &joint_locking_hex, fund_amount, "#13 multi-input fund 0").await;
+    let fund_txid_0 = fund_joint(
+        &http,
+        &joint_locking_hex,
+        fund_amount,
+        "#13 multi-input fund 0",
+    )
+    .await;
     eprintln!("✔ funded joint UTXO #0: txid={fund_txid_0}");
-    let fund_txid_1 = fund_joint(&http, &joint_locking_hex, fund_amount, "#13 multi-input fund 1").await;
+    let fund_txid_1 = fund_joint(
+        &http,
+        &joint_locking_hex,
+        fund_amount,
+        "#13 multi-input fund 1",
+    )
+    .await;
     eprintln!("✔ funded joint UTXO #1: txid={fund_txid_1}");
 
     // ── 3. Find both UTXOs on WhatsOnChain ──────────────────────────────────
@@ -480,7 +500,8 @@ To run (BURNS REAL SATS): MULTI_INPUT_RELAY_MAINNET=1 cargo test -p bsv-mpc-prox
             }
         }
     }
-    let tx_json = tx_json.unwrap_or_else(|| panic!("spending tx {txid} MUST be found on WhatsOnChain"));
+    let tx_json =
+        tx_json.unwrap_or_else(|| panic!("spending tx {txid} MUST be found on WhatsOnChain"));
     let vins = tx_json["vin"].as_array().expect("vin array on WoC");
     assert!(
         vins.len() >= 2,
@@ -488,10 +509,7 @@ To run (BURNS REAL SATS): MULTI_INPUT_RELAY_MAINNET=1 cargo test -p bsv-mpc-prox
         vins.len()
     );
     // Each funding UTXO must appear as an input.
-    let spent_prev: Vec<&str> = vins
-        .iter()
-        .filter_map(|v| v["txid"].as_str())
-        .collect();
+    let spent_prev: Vec<&str> = vins.iter().filter_map(|v| v["txid"].as_str()).collect();
     assert!(
         spent_prev.contains(&fund_txid_0.as_str()),
         "vin MUST spend funding UTXO #0 {fund_txid_0}; got {spent_prev:?}"
@@ -508,7 +526,10 @@ To run (BURNS REAL SATS): MULTI_INPUT_RELAY_MAINNET=1 cargo test -p bsv-mpc-prox
     eprintln!("  joint_pubkey:  {}", hex::encode(joint_arr));
     eprintln!("  funding_txid0: {fund_txid_0}:{vout0} ({value0} sats)");
     eprintln!("  funding_txid1: {fund_txid_1}:{vout1} ({value1} sats)");
-    eprintln!("  spending_txid: {txid}  ({} vin, confirmed on WhatsOnChain)", vins.len());
+    eprintln!(
+        "  spending_txid: {txid}  ({} vin, confirmed on WhatsOnChain)",
+        vins.len()
+    );
     eprintln!("  cosigner:      deployed bsv-mpc-worker DO (share_A partials over authed relay)");
     eprintln!("  view: https://whatsonchain.com/tx/{txid}");
     eprintln!("  total wall-clock: {:?}", t0.elapsed());
