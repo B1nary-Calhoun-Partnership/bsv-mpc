@@ -18,6 +18,7 @@ mod chain;
 mod client;
 mod error;
 mod keystore;
+mod signer;
 mod storage;
 pub mod txbuild;
 
@@ -25,4 +26,5 @@ pub use chain::{BroadcastResult, ChainServices, Utxo};
 pub use client::WalletClient;
 pub use error::ClientError;
 pub use keystore::{InMemoryKeyStore, KeyStore};
+pub use signer::unseal_signing_scalar;
 pub use storage::{StoredShare, WalletStorage};

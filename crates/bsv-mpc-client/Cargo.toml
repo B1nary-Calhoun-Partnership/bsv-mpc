@@ -36,6 +36,16 @@ tokio = { version = "1", default-features = false, features = ["rt", "macros"] }
 # Used by the tests/ integration binaries (hex-encode the golden vectors).
 hex.workspace = true
 
+# Native-only: the signer hot-path test builds a REAL cggmp24 2-of-2 share via
+# trusted_dealer (fast — no DKG/Paillier) to prove unseal → parse_share_scalar.
+# Gated to native in-source (`cfg(not(target_arch="wasm32"))`), so they never
+# enter the wasm build.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+# `spof` enables cggmp24::trusted_dealer (mirrors bsv-mpc-core's dev-dep).
+cggmp24 = { git = "https://github.com/LFDT-Lockness/cggmp21", features = ["curve-secp256k1", "hd-wallet", "hd-slip10", "spof"] }
+generic-ec.workspace = true
+rand.workspace = true
+
 # wasm32-only: the #[wasm_bindgen_test] harness for tests/wasm32_txbuild.rs
 # (run via `wasm-pack test --node -p bsv-mpc-client --test wasm32_txbuild`).
 # getrandom/js is needed to LINK the wasm32 test binary. Mirrors bsv-mpc-core.
