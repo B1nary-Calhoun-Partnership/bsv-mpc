@@ -22,3 +22,13 @@ fn wasm_tx_helpers_are_byte_identical_to_native() {
     assert_eq!(hex::encode(demo_sighash()), GOLDEN_SIGHASH_HEX);
     assert_eq!(compute_txid(&demo_serialized()), GOLDEN_TXID_HEX);
 }
+
+// The wasm-bindgen skin (JS-callable surface) over the same helpers.
+#[wasm_bindgen_test]
+fn wasm_bindgen_skin_txid_and_outputs_match() {
+    let raw_hex = hex::encode(demo_serialized());
+    let txid = bsv_mpc_client::wasm::tx_txid(&raw_hex).expect("tx_txid");
+    assert_eq!(txid, GOLDEN_TXID_HEX);
+    let sats = bsv_mpc_client::wasm::tx_output_sats(&raw_hex).expect("tx_output_sats");
+    assert_eq!(sats, vec![50_000u64, 49_000u64]);
+}

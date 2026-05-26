@@ -46,9 +46,14 @@ cggmp24 = { git = "https://github.com/LFDT-Lockness/cggmp21", features = ["curve
 generic-ec.workspace = true
 rand.workspace = true
 
-# wasm32-only: the #[wasm_bindgen_test] harness for tests/wasm32_txbuild.rs
-# (run via `wasm-pack test --node -p bsv-mpc-client --test wasm32_txbuild`).
-# getrandom/js is needed to LINK the wasm32 test binary. Mirrors bsv-mpc-core.
+# wasm-bindgen skin (web client). wasm32-only — the native build never sees it,
+# so no feature flag is needed; the `wasm` module is `cfg(target_arch="wasm32")`.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+
+# wasm32-only: the #[wasm_bindgen_test] harness (run via
+# `wasm-pack test --node -p bsv-mpc-client`). getrandom/js LINKs the wasm test
+# binary. Mirrors bsv-mpc-core.
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
 wasm-bindgen-test = "0.3"
 getrandom = { version = "0.2", features = ["js"] }

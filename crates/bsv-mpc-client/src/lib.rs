@@ -22,6 +22,10 @@ mod signer;
 mod storage;
 pub mod txbuild;
 
+/// wasm-bindgen skin (web client). Only compiled on `wasm32`.
+#[cfg(target_arch = "wasm32")]
+pub mod wasm;
+
 pub use chain::{BroadcastResult, ChainServices, Utxo};
 pub use client::WalletClient;
 pub use error::ClientError;
