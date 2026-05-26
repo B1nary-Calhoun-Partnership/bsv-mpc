@@ -6,12 +6,15 @@ rust-version.workspace = true
 license.workspace = true
 description = "Greenfield native (iOS/Android via UniFFI) + web (wasm-bindgen) client for bsv-mpc threshold signing. Wraps bsv-mpc-core; zero rust-mpc / 100cash dependency (issue #41)."
 
-# Phase 1 is the target-agnostic core: 3 injected traits + WalletClient + InMemoryKeyStore,
-# building on BOTH native and wasm32. The UniFFI / wasm-bindgen FFI skins, the per-target
-# bsv-rs split, and the optional native (sqlx/reqwest) impls land in Phases 2-4 — see
-# docs/41-CLIENT-PLAN.md. Until then crate-type stays "lib" (cdylib/staticlib added with FFI).
+# `lib` for in-workspace use + tests; `cdylib`/`staticlib` for the FFI artifacts
+# (UniFFI dylib + iOS staticlib, wasm-bindgen cdylib).
 [lib]
-crate-type = ["lib"]
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[features]
+# `native` turns on the UniFFI skin (iOS/Android shells). Off by default so the
+# pure lib + the wasm build never pull uniffi. See docs/41-CLIENT-PLAN.md.
+native = ["dep:uniffi"]
 
 [dependencies]
 # The one allowed in-workspace dependency — the wasm-safe MPC primitives we wrap.
@@ -24,11 +27,20 @@ zeroize.workspace = true
 # `?Send` async traits — host callbacks (wasm JS closures / UniFFI foreign traits) are !Send.
 async-trait = "0.1"
 
+# UniFFI skin (native feature only). 0.28 proc-macro mode — no .udl file.
+uniffi = { version = "0.28", features = ["cli"], optional = true }
+
 serde.workspace = true
 serde_json.workspace = true
 hex.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
+
+# Native-only UniFFI bindgen helper (generates Swift/Kotlin from the built dylib).
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+required-features = ["native"]
 
 [dev-dependencies]
 # Native-only test executor for the async trait round-trips (not in the wasm lib build).

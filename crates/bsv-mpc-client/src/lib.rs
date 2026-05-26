@@ -26,6 +26,13 @@ pub mod txbuild;
 #[cfg(target_arch = "wasm32")]
 pub mod wasm;
 
+/// UniFFI skin (native shells). Only compiled under `--features native`.
+#[cfg(feature = "native")]
+pub mod ffi;
+
+#[cfg(feature = "native")]
+uniffi::setup_scaffolding!();
+
 pub use chain::{BroadcastResult, ChainServices, Utxo};
 pub use client::WalletClient;
 pub use error::ClientError;
