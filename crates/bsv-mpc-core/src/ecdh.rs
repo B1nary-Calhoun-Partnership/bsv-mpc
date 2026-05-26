@@ -37,6 +37,7 @@ use crate::hd::{compute_brc42_hmac, compute_invoice, derive_child_pubkey};
 use bsv::primitives::ec::PublicKey;
 use cggmp24::supported_curves::Secp256k1;
 use generic_ec::{Scalar, SecretScalar};
+use zeroize::Zeroizing;
 
 // ── Share parsing ────────────────────────────────────────────────────────────
 
@@ -74,13 +75,16 @@ fn parse_incomplete_key_share(
 ///
 /// Handles both full `KeyShare` and raw `IncompleteKeyShare` formats.
 ///
-/// Returns the 32-byte big-endian scalar.
-pub fn parse_share_scalar(raw_share_json: &[u8]) -> Result<[u8; 32]> {
+/// Returns the 32-byte big-endian scalar, wrapped in [`Zeroizing`] so the
+/// plaintext secret is wiped from memory when the caller drops it (Finding 4,
+/// `docs/41-AUDIT-FINDINGS.md`). `Zeroizing<[u8; 32]>` derefs to `[u8; 32]`, so
+/// read sites (`&scalar`, indexing, passing to `&[u8; 32]` params) are unchanged.
+pub fn parse_share_scalar(raw_share_json: &[u8]) -> Result<Zeroizing<[u8; 32]>> {
     let share = parse_incomplete_key_share(raw_share_json)?;
     let scalar: &Scalar<Secp256k1> =
         <SecretScalar<Secp256k1> as AsRef<Scalar<Secp256k1>>>::as_ref(&share.x);
     let encoded = scalar.to_be_bytes();
-    let mut arr = [0u8; 32];
+    let mut arr = Zeroizing::new([0u8; 32]);
     arr.copy_from_slice(encoded.as_bytes());
     Ok(arr)
 }
@@ -352,10 +356,14 @@ mod tests {
         let shares = generate_2of2_shares(&root_key);
         let share_json = serde_json::to_vec(&shares[0]).unwrap();
 
-        let parsed_scalar = parse_share_scalar(&share_json).unwrap();
+        // Type lock (Finding 4): the explicit annotation fails to compile if the
+        // accessor ever stops wrapping the raw scalar in `Zeroizing`, so the
+        // secret can't silently escape un-wiped. `Zeroizing<[u8; 32]>` derefs to
+        // `[u8; 32]`, so downstream EC-mult callers are unchanged.
+        let parsed_scalar: zeroize::Zeroizing<[u8; 32]> = parse_share_scalar(&share_json).unwrap();
         let expected_scalar = share_to_bytes(&shares[0]);
 
-        assert_eq!(parsed_scalar, expected_scalar);
+        assert_eq!(*parsed_scalar, expected_scalar);
     }
 
     #[test]

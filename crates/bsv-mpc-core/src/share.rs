@@ -35,6 +35,7 @@ use hmac::{Hmac, Mac};
 use rand::rngs::OsRng;
 use rand::RngCore;
 use sha2::Sha256;
+use zeroize::Zeroizing;
 
 use crate::error::{MpcError, Result};
 use crate::types::{EncryptedShare, SessionId, ShareIndex, ThresholdConfig};
@@ -104,7 +105,9 @@ pub fn encrypt_share(share_bytes: &[u8], encryption_key: &[u8; 32]) -> Result<En
 ///
 /// # Returns
 ///
-/// The plaintext key share bytes.
+/// The plaintext key share bytes, wrapped in [`Zeroizing`] so the recovered
+/// plaintext share is wiped on drop (Finding 4, `docs/41-AUDIT-FINDINGS.md`).
+/// `Zeroizing<Vec<u8>>` derefs to `Vec<u8>`, so existing read sites are unchanged.
 ///
 /// # Errors
 ///
@@ -112,7 +115,10 @@ pub fn encrypt_share(share_bytes: &[u8], encryption_key: &[u8; 32]) -> Result<En
 /// - The encryption key is wrong (GCM auth tag verification fails).
 /// - The ciphertext has been tampered with.
 /// - The nonce is not exactly 12 bytes.
-pub fn decrypt_share(encrypted: &EncryptedShare, encryption_key: &[u8; 32]) -> Result<Vec<u8>> {
+pub fn decrypt_share(
+    encrypted: &EncryptedShare,
+    encryption_key: &[u8; 32],
+) -> Result<Zeroizing<Vec<u8>>> {
     // Validate the encrypted share structure before attempting decryption.
     // This catches obvious structural issues (wrong nonce length, empty
     // ciphertext, invalid config) before we hit the crypto layer.
@@ -129,6 +135,7 @@ pub fn decrypt_share(encrypted: &EncryptedShare, encryption_key: &[u8; 32]) -> R
     // is wrong or the ciphertext was tampered with, decrypt() returns an error.
     cipher
         .decrypt(nonce, encrypted.ciphertext.as_ref())
+        .map(Zeroizing::new)
         .map_err(|e| MpcError::Encryption(e.to_string()))
 }
 
@@ -147,14 +154,21 @@ pub fn decrypt_share(encrypted: &EncryptedShare, encryption_key: &[u8; 32]) -> R
 ///
 /// # Returns
 ///
-/// A 32-byte AES-256 encryption key unique to this session.
+/// A 32-byte AES-256 encryption key unique to this session, wrapped in
+/// [`Zeroizing`] so the derived key is wiped on drop (Finding 4,
+/// `docs/41-AUDIT-FINDINGS.md`). `Zeroizing<[u8; 32]>` derefs to `[u8; 32]`,
+/// so it passes straight to the `&[u8; 32]` params of `encrypt_share` /
+/// `decrypt_share` and existing read sites are unchanged.
 ///
 /// # Determinism
 ///
 /// The same `(root_key, session_id)` pair always produces the same encryption
 /// key. This is essential for wallet backup/restore — a restored wallet can
 /// re-derive the encryption key to decrypt its shares.
-pub fn derive_share_encryption_key(root_key: &[u8; 32], session_id: &SessionId) -> [u8; 32] {
+pub fn derive_share_encryption_key(
+    root_key: &[u8; 32],
+    session_id: &SessionId,
+) -> Zeroizing<[u8; 32]> {
     // HMAC-SHA256 with root_key as the HMAC key.
     // Message = domain_separator || session_id_bytes
     //
@@ -170,7 +184,7 @@ pub fn derive_share_encryption_key(root_key: &[u8; 32], session_id: &SessionId) 
     let result = mac.finalize();
 
     // HMAC-SHA256 output is exactly 32 bytes, which is exactly what AES-256 needs.
-    let mut key = [0u8; 32];
+    let mut key = Zeroizing::new([0u8; 32]);
     key.copy_from_slice(&result.into_bytes());
     key
 }
@@ -247,7 +261,7 @@ mod tests {
 
         let decrypted = decrypt_share(&encrypted, &key).expect("decrypt should succeed");
 
-        assert_eq!(decrypted, plaintext);
+        assert_eq!(&decrypted[..], &plaintext[..]);
     }
 
     #[test]
@@ -258,7 +272,7 @@ mod tests {
         let share = make_encrypted_share(plaintext, &key, "session-abc", 0, 2, 3);
         let decrypted = decrypt_share(&share, &key).expect("decrypt should succeed");
 
-        assert_eq!(decrypted, plaintext);
+        assert_eq!(&decrypted[..], &plaintext[..]);
     }
 
     #[test]
@@ -281,7 +295,7 @@ mod tests {
         let share = make_encrypted_share(&plaintext, &key, "session-large", 1, 2, 3);
         let decrypted = decrypt_share(&share, &key).expect("decrypt should succeed");
 
-        assert_eq!(decrypted, plaintext);
+        assert_eq!(&decrypted[..], &plaintext[..]);
     }
 
     // ----------------------------------------------------------------
@@ -439,7 +453,7 @@ mod tests {
         let session = SessionId::from_str_hash("zero-root");
 
         let key = derive_share_encryption_key(&root_key, &session);
-        assert_ne!(key, [0u8; 32], "derived key should not be all zeros");
+        assert_ne!(*key, [0u8; 32], "derived key should not be all zeros");
     }
 
     // ----------------------------------------------------------------
@@ -456,7 +470,7 @@ mod tests {
         let share = make_encrypted_share(plaintext, &enc_key, "flow-test-session", 0, 2, 3);
         let decrypted = decrypt_share(&share, &enc_key).expect("full flow decrypt should succeed");
 
-        assert_eq!(decrypted, plaintext);
+        assert_eq!(&decrypted[..], &plaintext[..]);
     }
 
     // ----------------------------------------------------------------
@@ -548,5 +562,85 @@ mod tests {
             joint_pubkey_compressed: Vec::new(),
         };
         assert!(validate_encrypted_share(&share).is_err());
+    }
+
+    // ----------------------------------------------------------------
+    // Zeroize (Finding 4, docs/41-AUDIT-FINDINGS.md) — proof-plan Tier 1.
+    //
+    // Two independent guarantees, both falsifiable:
+    //   (1) OBSERVABLE DROP: `Zeroizing<[u8; 32]>::drop` actually overwrites the
+    //       bytes with zero. Proven soundly (no use-after-free) by managing the
+    //       allocation by hand: `drop_in_place` runs the destructor (the wipe)
+    //       while the backing memory is still allocated, so the post-drop read is
+    //       a read of a valid (zeroed) `[u8; 32]`, not freed memory.
+    //   (2) TYPE LOCK: the secret-bearing accessors return `Zeroizing<_>`. These
+    //       compile only while the wrapper is present, so a future refactor cannot
+    //       silently unwrap the secret without breaking the build.
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn zeroizing_array_is_wiped_when_dropped() {
+        use std::alloc::{alloc, dealloc, Layout};
+        use std::ptr;
+
+        let layout = Layout::new::<Zeroizing<[u8; 32]>>();
+        // SAFETY: we own this allocation for the whole test. `drop_in_place` runs
+        // `Zeroizing::drop` (which zeroizes the inner array) but does NOT free the
+        // memory; we read the still-allocated `[u8; 32]` (a plain-old-data type
+        // with no invalid bit patterns) before calling `dealloc` ourselves.
+        unsafe {
+            let p = alloc(layout) as *mut Zeroizing<[u8; 32]>;
+            assert!(!p.is_null(), "test allocation failed");
+            ptr::write(p, Zeroizing::new([0xABu8; 32]));
+            assert!(
+                (*p).iter().all(|&b| b == 0xAB),
+                "precondition: buffer holds the secret before drop"
+            );
+
+            ptr::drop_in_place(p); // runs the zeroize-on-drop
+
+            let after = &*(p as *const [u8; 32]);
+            assert_eq!(
+                *after, [0u8; 32],
+                "Zeroizing must overwrite the secret with zeros on drop"
+            );
+            dealloc(p as *mut u8, layout);
+        }
+    }
+
+    #[test]
+    fn zeroize_primitive_clears_our_secret_types() {
+        use zeroize::Zeroize;
+        // The exact secret payload shapes the accessors hand out.
+        let mut scalar = [0x5Au8; 32];
+        scalar.zeroize();
+        assert_eq!(scalar, [0u8; 32], "scalar bytes must be wiped");
+
+        let mut share_plaintext = vec![0x5Au8; 10_240]; // ~10KB cggmp24 KeyShare
+        share_plaintext.zeroize();
+        assert!(
+            share_plaintext.is_empty() || share_plaintext.iter().all(|&b| b == 0),
+            "share plaintext must be wiped"
+        );
+    }
+
+    #[test]
+    fn decrypt_share_returns_zeroizing() {
+        // Type lock: the binding only compiles while the return stays wrapped.
+        let key = [0x42u8; 32];
+        let plaintext = b"lock the return type to Zeroizing";
+        let share = make_encrypted_share(plaintext, &key, "session-typelock", 0, 2, 3);
+        let decrypted: Zeroizing<Vec<u8>> =
+            decrypt_share(&share, &key).expect("decrypt should succeed");
+        assert_eq!(&decrypted[..], &plaintext[..]);
+    }
+
+    #[test]
+    fn derive_share_encryption_key_returns_zeroizing() {
+        // Type lock: the explicit annotation fails to compile if the wrapper is dropped.
+        let root_key = [0x11u8; 32];
+        let session = SessionId::from_str_hash("typelock-session");
+        let key: Zeroizing<[u8; 32]> = derive_share_encryption_key(&root_key, &session);
+        assert_ne!(*key, [0u8; 32]);
     }
 }

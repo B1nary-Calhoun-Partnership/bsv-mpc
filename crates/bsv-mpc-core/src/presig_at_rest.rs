@@ -162,7 +162,7 @@ mod tests {
         let share_key = derive_share_encryption_key(&ROOT, &sid);
         let presig_key = derive_presig_at_rest_key(&ROOT, &"\u{1}".repeat(32));
         assert_ne!(
-            share_key, presig_key,
+            *share_key, presig_key,
             "presig at-rest key domain must not collide with DKG-share key domain"
         );
     }

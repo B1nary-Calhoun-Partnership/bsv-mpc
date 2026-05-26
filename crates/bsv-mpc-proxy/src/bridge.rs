@@ -57,6 +57,7 @@ use bsv_mpc_core::presigning::{PresigningManager, PresigningRoundResult};
 use bsv_mpc_core::types::*;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex, RwLock};
+use zeroize::Zeroizing;
 
 // ============================================================================
 // KSS HTTP API types (compatible with bsv-mpc-worker::api)
@@ -789,7 +790,12 @@ impl MpcBridge {
         // 2. Decode to plaintext JSON bytes (optionally decrypt first), then
         //    parse EITHER a multi-share device bundle (§1 device-holds-(t−1),
         //    issue #38) OR a single-share `DkgResult` (the normal deployment).
-        let plaintext_bytes: Vec<u8> = if let Some(ref enc_key_hex) = config.encryption_key {
+        // `Zeroizing` so the decrypted plaintext share (the most secret buffer
+        // here) is wiped on drop; `decrypt_share` now returns `Zeroizing<Vec<u8>>`
+        // (Finding 4). The unencrypted-file branch is wrapped to match — that
+        // path holds the same plaintext share and benefits equally.
+        // Inferred type is `Zeroizing<Vec<u8>>` (both arms yield it).
+        let plaintext_bytes = if let Some(ref enc_key_hex) = config.encryption_key {
             let key_bytes = hex_decode(enc_key_hex)
                 .map_err(|e| anyhow::anyhow!("invalid encryption key hex: {e}"))?;
             if key_bytes.len() != 32 {
@@ -808,7 +814,7 @@ impl MpcBridge {
             bsv_mpc_core::share::decrypt_share(&encrypted, &key)
                 .map_err(|e| anyhow::anyhow!("failed to decrypt share: {e}"))?
         } else {
-            file_bytes
+            Zeroizing::new(file_bytes)
         };
 
         // Try the multi-share device bundle first (its required `shares` array
@@ -896,7 +902,7 @@ impl MpcBridge {
                         "failed to parse share for partial ECDH — \
                          encrypt/decrypt with 'self'/'other' counterparty will fail"
                     );
-                    ([0u8; 32], vec![])
+                    (Zeroizing::new([0u8; 32]), vec![])
                 }
             };
 
@@ -988,7 +994,11 @@ impl MpcBridge {
                 share: Arc::new(RwLock::new(dkg_result.share)),
                 joint_key: dkg_result.joint_key,
                 root_pub,
-                share_scalar: Arc::new(RwLock::new(share_scalar)),
+                // `share_scalar` is `Zeroizing<[u8; 32]>` (Finding 4); deref-copy the
+                // bytes into the long-lived `[u8; 32]` field, which has its own manual
+                // wipe on `Drop` + rotation (`zeroize_secret_material` / `apply_refreshed_share`).
+                // The transient `Zeroizing` original is wiped when `new()` returns.
+                share_scalar: Arc::new(RwLock::new(*share_scalar)),
                 vss_points,
                 client,
                 session_id: dkg_result.session_id,
@@ -1007,7 +1017,11 @@ impl MpcBridge {
             share: Arc::new(RwLock::new(dkg_result.share)),
             joint_key: dkg_result.joint_key,
             root_pub,
-            share_scalar: Arc::new(RwLock::new(share_scalar)),
+            // `share_scalar` is `Zeroizing<[u8; 32]>` (Finding 4); deref-copy the
+            // bytes into the long-lived `[u8; 32]` field, which has its own manual
+            // wipe on `Drop` + rotation (`zeroize_secret_material` / `apply_refreshed_share`).
+            // The transient `Zeroizing` original is wiped when `new()` returns.
+            share_scalar: Arc::new(RwLock::new(*share_scalar)),
             vss_points,
             client,
             session_id: dkg_result.session_id,
@@ -1065,7 +1079,7 @@ impl MpcBridge {
         {
             let mut sc = self.share_scalar.write().unwrap_or_else(|p| p.into_inner());
             sc.zeroize(); // the old secret scalar
-            *sc = new_scalar;
+            *sc = *new_scalar; // deref-copy out of `Zeroizing` (field is `[u8; 32]`)
         }
         // The transient copy of the new scalar on the stack is no longer needed.
         new_scalar.zeroize();
@@ -3166,10 +3180,10 @@ mod refresh_rotation_tests {
         let shares = dkg_2of2().await;
         let jpk = shares[0].core.shared_public_key.to_bytes(true).to_vec();
         let scalar0 =
-            bsv_mpc_core::ecdh::parse_share_scalar(&serde_json::to_vec(&shares[0]).unwrap())
+            *bsv_mpc_core::ecdh::parse_share_scalar(&serde_json::to_vec(&shares[0]).unwrap())
                 .unwrap();
         let scalar1 =
-            bsv_mpc_core::ecdh::parse_share_scalar(&serde_json::to_vec(&shares[1]).unwrap())
+            *bsv_mpc_core::ecdh::parse_share_scalar(&serde_json::to_vec(&shares[1]).unwrap())
                 .unwrap();
         assert_ne!(scalar0, scalar1);
 
@@ -3390,7 +3404,7 @@ mod refresh_rotation_tests {
         // Safety: a bad refresh MUST NOT clobber the live share (no asterisks).
         let shares = dkg_2of2().await;
         let scalar1 =
-            bsv_mpc_core::ecdh::parse_share_scalar(&serde_json::to_vec(&shares[1]).unwrap())
+            *bsv_mpc_core::ecdh::parse_share_scalar(&serde_json::to_vec(&shares[1]).unwrap())
                 .unwrap();
         let dir = tempfile::tempdir().unwrap();
         let share_path = dir.path().join("share.json");

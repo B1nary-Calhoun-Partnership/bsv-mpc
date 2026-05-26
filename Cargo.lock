@@ -315,6 +315,7 @@ dependencies = [
  "tokio",
  "tracing",
  "wasm-bindgen-test",
+ "zeroize",
 ]
 
 [[package]]
