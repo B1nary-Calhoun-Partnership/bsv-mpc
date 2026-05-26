@@ -19,6 +19,7 @@ mod client;
 mod error;
 mod keystore;
 mod storage;
+pub mod txbuild;
 
 pub use chain::{BroadcastResult, ChainServices, Utxo};
 pub use client::WalletClient;

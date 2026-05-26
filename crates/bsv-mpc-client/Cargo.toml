@@ -27,8 +27,18 @@ async-trait = "0.1"
 serde.workspace = true
 serde_json.workspace = true
 hex.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
 # Native-only test executor for the async trait round-trips (not in the wasm lib build).
 tokio = { version = "1", default-features = false, features = ["rt", "macros"] }
+# Used by the tests/ integration binaries (hex-encode the golden vectors).
+hex.workspace = true
+
+# wasm32-only: the #[wasm_bindgen_test] harness for tests/wasm32_txbuild.rs
+# (run via `wasm-pack test --node -p bsv-mpc-client --test wasm32_txbuild`).
+# getrandom/js is needed to LINK the wasm32 test binary. Mirrors bsv-mpc-core.
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = "0.3"
+getrandom = { version = "0.2", features = ["js"] }
