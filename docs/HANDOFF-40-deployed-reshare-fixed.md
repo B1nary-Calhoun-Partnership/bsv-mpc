@@ -9,7 +9,75 @@
 
 ---
 
-## 0. LIVE STATUS — 2026-05-25 (newest first)
+## 0. LIVE STATUS — 2026-05-26 (newest first)
+
+### 🎉 #40 LANDED — recovered-device mainnet TXID `f8b514586b8d029f9679c5f0bb8621e91d24d0e88d2b5eaf0500beac2aa21992`
+The full true-loss recovery gate `recovery_spend_deployed_mainnet_e2e` **PASSED end-to-end** (`test result: ok`):
+DKG → fund K → reshare#1 (2-of-3) → lose phone P2′ → reshare#2 (recovery onto fresh device) → `{0,2}` presign+
+sign over the relay → ECDSA verify under K → spend. WoC-confirmed: spends K's UTXO `802afcdb…:0`, signed under
+joint key `02613431…` **= K (address UNCHANGED across DKG → 2 reshares)**. Posted to #40 (comment 4544188610).
+The fix chain below (OOM → bsv-rs timeout → relay LIMIT + acknowledge-on-consume + backlog drain) is what
+unblocked it; the presign/sign code was already correct. **Remaining: commit bsv-mpc working tree (pending
+approval); open PRs for Calhooon/bsv-rs `fix/brc104-transport-timeout` + Calhooon/rust-message-box
+`fix/listmessages-memory-bound`; close #58 notes.** Gate runs this session: 4 (OOM) → 4/5 (send hang) → 5
+(phase A converged, phase B slow) → drain → 7 (PASS).
+
+### ✅ TRUE ROOT CAUSE FOUND + FIXED — relay 128 MB OOM from unbounded `listMessages` (2026-05-26)
+The #40 TXID was NOT blocked by OOM (container) or crypto — it was a **relay-side memory regression**.
+Full causal chain, each layer instrumented + proven, NOT guessed:
+1. **CF Container OOM — FIXED + PROVEN.** `MALLOC_ARENA_MAX=2` (Dockerfile) + process-global safe-prime
+   serialization (`paillier_pool::generate_serialized`, wired into `dkg.rs` + `reshare_relay_handlers.rs`)
+   + `worker.js` readiness barrier (`startAndWaitForPorts` + `containerFetch` + onStart/onStop/onError).
+   Evidence: 3 gate runs, container uptime monotonic to ~1.5 ks, **ZERO `runtime_signal`** (only graceful
+   `exitCode=0 reason=exit` from my `max_instances` toggles). The mid-reshare restart class is gone.
+2. **bsv-rs BRC-104 no-timeout hang — FIXED.** `SimplifiedFetchTransport::new` built `reqwest::Client::new()`
+   (no timeout, no connect-timeout, default keep-alive pool) → CF egress NAT drops the idle pooled socket →
+   the BRC-104 General POST (`/sendMessage`) hung forever. Fix: builder with `timeout(30s)` +
+   `connect_timeout(10s)` + `pool_max_idle_per_host(0)`. Calhooon/bsv-rs branch `fix/brc104-transport-timeout`
+   commit `382282d`, pinned in bsv-mpc root `Cargo.toml` `[patch.crates-io] bsv-rs = { git=…, rev=382282d }`.
+   (The container builds published `bsv-rs 0.3.12`, NOT `../bsv-rs` — the path override is host-only.)
+3. **THE BLOCKER — relay (`rust-message-box`) Worker OOM (CF error 1102 = "exceeded memory limit").**
+   Instrumented with a container `GET /reshare-relay/send-test` probe (self-send, with/without an active
+   subscription) + `wrangler tail` on the RELAY. Ground truth: a bare send is OK; a send **while a BRC-103
+   subscription is active** 503s. Relay tail = `Error: Worker exceeded memory limit` on `/listMessages` AND
+   `/sendMessage`. Cause: `storage.rs::list_messages` did `SELECT … FROM messages WHERE recipient=? AND
+   message_box_id=?` **with NO LIMIT**. A long-lived cosigner identity's `mpc-dkg` box accumulated thousands
+   of **un-acknowledged** messages (we NEVER called `acknowledge()`); the unbounded SELECT loaded the whole
+   box into the **128 MB Worker isolate** → OOM → poisoned the isolate → concurrent `/sendMessage` collateral
+   OOM → reshare round-1 ship 503'd (container trail froze at `init:dkg_initiated`, never `round1_shipped`).
+   This is why `6c0f17cc` passed early (fresh box) and every later run failed "after a full day of gates"
+   (accumulation). **FIX (PROVEN): bound `list_messages` to `LIMIT 100`, NO `ORDER BY`** — an
+   `ORDER BY created_at` (uncovered by any index) forced a full scan+sort of the bloated set into the isolate
+   *before* the LIMIT, so it STILL OOM'd; un-ordered, the engine stops after LIMIT rows (rowid≈insertion order).
+   Calhooon/rust-message-box branch `fix/listmessages-memory-bound`, deployed Version `79ea0061`. After deploy
+   the `send-test` probe `send_with_active_subscription` → **ok (1842 ms)** — the 503/1102 is GONE.
+
+**God-tier model (per canonical TS, verified in `~/bsv/message-box-{server,client}`):** the TS server returns
+the ENTIRE mailbox (no LIMIT, no TTL, no auto-mark-read); the drain is the client calling `acknowledgeMessage`
+(hard DELETE) after processing. It survives only because it's a Node host with GBs of RAM. We never acknowledged
+→ unbounded growth. **Fix = canonical acknowledge-on-consume:** `ack_best_effort` wired into
+`MessageBoxListener::run_loop` (`bsv-mpc-service/src/messagebox.rs`, main + duplicate paths) so every consumed
+message is DELETEd server-side → boxes never accumulate (used by BOTH container and proxy). The relay `LIMIT` is
+the CF-Worker platform guard the Node reference doesn't need; together = canonical + platform-safe. Backlog
+self-drains ~100/subscribe via the ack wiring — no manual drain needed.
+
+**RIGHT NOW (in flight):** container redeploying with the ack-on-consume wiring (bg `b4cy9ciau`, build
+non-stale `Compiling bsv-mpc-service`). NEXT: toggle a fresh instance → warm (`/health` uptime≥12) → re-run
+`RECOVERY_MAINNET=1 … recovery_spend_deployed_mainnet_e2e`. With the relay OOM gone (proven), reshare #1's
+round-1 ships → DKG converges → reshares pass → reach `(6) presign` → land the recovered-device TXID.
+At `(6) presign`: `curl …/presign-relay/debug` → `stored_share_index` MUST==0, `jpk` MUST==K.
+
+**UNCOMMITTED (working trees), pending approval:**
+- bsv-mpc (`fix/presign-relay-ws-pump-and-index`): `Dockerfile` (MALLOC_ARENA_MAX), `paillier_pool.rs`,
+  `dkg.rs`, `reshare_relay_handlers.rs` (serialize + send-probe endpoint), `messagebox.rs` (ack wiring),
+  `lib.rs` (send-test route), root `Cargo.toml` (bsv-rs git patch), `poc/cf-container-p2/{worker.js}`.
+- Calhooon/bsv-rs `fix/brc104-transport-timeout` (`382282d`, pushed) — open a PR.
+- Calhooon/rust-message-box `fix/listmessages-memory-bound` (deployed, committed) — open a PR; consider
+  the same LIMIT on other unbounded reads + a DB index review.
+
+---
+
+## 0b. LIVE STATUS — 2026-05-25 (newest first)
 
 ### VALIDATION IN FLIGHT (index fix) + an infra hiccup to know about
 - The index fix is deployed (image `06b7bcdf`, fresh instance). First validation run (`recovery_rerun_6`)

@@ -37,7 +37,7 @@ use bsv_mpc_messagebox::types::{BOX_DKG, BOX_REFRESH};
 use bsv_mpc_messagebox::MessageBoxClient;
 use cggmp24::security_level::SecurityLevel128;
 use cggmp24::supported_curves::Secp256k1;
-use cggmp24::{KeyShare, PregeneratedPrimes};
+use cggmp24::KeyShare;
 use generic_ec::{NonZero, Scalar, SecretScalar};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
@@ -572,7 +572,9 @@ pub async fn handle_reshare_relay_init(
         let seed_handler = dkg_handler.clone();
         tokio::spawn(async move {
             match tokio::task::spawn_blocking(|| {
-                PregeneratedPrimes::<SecurityLevel128>::generate(&mut rand::rngs::OsRng)
+                // Process-global gate: one safe-prime gen's RSS peak live at a
+                // time so back-to-back DKG + reshares can't OOM the container.
+                bsv_mpc_core::paillier_pool::generate_serialized(&mut rand::rngs::OsRng)
             })
             .await
             {

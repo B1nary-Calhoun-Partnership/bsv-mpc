@@ -73,6 +73,42 @@ const POOL_KEY_DOMAIN: &[u8] = b"bsv-mpc-paillier-pool";
 /// 2-party auxinfo without falling back to inline generation.
 pub const DEFAULT_FLOOR: usize = 2;
 
+/// Process-global serialization gate for 2048-bit Paillier safe-prime
+/// generation.
+///
+/// Each `PregeneratedPrimes::generate` has a multi-GiB transient RSS peak
+/// (`num-bigint`, no GMP). On a memory-capped host running N generations
+/// concurrently, those peaks SUM — and a Cloudflare Container caps at 12 GiB
+/// with **no swap**, so the kernel OOM-kills the instance, wiping the
+/// in-memory MPC coordinator state and hanging every in-flight ceremony
+/// (the #40 / #58 deployed instability — see
+/// `docs/HANDOFF-40-deployed-reshare-fixed.md` §0 "CF CONTAINERS ROOT CAUSE").
+///
+/// Routing every generation through this gate guarantees only ONE generation's
+/// RSS peak is live at a time (never N-parallel). Pair it with
+/// `MALLOC_ARENA_MAX=2` in the deployed image so glibc returns the freed arenas
+/// to the OS between sequential generations instead of retaining them.
+static PRIME_GEN_GATE: Mutex<()> = Mutex::new(());
+
+/// Generate one set of 2048-bit Paillier safe primes while holding the
+/// process-global [`PRIME_GEN_GATE`], so no two generations' RSS peaks overlap
+/// within this process.
+///
+/// **Blocking** — `generate` is heavily CPU-bound (1-30s); call it from a
+/// blocking context (e.g. `tokio::task::spawn_blocking`) or a dedicated thread,
+/// never directly on an async runtime worker. The gate is a plain
+/// `std::sync::Mutex`: a second caller blocks until the first finishes, which is
+/// exactly the serialization we want (and is wasm-safe — wasm32 is
+/// single-threaded so the gate is uncontended there).
+pub fn generate_serialized<R: RngCore + CryptoRng>(
+    rng: &mut R,
+) -> PregeneratedPrimes<SecurityLevel128> {
+    let _gate = PRIME_GEN_GATE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    PregeneratedPrimes::<SecurityLevel128>::generate(rng)
+}
+
 /// At-rest ciphertext blob format.
 ///
 /// `nonce` is the random per-`put` AES-GCM nonce; `ciphertext` is
@@ -224,7 +260,9 @@ impl<S: PrimePoolStorage> PaillierPool<S> {
     pub fn backfill_to_floor<R: RngCore + CryptoRng>(&self, rng: &mut R) -> Result<usize> {
         let mut added = 0;
         while self.storage.count()? < self.floor {
-            let primes = PregeneratedPrimes::<SecurityLevel128>::generate(rng);
+            // Serialized so a concurrent ceremony's inline aux-gen and this
+            // backfill never spike the process RSS in parallel (OOM guard).
+            let primes = generate_serialized(rng);
             self.put(primes)?;
             added += 1;
         }
