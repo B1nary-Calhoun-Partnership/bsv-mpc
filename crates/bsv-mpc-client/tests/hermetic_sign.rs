@@ -296,3 +296,67 @@ async fn wallet_client_signs_a_real_threshold_ecdsa_signature() {
         "BSV SDK must verify the threshold signature against the joint key"
     );
 }
+
+/// The UniFFI host-driven signing session (`FfiSigningSession`) drives a real
+/// 2-party sign the way a Swift/Kotlin shell would: the host pumps round messages
+/// between two sessions. Proves the sync FFI facade produces a valid signature.
+#[cfg(feature = "native")]
+#[test]
+fn ffi_signing_session_drives_a_real_threshold_signature() {
+    use bsv_mpc_client::ffi::{FfiSignStep, FfiSigningSession};
+
+    let key_shares = dkg_key_shares(2, 2);
+    let session_id = vec![0x5bu8; 32];
+    let joint = key_shares[0].core.shared_public_key.to_bytes(true).to_vec();
+    let sighash = [0x9fu8; 32];
+
+    let mk = |i: u16| {
+        FfiSigningSession::new(
+            serde_json::to_vec(&key_shares[usize::from(i)]).unwrap(),
+            joint.clone(),
+            session_id.clone(),
+            i,
+            2,
+            2,
+        )
+        .expect("ffi session")
+    };
+    let s0 = mk(0);
+    let s1 = mk(1);
+
+    let mut out0 = s0.init(sighash.to_vec(), None).expect("s0 init");
+    let mut out1 = s1.init(sighash.to_vec(), None).expect("s1 init");
+
+    for _ in 0..20 {
+        let step0 = s0.process(out1.clone()).expect("s0 process");
+        let step1 = s1.process(out0.clone()).expect("s1 process");
+        match (step0, step1) {
+            (FfiSignStep::NextRound { messages: n0 }, FfiSignStep::NextRound { messages: n1 }) => {
+                out0 = n0;
+                out1 = n1;
+            }
+            (
+                FfiSignStep::Complete {
+                    r,
+                    s,
+                    signature_der,
+                },
+                FfiSignStep::Complete { .. },
+            ) => {
+                assert_eq!(signature_der[0], 0x30, "DER SEQUENCE");
+                let pk = bsv::PublicKey::from_bytes(&joint).unwrap();
+                let mut compact = [0u8; 64];
+                compact[..32].copy_from_slice(&r);
+                compact[32..].copy_from_slice(&s);
+                let sig = bsv::Signature::from_compact(&compact).unwrap();
+                assert!(
+                    pk.verify(&sighash, &sig),
+                    "BSV SDK must verify the FFI-driven sig"
+                );
+                return;
+            }
+            _ => panic!("FFI signing sessions desynchronized"),
+        }
+    }
+    panic!("FFI signing did not complete within 20 rounds");
+}
