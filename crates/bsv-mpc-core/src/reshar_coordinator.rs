@@ -34,7 +34,9 @@ use cggmp24::supported_curves::Secp256k1;
 use generic_ec::{NonZero, Point, Scalar};
 
 use crate::error::{MpcError, Result};
-use crate::refresh::{build_reshared_incomplete_share_for, party_reshare_contribution, verify_reshare};
+use crate::refresh::{
+    build_reshared_incomplete_share_for, party_reshare_contribution, verify_reshare,
+};
 use crate::types::{RoundMessage, SessionId, ShareIndex};
 
 const ROUND_CONTRIBUTION: u8 = 1;
@@ -125,12 +127,16 @@ impl ResharCoordinator {
                 config.new_t
             )));
         }
-        let original_joint_pubkey = Point::<Secp256k1>::from_bytes(&config.original_joint_pubkey)
-            .map_err(|_| MpcError::Protocol("reshar: invalid joint pubkey bytes".into()))?;
-        let am_i_contributor = config.contributor_new_indices.contains(&config.my_new_index);
+        let original_joint_pubkey =
+            Point::<Secp256k1>::from_bytes(&config.original_joint_pubkey)
+                .map_err(|_| MpcError::Protocol("reshar: invalid joint pubkey bytes".into()))?;
+        let am_i_contributor = config
+            .contributor_new_indices
+            .contains(&config.my_new_index);
         if am_i_contributor != config.contributor.is_some() {
             return Err(MpcError::Protocol(
-                "reshar: contributor inputs must be present iff my_new_index is a contributor".into(),
+                "reshar: contributor inputs must be present iff my_new_index is a contributor"
+                    .into(),
             ));
         }
         // Round-1 evals expected from OTHER contributors.
@@ -195,7 +201,9 @@ impl ResharCoordinator {
 
     pub fn process_round(&mut self, incoming: Vec<RoundMessage>) -> Result<ResharRoundResult> {
         if self.current_round == 0 {
-            return Err(MpcError::Protocol("reshar: process_round before init".into()));
+            return Err(MpcError::Protocol(
+                "reshar: process_round before init".into(),
+            ));
         }
         for msg in incoming {
             self.ingest(msg)?;
@@ -219,7 +227,8 @@ impl ResharCoordinator {
         match msg.round {
             ROUND_CONTRIBUTION => {
                 if self.contributor_new_indices.contains(&from) {
-                    self.received_evals.insert(from, scalar_from_bytes(&msg.payload)?);
+                    self.received_evals
+                        .insert(from, scalar_from_bytes(&msg.payload)?);
                 }
             }
             ROUND_PUBSHARE => {
@@ -320,7 +329,9 @@ pub fn combine_reshared_with_aux(
     use cggmp24::security_level::SecurityLevel128;
 
     let incomplete: IncompleteKeyShare<Secp256k1> = serde_json::from_slice(incomplete_share_json)
-        .map_err(|e| MpcError::Protocol(format!("reshar combine: bad incomplete share: {e}")))?;
+        .map_err(|e| {
+        MpcError::Protocol(format!("reshar combine: bad incomplete share: {e}"))
+    })?;
     let throwaway: KeyShare<Secp256k1, SecurityLevel128> =
         serde_json::from_slice(throwaway_keyshare_json)
             .map_err(|e| MpcError::Protocol(format!("reshar combine: bad throwaway share: {e}")))?;
@@ -392,14 +403,23 @@ mod tests {
     );
     impl<M: Unpin, Inner: futures::Sink<M>> futures::Sink<M> for BufferedSink<M, Inner> {
         type Error = Inner::Error;
-        fn poll_ready(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> std::task::Poll<std::result::Result<(), Self::Error>> {
+        fn poll_ready(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::result::Result<(), Self::Error>> {
             std::task::Poll::Ready(Ok(()))
         }
-        fn start_send(self: std::pin::Pin<&mut Self>, item: M) -> std::result::Result<(), Self::Error> {
+        fn start_send(
+            self: std::pin::Pin<&mut Self>,
+            item: M,
+        ) -> std::result::Result<(), Self::Error> {
             self.project().messages.get_mut().push_back(item);
             Ok(())
         }
-        fn poll_flush(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::result::Result<(), Self::Error>> {
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::result::Result<(), Self::Error>> {
             while !self.messages.is_empty() {
                 let mut p = self.as_mut().project();
                 let mut inner = p.inner;
@@ -410,64 +430,120 @@ mod tests {
             }
             self.project().inner.poll_flush(cx)
         }
-        fn poll_close(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::result::Result<(), Self::Error>> {
+        fn poll_close(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::result::Result<(), Self::Error>> {
             self.project().inner.poll_close(cx)
         }
     }
-    fn buffer_outgoing<M, D, R>(party: round_based::MpcParty<M, D, R>) -> round_based::MpcParty<M, BufferedDelivery<M, D>, R>
-    where M: Unpin, D: round_based::Delivery<M>, R: round_based::runtime::AsyncRuntime {
+    fn buffer_outgoing<M, D, R>(
+        party: round_based::MpcParty<M, D, R>,
+    ) -> round_based::MpcParty<M, BufferedDelivery<M, D>, R>
+    where
+        M: Unpin,
+        D: round_based::Delivery<M>,
+        R: round_based::runtime::AsyncRuntime,
+    {
         party.map_delivery(|d| {
             let (incoming, outgoing) = d.split();
-            (incoming, BufferedSink { messages: VecDeque::new(), inner: outgoing })
+            (
+                incoming,
+                BufferedSink {
+                    messages: VecDeque::new(),
+                    inner: outgoing,
+                },
+            )
         })
     }
     fn blum(rng: &mut impl rand::RngCore, bits: u32) -> cggmp24::backend::Integer {
         use cggmp24::backend::Integer;
         loop {
             let n = Integer::generate_prime(rng, bits);
-            if n.mod_u(4) == 3 { break n; }
+            if n.mod_u(4) == 3 {
+                break n;
+            }
         }
     }
-    fn primes(rng: &mut impl rand::RngCore) -> cggmp24::key_refresh::PregeneratedPrimes<SecurityLevel128> {
+    fn primes(
+        rng: &mut impl rand::RngCore,
+    ) -> cggmp24::key_refresh::PregeneratedPrimes<SecurityLevel128> {
         use cggmp24::security_level::SecurityLevel;
         let b = SecurityLevel128::RSA_PRIME_BITLEN;
-        cggmp24::key_refresh::PregeneratedPrimes::try_from([blum(rng,b),blum(rng,b),blum(rng,b),blum(rng,b)]).expect("primes")
+        cggmp24::key_refresh::PregeneratedPrimes::try_from([
+            blum(rng, b),
+            blum(rng, b),
+            blum(rng, b),
+            blum(rng, b),
+        ])
+        .expect("primes")
     }
     async fn keygen(n: u16, t: u16) -> Vec<cggmp24::key_share::IncompleteKeyShare<Secp256k1>> {
         let mut rng = rand::rngs::OsRng;
-        let eid_bytes: [u8;32] = rng.gen();
+        let eid_bytes: [u8; 32] = rng.gen();
         let eid = ExecutionId::new(&eid_bytes);
         round_based::sim::run(n, |i, party| {
             let party = buffer_outgoing(party);
             let mut r = rand::rngs::OsRng;
-            async move { cggmp24::keygen::<Secp256k1>(eid, i, n).set_threshold(t).start(&mut r, party).await }
-        }).unwrap().expect_ok().into_vec()
+            async move {
+                cggmp24::keygen::<Secp256k1>(eid, i, n)
+                    .set_threshold(t)
+                    .start(&mut r, party)
+                    .await
+            }
+        })
+        .unwrap()
+        .expect_ok()
+        .into_vec()
     }
     async fn aux_gen(n: u16) -> Vec<cggmp24::key_share::AuxInfo<SecurityLevel128>> {
         let mut rng = rand::rngs::OsRng;
-        let eid_bytes: [u8;32] = rng.gen();
+        let eid_bytes: [u8; 32] = rng.gen();
         let eid = ExecutionId::new(&eid_bytes);
         let pr: Vec<_> = (0..n).map(|_| primes(&mut rng)).collect();
         round_based::sim::run(n, |i, party| {
             let party = buffer_outgoing(party);
             let mut r = rand::rngs::OsRng;
             let pre = pr[usize::from(i)].clone();
-            async move { cggmp24::aux_info_gen(eid, i, n, pre).start(&mut r, party).await }
-        }).unwrap().expect_ok().into_vec()
+            async move {
+                cggmp24::aux_info_gen(eid, i, n, pre)
+                    .start(&mut r, party)
+                    .await
+            }
+        })
+        .unwrap()
+        .expect_ok()
+        .into_vec()
     }
-    async fn sign_verify(shares: &[cggmp24::KeyShare<Secp256k1, SecurityLevel128>], parts: &[u16], joint: &Point<Secp256k1>, msg: &[u8]) {
+    async fn sign_verify(
+        shares: &[cggmp24::KeyShare<Secp256k1, SecurityLevel128>],
+        parts: &[u16],
+        joint: &Point<Secp256k1>,
+        msg: &[u8],
+    ) {
         let mut rng = rand::rngs::OsRng;
-        let eid_bytes: [u8;32] = rng.gen();
+        let eid_bytes: [u8; 32] = rng.gen();
         let eid = ExecutionId::new(&eid_bytes);
         let pv = parts.to_vec();
         let data = DataToSign::<Secp256k1>::digest::<Sha256>(msg);
-        let sig = round_based::sim::run_with_setup(parts.iter().map(|i| &shares[usize::from(*i)]), |i, party, share| {
-            let party = buffer_outgoing(party);
-            let mut r = rand::rngs::OsRng;
-            let p = pv.clone();
-            async move { cggmp24::signing(eid, i, &p, share).sign(&mut r, party, &data).await }
-        }).unwrap().expect_ok().expect_eq();
-        sig.verify(joint, &data).expect("post-reshare sig must verify vs ORIGINAL joint key");
+        let sig = round_based::sim::run_with_setup(
+            parts.iter().map(|i| &shares[usize::from(*i)]),
+            |i, party, share| {
+                let party = buffer_outgoing(party);
+                let mut r = rand::rngs::OsRng;
+                let p = pv.clone();
+                async move {
+                    cggmp24::signing(eid, i, &p, share)
+                        .sign(&mut r, party, &data)
+                        .await
+                }
+            },
+        )
+        .unwrap()
+        .expect_ok()
+        .expect_eq();
+        sig.verify(joint, &data)
+            .expect("post-reshare sig must verify vs ORIGINAL joint key");
     }
 
     /// **#35b — DISTRIBUTED cross-(t,n) reshare 3-of-4 → 4-of-6.** Drives 6
@@ -497,13 +573,13 @@ mod tests {
         // NEW 4-of-6: 6 fresh eval points, contributors = the 4 continuing parties.
         let new_t: u16 = 4;
         let n_new: u16 = 6;
-        let new_eval: Vec<NonZero<Scalar<Secp256k1>>> =
-            (1..=n_new).map(|i| NonZero::from_scalar(Scalar::from(i as u64)).unwrap()).collect();
-        let contributor_new_indices: Vec<u16> = (0..new_t).collect(); // parties 0..3 continue + contribute
-        // Contributor subset's OLD eval points (for λ): the 4 old parties' eval points.
-        let subset_old_eval: Vec<NonZero<Scalar<Secp256k1>>> = (0..new_t)
-            .map(|k| old_eval[k as usize])
+        let new_eval: Vec<NonZero<Scalar<Secp256k1>>> = (1..=n_new)
+            .map(|i| NonZero::from_scalar(Scalar::from(i as u64)).unwrap())
             .collect();
+        let contributor_new_indices: Vec<u16> = (0..new_t).collect(); // parties 0..3 continue + contribute
+                                                                      // Contributor subset's OLD eval points (for λ): the 4 old parties' eval points.
+        let subset_old_eval: Vec<NonZero<Scalar<Secp256k1>>> =
+            (0..new_t).map(|k| old_eval[k as usize]).collect();
 
         // Build 6 coordinators.
         let mut coords: Vec<ResharCoordinator> = (0..n_new)
@@ -533,14 +609,21 @@ mod tests {
         // Router (mirror refresh_coordinator::run_refresh_ceremony).
         let mut queue: VecDeque<(u16, RoundMessage)> = VecDeque::new();
         let mut commits: Vec<Option<ResharCommit>> = (0..n_new).map(|_| None).collect();
-        let enqueue = |q: &mut VecDeque<(u16, RoundMessage)>, from: u16, msgs: Vec<RoundMessage>| {
-            for m in msgs {
-                match m.to {
-                    Some(ShareIndex(j)) => q.push_back((j, m)),
-                    None => for j in 0..n_new { if j != from { q.push_back((j, m.clone())); } },
+        let enqueue =
+            |q: &mut VecDeque<(u16, RoundMessage)>, from: u16, msgs: Vec<RoundMessage>| {
+                for m in msgs {
+                    match m.to {
+                        Some(ShareIndex(j)) => q.push_back((j, m)),
+                        None => {
+                            for j in 0..n_new {
+                                if j != from {
+                                    q.push_back((j, m.clone()));
+                                }
+                            }
+                        }
+                    }
                 }
-            }
-        };
+            };
         for j in 0..n_new {
             let out = coords[j as usize].init().unwrap();
             enqueue(&mut queue, j, out);
@@ -554,11 +637,17 @@ mod tests {
                 ResharRoundResult::Complete(c) => commits[rcpt as usize] = Some(*c),
             }
         }
-        let commits: Vec<ResharCommit> = commits.into_iter().map(|c| c.expect("all complete")).collect();
+        let commits: Vec<ResharCommit> = commits
+            .into_iter()
+            .map(|c| c.expect("all complete"))
+            .collect();
 
         // Every party reports the unchanged joint pubkey.
         for c in &commits {
-            assert_eq!(c.joint_pubkey_compressed, jpk_bytes, "joint pubkey unchanged");
+            assert_eq!(
+                c.joint_pubkey_compressed, jpk_bytes,
+                "joint pubkey unchanged"
+            );
         }
 
         // Reassemble IncompleteKeyShares → fresh aux(6) → KeyShares → sign.

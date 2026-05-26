@@ -64,9 +64,7 @@ use bsv_mpc_core::presig_encryption::{
     decrypt_and_issue_partial, encrypt_presig_share, wallet_from_identity,
 };
 use bsv_mpc_core::signing::{SigningCoordinator, SigningRoundResult};
-use bsv_mpc_core::types::{
-    EncryptedShare, RoundMessage, SessionId, ShareIndex, ThresholdConfig,
-};
+use bsv_mpc_core::types::{EncryptedShare, RoundMessage, SessionId, ShareIndex, ThresholdConfig};
 use cggmp24::security_level::SecurityLevel128;
 use cggmp24::signing::PresignaturePublicData;
 use cggmp24::supported_curves::Secp256k1;
@@ -239,10 +237,7 @@ impl<M: Unpin, Inner: futures::Sink<M>> futures::Sink<M> for BufferedSink<M, Inn
         std::task::Poll::Ready(Ok(()))
     }
 
-    fn start_send(
-        self: std::pin::Pin<&mut Self>,
-        item: M,
-    ) -> std::result::Result<(), Self::Error> {
+    fn start_send(self: std::pin::Pin<&mut Self>, item: M) -> std::result::Result<(), Self::Error> {
         self.project().messages.get_mut().push_back(item);
         Ok(())
     }

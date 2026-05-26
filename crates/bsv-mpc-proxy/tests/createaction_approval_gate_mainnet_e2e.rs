@@ -163,7 +163,10 @@ async fn broadcast_via_arc(http: &reqwest::Client, body_hex: &str) -> bool {
         let Ok(resp) = req.send().await else { continue };
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        eprintln!("  ARC {url}: status={status} body={}", text.chars().take(200).collect::<String>());
+        eprintln!(
+            "  ARC {url}: status={status} body={}",
+            text.chars().take(200).collect::<String>()
+        );
         if status.is_success()
             || text.contains("SEEN_ON_NETWORK")
             || text.contains("STORED")
@@ -277,7 +280,11 @@ To run (BURNS REAL SATS): APPROVAL_GATE_MAINNET=1 cargo test -p bsv-mpc-proxy \\
     let joint_pub = PublicKey::from_bytes(&joint_arr).expect("joint pubkey");
     let joint_locking = p2pkh_locking_script(&joint_pub.hash160());
     let joint_locking_hex = hex::encode(&joint_locking);
-    eprintln!("✔ joint pubkey {} / {}", hex::encode(joint_arr), joint.address);
+    eprintln!(
+        "✔ joint pubkey {} / {}",
+        hex::encode(joint_arr),
+        joint.address
+    );
     let (presig_a_json, presig_b, box_b) = gen_presig_pair(share0, share1.clone());
 
     // ── 2. The APPROVER identity + the policy manifest requiring its approval ─
@@ -339,7 +346,12 @@ To run (BURNS REAL SATS): APPROVAL_GATE_MAINNET=1 cargo test -p bsv-mpc-proxy \\
     };
     let bridge = MpcBridge::new(&config).await.expect("bridge handshake");
     bridge
-        .provision_presig_to_do(&hex::encode(joint_arr), &presig_a_json, "approval-gate", "approval-gate-1")
+        .provision_presig_to_do(
+            &hex::encode(joint_arr),
+            &presig_a_json,
+            "approval-gate",
+            "approval-gate-1",
+        )
         .await
         .expect("provision presig to DO pool");
     let mut mgr = PresignManager::new(4);
@@ -491,7 +503,9 @@ To run (BURNS REAL SATS): APPROVAL_GATE_MAINNET=1 cargo test -p bsv-mpc-proxy \\
     eprintln!("  joint_pubkey:  {}", hex::encode(joint_arr));
     eprintln!("  policy:        rule \"*\" → RequireApproval k=1 of [approver]");
     eprintln!("  approver:      {}", approver_pub.to_hex());
-    eprintln!("  flow:          createAction → RequireApproval → approval collected over relay → SIGN");
+    eprintln!(
+        "  flow:          createAction → RequireApproval → approval collected over relay → SIGN"
+    );
     eprintln!("  funding_txid:  {fund_txid}:{vout} ({value} sats)");
     eprintln!("  spending_txid: {txid}  (confirmed on WhatsOnChain)");
     eprintln!("  view: https://whatsonchain.com/tx/{txid}");

@@ -85,7 +85,11 @@ fn sign_general(
     (msg, payload, key_id)
 }
 
-fn server_session(server_session_nonce: &str, client_id_hex: &str, peer_nonce: &str) -> StoredSession {
+fn server_session(
+    server_session_nonce: &str,
+    client_id_hex: &str,
+    peer_nonce: &str,
+) -> StoredSession {
     let mut s = StoredSession::new(server_session_nonce.to_string(), client_id_hex.to_string());
     s.peer_nonce = Some(peer_nonce.to_string());
     s.is_authenticated = true;
@@ -282,6 +286,9 @@ fn tampered_payload_rejected() {
 fn fixed_nonces_decode_as_documented() {
     let r = root();
     let inp = &r["vectors"][0]["inputs"];
-    assert_eq!(b32_from_b64(s(inp, "server_session_nonce_b64")), [0xA1u8; 32]);
+    assert_eq!(
+        b32_from_b64(s(inp, "server_session_nonce_b64")),
+        [0xA1u8; 32]
+    );
     assert_eq!(b32_from_b64(s(inp, "request_nonce_b64")), [0xC3u8; 32]);
 }

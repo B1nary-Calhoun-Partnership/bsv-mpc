@@ -213,9 +213,7 @@ impl ProxyBuilder {
                 .build()?,
         };
 
-        let device_presig_pool = self
-            .device_presig_pool
-            .map(|p| Arc::new(RwLock::new(p)));
+        let device_presig_pool = self.device_presig_pool.map(|p| Arc::new(RwLock::new(p)));
 
         let policy_engine = self
             .policy_engine

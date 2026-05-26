@@ -1432,10 +1432,15 @@ async fn enforce_policy_and_approval(
         }
         Verdict::RateLimited { retry_after_secs } => {
             if dry_run {
-                tracing::warn!(retry_after_secs, "policy RATE-LIMITED (dry-run: not enforced)");
+                tracing::warn!(
+                    retry_after_secs,
+                    "policy RATE-LIMITED (dry-run: not enforced)"
+                );
                 Ok(())
             } else {
-                Err(format!("policy rate-limited; retry after {retry_after_secs}s"))
+                Err(format!(
+                    "policy rate-limited; retry after {retry_after_secs}s"
+                ))
             }
         }
         Verdict::RequireApproval(quorum) => {

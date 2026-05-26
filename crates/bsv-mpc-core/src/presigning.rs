@@ -287,7 +287,11 @@ impl PresigningManager {
             let dirty = &key_share.core;
             let vss = dirty.key_info.vss_setup.as_ref();
             let vss_i_hex: Vec<String> = vss
-                .map(|v| v.I.iter().map(|p| hex::encode(p.as_ref().to_be_bytes())).collect())
+                .map(|v| {
+                    v.I.iter()
+                        .map(|p| hex::encode(p.as_ref().to_be_bytes()))
+                        .collect()
+                })
                 .unwrap_or_default();
             tracing::trace!(
                 target: "presign_index_diverge",

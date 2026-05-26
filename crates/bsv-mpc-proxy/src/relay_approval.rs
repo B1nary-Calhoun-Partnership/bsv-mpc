@@ -24,9 +24,7 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bsv::primitives::ec::PrivateKey;
-use bsv_mpc_core::approval::{
-    sign_approval, ApprovalCollector, ApprovalDecision, ApprovalStatus,
-};
+use bsv_mpc_core::approval::{sign_approval, ApprovalCollector, ApprovalDecision, ApprovalStatus};
 use bsv_mpc_core::envelope::WrapParams;
 use bsv_mpc_core::error::{MpcError, Result};
 use bsv_mpc_core::policy::ApprovalQuorum;
@@ -145,8 +143,12 @@ pub async fn collect_approval_over_relay(
     // Collect until quorum / deadline.
     let start = now_ms();
     let deadline_ms = start.saturating_add(recv_timeout.as_millis() as u64);
-    let mut collector =
-        ApprovalCollector::new(quorum, request_view_hash, *session_id.as_bytes(), deadline_ms);
+    let mut collector = ApprovalCollector::new(
+        quorum,
+        request_view_hash,
+        *session_id.as_bytes(),
+        deadline_ms,
+    );
 
     let recv_deadline = tokio::time::Instant::now() + recv_timeout;
     loop {
@@ -230,16 +232,17 @@ pub async fn serve_one_approval(
             .ok_or_else(|| MpcError::Protocol("approver timed out awaiting request".into()))?;
         let decoded = match tokio::time::timeout(remaining, sub.next()).await {
             Err(_) => {
-                return Err(MpcError::Protocol("approver timed out awaiting request".into()))
+                return Err(MpcError::Protocol(
+                    "approver timed out awaiting request".into(),
+                ))
             }
             Ok(None) => return Err(MpcError::Protocol("approval relay closed".into())),
             Ok(Some(r)) => r.map_err(proto)?,
         };
-        let req: ApprovalRequestPayload =
-            match serde_json::from_slice(&decoded.round_msg.payload) {
-                Ok(r) => r,
-                Err(_) => continue,
-            };
+        let req: ApprovalRequestPayload = match serde_json::from_slice(&decoded.round_msg.payload) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
         if req.kind != "approval-request" {
             continue;
         }
@@ -247,7 +250,9 @@ pub async fn serve_one_approval(
         let vh_bytes = hex::decode(&req.request_view_hash)
             .map_err(|e| MpcError::Protocol(format!("request_view_hash hex: {e}")))?;
         if vh_bytes.len() != 32 {
-            return Err(MpcError::Protocol("request_view_hash must be 32 bytes".into()));
+            return Err(MpcError::Protocol(
+                "request_view_hash must be 32 bytes".into(),
+            ));
         }
         let mut request_view_hash = [0u8; 32];
         request_view_hash.copy_from_slice(&vh_bytes);

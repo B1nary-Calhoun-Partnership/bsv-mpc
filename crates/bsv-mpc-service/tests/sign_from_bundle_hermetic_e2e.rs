@@ -50,17 +50,21 @@
 use std::collections::VecDeque;
 
 use bsv::primitives::ec::{PrivateKey, PublicKey, Signature};
-use bsv_mpc_core::presig_at_rest::{derive_presig_at_rest_key, seal_presig_bytes, unseal_presig_bytes};
+use bsv_mpc_core::presig_at_rest::{
+    derive_presig_at_rest_key, seal_presig_bytes, unseal_presig_bytes,
+};
 use bsv_mpc_core::presig_encryption::{
     decrypt_and_issue_partial, encrypt_presig_share, wallet_from_identity,
 };
 use bsv_mpc_core::presigning::serialize_party_presig_with_public_data;
-use bsv_mpc_core::signing::{deserialize_presig_public_data, SigningCoordinator, SigningRoundResult};
+use bsv_mpc_core::signing::{
+    deserialize_presig_public_data, SigningCoordinator, SigningRoundResult,
+};
 use bsv_mpc_core::types::{
     EncryptedShare, PolicyId, PresigBundle, RoundMessage, SessionId, ShareIndex, ThresholdConfig,
 };
-use bsv_mpc_service::FileBundleStore;
 use bsv_mpc_service::presign_handler::BundleStore;
+use bsv_mpc_service::FileBundleStore;
 use cggmp24::security_level::SecurityLevel128;
 use cggmp24::supported_curves::Secp256k1;
 use cggmp24::{ExecutionId, Presignature};
@@ -105,10 +109,7 @@ impl<M: Unpin, Inner: futures::Sink<M>> futures::Sink<M> for BufferedSink<M, Inn
         std::task::Poll::Ready(Ok(()))
     }
 
-    fn start_send(
-        self: std::pin::Pin<&mut Self>,
-        item: M,
-    ) -> std::result::Result<(), Self::Error> {
+    fn start_send(self: std::pin::Pin<&mut Self>, item: M) -> std::result::Result<(), Self::Error> {
         self.project().messages.get_mut().push_back(item);
         Ok(())
     }
@@ -320,7 +321,10 @@ async fn coordinator_signs_from_durable_bundle_with_cosigner_encrypted_own_share
     joint_pubkey_arr.copy_from_slice(joint_compressed.as_ref());
     let joint_pubkey =
         PublicKey::from_bytes(&joint_pubkey_arr).expect("joint pubkey from compressed bytes");
-    eprintln!("✔ DKG complete — joint_pubkey={}", hex::encode(joint_pubkey_arr));
+    eprintln!(
+        "✔ DKG complete — joint_pubkey={}",
+        hex::encode(joint_pubkey_arr)
+    );
 
     // ===== 2) Per-party presig (each party gets its OWN share) =====
     let presigs = generate_presignatures_2of2(&key_shares).await;
@@ -345,7 +349,10 @@ async fn coordinator_signs_from_durable_bundle_with_cosigner_encrypted_own_share
         serde_json::to_vec(&presig1.0).expect("serialize cosigner presig share");
     let cosigner_ct = encrypt_presig_share(&cosigner_wallet, &presig_id, &cosigner_share_bytes)
         .expect("§06.16 BRC-2 encrypt cosigner OWN presig share");
-    assert!(!cosigner_ct.is_empty(), "cosigner ciphertext must be non-empty");
+    assert!(
+        !cosigner_ct.is_empty(),
+        "cosigner ciphertext must be non-empty"
+    );
     eprintln!(
         "✔ cosigner generated + BRC-2-encrypted its OWN share — presig_id={presig_id} ct={} bytes",
         cosigner_ct.len()
@@ -401,7 +408,10 @@ async fn coordinator_signs_from_durable_bundle_with_cosigner_encrypted_own_share
     let reloaded = store
         .get(&presig_id)
         .expect("bundle MUST reload from disk (durable across coordinator restart)");
-    eprintln!("✔ bundle persisted + reloaded from disk at {}", tmp.display());
+    eprintln!(
+        "✔ bundle persisted + reloaded from disk at {}",
+        tmp.display()
+    );
 
     // Binding triple survives the round-trip.
     assert_eq!(reloaded.policy_id, policy_id, "binding: policy_id durable");
@@ -429,7 +439,10 @@ async fn coordinator_signs_from_durable_bundle_with_cosigner_encrypted_own_share
         "cosigner ciphertext durable at positional index 1"
     );
     assert!(!reloaded.gamma_hex.is_empty(), "gamma_hex durable");
-    assert!(!reloaded.commitments.is_empty(), "public-data commitments durable");
+    assert!(
+        !reloaded.commitments.is_empty(),
+        "public-data commitments durable"
+    );
 
     // ===== 6) §06.17.1 threshold: coordinator CANNOT read the cosigner share =====
     let coord_wallet = wallet_from_identity(&coord_priv);
@@ -504,10 +517,7 @@ async fn coordinator_signs_from_durable_bundle_with_cosigner_encrypted_own_share
     r_arr.copy_from_slice(&signing_result.r);
     s_arr.copy_from_slice(&signing_result.s);
     let bsv_sig = Signature::new(r_arr, s_arr);
-    assert!(
-        bsv_sig.is_low_s(),
-        "MPC signature MUST be low-s (BIP-62)"
-    );
+    assert!(bsv_sig.is_low_s(), "MPC signature MUST be low-s (BIP-62)");
     assert!(
         joint_pubkey.verify(&sighash, &bsv_sig),
         "§06.17.1 sign-from-bundle signature MUST verify under the joint pubkey"

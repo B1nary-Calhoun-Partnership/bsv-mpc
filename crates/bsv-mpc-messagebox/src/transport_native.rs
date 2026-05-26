@@ -174,7 +174,9 @@ async fn connect_tcp_prefer_ipv4(host: &str, port: u16) -> std::result::Result<T
             Err(_) => last_err = format!("connect {addr} timed out after {TCP_CONNECT_TIMEOUT:?}"),
         }
     }
-    Err(format!("all addresses failed for {host}:{port}: {last_err}"))
+    Err(format!(
+        "all addresses failed for {host}:{port}: {last_err}"
+    ))
 }
 
 type NativeWsStream = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;

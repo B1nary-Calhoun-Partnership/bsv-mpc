@@ -240,7 +240,10 @@ mod tests {
         }
         let sample = t + 0.5;
         let br = r.burn_rate(sample);
-        assert!((br - 1.0).abs() < 0.02, "burn_rate {br} should converge to ~1.0/sec");
+        assert!(
+            (br - 1.0).abs() < 0.02,
+            "burn_rate {br} should converge to ~1.0/sec"
+        );
         assert_eq!(r.target_pool_size(sample), 30);
         assert_eq!(r.low_water(sample), 15);
         assert_eq!(r.high_water_cap(sample), 60);
@@ -256,17 +259,27 @@ mod tests {
             t += 0.5; // 2/sec
             r.record_consumption(t);
         }
-        assert!(r.burn_rate(t + 0.25) > 1.8, "should be elevated (~2/sec) after the burst");
+        assert!(
+            r.burn_rate(t + 0.25) > 1.8,
+            "should be elevated (~2/sec) after the burst"
+        );
         // 5 windows of silence (300s): exp(-5) ≈ 0.0067 → effectively zero.
         let later = t + 5.0 * 60.0;
-        assert!(r.burn_rate(later) < 0.05, "rate should decay to ~0 when idle");
-        assert_eq!(r.target_pool_size(later), 8, "target falls back to the floor");
+        assert!(
+            r.burn_rate(later) < 0.05,
+            "rate should decay to ~0 when idle"
+        );
+        assert_eq!(
+            r.target_pool_size(later),
+            8,
+            "target falls back to the floor"
+        );
     }
 
     #[test]
     fn regen_triggers_only_below_low_water_and_fills_to_target() {
         let r = BurnRateRegulator::new(); // idle → target 8, low_water 4, cap 16
-        // At or above low_water → no regen.
+                                          // At or above low_water → no regen.
         assert_eq!(r.regen_count(0.0, 4, 0), 0);
         assert_eq!(r.regen_count(0.0, 8, 0), 0);
         // Below low_water → fill to target (8 - available).
@@ -277,7 +290,7 @@ mod tests {
     #[test]
     fn regen_is_bounded_by_cap_counting_in_flight() {
         let r = BurnRateRegulator::new(); // target 8, cap 16
-        // available 0, but 14 already in flight → only room for 2 more (cap 16).
+                                          // available 0, but 14 already in flight → only room for 2 more (cap 16).
         assert_eq!(r.regen_count(0.0, 0, 14), 2);
         // in_flight already at/over cap → launch nothing.
         assert_eq!(r.regen_count(0.0, 0, 16), 0);

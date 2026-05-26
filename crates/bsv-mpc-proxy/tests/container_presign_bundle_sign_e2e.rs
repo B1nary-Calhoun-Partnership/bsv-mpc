@@ -49,9 +49,7 @@ use bsv_mpc_core::types::{
 };
 use bsv_mpc_proxy::relay_presign::{coordinate_presign_over_relay, CosignerArm};
 use bsv_mpc_proxy::relay_sign::{combine_sign_from_bundle_over_relay, DoTrigger};
-use bsv_mpc_service::{
-    build_router, AppState, AuthState, FileBundleStore, SqliteShareStorage,
-};
+use bsv_mpc_service::{build_router, AppState, AuthState, FileBundleStore, SqliteShareStorage};
 use cggmp24::security_level::SecurityLevel128;
 use cggmp24::supported_curves::Secp256k1;
 use cggmp24::ExecutionId;
@@ -94,10 +92,7 @@ impl<M: Unpin, Inner: futures::Sink<M>> futures::Sink<M> for BufferedSink<M, Inn
     ) -> std::task::Poll<std::result::Result<(), Self::Error>> {
         std::task::Poll::Ready(Ok(()))
     }
-    fn start_send(
-        self: std::pin::Pin<&mut Self>,
-        item: M,
-    ) -> std::result::Result<(), Self::Error> {
+    fn start_send(self: std::pin::Pin<&mut Self>, item: M) -> std::result::Result<(), Self::Error> {
         self.project().messages.get_mut().push_back(item);
         Ok(())
     }
@@ -287,11 +282,15 @@ async fn container_self_presigns_coordinator_holds_ct_then_signs_from_bundle() {
         custody: None,
     });
     let app = build_router(state);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
     let svc_addr = listener.local_addr().unwrap();
     let svc_url = format!("http://{svc_addr}");
     tokio::spawn(async move {
-        axum::serve(listener, app.into_make_service()).await.unwrap();
+        axum::serve(listener, app.into_make_service())
+            .await
+            .unwrap();
     });
     // Wait for liveness.
     let http = reqwest::Client::new();
@@ -318,10 +317,11 @@ async fn container_self_presigns_coordinator_holds_ct_then_signs_from_bundle() {
     let presign_session = SessionId::from_str_hash(&format!("presig-{agent_id}-1"));
 
     // Dev-mode service ⇒ no auth headers needed; the request_signer is a no-op.
-    let no_auth_signer = move |_m: &str,
-                               _p: &str,
-                               _b: &[u8]|
-          -> bsv_mpc_core::error::Result<Vec<(String, String)>> { Ok(vec![]) };
+    let no_auth_signer =
+        move |_m: &str,
+              _p: &str,
+              _b: &[u8]|
+              -> bsv_mpc_core::error::Result<Vec<(String, String)>> { Ok(vec![]) };
 
     let bundle = coordinate_presign_over_relay(
         &relay_url,
@@ -343,7 +343,10 @@ async fn container_self_presigns_coordinator_holds_ct_then_signs_from_bundle() {
     )
     .await
     .expect("coordinator presign over relay → bundle");
-    eprintln!("✔ PresigBundle assembled + persisted (presig_id={})", bundle.presig_id);
+    eprintln!(
+        "✔ PresigBundle assembled + persisted (presig_id={})",
+        bundle.presig_id
+    );
 
     // ── 5. THE GATE: bundle holds the container's OWN ct; coordinator can't read it.
     assert_eq!(bundle.presig_id, presign_session.hex());
@@ -353,20 +356,32 @@ async fn container_self_presigns_coordinator_holds_ct_then_signs_from_bundle() {
     // Coordinator = party 1 → its own positional slot (index 1) is empty (plaintext
     // sealed in presig_bytes); the container (party 0) ct lands at index 0.
     let container_ct = bundle.cosigner_encrypted_shares[0].clone().into_vec();
-    assert!(!container_ct.is_empty(), "container ct at positional index 0");
+    assert!(
+        !container_ct.is_empty(),
+        "container ct at positional index 0"
+    );
     assert!(
         bundle.cosigner_encrypted_shares[1].is_empty(),
         "coordinator's own slot empty"
     );
-    assert!(!bundle.presig_bytes.is_empty(), "coordinator own sealed share");
-    assert!(!bundle.commitments.is_empty(), "durable public-data commitments");
+    assert!(
+        !bundle.presig_bytes.is_empty(),
+        "coordinator own sealed share"
+    );
+    assert!(
+        !bundle.commitments.is_empty(),
+        "durable public-data commitments"
+    );
 
     // The container ct DECRYPTS under the container identity (genuine share), and
     // the coordinator (proxy identity) CANNOT decrypt it (§06.17.1 threshold).
     let container_wallet = wallet_from_identity(&container_identity);
-    let recovered =
-        bsv_mpc_core::presig_encryption::decrypt_presig_share(&container_wallet, &bundle.presig_id, &container_ct)
-            .expect("container ct decrypts under container identity");
+    let recovered = bsv_mpc_core::presig_encryption::decrypt_presig_share(
+        &container_wallet,
+        &bundle.presig_id,
+        &container_ct,
+    )
+    .expect("container ct decrypts under container identity");
     let _p: cggmp24::Presignature<Secp256k1> =
         serde_json::from_slice(&recovered).expect("decrypts to a valid cggmp24 Presignature");
     assert!(
@@ -391,10 +406,8 @@ async fn container_self_presigns_coordinator_holds_ct_then_signs_from_bundle() {
     // ── 7. Sign from the reloaded bundle: ship the container's own ct to
     //       /sign-relay, container decrypts + co-signs, proxy combines.
     let sighash = deterministic_sighash(reloaded.presig_id.as_bytes());
-    let coord_at_rest = bsv_mpc_core::presig_at_rest::derive_presig_at_rest_key(
-        &at_rest_root,
-        &reloaded.presig_id,
-    );
+    let coord_at_rest =
+        bsv_mpc_core::presig_at_rest::derive_presig_at_rest_key(&at_rest_root, &reloaded.presig_id);
     let own_presig_json =
         bsv_mpc_core::presig_at_rest::unseal_presig_bytes(&reloaded.presig_bytes, &coord_at_rest)
             .expect("unseal coordinator own presig share");
@@ -433,7 +446,10 @@ async fn container_self_presigns_coordinator_holds_ct_then_signs_from_bundle() {
     )
     .await
     .expect("sign from bundle over relay → final signature");
-    eprintln!("✔ combine complete — DER sig {} bytes", sig_result.signature.len());
+    eprintln!(
+        "✔ combine complete — DER sig {} bytes",
+        sig_result.signature.len()
+    );
 
     // ── 8. The signature VERIFIES under the joint key (BSV-valid ECDSA, low-s).
     let mut r = [0u8; 32];
@@ -441,7 +457,10 @@ async fn container_self_presigns_coordinator_holds_ct_then_signs_from_bundle() {
     r.copy_from_slice(&sig_result.r);
     s.copy_from_slice(&sig_result.s);
     let bsv_sig = Signature::new(r, s);
-    assert!(bsv_sig.is_low_s(), "§06.17.1 signature MUST be low-s (BIP-62)");
+    assert!(
+        bsv_sig.is_low_s(),
+        "§06.17.1 signature MUST be low-s (BIP-62)"
+    );
     let pubkey = PublicKey::from_bytes(&joint_pubkey).expect("joint pubkey");
     assert!(
         pubkey.verify(&sighash, &bsv_sig),

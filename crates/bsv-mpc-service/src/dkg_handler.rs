@@ -375,8 +375,7 @@ async fn dispatch_one(
             DkgRoundResult::NextRound(next_msgs) => {
                 let mut outgoing = wrap_outgoing(&next_msgs, session_id, &peers);
                 {
-                    let mut coords =
-                        inner.coordinators.lock().unwrap_or_else(|p| p.into_inner());
+                    let mut coords = inner.coordinators.lock().unwrap_or_else(|p| p.into_inner());
                     coords.insert(session_id, CoordinatorSlot { coord, peers });
                 }
                 debug!(

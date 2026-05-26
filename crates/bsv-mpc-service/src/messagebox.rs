@@ -144,7 +144,9 @@ impl MessageBoxListener {
         let sub = client
             .subscribe_round_messages_many(message_boxes.clone())
             .await
-            .map_err(|e| anyhow::anyhow!("subscribe_round_messages_many({message_boxes:?}): {e}"))?;
+            .map_err(|e| {
+                anyhow::anyhow!("subscribe_round_messages_many({message_boxes:?}): {e}")
+            })?;
 
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let handler: Arc<F> = Arc::new(handler);

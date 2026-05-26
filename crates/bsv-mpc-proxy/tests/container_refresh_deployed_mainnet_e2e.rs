@@ -207,7 +207,10 @@ async fn container_refresh_then_sign_deployed_real_mainnet_tx() {
 
     // ── 2. MpcBridge from share_B, presign_url = the container ─────────────────
     let dir = std::env::temp_dir();
-    let share_path = dir.join(format!("refresh_container_share_{}.json", std::process::id()));
+    let share_path = dir.join(format!(
+        "refresh_container_share_{}.json",
+        std::process::id()
+    ));
     let share_path_str = share_path.to_string_lossy().to_string();
     tokio::fs::write(&share_path, serde_json::to_vec(&dkg_b).unwrap())
         .await
@@ -304,7 +307,10 @@ async fn container_refresh_then_sign_deployed_real_mainnet_tx() {
         .get(&bundle2.presig_id)
         .expect("bundle #2 reloads from disk");
     assert_ne!(bundle2.presig_id, bundle1_id, "bundle #2 is a fresh presig");
-    eprintln!("✔ post-refresh PresigBundle #2 (refreshed shares): presig_id={}", bundle2.presig_id);
+    eprintln!(
+        "✔ post-refresh PresigBundle #2 (refreshed shares): presig_id={}",
+        bundle2.presig_id
+    );
 
     // ── 6. Fund the (UNCHANGED) joint P2PKH on mainnet ─────────────────────────
     let funding_amount: u64 = 1500;
@@ -330,7 +336,10 @@ async fn container_refresh_then_sign_deployed_real_mainnet_tx() {
         "wallet createAction failed ({fund_status}): {fund_text}"
     );
     let fund_json: serde_json::Value = serde_json::from_str(&fund_text).expect("fund JSON");
-    let fund_txid = fund_json["txid"].as_str().expect("createAction txid").to_string();
+    let fund_txid = fund_json["txid"]
+        .as_str()
+        .expect("createAction txid")
+        .to_string();
     eprintln!("✔ funded joint address: txid={fund_txid}");
     if let Some(raw) = raw_tx_hex_from_create_action(&fund_json) {
         eprintln!("  self-broadcasting funding tx via ARC...");
@@ -364,8 +373,11 @@ async fn container_refresh_then_sign_deployed_real_mainnet_tx() {
         .as_str()
         .expect("publicKey")
         .to_string();
-    let change_script =
-        p2pkh_locking_script(&PublicKey::from_hex(&wallet_pub_hex).expect("wallet pub").hash160());
+    let change_script = p2pkh_locking_script(
+        &PublicKey::from_hex(&wallet_pub_hex)
+            .expect("wallet pub")
+            .hash160(),
+    );
 
     let scope = SIGHASH_ALL | SIGHASH_FORKID;
     let sighash = compute_sighash_for_signing(&SighashParams {
@@ -390,10 +402,19 @@ async fn container_refresh_then_sign_deployed_real_mainnet_tx() {
 
     // ── 8. Sign from bundle #2 (REFRESHED shares) over the relay ───────────────
     let sig = bridge
-        .sign_from_bundle_over_relay(&sighash, &bundle2, at_rest_root, Duration::from_secs(60), None)
+        .sign_from_bundle_over_relay(
+            &sighash,
+            &bundle2,
+            at_rest_root,
+            Duration::from_secs(60),
+            None,
+        )
         .await
         .expect("§06.17.1 sign from refreshed bundle over relay");
-    eprintln!("✔ co-signed with REFRESHED shares: DER {} bytes", sig.signature.len());
+    eprintln!(
+        "✔ co-signed with REFRESHED shares: DER {} bytes",
+        sig.signature.len()
+    );
 
     // ── 9. PRE-FLIGHT verify under the SAME joint pubkey (refreshed shares are
     //       mutually consistent) — fail-closed BEFORE broadcast ────────────────
@@ -411,7 +432,8 @@ async fn container_refresh_then_sign_deployed_real_mainnet_tx() {
 
     // ── 10. Assemble + broadcast ───────────────────────────────────────────────
     let tx_sig = TransactionSignature::new(bsv_sig, scope);
-    let unlocking = p2pkh_unlocking_script(&tx_sig.to_checksig_format(), &joint_pub.to_compressed());
+    let unlocking =
+        p2pkh_unlocking_script(&tx_sig.to_checksig_format(), &joint_pub.to_compressed());
     let raw_tx = serialize_transaction(
         1,
         &[(prev_txid, vout, unlocking, 0xFFFFFFFF)],
@@ -426,7 +448,10 @@ async fn container_refresh_then_sign_deployed_real_mainnet_tx() {
 
     let ok = broadcast_via_arc(&http, &raw_tx_hex).await;
     let _ = tokio::fs::remove_file(&share_path).await;
-    assert!(ok, "ARC broadcast MUST succeed — TXID={txid_hex} rawTx={raw_tx_hex}");
+    assert!(
+        ok,
+        "ARC broadcast MUST succeed — TXID={txid_hex} rawTx={raw_tx_hex}"
+    );
 
     eprintln!();
     eprintln!("╔══════════════════════════════════════════════════════════════╗");
@@ -436,7 +461,10 @@ async fn container_refresh_then_sign_deployed_real_mainnet_tx() {
     eprintln!("  joint_address:    {}", joint.address);
     eprintln!("  bundle#1 (pre):   {bundle1_id} — PURGED on refresh (#22c)");
     eprintln!("  bundles_purged:   {purged}");
-    eprintln!("  bundle#2 (post):  {} — refreshed shares", bundle2.presig_id);
+    eprintln!(
+        "  bundle#2 (post):  {} — refreshed shares",
+        bundle2.presig_id
+    );
     eprintln!("  funding_txid:     {fund_txid}");
     eprintln!("  funded_sats:      {value}");
     eprintln!("  spending_txid:    {txid_hex}");

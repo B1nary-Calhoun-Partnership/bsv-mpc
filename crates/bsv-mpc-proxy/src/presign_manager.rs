@@ -136,7 +136,11 @@ impl DevicePresigSetPool {
                 .map(|(idx, raw)| {
                     // We own the entry now; unwrap the Sync shim. `into_inner`
                     // only fails on a poisoned mutex, impossible here (never locked).
-                    (idx, raw.into_inner().expect("device presig mutex never poisoned"))
+                    (
+                        idx,
+                        raw.into_inner()
+                            .expect("device presig mutex never poisoned"),
+                    )
                 })
                 .collect(),
         )
@@ -318,15 +322,17 @@ impl PresignManager {
     /// §06.19 `high_water_cap = target * 2` — storage bound. Also clamped by
     /// `max_size` (the hard storage ceiling).
     pub fn high_water_cap(&self) -> usize {
-        self.regulator.high_water_cap(self.now_secs()).min(self.max_size)
+        self.regulator
+            .high_water_cap(self.now_secs())
+            .min(self.max_size)
     }
 
     /// How many presign sessions to launch now (§06.19), given regens already
     /// in flight. Also clamped so the pool + in-flight never exceeds `max_size`.
     pub fn regen_count(&self) -> usize {
-        let by_rate = self
-            .regulator
-            .regen_count(self.now_secs(), self.pool.len(), self.regen_in_flight);
+        let by_rate =
+            self.regulator
+                .regen_count(self.now_secs(), self.pool.len(), self.regen_in_flight);
         let hard_room = self
             .max_size
             .saturating_sub(self.pool.len() + self.regen_in_flight);
@@ -468,7 +474,8 @@ pub async fn background_replenish(state: Arc<AppState>) {
             tracing::warn!(
                 error = last_err.unwrap_or_default(),
                 consecutive_failures,
-                next_retry_secs = (BASE_INTERVAL_SECS * 2u64.saturating_pow(consecutive_failures)).min(MAX_BACKOFF_SECS),
+                next_retry_secs = (BASE_INTERVAL_SECS * 2u64.saturating_pow(consecutive_failures))
+                    .min(MAX_BACKOFF_SECS),
                 "burn-rate regen batch produced no presignatures"
             );
         }

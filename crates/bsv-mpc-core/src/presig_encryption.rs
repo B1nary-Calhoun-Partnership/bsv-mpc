@@ -171,7 +171,11 @@ mod tests {
         let ct = encrypt_presig_share(&w, presig_id, plaintext).unwrap();
         // Ciphertext is not the plaintext, and carries the 32-byte IV + 16-byte tag.
         assert_ne!(ct.as_slice(), plaintext.as_slice());
-        assert_eq!(ct.len(), 32 + plaintext.len() + 16, "IV(32) || ct || tag(16)");
+        assert_eq!(
+            ct.len(),
+            32 + plaintext.len() + 16,
+            "IV(32) || ct || tag(16)"
+        );
         let pt = decrypt_presig_share(&w, presig_id, &ct).unwrap();
         assert_eq!(pt.as_slice(), plaintext.as_slice());
     }
@@ -224,6 +228,9 @@ mod tests {
         let data = b"identical plaintext for both ids";
         let ct_a = encrypt_presig_share(&w, "presig-aaa", data).unwrap();
         let ct_b = encrypt_presig_share(&w, "presig-bbb", data).unwrap();
-        assert_ne!(ct_a, ct_b, "same plaintext, different presig_id → ciphertexts differ");
+        assert_ne!(
+            ct_a, ct_b,
+            "same plaintext, different presig_id → ciphertexts differ"
+        );
     }
 }

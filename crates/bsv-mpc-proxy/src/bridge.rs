@@ -200,7 +200,8 @@ fn fresh_throwaway_storage() -> Arc<RwLock<bsv_mpc_service::SqliteShareStorage>>
     use rand::RngCore;
     let mut tag = [0u8; 8];
     rand::rngs::OsRng.fill_bytes(&mut tag);
-    let dir = std::env::temp_dir().join(format!("mpc-proxy-reshare-throwaway-{}", hex_encode(&tag)));
+    let dir =
+        std::env::temp_dir().join(format!("mpc-proxy-reshare-throwaway-{}", hex_encode(&tag)));
     let path = dir.to_string_lossy().to_string();
     let s = bsv_mpc_service::SqliteShareStorage::open(&path).expect("open throwaway storage");
     Arc::new(RwLock::new(s))
@@ -822,13 +823,17 @@ impl MpcBridge {
                 (bundle.joint_key, bundle.session_id, bundle.shares)
             }
             _ => {
-                let dkg_result: DkgResult = serde_json::from_slice(&plaintext_bytes)
-                    .map_err(|e| {
+                let dkg_result: DkgResult =
+                    serde_json::from_slice(&plaintext_bytes).map_err(|e| {
                         anyhow::anyhow!(
                             "failed to parse share file as DeviceShareBundle or DkgResult: {e}"
                         )
                     })?;
-                (dkg_result.joint_key, dkg_result.session_id, vec![dkg_result.share])
+                (
+                    dkg_result.joint_key,
+                    dkg_result.session_id,
+                    vec![dkg_result.share],
+                )
             }
         };
 
@@ -1020,10 +1025,7 @@ impl MpcBridge {
     /// ([`apply_refreshed_share`](Self::apply_refreshed_share)) takes the matching
     /// write-lock, so a sign/presign always reads a consistent share.
     fn current_share(&self) -> EncryptedShare {
-        self.share
-            .read()
-            .unwrap_or_else(|p| p.into_inner())
-            .clone()
+        self.share.read().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
     /// Current share scalar (Copy) for local partial ECDH.
@@ -1037,7 +1039,10 @@ impl MpcBridge {
     /// invariant); the new `share_scalar` is re-extracted from the rotated cggmp24
     /// KeyShare. Returns an error (leaving the live share untouched) if the
     /// rotated share is malformed.
-    pub fn apply_refreshed_share(&self, rotated: &EncryptedShare) -> bsv_mpc_core::error::Result<()> {
+    pub fn apply_refreshed_share(
+        &self,
+        rotated: &EncryptedShare,
+    ) -> bsv_mpc_core::error::Result<()> {
         use zeroize::Zeroize;
         // Re-derive the local share scalar from the rotated KeyShare JSON.
         let mut new_scalar = bsv_mpc_core::ecdh::parse_share_scalar(&rotated.ciphertext)
@@ -1228,8 +1233,10 @@ impl MpcBridge {
             let p_idx = p as usize;
             if p_idx == my_index {
                 // Local computation: counterparty_pub * our_share_scalar
-                let partial =
-                    ecdh::compute_partial_ecdh_point(counterparty_pub, &self.current_share_scalar())?;
+                let partial = ecdh::compute_partial_ecdh_point(
+                    counterparty_pub,
+                    &self.current_share_scalar(),
+                )?;
                 partials.push((partial, self.vss_points[p_idx]));
             } else {
                 // Remote (KSS): POST /ecdh
@@ -1512,7 +1519,6 @@ impl MpcBridge {
         presign_manager: std::sync::Arc<RwLock<crate::presign_manager::PresignManager>>,
         timeout: std::time::Duration,
     ) -> bsv_mpc_core::error::Result<(String, u64)> {
-
         let identity_priv = {
             let auth = self
                 .auth
@@ -1698,7 +1704,11 @@ impl MpcBridge {
         let mk_session = |tag: &str| {
             let mut seed = [0u8; 16];
             rand::rngs::OsRng.fill_bytes(&mut seed);
-            SessionId::from_str_hash(&format!("reshare-{tag}-{}-{}", self.agent_id, hex_encode(&seed)))
+            SessionId::from_str_hash(&format!(
+                "reshare-{tag}-{}-{}",
+                self.agent_id,
+                hex_encode(&seed)
+            ))
         };
         let dkg_session = mk_session("dkg");
         let reshare_session = mk_session("pss");
@@ -1773,22 +1783,23 @@ impl MpcBridge {
         };
         let arm_timeout = timeout + std::time::Duration::from_secs(60);
         let arm_handle = tokio::spawn(async move {
-            let request_signer = move |method: &str,
-                                       path: &str,
-                                       body: &[u8]|
-                  -> bsv_mpc_core::error::Result<Vec<(String, String)>> {
-                let guard = presign_auth
-                    .lock()
-                    .map_err(|_| MpcError::Protocol("presign auth mutex poisoned".into()))?;
-                if !guard.is_authenticated() {
-                    return Ok(vec![]);
-                }
-                Ok(guard
-                    .auth_header_pairs(method, path, body)?
-                    .into_iter()
-                    .map(|(k, v)| (k.to_string(), v))
-                    .collect())
-            };
+            let request_signer =
+                move |method: &str,
+                      path: &str,
+                      body: &[u8]|
+                      -> bsv_mpc_core::error::Result<Vec<(String, String)>> {
+                    let guard = presign_auth
+                        .lock()
+                        .map_err(|_| MpcError::Protocol("presign auth mutex poisoned".into()))?;
+                    if !guard.is_authenticated() {
+                        return Ok(vec![]);
+                    }
+                    Ok(guard
+                        .auth_header_pairs(method, path, body)?
+                        .into_iter()
+                        .map(|(k, v)| (k.to_string(), v))
+                        .collect())
+                };
             crate::relay_reshare::arm_container(&arm, &request_signer, arm_timeout).await
         });
 
@@ -1832,7 +1843,12 @@ impl MpcBridge {
         for (pos, out) in dkg_sends {
             for o in out {
                 proxy_clients[pos]
-                    .send_round_message(&o.recipient_pub_hex, &o.message_box, &o.round_msg, o.params)
+                    .send_round_message(
+                        &o.recipient_pub_hex,
+                        &o.message_box,
+                        &o.round_msg,
+                        o.params,
+                    )
                     .await
                     .map_err(proto)?;
             }
@@ -1882,20 +1898,32 @@ impl MpcBridge {
             match tokio::time::timeout(timeout, &mut dkg_rxs[pos]).await {
                 Ok(Ok(r)) => proxy_aux.push(r),
                 Ok(Err(e)) => {
-                    for l in dkg_listeners { let _ = l.shutdown().await; }
-                    return Err(MpcError::Protocol(format!("reshare: party {idx} DKG channel dropped: {e}")));
+                    for l in dkg_listeners {
+                        let _ = l.shutdown().await;
+                    }
+                    return Err(MpcError::Protocol(format!(
+                        "reshare: party {idx} DKG channel dropped: {e}"
+                    )));
                 }
                 Err(_) => {
-                    for l in dkg_listeners { let _ = l.shutdown().await; }
-                    return Err(MpcError::Protocol(format!("reshare: party {idx} timed out awaiting throwaway DKG aux")));
+                    for l in dkg_listeners {
+                        let _ = l.shutdown().await;
+                    }
+                    return Err(MpcError::Protocol(format!(
+                        "reshare: party {idx} timed out awaiting throwaway DKG aux"
+                    )));
                 }
             }
         }
-        for l in dkg_listeners { let _ = tokio::time::timeout(std::time::Duration::from_secs(10), l.shutdown()).await; }
+        for l in dkg_listeners {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(10), l.shutdown()).await;
+        }
 
         // ════ PHASE B — cross-(t,n) PSS reshare over the relay (proxy parties 1,2) ══
-        let reshar_handlers: Vec<ResharHandler> =
-            proxy_new_indices.iter().map(|_| ResharHandler::new()).collect();
+        let reshar_handlers: Vec<ResharHandler> = proxy_new_indices
+            .iter()
+            .map(|_| ResharHandler::new())
+            .collect();
         let mut pss_listeners: Vec<MessageBoxListener> = Vec::new();
         for (pos, h) in reshar_handlers.iter().enumerate() {
             let l =
@@ -1945,7 +1973,12 @@ impl MpcBridge {
         for (pos, out) in pss_sends {
             for o in out {
                 proxy_clients[pos]
-                    .send_round_message(&o.recipient_pub_hex, &o.message_box, &o.round_msg, o.params)
+                    .send_round_message(
+                        &o.recipient_pub_hex,
+                        &o.message_box,
+                        &o.round_msg,
+                        o.params,
+                    )
                     .await
                     .map_err(proto)?;
             }
@@ -1957,25 +1990,39 @@ impl MpcBridge {
             let commit = match tokio::time::timeout(timeout, &mut pss_rxs[pos]).await {
                 Ok(Ok(c)) => c,
                 Ok(Err(e)) => {
-                    for l in pss_listeners { let _ = l.shutdown().await; }
-                    return Err(MpcError::Protocol(format!("reshare: party {idx} PSS channel dropped: {e}")));
+                    for l in pss_listeners {
+                        let _ = l.shutdown().await;
+                    }
+                    return Err(MpcError::Protocol(format!(
+                        "reshare: party {idx} PSS channel dropped: {e}"
+                    )));
                 }
                 Err(_) => {
-                    for l in pss_listeners { let _ = l.shutdown().await; }
-                    return Err(MpcError::Protocol(format!("reshare: party {idx} timed out awaiting PSS commit")));
+                    for l in pss_listeners {
+                        let _ = l.shutdown().await;
+                    }
+                    return Err(MpcError::Protocol(format!(
+                        "reshare: party {idx} timed out awaiting PSS commit"
+                    )));
                 }
             };
             if commit.joint_pubkey_compressed != jpk_bytes {
-                for l in pss_listeners { let _ = l.shutdown().await; }
+                for l in pss_listeners {
+                    let _ = l.shutdown().await;
+                }
                 return Err(MpcError::Protocol(format!(
                     "reshare: party {idx} joint pubkey CHANGED (reshare invariant violated)"
                 )));
             }
-            let combined =
-                combine_reshared_with_aux(&commit.incomplete_share_json, &proxy_aux[pos].share.ciphertext)?;
+            let combined = combine_reshared_with_aux(
+                &commit.incomplete_share_json,
+                &proxy_aux[pos].share.ciphertext,
+            )?;
             proxy_key_shares_json.push((idx, combined));
         }
-        for l in pss_listeners { let _ = tokio::time::timeout(std::time::Duration::from_secs(10), l.shutdown()).await; }
+        for l in pss_listeners {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(10), l.shutdown()).await;
+        }
 
         // ── Confirm the container armed + responded (it stored its own party-0
         //    share on commit). ──
@@ -2134,8 +2181,9 @@ impl MpcBridge {
         let tmp = format!("{share_path}.tmp");
         std::fs::write(&tmp, &bytes)
             .map_err(|e| MpcError::Protocol(format!("write rotated share {tmp}: {e}")))?;
-        std::fs::rename(&tmp, share_path)
-            .map_err(|e| MpcError::Protocol(format!("rename rotated share into {share_path}: {e}")))?;
+        std::fs::rename(&tmp, share_path).map_err(|e| {
+            MpcError::Protocol(format!("rename rotated share into {share_path}: {e}"))
+        })?;
         Ok(())
     }
 
@@ -2207,8 +2255,10 @@ impl MpcBridge {
             auth.auth_key().clone()
         };
         // Unseal the coordinator's own presig share from the durable bundle.
-        let at_rest_key =
-            bsv_mpc_core::presig_at_rest::derive_presig_at_rest_key(&at_rest_root, &bundle.presig_id);
+        let at_rest_key = bsv_mpc_core::presig_at_rest::derive_presig_at_rest_key(
+            &at_rest_root,
+            &bundle.presig_id,
+        );
         let own_presig_json =
             bsv_mpc_core::presig_at_rest::unseal_presig_bytes(&bundle.presig_bytes, &at_rest_key)
                 .map_err(|e| MpcError::Protocol(format!("unseal own presig share: {e}")))?;
@@ -2698,7 +2748,10 @@ mod tests {
             s.ciphertext.iter().all(|&b| b == 0),
             "#44: KeyShare ciphertext (the secret) MUST be zeroized"
         );
-        assert!(s.nonce.iter().all(|&b| b == 0), "#44: nonce MUST be zeroized");
+        assert!(
+            s.nonce.iter().all(|&b| b == 0),
+            "#44: nonce MUST be zeroized"
+        );
         assert_eq!(
             *bridge.share_scalar.read().unwrap(),
             [0u8; 32],
@@ -3062,7 +3115,11 @@ mod refresh_rotation_tests {
             let p = buffer_outgoing(p);
             let mut r = rand::rngs::OsRng;
             let pre = pr[usize::from(i)].clone();
-            async move { cggmp24::aux_info_gen(eid_aux, i, n, pre).start(&mut r, p).await }
+            async move {
+                cggmp24::aux_info_gen(eid_aux, i, n, pre)
+                    .start(&mut r, p)
+                    .await
+            }
         })
         .unwrap()
         .expect_ok()
@@ -3072,16 +3129,16 @@ mod refresh_rotation_tests {
             .map(|(s, a)| cggmp24::KeyShare::from_parts((s, a)).expect("key share"))
             .collect()
     }
-    fn enc_share(
-        ks: &cggmp24::KeyShare<Secp256k1, SecurityLevel128>,
-        idx: u16,
-    ) -> EncryptedShare {
+    fn enc_share(ks: &cggmp24::KeyShare<Secp256k1, SecurityLevel128>, idx: u16) -> EncryptedShare {
         EncryptedShare {
             nonce: vec![0u8; 12],
             ciphertext: serde_json::to_vec(ks).unwrap(),
             session_id: SessionId::from_str_hash("refresh-rot-test"),
             share_index: ShareIndex(idx),
-            config: ThresholdConfig { threshold: 2, parties: 2 },
+            config: ThresholdConfig {
+                threshold: 2,
+                parties: 2,
+            },
             joint_pubkey_compressed: ks.core.shared_public_key.to_bytes(true).to_vec(),
         }
     }
@@ -3108,14 +3165,12 @@ mod refresh_rotation_tests {
     async fn hot_swap_and_persist_rotated_share_roundtrips() {
         let shares = dkg_2of2().await;
         let jpk = shares[0].core.shared_public_key.to_bytes(true).to_vec();
-        let scalar0 = bsv_mpc_core::ecdh::parse_share_scalar(
-            &serde_json::to_vec(&shares[0]).unwrap(),
-        )
-        .unwrap();
-        let scalar1 = bsv_mpc_core::ecdh::parse_share_scalar(
-            &serde_json::to_vec(&shares[1]).unwrap(),
-        )
-        .unwrap();
+        let scalar0 =
+            bsv_mpc_core::ecdh::parse_share_scalar(&serde_json::to_vec(&shares[0]).unwrap())
+                .unwrap();
+        let scalar1 =
+            bsv_mpc_core::ecdh::parse_share_scalar(&serde_json::to_vec(&shares[1]).unwrap())
+                .unwrap();
         assert_ne!(scalar0, scalar1);
 
         // Bridge starts on party 1's share (written as a plaintext DkgResult file).
@@ -3133,7 +3188,11 @@ mod refresh_rotation_tests {
         let bridge = MpcBridge::new(&config_for(share_path.to_str().unwrap(), None))
             .await
             .unwrap();
-        assert_eq!(bridge.current_share_scalar(), scalar1, "starts on party-1 scalar");
+        assert_eq!(
+            bridge.current_share_scalar(),
+            scalar1,
+            "starts on party-1 scalar"
+        );
 
         // Hot-swap to a "rotated" share (party 0, same joint key).
         let rotated = enc_share(&shares[0], 0);
@@ -3168,12 +3227,9 @@ mod refresh_rotation_tests {
         bridge
             .persist_rotated_share(share_path.to_str().unwrap(), Some(&key), &rotated)
             .unwrap();
-        let reloaded_enc = MpcBridge::new(&config_for(
-            share_path.to_str().unwrap(),
-            Some(key_hex),
-        ))
-        .await
-        .unwrap();
+        let reloaded_enc = MpcBridge::new(&config_for(share_path.to_str().unwrap(), Some(key_hex)))
+            .await
+            .unwrap();
         assert_eq!(
             reloaded_enc.current_share_scalar(),
             scalar0,
@@ -3215,7 +3271,9 @@ mod refresh_rotation_tests {
         // Matching bundle: consume once OK, second time Err (single-use).
         use bsv_mpc_service::BundleStore;
         let good_id = "aa".repeat(32);
-        store.persist(&mk(&good_id, [0x09; 32], jpk.clone())).unwrap();
+        store
+            .persist(&mk(&good_id, [0x09; 32], jpk.clone()))
+            .unwrap();
         let got = bridge
             .consume_bundle_for_sign(&store, &good_id, policy)
             .expect("matching bundle consumes");
@@ -3233,7 +3291,10 @@ mod refresh_rotation_tests {
             .persist(&mk(&stale_id, [0x09; 32], vec![0x03; 33]))
             .unwrap();
         let err = bridge.consume_bundle_for_sign(&store, &stale_id, policy);
-        assert!(err.is_err(), "binding mismatch MUST refuse signing (§06.18 guard)");
+        assert!(
+            err.is_err(),
+            "binding mismatch MUST refuse signing (§06.18 guard)"
+        );
         assert!(
             store.consume(&stale_id).unwrap().is_none(),
             "the stale bundle is purged by the consume, not left for reuse"
@@ -3241,7 +3302,9 @@ mod refresh_rotation_tests {
 
         // Wrong policy id also fails the binding check.
         let pol_id = "cc".repeat(32);
-        store.persist(&mk(&pol_id, [0xFF; 32], jpk.clone())).unwrap();
+        store
+            .persist(&mk(&pol_id, [0xFF; 32], jpk.clone()))
+            .unwrap();
         assert!(
             bridge
                 .consume_bundle_for_sign(&store, &pol_id, policy)
@@ -3252,10 +3315,10 @@ mod refresh_rotation_tests {
 
     #[tokio::test]
     async fn invalidation_trigger_entry_points_purge_and_audit() {
-        use bsv_mpc_core::types::{PolicyId, PresigBundle};
-        use bsv_mpc_service::{BundleStore, FileBundleStore};
         use crate::burn_rate::InvalidationReason;
         use crate::presign_manager::PresignManager;
+        use bsv_mpc_core::types::{PolicyId, PresigBundle};
+        use bsv_mpc_service::{BundleStore, FileBundleStore};
 
         let jpk = vec![0x02u8; 33];
         let bridge = MpcBridge::new_for_test(JointPublicKey {
@@ -3279,8 +3342,12 @@ mod refresh_rotation_tests {
         };
 
         // PolicyUpdate: a stale-policy bundle is purged; current-policy survives.
-        store.persist(&mk(&"a1".repeat(32), [0x09; 32], jpk.clone(), vec![0, 1])).unwrap();
-        store.persist(&mk(&"a2".repeat(32), [0xFF; 32], jpk.clone(), vec![0, 1])).unwrap();
+        store
+            .persist(&mk(&"a1".repeat(32), [0x09; 32], jpk.clone(), vec![0, 1]))
+            .unwrap();
+        store
+            .persist(&mk(&"a2".repeat(32), [0xFF; 32], jpk.clone(), vec![0, 1]))
+            .unwrap();
         let audit = bridge
             .on_policy_update(&store, &mgr, PolicyId([0x09; 32]))
             .unwrap();
@@ -3292,9 +3359,15 @@ mod refresh_rotation_tests {
         assert!(store.get(&"a2".repeat(32)).is_none());
 
         // CosignerSubsetChange(prior=[0,1]) purges the [0,1] bundle.
-        store.persist(&mk(&"b1".repeat(32), [0x09; 32], jpk.clone(), vec![0, 1])).unwrap();
-        store.persist(&mk(&"b2".repeat(32), [0x09; 32], jpk.clone(), vec![0, 2])).unwrap();
-        let audit = bridge.on_cosigner_subset_change(&store, &mgr, &[0, 1]).unwrap();
+        store
+            .persist(&mk(&"b1".repeat(32), [0x09; 32], jpk.clone(), vec![0, 1]))
+            .unwrap();
+        store
+            .persist(&mk(&"b2".repeat(32), [0x09; 32], jpk.clone(), vec![0, 2]))
+            .unwrap();
+        let audit = bridge
+            .on_cosigner_subset_change(&store, &mgr, &[0, 1])
+            .unwrap();
         // Two [0,1]-subset bundles exist now: a1 (survived the policy purge) + b1.
         assert_eq!(audit.purged, 2, "both [0,1]-subset bundles purged");
         assert_eq!(audit.reason, InvalidationReason::Subset);
@@ -3316,10 +3389,9 @@ mod refresh_rotation_tests {
     async fn malformed_rotated_share_aborts_without_corrupting_live_share() {
         // Safety: a bad refresh MUST NOT clobber the live share (no asterisks).
         let shares = dkg_2of2().await;
-        let scalar1 = bsv_mpc_core::ecdh::parse_share_scalar(
-            &serde_json::to_vec(&shares[1]).unwrap(),
-        )
-        .unwrap();
+        let scalar1 =
+            bsv_mpc_core::ecdh::parse_share_scalar(&serde_json::to_vec(&shares[1]).unwrap())
+                .unwrap();
         let dir = tempfile::tempdir().unwrap();
         let share_path = dir.path().join("share.json");
         let orig = DkgResult {

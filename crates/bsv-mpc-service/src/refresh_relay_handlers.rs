@@ -63,7 +63,9 @@ fn err_response(
 
 /// `GET /refresh-relay/identity` — the container's relay / BRC-31 identity hex.
 /// Read-only; also the deployed-image staleness smoke test (404 ⇒ stale image).
-pub async fn handle_refresh_relay_identity(State(_state): State<Arc<AppState>>) -> impl IntoResponse {
+pub async fn handle_refresh_relay_identity(
+    State(_state): State<Arc<AppState>>,
+) -> impl IntoResponse {
     match crate::auth::server_identity_priv_from_env() {
         Ok(k) => (
             StatusCode::OK,
@@ -215,7 +217,10 @@ pub async fn handle_refresh_relay_init(
             )
             .await
         {
-            return err_response(StatusCode::BAD_GATEWAY, format!("ship refresh round-1: {e}"));
+            return err_response(
+                StatusCode::BAD_GATEWAY,
+                format!("ship refresh round-1: {e}"),
+            );
         }
     }
 
@@ -267,9 +272,7 @@ pub async fn handle_refresh_relay_init(
 fn rotate_on_commit(state: &Arc<AppState>, agent_id: &str, commit: &bsv_mpc_core::RefreshCommit) {
     match state.storage.write() {
         Ok(mut storage) => {
-            if let Err(e) =
-                storage.store_share_with_owner(agent_id, &commit.rotated_share, "")
-            {
+            if let Err(e) = storage.store_share_with_owner(agent_id, &commit.rotated_share, "") {
                 warn!("refresh-relay: failed to rotate share for {agent_id}: {e}");
                 return;
             }

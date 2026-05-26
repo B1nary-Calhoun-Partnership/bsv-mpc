@@ -118,7 +118,11 @@ impl RefreshHandler {
         let (completion_tx, completion_rx) = oneshot::channel::<RefreshCommit>();
         let outgoing = wrap_outgoing(&initial, session_id, &peers, &joint_pubkey);
         {
-            let mut coords = self.inner.coordinators.lock().unwrap_or_else(|p| p.into_inner());
+            let mut coords = self
+                .inner
+                .coordinators
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
             coords.insert(
                 session_id,
                 CoordinatorSlot {
@@ -129,7 +133,11 @@ impl RefreshHandler {
             );
         }
         {
-            let mut tx = self.inner.completion_tx.lock().unwrap_or_else(|p| p.into_inner());
+            let mut tx = self
+                .inner
+                .completion_tx
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
             tx.insert(session_id, completion_tx);
         }
         Ok((completion_rx, outgoing))
@@ -149,7 +157,11 @@ impl RefreshHandler {
 
     /// Test/inspect — number of live ceremonies the handler is tracking.
     pub fn live_session_count(&self) -> usize {
-        self.inner.coordinators.lock().unwrap_or_else(|p| p.into_inner()).len()
+        self.inner
+            .coordinators
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .len()
     }
 }
 
@@ -199,7 +211,10 @@ async fn dispatch_one(
                 hex::encode(&commit.joint_pubkey_compressed),
             );
             let tx = {
-                let mut txs = inner.completion_tx.lock().unwrap_or_else(|p| p.into_inner());
+                let mut txs = inner
+                    .completion_tx
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
                 txs.remove(&session_id)
             };
             if let Some(tx) = tx {
@@ -299,19 +314,40 @@ mod tests {
         };
         let peers = vec![(1u16, "02deadbeef".to_string())];
 
-        let a = wrap_outgoing(std::slice::from_ref(&rm_p2p), SessionId([0xaa; 32]), &peers, &jpk);
+        let a = wrap_outgoing(
+            std::slice::from_ref(&rm_p2p),
+            SessionId([0xaa; 32]),
+            &peers,
+            &jpk,
+        );
         assert_eq!(a.len(), 1);
         assert_eq!(a[0].message_box, "mpc-refresh");
         assert_eq!(a[0].params.phase, "refresh");
-        assert_eq!(a[0].params.joint_pubkey, jpk, "refresh binds the real joint key");
+        assert_eq!(
+            a[0].params.joint_pubkey, jpk,
+            "refresh binds the real joint key"
+        );
         assert_eq!(a[0].params.to_party, 1);
 
         // Different session → different ExecutionId prefix (binding property §02).
-        let c = wrap_outgoing(std::slice::from_ref(&rm_p2p), SessionId([0xbb; 32]), &peers, &jpk);
-        assert_ne!(a[0].params.execution_id_prefix, c[0].params.execution_id_prefix);
+        let c = wrap_outgoing(
+            std::slice::from_ref(&rm_p2p),
+            SessionId([0xbb; 32]),
+            &peers,
+            &jpk,
+        );
+        assert_ne!(
+            a[0].params.execution_id_prefix,
+            c[0].params.execution_id_prefix
+        );
 
         // Broadcast fans to every peer.
-        let b = wrap_outgoing(std::slice::from_ref(&rm_broadcast), SessionId([0xaa; 32]), &peers, &jpk);
+        let b = wrap_outgoing(
+            std::slice::from_ref(&rm_broadcast),
+            SessionId([0xaa; 32]),
+            &peers,
+            &jpk,
+        );
         assert_eq!(b.len(), 1);
         assert_eq!(b[0].params.to_party, 1);
     }

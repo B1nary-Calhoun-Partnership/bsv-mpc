@@ -74,10 +74,7 @@ impl<M: Unpin, Inner: futures::Sink<M>> futures::Sink<M> for BufferedSink<M, Inn
     ) -> std::task::Poll<std::result::Result<(), Self::Error>> {
         std::task::Poll::Ready(Ok(()))
     }
-    fn start_send(
-        self: std::pin::Pin<&mut Self>,
-        item: M,
-    ) -> std::result::Result<(), Self::Error> {
+    fn start_send(self: std::pin::Pin<&mut Self>, item: M) -> std::result::Result<(), Self::Error> {
         self.project().messages.get_mut().push_back(item);
         Ok(())
     }
@@ -170,12 +167,18 @@ async fn run_dkg_2of2() -> Vec<cggmp24::KeyShare<Secp256k1, SecurityLevel128>> {
 
     let eid_aux_bytes: [u8; 32] = rng.gen();
     let eid_aux = ExecutionId::new(&eid_aux_bytes);
-    let primes: Vec<_> = (0..n).map(|_| generate_pregenerated_primes(&mut rng)).collect();
+    let primes: Vec<_> = (0..n)
+        .map(|_| generate_pregenerated_primes(&mut rng))
+        .collect();
     let aux = round_based::sim::run(n, |i, party| {
         let party = buffer_outgoing(party);
         let mut prng = rand::rngs::OsRng;
         let pre = primes[usize::from(i)].clone();
-        async move { cggmp24::aux_info_gen(eid_aux, i, n, pre).start(&mut prng, party).await }
+        async move {
+            cggmp24::aux_info_gen(eid_aux, i, n, pre)
+                .start(&mut prng, party)
+                .await
+        }
     })
     .unwrap()
     .expect_ok()
@@ -304,17 +307,30 @@ async fn within_stack_2of2_refresh_rotates_and_signs_via_messagebox() {
         .initiate(session_id, share1, vec![(0u16, p0_pub.clone())])
         .await
         .expect("p1 initiate");
-    assert!(!out0.is_empty() && !out1.is_empty(), "both round-1 outbound");
+    assert!(
+        !out0.is_empty() && !out1.is_empty(),
+        "both round-1 outbound"
+    );
 
     for out in out0 {
         p0_client
-            .send_round_message(&out.recipient_pub_hex, &out.message_box, &out.round_msg, out.params)
+            .send_round_message(
+                &out.recipient_pub_hex,
+                &out.message_box,
+                &out.round_msg,
+                out.params,
+            )
             .await
             .expect("p0 round-1 send");
     }
     for out in out1 {
         p1_client
-            .send_round_message(&out.recipient_pub_hex, &out.message_box, &out.round_msg, out.params)
+            .send_round_message(
+                &out.recipient_pub_hex,
+                &out.message_box,
+                &out.round_msg,
+                out.params,
+            )
             .await
             .expect("p1 round-1 send");
     }
@@ -334,8 +350,14 @@ async fn within_stack_2of2_refresh_rotates_and_signs_via_messagebox() {
 
     // ----- THE GATE -----
     // (2) Joint pubkey unchanged on BOTH sides.
-    assert_eq!(commit0.joint_pubkey_compressed, joint_pubkey, "p0 joint pubkey unchanged");
-    assert_eq!(commit1.joint_pubkey_compressed, joint_pubkey, "p1 joint pubkey unchanged");
+    assert_eq!(
+        commit0.joint_pubkey_compressed, joint_pubkey,
+        "p0 joint pubkey unchanged"
+    );
+    assert_eq!(
+        commit1.joint_pubkey_compressed, joint_pubkey,
+        "p1 joint pubkey unchanged"
+    );
 
     // Rebuild rotated cggmp24 KeyShares from the committed rotated shares.
     let rotated: Vec<cggmp24::KeyShare<Secp256k1, SecurityLevel128>> = [&commit0, &commit1]
@@ -345,13 +367,22 @@ async fn within_stack_2of2_refresh_rotates_and_signs_via_messagebox() {
 
     // (3) Every secret share rotated; shared pubkey unchanged on each.
     for (i, ks) in rotated.iter().enumerate() {
-        assert_eq!(*ks.core.shared_public_key, joint_point, "shared pubkey unchanged");
-        assert_ne!(secret_of(ks), old_secrets[i], "secret share[{i}] MUST rotate");
+        assert_eq!(
+            *ks.core.shared_public_key, joint_point,
+            "shared pubkey unchanged"
+        );
+        assert_ne!(
+            secret_of(ks),
+            old_secrets[i],
+            "secret share[{i}] MUST rotate"
+        );
     }
 
     // (4) The rotated shares sign together → verify against the ORIGINAL joint key.
     sign_2of2_and_verify(&rotated, &joint_point, b"sign after relay refresh").await;
-    eprintln!("✔✔ refresh over MessageBox: shares rotated, joint key preserved, rotated shares SIGN");
+    eprintln!(
+        "✔✔ refresh over MessageBox: shares rotated, joint key preserved, rotated shares SIGN"
+    );
 
     assert_eq!(h0.live_session_count(), 0, "p0 cleaned up");
     assert_eq!(h1.live_session_count(), 0, "p1 cleaned up");

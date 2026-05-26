@@ -78,10 +78,7 @@ impl<M: Unpin, Inner: futures::Sink<M>> futures::Sink<M> for BufferedSink<M, Inn
     ) -> std::task::Poll<std::result::Result<(), Self::Error>> {
         std::task::Poll::Ready(Ok(()))
     }
-    fn start_send(
-        self: std::pin::Pin<&mut Self>,
-        item: M,
-    ) -> std::result::Result<(), Self::Error> {
+    fn start_send(self: std::pin::Pin<&mut Self>, item: M) -> std::result::Result<(), Self::Error> {
         self.project().messages.get_mut().push_back(item);
         Ok(())
     }
@@ -259,8 +256,7 @@ async fn run_presign_over_relay(
 
     // ── 3. Boot the in-process bsv-mpc-service with the cosigner share seeded ──
     let data_dir = tempfile::tempdir().expect("tempdir");
-    let mut storage =
-        SqliteShareStorage::open(data_dir.path().to_str().unwrap()).expect("storage");
+    let mut storage = SqliteShareStorage::open(data_dir.path().to_str().unwrap()).expect("storage");
     storage
         .store_share_with_owner(&agent_id, &cosigner_share, "")
         .expect("seed cosigner share");
@@ -279,7 +275,9 @@ async fn run_presign_over_relay(
     let svc_addr = listener.local_addr().unwrap();
     let svc_url = format!("http://{svc_addr}");
     tokio::spawn(async move {
-        axum::serve(listener, app.into_make_service()).await.unwrap();
+        axum::serve(listener, app.into_make_service())
+            .await
+            .unwrap();
     });
     let http = reqwest::Client::new();
     for _ in 0..50 {
@@ -303,10 +301,11 @@ async fn run_presign_over_relay(
     let at_rest_root = [0x42u8; 32];
     let presign_session = SessionId::from_str_hash(&format!("presig-{agent_id}-{label}"));
 
-    let no_auth_signer = move |_m: &str,
-                               _p: &str,
-                               _b: &[u8]|
-          -> bsv_mpc_core::error::Result<Vec<(String, String)>> { Ok(vec![]) };
+    let no_auth_signer =
+        move |_m: &str,
+              _p: &str,
+              _b: &[u8]|
+              -> bsv_mpc_core::error::Result<Vec<(String, String)>> { Ok(vec![]) };
 
     let result = coordinate_presign_over_relay(
         &relay_url,
@@ -336,8 +335,14 @@ async fn run_presign_over_relay(
                 bundle.parties_at_keygen,
                 bundle.cosigner_encrypted_shares.len()
             );
-            assert_eq!(bundle.joint_pubkey, joint_pubkey, "[{label}] joint_pubkey binding");
-            assert_eq!(bundle.parties_at_keygen, parties_at_keygen, "[{label}] subset binding");
+            assert_eq!(
+                bundle.joint_pubkey, joint_pubkey,
+                "[{label}] joint_pubkey binding"
+            );
+            assert_eq!(
+                bundle.parties_at_keygen, parties_at_keygen,
+                "[{label}] subset binding"
+            );
             true
         }
         Err(e) => {
@@ -357,7 +362,10 @@ async fn presign_realrelay_contiguous_01_control() {
     }
     let _ = tracing_subscriber::fmt::try_init();
     let ok = run_presign_over_relay(vec![0, 1], 1, 0, 0, 2, 2, "01").await;
-    assert!(ok, "CONTROL {{0,1}} presign over the real relay MUST assemble a bundle");
+    assert!(
+        ok,
+        "CONTROL {{0,1}} presign over the real relay MUST assemble a bundle"
+    );
 }
 
 /// **DECISIVE: `{0,2}` non-contiguous, coordinator = party 2 (SM-position 1),

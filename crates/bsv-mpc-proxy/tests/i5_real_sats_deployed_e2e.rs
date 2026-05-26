@@ -488,9 +488,7 @@ async fn sec0620_deployed_decrypt_at_rest_real_mainnet_tx() {
     use bsv_mpc_proxy::config::ProxyConfig;
 
     if !opt_in() {
-        eprintln!(
-            "E2E_MAINNET=1 not set — skipping #25b §06.20 decrypt-at-rest real-sats gate."
-        );
+        eprintln!("E2E_MAINNET=1 not set — skipping #25b §06.20 decrypt-at-rest real-sats gate.");
         return;
     }
     let _ = tracing_subscriber::fmt::try_init();
@@ -662,7 +660,10 @@ async fn sec0620_deployed_decrypt_at_rest_real_mainnet_tx() {
         .sign_over_relay(&sighash, box_b, None, trigger, Duration::from_secs(60))
         .await
         .expect("proxy + deployed worker co-sign via authed /sign-relay (§06.20 decrypt-at-rest)");
-    eprintln!("✔ co-signed via decrypt-at-rest pool path: DER {} bytes", sig.signature.len());
+    eprintln!(
+        "✔ co-signed via decrypt-at-rest pool path: DER {} bytes",
+        sig.signature.len()
+    );
 
     // ── 7. PRE-FLIGHT verify — fail-closed BEFORE broadcast. ────────────────
     let mut r = [0u8; 32];

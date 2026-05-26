@@ -43,9 +43,7 @@ use bsv_mpc_core::signing::{
     issue_partial_signature_json, issue_partial_signature_json_with_offset, SigningCoordinator,
     SigningRoundResult,
 };
-use bsv_mpc_core::types::{
-    EncryptedShare, SessionId, ShareIndex, SigningResult, ThresholdConfig,
-};
+use bsv_mpc_core::types::{EncryptedShare, SessionId, ShareIndex, SigningResult, ThresholdConfig};
 use cggmp24::security_level::SecurityLevel128;
 use cggmp24::supported_curves::Secp256k1;
 use cggmp24::ExecutionId;
@@ -73,10 +71,7 @@ impl<M: Unpin, Inner: futures::Sink<M>> futures::Sink<M> for BufferedSink<M, Inn
     ) -> std::task::Poll<std::result::Result<(), Self::Error>> {
         std::task::Poll::Ready(Ok(()))
     }
-    fn start_send(
-        self: std::pin::Pin<&mut Self>,
-        item: M,
-    ) -> std::result::Result<(), Self::Error> {
+    fn start_send(self: std::pin::Pin<&mut Self>, item: M) -> std::result::Result<(), Self::Error> {
         self.project().messages.get_mut().push_back(item);
         Ok(())
     }
@@ -382,7 +377,9 @@ async fn device_holds_3_presigned_relay_combine_signs_and_verifies() {
         joint_pub.verify(&sighash, &bsv_sig),
         "device-holds-3 presigned 4-of-6 signature MUST verify under the joint pubkey"
     );
-    eprintln!("✔ base-key device-holds-3 presigned signature is low-s AND verifies under joint pubkey");
+    eprintln!(
+        "✔ base-key device-holds-3 presigned signature is low-s AND verifies under joint pubkey"
+    );
 
     // ── 3. BRC-42 OFFSET (§06.20): same path → verifies under child key. ─────
     eprintln!("(device-holds presigned combine with a BRC-42 offset — verifies under child key)");
@@ -421,7 +418,9 @@ async fn device_holds_3_presigned_relay_combine_signs_and_verifies() {
         !joint_pub.verify(&sighash, &bsv_sig_off),
         "offset signature MUST NOT verify under the BASE joint key (it signs the child key)"
     );
-    eprintln!("✔ BRC-42-offset device-holds-3 signature verifies under child key, NOT the base key");
+    eprintln!(
+        "✔ BRC-42-offset device-holds-3 signature verifies under child key, NOT the base key"
+    );
 
     // ── 4. NEGATIVE: device-alone {0,1,2} (3 < t=4) cannot combine. ──────────
     // Only 3 of the 4 commitment slots are filled → process is never invoked
@@ -452,11 +451,18 @@ async fn device_holds_3_presigned_relay_combine_signs_and_verifies() {
     // (3 of 4 slots filled) — the device alone CANNOT produce the 4-of-6 sig.
     match coord.process_round(vec![]).expect("probe round") {
         SigningRoundResult::NextRound(msgs) => {
-            assert!(msgs.is_empty(), "no outgoing expected on the presigned wait path");
-            eprintln!("✔ NEGATIVE: device-alone {{0,1,2}} stays PENDING (3<t=4) — cannot sign alone");
+            assert!(
+                msgs.is_empty(),
+                "no outgoing expected on the presigned wait path"
+            );
+            eprintln!(
+                "✔ NEGATIVE: device-alone {{0,1,2}} stays PENDING (3<t=4) — cannot sign alone"
+            );
         }
         SigningRoundResult::Complete(_) => {
-            panic!("SECURITY VIOLATION: device-alone {{0,1,2}} (3<t=4) produced a 4-of-6 signature");
+            panic!(
+                "SECURITY VIOLATION: device-alone {{0,1,2}} (3<t=4) produced a 4-of-6 signature"
+            );
         }
     }
 

@@ -27,13 +27,10 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use bsv::primitives::ec::PrivateKey;
-use bsv_mpc_core::types::{
-    EncryptedShare, PolicyId, SessionId, ShareIndex, ThresholdConfig,
-};
+use bsv_mpc_core::types::{EncryptedShare, PolicyId, SessionId, ShareIndex, ThresholdConfig};
 use bsv_mpc_messagebox::{DecodedRoundMessage, InboundVia};
 use bsv_mpc_service::{
-    InMemoryBundleStore, OutgoingRoundMessage, PresignHandler, PresignHandlerConfig,
-    PresignOutcome,
+    InMemoryBundleStore, OutgoingRoundMessage, PresignHandler, PresignHandlerConfig, PresignOutcome,
 };
 use cggmp24::security_level::SecurityLevel128;
 use cggmp24::supported_curves::Secp256k1;
@@ -60,10 +57,7 @@ impl<M: Unpin, Inner: futures::Sink<M>> futures::Sink<M> for BufferedSink<M, Inn
     ) -> std::task::Poll<std::result::Result<(), Self::Error>> {
         std::task::Poll::Ready(Ok(()))
     }
-    fn start_send(
-        self: std::pin::Pin<&mut Self>,
-        item: M,
-    ) -> std::result::Result<(), Self::Error> {
+    fn start_send(self: std::pin::Pin<&mut Self>, item: M) -> std::result::Result<(), Self::Error> {
         self.project().messages.get_mut().push_back(item);
         Ok(())
     }
@@ -296,14 +290,18 @@ async fn drive_presign(
     for out in &coord_round1 {
         eprintln!(
             "[{label}] COORD round-1 wire from={} to={:?} round={} -> cosigner",
-            out.round_msg.from.0, out.round_msg.to.map(|t| t.0), out.round_msg.round
+            out.round_msg.from.0,
+            out.round_msg.to.map(|t| t.0),
+            out.round_msg.round
         );
         queue.push_back((false, deliver(out, &coord_pub_hex, &mut seq)));
     }
     for out in &cosigner_round1 {
         eprintln!(
             "[{label}] COSIGNER round-1 wire from={} to={:?} round={} -> coord",
-            out.round_msg.from.0, out.round_msg.to.map(|t| t.0), out.round_msg.round
+            out.round_msg.from.0,
+            out.round_msg.to.map(|t| t.0),
+            out.round_msg.round
         );
         queue.push_back((true, deliver(out, &cosigner_pub_hex, &mut seq)));
     }
@@ -339,7 +337,11 @@ async fn drive_presign(
             let recipient_is_coord = out.recipient_pub_hex == coord_pub_hex;
             eprintln!(
                 "[{label}]   {who} -> {} wire from={} to={:?} round={} box={}",
-                if recipient_is_coord { "COORD" } else { "COSIGNER" },
+                if recipient_is_coord {
+                    "COORD"
+                } else {
+                    "COSIGNER"
+                },
                 out.round_msg.from.0,
                 out.round_msg.to.map(|t| t.0),
                 out.round_msg.round,
@@ -377,7 +379,10 @@ async fn presign_relay_contiguous_01_passes() {
         "01",
     )
     .await;
-    assert!(bundle.is_some(), "CONTROL {{0,1}} presign MUST assemble a bundle");
+    assert!(
+        bundle.is_some(),
+        "CONTROL {{0,1}} presign MUST assemble a bundle"
+    );
 }
 
 /// **REPRO: `{0,2}` non-contiguous, coordinator = party 2 (SM-position 1).**

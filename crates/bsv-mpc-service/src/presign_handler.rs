@@ -280,7 +280,13 @@ impl FileBundleStore {
     fn path_for(&self, presig_id: &str) -> std::path::PathBuf {
         let safe: String = presig_id
             .chars()
-            .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
             .collect();
         self.root.join(format!("{safe}.json"))
     }
@@ -349,9 +355,8 @@ impl BundleStore for FileBundleStore {
         let mut purged = 0u64;
         for (path, bundle) in self.all_bundles() {
             if bundle.invalidated_by(trigger) {
-                Self::zeroize_and_remove(&path).map_err(|e| {
-                    anyhow::anyhow!("zeroize bundle {}: {e}", path.display())
-                })?;
+                Self::zeroize_and_remove(&path)
+                    .map_err(|e| anyhow::anyhow!("zeroize bundle {}: {e}", path.display()))?;
                 purged += 1;
             }
         }
@@ -370,10 +375,7 @@ impl BundleStore for FileBundleStore {
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         let seq = CLAIM_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let claim = path.with_extension(format!(
-            "consuming.{}.{nanos}.{seq}",
-            std::process::id()
-        ));
+        let claim = path.with_extension(format!("consuming.{}.{nanos}.{seq}", std::process::id()));
         match std::fs::rename(&path, &claim) {
             Ok(()) => {
                 let bytes = std::fs::read(&claim)
@@ -485,8 +487,13 @@ impl PresignHandler {
         .map_err(|e| anyhow::anyhow!("init_generate task panicked: {e}"))??;
 
         let (tx, rx) = oneshot::channel::<PresignOutcome>();
-        let mut outgoing =
-            wrap_protocol(&initial, session_id, joint_pubkey, &peers, &self.inner.parties_at_keygen);
+        let mut outgoing = wrap_protocol(
+            &initial,
+            session_id,
+            joint_pubkey,
+            &peers,
+            &self.inner.parties_at_keygen,
+        );
         {
             let mut t = self
                 .inner
@@ -501,7 +508,11 @@ impl PresignHandler {
         // buffered message is lost between the insert and the drain (same lock
         // discipline as `DkgHandler::initiate`).
         let buffered: Vec<DecodedRoundMessage> = {
-            let mut c = self.inner.ceremonies.lock().unwrap_or_else(|p| p.into_inner());
+            let mut c = self
+                .inner
+                .ceremonies
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
             c.insert(
                 session_id,
                 CeremonySlot {
@@ -628,12 +639,19 @@ impl PresignHandler {
             // (or the post-advance drain below) replays it once the slot exists.
             // Lock order `ceremonies` → `pending_inbound` matches `initiate`.
             let slot = {
-                let mut c = self.inner.ceremonies.lock().unwrap_or_else(|p| p.into_inner());
+                let mut c = self
+                    .inner
+                    .ceremonies
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
                 match c.remove(&session_id) {
                     Some(s) => s,
                     None => {
-                        let mut pend =
-                            self.inner.pending_inbound.lock().unwrap_or_else(|p| p.into_inner());
+                        let mut pend = self
+                            .inner
+                            .pending_inbound
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner());
                         let buf = pend.entry(session_id).or_default();
                         buf.push(next);
                         buf.extend(queue.drain(..));
@@ -675,8 +693,11 @@ impl PresignHandler {
                         &self.inner.parties_at_keygen,
                     );
                     {
-                        let mut c =
-                            self.inner.ceremonies.lock().unwrap_or_else(|p| p.into_inner());
+                        let mut c = self
+                            .inner
+                            .ceremonies
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner());
                         c.insert(
                             session_id,
                             CeremonySlot {
@@ -755,7 +776,11 @@ impl PresignHandler {
 
             let n = self.inner.parties_at_keygen.len();
             {
-                let mut col = self.inner.collections.lock().unwrap_or_else(|p| p.into_inner());
+                let mut col = self
+                    .inner
+                    .collections
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
                 col.entry(session_id).or_insert_with(|| CollectionSlot {
                     own_presig_sealed: sealed,
                     public_data_cbor,
@@ -806,11 +831,7 @@ impl PresignHandler {
                 recipient_pub_hex: coordinator.1.clone(),
                 message_box: presig_return_box(&presig_id),
                 round_msg: return_msg,
-                params: presign_wrap_params(
-                    session_id,
-                    joint_pubkey,
-                    self.inner.coordinator_party,
-                ),
+                params: presign_wrap_params(session_id, joint_pubkey, self.inner.coordinator_party),
             };
             info!(
                 "PresignHandler[cosigner {}]: shipping return ciphertext to coordinator {}",
@@ -845,7 +866,11 @@ impl PresignHandler {
             })?;
 
         let joint_pubkey = {
-            let mut col = self.inner.collections.lock().unwrap_or_else(|p| p.into_inner());
+            let mut col = self
+                .inner
+                .collections
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
             let Some(slot) = col.get_mut(&session_id) else {
                 // Round-3 hasn't completed on the coordinator yet (return share
                 // raced ahead of the coordinator's own SM completion). The
@@ -880,19 +905,23 @@ impl PresignHandler {
         joint_pubkey: [u8; 33],
     ) -> anyhow::Result<()> {
         let bundle = {
-            let mut col = self.inner.collections.lock().unwrap_or_else(|p| p.into_inner());
+            let mut col = self
+                .inner
+                .collections
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
             let Some(slot) = col.get(&session_id) else {
                 return Ok(());
             };
             // All cosigner slots (every party except the coordinator) filled?
-            let all_filled = self
-                .inner
-                .parties_at_keygen
-                .iter()
-                .enumerate()
-                .all(|(pos, &party)| {
-                    party == self.inner.coordinator_party || slot.cosigner_shares[pos].is_some()
-                });
+            let all_filled =
+                self.inner
+                    .parties_at_keygen
+                    .iter()
+                    .enumerate()
+                    .all(|(pos, &party)| {
+                        party == self.inner.coordinator_party || slot.cosigner_shares[pos].is_some()
+                    });
             if !all_filled {
                 return Ok(());
             }
@@ -906,7 +935,9 @@ impl PresignHandler {
                 .iter()
                 .enumerate()
                 .map(|(pos, _party)| {
-                    serde_bytes::ByteBuf::from(slot.cosigner_shares[pos].clone().unwrap_or_default())
+                    serde_bytes::ByteBuf::from(
+                        slot.cosigner_shares[pos].clone().unwrap_or_default(),
+                    )
                 })
                 .collect::<Vec<_>>();
 
@@ -950,7 +981,10 @@ impl PresignHandler {
             ack_ids.len()
         );
 
-        self.fire_completion(session_id, PresignOutcome::BundlePersisted(Box::new(bundle)));
+        self.fire_completion(
+            session_id,
+            PresignOutcome::BundlePersisted(Box::new(bundle)),
+        );
         Ok(())
     }
 
@@ -1048,11 +1082,7 @@ fn wrap_protocol(
     out
 }
 
-fn presign_wrap_params(
-    session_id: SessionId,
-    joint_pubkey: [u8; 33],
-    to_party: u16,
-) -> WrapParams {
+fn presign_wrap_params(session_id: SessionId, joint_pubkey: [u8; 33], to_party: u16) -> WrapParams {
     WrapParams {
         to_party,
         joint_pubkey,
@@ -1230,10 +1260,23 @@ mod tests {
             to: Some(ShareIndex(1)), // SM POSITION of party 2
             payload: vec![9, 9, 9],
         };
-        let out = wrap_protocol(std::slice::from_ref(&rm), sid, jpk, &peers, &parties_at_keygen);
-        assert_eq!(out.len(), 1, "p2p MUST route to the absolute-index-2 peer (not dropped)");
+        let out = wrap_protocol(
+            std::slice::from_ref(&rm),
+            sid,
+            jpk,
+            &peers,
+            &parties_at_keygen,
+        );
+        assert_eq!(
+            out.len(),
+            1,
+            "p2p MUST route to the absolute-index-2 peer (not dropped)"
+        );
         assert_eq!(out[0].recipient_pub_hex, "02cafe");
-        assert_eq!(out[0].params.to_party, 2, "envelope to_party = absolute index 2");
+        assert_eq!(
+            out[0].params.to_party, 2,
+            "envelope to_party = absolute index 2"
+        );
         // Wire carries ABSOLUTE indices (§05.4.6): from 0→0, to position 1→absolute 2.
         assert_eq!(out[0].round_msg.from, ShareIndex(0));
         assert_eq!(out[0].round_msg.to, Some(ShareIndex(2)));
@@ -1246,9 +1289,19 @@ mod tests {
             to: None,
             payload: vec![1],
         };
-        let out2 = wrap_protocol(std::slice::from_ref(&bcast), sid, jpk, &peers, &parties_at_keygen);
+        let out2 = wrap_protocol(
+            std::slice::from_ref(&bcast),
+            sid,
+            jpk,
+            &peers,
+            &parties_at_keygen,
+        );
         assert_eq!(out2.len(), 1);
-        assert_eq!(out2[0].round_msg.from, ShareIndex(2), "broadcast from = absolute index 2");
+        assert_eq!(
+            out2[0].round_msg.from,
+            ShareIndex(2),
+            "broadcast from = absolute index 2"
+        );
         assert_eq!(out2[0].round_msg.to, None);
     }
 
@@ -1363,7 +1416,10 @@ mod tests {
         }
         // Not finalizable yet (party 1 share missing).
         coord.try_finalize_bundle(sid, jpk).await.unwrap();
-        assert!(store.is_empty(), "must NOT finalize before all shares arrive");
+        assert!(
+            store.is_empty(),
+            "must NOT finalize before all shares arrive"
+        );
 
         // Party 1's return ciphertext arrives.
         let p1_ciphertext = b"party-1-brc2-ciphertext".to_vec();
@@ -1390,7 +1446,10 @@ mod tests {
 
         let bundle = store.get(&presig_id).expect("bundle MUST be persisted");
         assert_eq!(bundle.presig_id, presig_id);
-        assert_eq!(bundle.presig_bytes, sealed, "coordinator's own sealed share");
+        assert_eq!(
+            bundle.presig_bytes, sealed,
+            "coordinator's own sealed share"
+        );
         assert_eq!(bundle.parties_at_keygen, vec![0, 1]);
         assert_eq!(bundle.cosigner_encrypted_shares.len(), 2);
         // Positional: index 0 = coordinator (empty), index 1 = party-1 ciphertext.
@@ -1477,7 +1536,12 @@ mod tests {
             .unwrap();
         let stale_id = "bb".repeat(32);
         store
-            .persist(&bundle_with(&stale_id, stale_policy, vec![0x02; 33], vec![0, 1]))
+            .persist(&bundle_with(
+                &stale_id,
+                stale_policy,
+                vec![0x02; 33],
+                vec![0, 1],
+            ))
             .unwrap();
         let stale_path = store.path_for(&stale_id);
         assert!(stale_path.exists());
@@ -1489,7 +1553,10 @@ mod tests {
             })
             .unwrap();
         assert_eq!(purged, 1, "only the stale-policy bundle is purged");
-        assert!(!stale_path.exists(), "stale bundle file removed (zeroized first)");
+        assert!(
+            !stale_path.exists(),
+            "stale bundle file removed (zeroized first)"
+        );
         assert!(
             store.get(&"aa".repeat(32)).is_some(),
             "current-policy bundle survives"
@@ -1510,10 +1577,20 @@ mod tests {
         let store = FileBundleStore::new(dir.path()).expect("open");
         // subset [0,1] vs [0,2]; jpk A vs B.
         store
-            .persist(&bundle_with(&"11".repeat(32), [0x11; 32], vec![0x02; 33], vec![0, 1]))
+            .persist(&bundle_with(
+                &"11".repeat(32),
+                [0x11; 32],
+                vec![0x02; 33],
+                vec![0, 1],
+            ))
             .unwrap();
         store
-            .persist(&bundle_with(&"22".repeat(32), [0x11; 32], vec![0x02; 33], vec![0, 2]))
+            .persist(&bundle_with(
+                &"22".repeat(32),
+                [0x11; 32],
+                vec![0x02; 33],
+                vec![0, 2],
+            ))
             .unwrap();
 
         // CosignerSubsetChange(prior=[0,1]) purges only the [0,1] bundle.
@@ -1575,10 +1652,7 @@ mod tests {
             "second consume yields None (single-use §06.17.3)"
         );
         // No stray consuming.* claim files left behind.
-        let leftovers = std::fs::read_dir(dir.path())
-            .unwrap()
-            .flatten()
-            .count();
+        let leftovers = std::fs::read_dir(dir.path()).unwrap().flatten().count();
         assert_eq!(leftovers, 0, "no claim/temp files left after consume");
     }
 

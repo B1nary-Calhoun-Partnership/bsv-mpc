@@ -57,8 +57,16 @@ fn recovery_kek_vectors_reproduce_byte_for_byte() {
         let name = s(v, "name");
         let inp = &v["inputs"];
 
-        assert_eq!(s(inp, "algorithm"), "Argon2id", "{name}: algorithm must be Argon2id");
-        assert_eq!(u32_field(inp, "hash_len"), 32, "{name}: hash_len must be 32");
+        assert_eq!(
+            s(inp, "algorithm"),
+            "Argon2id",
+            "{name}: algorithm must be Argon2id"
+        );
+        assert_eq!(
+            u32_field(inp, "hash_len"),
+            32,
+            "{name}: hash_len must be 32"
+        );
 
         let passphrase = hex::decode(s(inp, "passphrase_utf8_bytes_hex"))
             .unwrap_or_else(|e| panic!("{name}: passphrase hex: {e}"));
@@ -72,7 +80,11 @@ fn recovery_kek_vectors_reproduce_byte_for_byte() {
         // Self-describing raw path: feed the vector's own pinned m/t/p.
         let kek = derive_recovery_kek_raw(&passphrase, &salt, m, t, p)
             .unwrap_or_else(|e| panic!("{name}: derive_recovery_kek_raw failed: {e}"));
-        assert_eq!(hex::encode(kek), expected, "{name}: KEK diverges (raw path)");
+        assert_eq!(
+            hex::encode(kek),
+            expected,
+            "{name}: KEK diverges (raw path)"
+        );
 
         // Cross-check: the named profile must select the same pinned params, so
         // the profile path MUST produce the identical KEK.

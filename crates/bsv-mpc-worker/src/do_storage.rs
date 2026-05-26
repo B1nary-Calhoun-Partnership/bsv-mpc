@@ -920,7 +920,10 @@ impl<'a> DoSqlStorage<'a> {
     /// predicate on one column. Returns the count purged.
     fn invalidate_bundles_where(&self, column: &str, value: &str) -> Result<u64> {
         let count_sql = format!("SELECT COUNT(*) AS n FROM mpc_presig_bundles WHERE {column} = ?");
-        let rows: Vec<CountRow> = self.sql().exec(&count_sql, vec![value.into()])?.to_array()?;
+        let rows: Vec<CountRow> = self
+            .sql()
+            .exec(&count_sql, vec![value.into()])?
+            .to_array()?;
         let n = rows.first().map(|r| r.n as u64).unwrap_or(0);
         let overwrite_sql = format!(
             "UPDATE mpc_presig_bundles SET bundle_cbor_hex = hex(zeroblob(length(bundle_cbor_hex)/2)) WHERE {column} = ?"

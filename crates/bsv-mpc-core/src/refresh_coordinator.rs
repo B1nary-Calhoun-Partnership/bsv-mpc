@@ -550,10 +550,7 @@ mod tests {
     async fn run_dkg(
         n: u16,
         t: u16,
-    ) -> (
-        Point<Secp256k1>,
-        Vec<KeyShare<Secp256k1, SecurityLevel128>>,
-    ) {
+    ) -> (Point<Secp256k1>, Vec<KeyShare<Secp256k1, SecurityLevel128>>) {
         let mut rng = rand::rngs::OsRng;
         let eid_bytes: [u8; 32] = rng.gen();
         let eid = ExecutionId::new(&eid_bytes);
@@ -580,7 +577,11 @@ mod tests {
             let party = buffer_outgoing(party);
             let mut prng = rand::rngs::OsRng;
             let pre = primes[usize::from(i)].clone();
-            async move { cggmp24::aux_info_gen(eid_aux, i, n, pre).start(&mut prng, party).await }
+            async move {
+                cggmp24::aux_info_gen(eid_aux, i, n, pre)
+                    .start(&mut prng, party)
+                    .await
+            }
         })
         .unwrap()
         .expect_ok()
@@ -661,20 +662,21 @@ mod tests {
         let mut queue: VecDeque<(u16, RoundMessage)> = VecDeque::new();
         let mut commits: Vec<Option<RefreshCommit>> = (0..n).map(|_| None).collect();
 
-        let enqueue = |queue: &mut VecDeque<(u16, RoundMessage)>, from: u16, msgs: Vec<RoundMessage>| {
-            for m in msgs {
-                match m.to {
-                    Some(ShareIndex(j)) => queue.push_back((j, m)),
-                    None => {
-                        for j in 0..n {
-                            if j != from {
-                                queue.push_back((j, m.clone()));
+        let enqueue =
+            |queue: &mut VecDeque<(u16, RoundMessage)>, from: u16, msgs: Vec<RoundMessage>| {
+                for m in msgs {
+                    match m.to {
+                        Some(ShareIndex(j)) => queue.push_back((j, m)),
+                        None => {
+                            for j in 0..n {
+                                if j != from {
+                                    queue.push_back((j, m.clone()));
+                                }
                             }
                         }
                     }
                 }
-            }
-        };
+            };
 
         for i in 0..n {
             let out = coords[usize::from(i)].init().expect("init");
@@ -706,9 +708,7 @@ mod tests {
             .collect()
     }
 
-    fn rotated_key_shares(
-        commits: &[RefreshCommit],
-    ) -> Vec<KeyShare<Secp256k1, SecurityLevel128>> {
+    fn rotated_key_shares(commits: &[RefreshCommit]) -> Vec<KeyShare<Secp256k1, SecurityLevel128>> {
         commits
             .iter()
             .map(|c| {
@@ -722,14 +722,20 @@ mod tests {
         let (t, n) = (2u16, 2u16);
         let (joint, orig) = run_dkg(n, t).await;
         let old_secrets: Vec<_> = orig.iter().map(secret_of).collect();
-        let shares: Vec<_> = orig.iter().map(|k| key_share_to_encrypted(k, t, n)).collect();
+        let shares: Vec<_> = orig
+            .iter()
+            .map(|k| key_share_to_encrypted(k, t, n))
+            .collect();
 
         let commits = run_refresh_ceremony(shares, n);
 
         // Every party reports the SAME joint pubkey, unchanged.
         let jpk = joint.to_bytes(true).to_vec();
         for c in &commits {
-            assert_eq!(c.joint_pubkey_compressed, jpk, "joint pubkey must be unchanged");
+            assert_eq!(
+                c.joint_pubkey_compressed, jpk,
+                "joint pubkey must be unchanged"
+            );
         }
 
         let rotated = rotated_key_shares(&commits);
@@ -737,8 +743,15 @@ mod tests {
         // Joint key reconstructs from rotated shares (proven via signing below),
         // and every secret share actually rotated.
         for (i, ks) in rotated.iter().enumerate() {
-            assert_eq!(*ks.core.key_info.shared_public_key, joint, "shared pubkey unchanged");
-            assert_ne!(secret_of(ks), old_secrets[i], "secret share[{i}] must rotate");
+            assert_eq!(
+                *ks.core.key_info.shared_public_key, joint,
+                "shared pubkey unchanged"
+            );
+            assert_ne!(
+                secret_of(ks),
+                old_secrets[i],
+                "secret share[{i}] must rotate"
+            );
         }
 
         // The rotated shares sign and verify against the ORIGINAL joint key.
@@ -750,14 +763,21 @@ mod tests {
         let (t, n) = (2u16, 3u16);
         let (joint, orig) = run_dkg(n, t).await;
         let old_secrets: Vec<_> = orig.iter().map(secret_of).collect();
-        let shares: Vec<_> = orig.iter().map(|k| key_share_to_encrypted(k, t, n)).collect();
+        let shares: Vec<_> = orig
+            .iter()
+            .map(|k| key_share_to_encrypted(k, t, n))
+            .collect();
 
         let commits = run_refresh_ceremony(shares, n);
         let rotated = rotated_key_shares(&commits);
 
         for (i, ks) in rotated.iter().enumerate() {
             assert_eq!(*ks.core.key_info.shared_public_key, joint);
-            assert_ne!(secret_of(ks), old_secrets[i], "secret share[{i}] must rotate");
+            assert_ne!(
+                secret_of(ks),
+                old_secrets[i],
+                "secret share[{i}] must rotate"
+            );
         }
 
         // ALL three 2-of-3 subsets sign with the rotated shares (incl. party 2,
@@ -773,7 +793,10 @@ mod tests {
         // corrupted reshare can NEVER rotate the stored key (§18.2 guard).
         let (t, n) = (2u16, 2u16);
         let (_joint, orig) = run_dkg(n, t).await;
-        let shares: Vec<_> = orig.iter().map(|k| key_share_to_encrypted(k, t, n)).collect();
+        let shares: Vec<_> = orig
+            .iter()
+            .map(|k| key_share_to_encrypted(k, t, n))
+            .collect();
 
         let mut c0 = RefreshCoordinator::new(
             SessionId::from_str_hash("corrupt"),
@@ -824,7 +847,10 @@ mod tests {
         assert_eq!(scalar_from_bytes(&scalar_to_bytes(&s)).unwrap(), s);
         let p = Point::<Secp256k1>::generator() * s;
         assert_eq!(point_from_bytes(&point_to_bytes(&p)).unwrap(), p);
-        assert!(scalar_from_bytes(&[0u8; 31]).is_err(), "bad length rejected");
+        assert!(
+            scalar_from_bytes(&[0u8; 31]).is_err(),
+            "bad length rejected"
+        );
     }
 
     #[tokio::test]

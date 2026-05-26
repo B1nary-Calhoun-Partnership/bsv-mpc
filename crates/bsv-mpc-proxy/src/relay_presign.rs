@@ -227,7 +227,9 @@ async fn fetch_cosigner_identity(arm: &CosignerArm) -> Result<String> {
     struct IdResponse {
         cosigner_pub_hex: String,
     }
-    let url = arm.url.replace("/presign-relay/init", "/presign-relay/identity");
+    let url = arm
+        .url
+        .replace("/presign-relay/init", "/presign-relay/identity");
     let resp = reqwest::Client::new()
         .get(&url)
         .send()

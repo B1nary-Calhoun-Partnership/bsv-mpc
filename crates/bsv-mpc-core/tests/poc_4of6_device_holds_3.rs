@@ -57,10 +57,7 @@ impl<M: Unpin, Inner: futures::Sink<M>> futures::Sink<M> for BufferedSink<M, Inn
     ) -> std::task::Poll<std::result::Result<(), Self::Error>> {
         std::task::Poll::Ready(Ok(()))
     }
-    fn start_send(
-        self: std::pin::Pin<&mut Self>,
-        item: M,
-    ) -> std::result::Result<(), Self::Error> {
+    fn start_send(self: std::pin::Pin<&mut Self>, item: M) -> std::result::Result<(), Self::Error> {
         self.project().messages.get_mut().push_back(item);
         Ok(())
     }
@@ -211,7 +208,11 @@ async fn sign_subset(
         let party = buffer_outgoing(party);
         let mut r = rand::rngs::OsRng;
         let p = pv.clone();
-        async move { cggmp24::signing(eid, i, &p, share).sign(&mut r, party, &data).await }
+        async move {
+            cggmp24::signing(eid, i, &p, share)
+                .sign(&mut r, party, &data)
+                .await
+        }
     })
     .unwrap()
     .expect_ok()

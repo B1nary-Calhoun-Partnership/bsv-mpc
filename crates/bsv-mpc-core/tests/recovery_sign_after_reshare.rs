@@ -48,9 +48,7 @@ use bsv_mpc_core::refresh::verify_reshare;
 use bsv_mpc_core::reshar_coordinator::{
     ContributorInputs, ResharCommit, ResharConfig, ResharCoordinator, ResharRoundResult,
 };
-use bsv_mpc_core::signing::{
-    issue_partial_signature_json, SigningCoordinator, SigningRoundResult,
-};
+use bsv_mpc_core::signing::{issue_partial_signature_json, SigningCoordinator, SigningRoundResult};
 use bsv_mpc_core::types::{
     EncryptedShare, RoundMessage, SessionId, ShareIndex, SigningResult, ThresholdConfig,
 };
@@ -139,7 +137,9 @@ fn generate_blum_prime(rng: &mut impl rand::RngCore, bits: u32) -> cggmp24::back
         }
     }
 }
-fn test_primes(rng: &mut impl rand::RngCore) -> cggmp24::key_refresh::PregeneratedPrimes<SecurityLevel128> {
+fn test_primes(
+    rng: &mut impl rand::RngCore,
+) -> cggmp24::key_refresh::PregeneratedPrimes<SecurityLevel128> {
     use cggmp24::security_level::SecurityLevel;
     let b = SecurityLevel128::RSA_PRIME_BITLEN;
     cggmp24::key_refresh::PregeneratedPrimes::try_from([
@@ -183,7 +183,11 @@ fn aux_gen(n: u16) -> Vec<cggmp24::key_share::AuxInfo<SecurityLevel128>> {
         let party = buffer_outgoing(party);
         let mut r = rand::rngs::OsRng;
         let pre = primes[usize::from(i)].clone();
-        async move { cggmp24::aux_info_gen(eid, i, n, pre).start(&mut r, party).await }
+        async move {
+            cggmp24::aux_info_gen(eid, i, n, pre)
+                .start(&mut r, party)
+                .await
+        }
     })
     .unwrap()
     .expect_ok()
@@ -268,7 +272,11 @@ fn relay_combine_2(
     participants: &[u16],
     sighash: &[u8; 32],
 ) -> SigningRoundResult {
-    assert_eq!(participants.len(), 2, "this helper drives a 2-party combine");
+    assert_eq!(
+        participants.len(),
+        2,
+        "this helper drives a 2-party combine"
+    );
     let mut it = presigs.into_iter();
     let p_primary = it.next().unwrap();
     let p_cosigner = it.next().unwrap();
@@ -345,7 +353,9 @@ async fn recovered_device_signs_after_true_loss_reshare() {
 
     // ── 3. Survivors {0,1} reshare → NEW 2-of-3 {P0′,P1′,P2′}; P2′ is brand-new
     //       (the recovered device). The lost party contributes NOTHING. ─────────
-    eprintln!("(3) survivors reshare 2-of-3 → 2-of-3 onto a fresh device (PSS over ResharCoordinators)");
+    eprintln!(
+        "(3) survivors reshare 2-of-3 → 2-of-3 onto a fresh device (PSS over ResharCoordinators)"
+    );
     let new_t: u16 = 2;
     let n_new: u16 = 3;
     let new_cfg = ThresholdConfig::new(new_t, n_new).expect("new 2-of-3 config");
@@ -363,13 +373,14 @@ async fn recovered_device_signs_after_true_loss_reshare() {
     let mut coords: Vec<ResharCoordinator> = (0..n_new)
         .map(|j| {
             // New parties 0,1 are the surviving contributors; new party 2 is fresh.
-            let contributor = contributor_new_indices.iter().position(|&c| c == j).map(|pos| {
-                ContributorInputs {
+            let contributor = contributor_new_indices
+                .iter()
+                .position(|&c| c == j)
+                .map(|pos| ContributorInputs {
                     my_subset_pos: pos,
                     subset_eval_points: subset_old_eval.clone(),
                     my_old_secret: old_secrets[survivors[pos] as usize],
-                }
-            });
+                });
             ResharCoordinator::new(ResharConfig {
                 session_id: SessionId::from_str_hash("recovery-reshare"),
                 my_new_index: j,
@@ -458,7 +469,10 @@ async fn recovered_device_signs_after_true_loss_reshare() {
         SigningRoundResult::NextRound(_) => panic!("recovery combine did not complete"),
     };
     let bsv_sig = to_bsv_sig(&sig);
-    assert!(bsv_sig.is_low_s(), "recovery signature MUST be low-s (BIP-62)");
+    assert!(
+        bsv_sig.is_low_s(),
+        "recovery signature MUST be low-s (BIP-62)"
+    );
     assert!(
         joint_pub.verify(&sighash, &bsv_sig),
         "RECOVERY: the recovered device's signature MUST verify under the UNCHANGED joint key K"
@@ -477,21 +491,26 @@ async fn recovered_device_signs_after_true_loss_reshare() {
         joint_pub.verify(&sighash, &to_bsv_sig(&sig_b)),
         "any 2-of-3 of the rotated sharing MUST verify under K"
     );
-    eprintln!("✔ second subset {{1,2}} also verifies under K — any 2-of-3 of the rotated set spends");
+    eprintln!(
+        "✔ second subset {{1,2}} also verifies under K — any 2-of-3 of the rotated set spends"
+    );
 
     // ── NEGATIVE: the recovered device ALONE (1 < t′=2) cannot sign. ───────────
     let presigs_neg = presign_subset(&new_shares, &subset);
     let mut it = presigs_neg.into_iter();
     let solo = it.next().unwrap();
     let sign_session = SessionId::from_str_hash("recovery-solo-neg");
-    let mut coord = SigningCoordinator::new(sign_session, new_enc[0].clone(), new_cfg, subset.to_vec());
+    let mut coord =
+        SigningCoordinator::new(sign_session, new_enc[0].clone(), new_cfg, subset.to_vec());
     coord
         .sign_with_presignature(&sighash, boxed(solo))
         .expect("prime primary");
     match coord.process_round(vec![]).expect("probe round") {
         SigningRoundResult::NextRound(msgs) => {
             assert!(msgs.is_empty(), "no outgoing on the presigned wait path");
-            eprintln!("✔ NEGATIVE: a single new-set party (1 < t′=2) stays PENDING — cannot sign alone");
+            eprintln!(
+                "✔ NEGATIVE: a single new-set party (1 < t′=2) stays PENDING — cannot sign alone"
+            );
         }
         SigningRoundResult::Complete(_) => {
             panic!("SECURITY VIOLATION: one party produced a 2-of-3 signature alone");
@@ -506,7 +525,12 @@ async fn recovered_device_signs_after_true_loss_reshare() {
         .map(|b| Point::<Secp256k1>::from_bytes(b).expect("new public share point"))
         .collect();
     assert!(
-        verify_reshare(&joint_point, &new_public_shares, &new_eval, usize::from(new_t)),
+        verify_reshare(
+            &joint_point,
+            &new_public_shares,
+            &new_eval,
+            usize::from(new_t)
+        ),
         "control: the rotated public shares MUST reconstruct K"
     );
     // Substitute the LOST party's OLD public share (G·x_lost) into a survivor slot
@@ -519,7 +543,9 @@ async fn recovered_device_signs_after_true_loss_reshare() {
         !verify_reshare(&joint_point, &tampered, &new_eval, usize::from(new_t)),
         "INVALIDATION: the lost party's OLD share MUST NOT rejoin the rotated sharing"
     );
-    eprintln!("✔ NEGATIVE: lost party's old share is invalidated — cannot rejoin the rotated sharing");
+    eprintln!(
+        "✔ NEGATIVE: lost party's old share is invalidated — cannot rejoin the rotated sharing"
+    );
 
     eprintln!();
     eprintln!("╔══════════════════════════════════════════════════════════════════╗");

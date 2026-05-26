@@ -140,12 +140,18 @@ async fn find_utxo_on_woc(
     for attempt in 1..=20 {
         eprintln!("  WoC attempt {attempt}: waiting 15s for indexing...");
         tokio::time::sleep(Duration::from_secs(15)).await;
-        let Ok(resp) = http.get(&url).send().await else { continue };
+        let Ok(resp) = http.get(&url).send().await else {
+            continue;
+        };
         if !resp.status().is_success() {
             continue;
         }
-        let Ok(json) = resp.json::<serde_json::Value>().await else { continue };
-        let Some(vouts) = json["vout"].as_array() else { continue };
+        let Ok(json) = resp.json::<serde_json::Value>().await else {
+            continue;
+        };
+        let Some(vouts) = json["vout"].as_array() else {
+            continue;
+        };
         for vout in vouts {
             if vout["scriptPubKey"]["hex"].as_str().unwrap_or("") == expected_locking_hex {
                 let n = vout["n"].as_u64().unwrap_or(0) as u32;
@@ -171,22 +177,55 @@ type BufferedDelivery<M, D> = (
 );
 impl<M: Unpin, Inner: futures::Sink<M>> futures::Sink<M> for BufferedSink<M, Inner> {
     type Error = Inner::Error;
-    fn poll_ready(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> std::task::Poll<std::result::Result<(), Self::Error>> { std::task::Poll::Ready(Ok(())) }
-    fn start_send(self: std::pin::Pin<&mut Self>, item: M) -> std::result::Result<(), Self::Error> { self.project().messages.get_mut().push_back(item); Ok(()) }
-    fn poll_flush(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::result::Result<(), Self::Error>> {
+    fn poll_ready(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::result::Result<(), Self::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+    fn start_send(self: std::pin::Pin<&mut Self>, item: M) -> std::result::Result<(), Self::Error> {
+        self.project().messages.get_mut().push_back(item);
+        Ok(())
+    }
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::result::Result<(), Self::Error>> {
         while !self.messages.is_empty() {
             let mut p = self.as_mut().project();
             let mut inner = p.inner;
             std::task::ready!(inner.as_mut().poll_ready(cx))?;
-            if let Some(item) = p.messages.pop_front() { inner.as_mut().start_send(item)?; }
+            if let Some(item) = p.messages.pop_front() {
+                inner.as_mut().start_send(item)?;
+            }
         }
         self.project().inner.poll_flush(cx)
     }
-    fn poll_close(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::result::Result<(), Self::Error>> { self.project().inner.poll_close(cx) }
+    fn poll_close(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::result::Result<(), Self::Error>> {
+        self.project().inner.poll_close(cx)
+    }
 }
-fn buffer_outgoing<M, D, R>(party: round_based::MpcParty<M, D, R>) -> round_based::MpcParty<M, BufferedDelivery<M, D>, R>
-where M: Unpin, D: round_based::Delivery<M>, R: round_based::runtime::AsyncRuntime {
-    party.map_delivery(|d| { let (i, o) = d.split(); (i, BufferedSink { messages: VecDeque::new(), inner: o }) })
+fn buffer_outgoing<M, D, R>(
+    party: round_based::MpcParty<M, D, R>,
+) -> round_based::MpcParty<M, BufferedDelivery<M, D>, R>
+where
+    M: Unpin,
+    D: round_based::Delivery<M>,
+    R: round_based::runtime::AsyncRuntime,
+{
+    party.map_delivery(|d| {
+        let (i, o) = d.split();
+        (
+            i,
+            BufferedSink {
+                messages: VecDeque::new(),
+                inner: o,
+            },
+        )
+    })
 }
 
 /// Sign a 32-byte prehashed sighash with a 2-of-3 subset (`participants`) of the
@@ -203,13 +242,23 @@ async fn sign_2of3(
     let pv = participants.to_vec();
     let scalar = Scalar::<Secp256k1>::from_be_bytes_mod_order(*sighash);
     let data = PrehashedDataToSign::from_scalar(scalar).insecure_assume_preimage_known();
-    let key_for = |idx: u16| shares.iter().find(|(i, _)| *i == idx).map(|(_, k)| k.clone()).expect("share for participant");
+    let key_for = |idx: u16| {
+        shares
+            .iter()
+            .find(|(i, _)| *i == idx)
+            .map(|(_, k)| k.clone())
+            .expect("share for participant")
+    };
     let selected: Vec<_> = participants.iter().map(|&i| key_for(i)).collect();
     round_based::sim::run_with_setup(selected.iter(), |i, party, share| {
         let party = buffer_outgoing(party);
         let mut r = rand::rngs::OsRng;
         let p = pv.clone();
-        async move { cggmp24::signing(eid, i, &p, share).sign(&mut r, party, &data).await }
+        async move {
+            cggmp24::signing(eid, i, &p, share)
+                .sign(&mut r, party, &data)
+                .await
+        }
     })
     .unwrap()
     .expect_ok()
@@ -265,7 +314,10 @@ async fn container_reshare_2of2_to_2of3_deployed_real_mainnet() {
 
     // ── 2. MpcBridge from share_B, presign_url = the container ─────────────────
     let dir = std::env::temp_dir();
-    let share_path = dir.join(format!("reshare_container_share_{}.json", std::process::id()));
+    let share_path = dir.join(format!(
+        "reshare_container_share_{}.json",
+        std::process::id()
+    ));
     let share_path_str = share_path.to_string_lossy().to_string();
     tokio::fs::write(&share_path, serde_json::to_vec(&dkg_b).unwrap())
         .await
@@ -315,7 +367,10 @@ async fn container_reshare_2of2_to_2of3_deployed_real_mainnet() {
         "wallet createAction failed ({fund_status}): {fund_text}"
     );
     let fund_json: serde_json::Value = serde_json::from_str(&fund_text).expect("fund JSON");
-    let fund_txid = fund_json["txid"].as_str().expect("createAction txid").to_string();
+    let fund_txid = fund_json["txid"]
+        .as_str()
+        .expect("createAction txid")
+        .to_string();
     eprintln!("✔ funded joint address: txid={fund_txid}");
     if let Some(raw) = raw_tx_hex_from_create_action(&fund_json) {
         eprintln!("  self-broadcasting funding tx via ARC...");
@@ -323,7 +378,9 @@ async fn container_reshare_2of2_to_2of3_deployed_real_mainnet() {
     }
 
     // ── 4. Reshare 2-of-2 → 2-of-3 over the relay (address-preserving) ─────────
-    eprintln!("(reshare over the relay against the deployed container — minutes: 3× safe-prime gen)");
+    eprintln!(
+        "(reshare over the relay against the deployed container — minutes: 3× safe-prime gen)"
+    );
     let summary = bridge
         .reshare_change_threshold_over_relay(Duration::from_secs(300))
         .await
@@ -347,8 +404,15 @@ async fn container_reshare_2of2_to_2of3_deployed_real_mainnet() {
         2,
         "proxy holds new parties 1 and 2 (container holds party 0)"
     );
-    let held: Vec<u16> = summary.proxy_key_shares_json.iter().map(|(i, _)| *i).collect();
-    assert!(held.contains(&1) && held.contains(&2), "proxy holds new indices 1 and 2");
+    let held: Vec<u16> = summary
+        .proxy_key_shares_json
+        .iter()
+        .map(|(i, _)| *i)
+        .collect();
+    assert!(
+        held.contains(&1) && held.contains(&2),
+        "proxy holds new indices 1 and 2"
+    );
     eprintln!("✔ §18 invariant: joint pubkey UNCHANGED across 2-of-2 → 2-of-3 reshare");
 
     // ── 5. Sign the spend with the NEW 2-of-3 sharing → spend K's address ──────
@@ -364,7 +428,12 @@ async fn container_reshare_2of2_to_2of3_deployed_real_mainnet() {
     let new_shares: Vec<(u16, cggmp24::KeyShare<Secp256k1, SecurityLevel128>)> = summary
         .proxy_key_shares_json
         .iter()
-        .map(|(idx, json)| (*idx, serde_json::from_slice(json).expect("new-set key share JSON")))
+        .map(|(idx, json)| {
+            (
+                *idx,
+                serde_json::from_slice(json).expect("new-set key share JSON"),
+            )
+        })
         .collect();
 
     // Find the funding UTXO + build the BIP-143 sighash (drain back to wallet).
@@ -392,13 +461,24 @@ async fn container_reshare_2of2_to_2of3_deployed_real_mainnet() {
         .as_str()
         .expect("publicKey")
         .to_string();
-    let change_script =
-        p2pkh_locking_script(&PublicKey::from_hex(&wallet_pub_hex).expect("wallet pub").hash160());
+    let change_script = p2pkh_locking_script(
+        &PublicKey::from_hex(&wallet_pub_hex)
+            .expect("wallet pub")
+            .hash160(),
+    );
     let scope = SIGHASH_ALL | SIGHASH_FORKID;
     let sighash = compute_sighash_for_signing(&SighashParams {
         version: 1,
-        inputs: &[TxInput { txid: prev_txid, output_index: vout, script: vec![], sequence: 0xFFFFFFFF }],
-        outputs: &[TxOutput { satoshis: change, script: change_script.clone() }],
+        inputs: &[TxInput {
+            txid: prev_txid,
+            output_index: vout,
+            script: vec![],
+            sequence: 0xFFFFFFFF,
+        }],
+        outputs: &[TxOutput {
+            satoshis: change,
+            script: change_script.clone(),
+        }],
         locktime: 0,
         input_index: 0,
         subscript: &joint_locking,
@@ -412,7 +492,10 @@ async fn container_reshare_2of2_to_2of3_deployed_real_mainnet() {
     let (r_bytes, s_bytes) = {
         use generic_ec::Scalar;
         let r: Scalar<Secp256k1> = sig.r.into();
-        (r.to_be_bytes().as_bytes().to_vec(), sig.s.as_ref().to_be_bytes().as_bytes().to_vec())
+        (
+            r.to_be_bytes().as_bytes().to_vec(),
+            sig.s.as_ref().to_be_bytes().as_bytes().to_vec(),
+        )
     };
     let mut r = [0u8; 32];
     let mut s = [0u8; 32];
@@ -431,7 +514,8 @@ async fn container_reshare_2of2_to_2of3_deployed_real_mainnet() {
     eprintln!("✔ pre-flight ECDSA verify under joint pubkey (reshared shares): PASS");
 
     let tx_sig = TransactionSignature::new(bsv_sig, scope);
-    let unlocking = p2pkh_unlocking_script(&tx_sig.to_checksig_format(), &joint_pub.to_compressed());
+    let unlocking =
+        p2pkh_unlocking_script(&tx_sig.to_checksig_format(), &joint_pub.to_compressed());
     let raw_tx = serialize_transaction(
         1,
         &[(prev_txid, vout, unlocking, 0xFFFFFFFF)],
@@ -446,7 +530,10 @@ async fn container_reshare_2of2_to_2of3_deployed_real_mainnet() {
 
     let ok = broadcast_via_arc(&http, &raw_tx_hex).await;
     let _ = tokio::fs::remove_file(&share_path).await;
-    assert!(ok, "ARC broadcast MUST succeed — TXID={txid_hex} rawTx={raw_tx_hex}");
+    assert!(
+        ok,
+        "ARC broadcast MUST succeed — TXID={txid_hex} rawTx={raw_tx_hex}"
+    );
 
     eprintln!();
     eprintln!("╔══════════════════════════════════════════════════════════════╗");
@@ -456,7 +543,10 @@ async fn container_reshare_2of2_to_2of3_deployed_real_mainnet() {
     eprintln!("  joint_address:    {}", joint.address);
     eprintln!("  funding_txid:     {fund_txid}");
     eprintln!("  funded_sats:      {value}");
-    eprintln!("  new config:       {}-of-{} (container=party0, proxy=parties{held:?})", summary.new_threshold, summary.new_parties);
+    eprintln!(
+        "  new config:       {}-of-{} (container=party0, proxy=parties{held:?})",
+        summary.new_threshold, summary.new_parties
+    );
     eprintln!("  spending_txid:    {txid_hex}  (signed with reshared 2-of-3 shares)");
     eprintln!("  view: https://whatsonchain.com/tx/{txid_hex}");
     eprintln!("  total wall-clock: {:?}", t0.elapsed());

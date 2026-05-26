@@ -67,8 +67,7 @@ fn fixture() -> PolicyManifest {
 }
 
 /// Byte-lock: the canonical fixture's `policy_id` (locked in MPC-Spec#43).
-const LOCKED_POLICY_ID: &str =
-    "d901a996cdbf7af492a0397f45bbc9bc99ed03c573463e8e2412753732af8382";
+const LOCKED_POLICY_ID: &str = "d901a996cdbf7af492a0397f45bbc9bc99ed03c573463e8e2412753732af8382";
 
 #[test]
 fn policy_id_is_byte_locked() {
@@ -102,11 +101,20 @@ fn verdicts_match_the_locked_vector() {
     };
 
     // 1. permissive agent/* under cap → Allow
-    assert_eq!(eng.check_signing(&chk("agent/api-x", 1000, 200), now), Verdict::Allow);
+    assert_eq!(
+        eng.check_signing(&chk("agent/api-x", 1000, 200), now),
+        Verdict::Allow
+    );
     // 2. agent/* over max_amount → Deny
-    assert!(matches!(eng.check_signing(&chk("agent/api-x", 60_000, 200), now), Verdict::Deny(_)));
+    assert!(matches!(
+        eng.check_signing(&chk("agent/api-x", 60_000, 200), now),
+        Verdict::Deny(_)
+    ));
     // 3. agent/* fee below min_fee → Deny
-    assert!(matches!(eng.check_signing(&chk("agent/api-x", 1000, 50), now), Verdict::Deny(_)));
+    assert!(matches!(
+        eng.check_signing(&chk("agent/api-x", 1000, 50), now),
+        Verdict::Deny(_)
+    ));
     // 4. treasury/* → RequireApproval k=1
     match eng.check_signing(&chk("treasury/move", 1_000_000, 1000), now) {
         Verdict::RequireApproval(q) => {
@@ -116,7 +124,10 @@ fn verdicts_match_the_locked_vector() {
         other => panic!("expected RequireApproval, got {other:?}"),
     }
     // 5. no rule match → default Deny
-    assert!(matches!(eng.check_signing(&chk("other/thing", 1, 1), now), Verdict::Deny(_)));
+    assert!(matches!(
+        eng.check_signing(&chk("other/thing", 1, 1), now),
+        Verdict::Deny(_)
+    ));
     // 6. rate limit: the 21st agent/* op within the hour (cap 20) → RateLimited
     let mut last = Verdict::Allow;
     for _ in 0..21 {

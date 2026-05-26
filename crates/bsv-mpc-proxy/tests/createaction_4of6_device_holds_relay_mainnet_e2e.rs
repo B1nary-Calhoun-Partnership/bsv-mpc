@@ -49,7 +49,9 @@ use bsv_mpc_core::types::{
 use bsv_mpc_proxy::config::ProxyConfig;
 use bsv_mpc_proxy::server::build_router;
 use bsv_mpc_proxy::storage::InMemoryBackend;
-use bsv_mpc_proxy::{DevicePresigSetPool, DeviceShareBundle, MpcBridge, ProxyBuilder, TrackedOutput};
+use bsv_mpc_proxy::{
+    DevicePresigSetPool, DeviceShareBundle, MpcBridge, ProxyBuilder, TrackedOutput,
+};
 
 const DEFAULT_WORKER: &str = "https://bsv-mpc-kss.dev-a3e.workers.dev";
 const DEFAULT_RELAY: &str = "https://rust-message-box.dev-a3e.workers.dev";
@@ -83,8 +85,10 @@ fn run_dkg(n: u16, t: u16, session: SessionId) -> (JointPublicKey, Vec<Encrypted
             c
         })
         .collect();
-    let mut outgoing: Vec<Vec<RoundMessage>> =
-        coords.iter_mut().map(|c| c.init().expect("dkg init")).collect();
+    let mut outgoing: Vec<Vec<RoundMessage>> = coords
+        .iter_mut()
+        .map(|c| c.init().expect("dkg init"))
+        .collect();
     let nn = n as usize;
     let mut shares: Vec<Option<EncryptedShare>> = (0..nn).map(|_| None).collect();
     let mut joint: Option<JointPublicKey> = None;
@@ -133,7 +137,14 @@ fn gen_presig_set(
     let k = participants.len();
     let mut mgrs: Vec<PresigningManager> = participants
         .iter()
-        .map(|&p| PresigningManager::new(session, shares[p as usize].clone(), participants.to_vec(), 2))
+        .map(|&p| {
+            PresigningManager::new(
+                session,
+                shares[p as usize].clone(),
+                participants.to_vec(),
+                2,
+            )
+        })
         .collect();
     let mut outgoing: Vec<Vec<RoundMessage>> = mgrs
         .iter_mut()
@@ -324,7 +335,11 @@ To run (BURNS REAL SATS): DEVICE_HOLDS_4OF6_MAINNET=1 cargo test -p bsv-mpc-prox
     let joint_pub = PublicKey::from_bytes(&joint_arr).expect("joint pubkey");
     let joint_locking = p2pkh_locking_script(&joint_pub.hash160());
     let joint_locking_hex = hex::encode(&joint_locking);
-    eprintln!("✔ joint pubkey {} / {}", hex::encode(joint_arr), joint.address);
+    eprintln!(
+        "✔ joint pubkey {} / {}",
+        hex::encode(joint_arr),
+        joint.address
+    );
 
     // ── 2. 4-party presign over {0,1,2,3} → 4 correlated presigs ───────────
     let participants = [0u16, 1, 2, 3];
@@ -333,7 +348,10 @@ To run (BURNS REAL SATS): DEVICE_HOLDS_4OF6_MAINNET=1 cargo test -p bsv-mpc-prox
     // Tagged by party index; split into the DEVICE set {0,1,2} + cosigner {3}.
     presigs.sort_by_key(|(p, _)| *p);
     let cosigner_entry = presigs.pop().expect("party 3 present");
-    assert_eq!(cosigner_entry.0, 3, "highest party is the external cosigner");
+    assert_eq!(
+        cosigner_entry.0, 3,
+        "highest party is the external cosigner"
+    );
     let device_set: Vec<(u16, PresignBox)> = presigs; // {0,1,2}
     assert_eq!(device_set.len(), 3, "device holds 3 correlated presigs");
     let cosigner_presig_json =
@@ -357,7 +375,10 @@ To run (BURNS REAL SATS): DEVICE_HOLDS_4OF6_MAINNET=1 cargo test -p bsv-mpc-prox
         shares: vec![shares[0].clone(), shares[1].clone(), shares[2].clone()],
     };
     let dir = std::env::temp_dir();
-    let share_path = dir.join(format!("device_holds_4of6_share_{}.json", std::process::id()));
+    let share_path = dir.join(format!(
+        "device_holds_4of6_share_{}.json",
+        std::process::id()
+    ));
     tokio::fs::write(&share_path, serde_json::to_vec(&device_bundle).unwrap())
         .await
         .expect("write device share bundle");
@@ -379,7 +400,10 @@ To run (BURNS REAL SATS): DEVICE_HOLDS_4OF6_MAINNET=1 cargo test -p bsv-mpc-prox
         presign_url: None,
     };
     let bridge = MpcBridge::new(&config).await.expect("bridge handshake");
-    assert!(bridge.is_device_holds(), "bridge MUST detect device-holds (3 shares)");
+    assert!(
+        bridge.is_device_holds(),
+        "bridge MUST detect device-holds (3 shares)"
+    );
     assert_eq!(
         bridge.device_party_indices(),
         vec![0, 1, 2],

@@ -38,7 +38,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bsv::primitives::ec::PrivateKey;
-use bsv_mpc_core::canonical::{canonical_session_id, payload_digest_presign, CeremonyKind, SessionParams};
+use bsv_mpc_core::canonical::{
+    canonical_session_id, payload_digest_presign, CeremonyKind, SessionParams,
+};
 use bsv_mpc_core::presig_encryption::{decrypt_presig_share, wallet_from_identity};
 use bsv_mpc_core::types::{EncryptedShare, PolicyId, SessionId, ShareIndex, ThresholdConfig};
 use bsv_mpc_messagebox::types::{presig_return_box, presign_protocol_box};
@@ -91,10 +93,7 @@ impl<M: Unpin, Inner: futures::Sink<M>> futures::Sink<M> for BufferedSink<M, Inn
         std::task::Poll::Ready(Ok(()))
     }
 
-    fn start_send(
-        self: std::pin::Pin<&mut Self>,
-        item: M,
-    ) -> std::result::Result<(), Self::Error> {
+    fn start_send(self: std::pin::Pin<&mut Self>, item: M) -> std::result::Result<(), Self::Error> {
         self.project().messages.get_mut().push_back(item);
         Ok(())
     }
@@ -381,13 +380,23 @@ async fn within_stack_2of2_presign_assembles_bundle_via_messagebox() {
     // Ship round-1 from both.
     for out in coord_out {
         coord_client
-            .send_round_message(&out.recipient_pub_hex, &out.message_box, &out.round_msg, out.params)
+            .send_round_message(
+                &out.recipient_pub_hex,
+                &out.message_box,
+                &out.round_msg,
+                out.params,
+            )
             .await
             .expect("coord round-1 send");
     }
     for out in cosigner_out {
         cosigner_client
-            .send_round_message(&out.recipient_pub_hex, &out.message_box, &out.round_msg, out.params)
+            .send_round_message(
+                &out.recipient_pub_hex,
+                &out.message_box,
+                &out.round_msg,
+                out.params,
+            )
             .await
             .expect("cosigner round-1 send");
     }
@@ -418,8 +427,13 @@ async fn within_stack_2of2_presign_assembles_bundle_via_messagebox() {
     // ----- THE GATE -----
     // 1) Bundle persisted under the canonical presig_id (= session_id hex).
     assert_eq!(bundle.presig_id, sid_hex, "presig_id = presign session_id");
-    let stored = bundle_store.get(&sid_hex).expect("bundle MUST be in the store");
-    assert_eq!(stored, bundle, "store holds the same bundle the coordinator fired");
+    let stored = bundle_store
+        .get(&sid_hex)
+        .expect("bundle MUST be in the store");
+    assert_eq!(
+        stored, bundle,
+        "store holds the same bundle the coordinator fired"
+    );
 
     // 2) Binding triple.
     assert_eq!(bundle.policy_id, policy_id, "binding: policy_id");
@@ -451,10 +465,12 @@ async fn within_stack_2of2_presign_assembles_bundle_via_messagebox() {
     //     coordinator can combine from the persisted bundle after a restart, not
     //     just from an in-memory pool.
     assert!(!bundle.gamma_hex.is_empty(), "bundle MUST carry gamma_hex");
-    assert!(!bundle.commitments.is_empty(), "bundle MUST carry public-data commitments");
-    let reconstructed =
-        bsv_mpc_core::signing::deserialize_presig_public_data(&bundle.commitments)
-            .expect("bundle commitments MUST reconstruct into PresignaturePublicData");
+    assert!(
+        !bundle.commitments.is_empty(),
+        "bundle MUST carry public-data commitments"
+    );
+    let reconstructed = bsv_mpc_core::signing::deserialize_presig_public_data(&bundle.commitments)
+        .expect("bundle commitments MUST reconstruct into PresignaturePublicData");
     assert_eq!(
         reconstructed.commitments.len(),
         parties_at_keygen.len(),
@@ -488,8 +504,16 @@ async fn within_stack_2of2_presign_assembles_bundle_via_messagebox() {
         "coordinator MUST NOT be able to decrypt the cosigner's share (opaque at rest, §06.17.1)"
     );
 
-    assert_eq!(coord_handler.live_session_count(), 0, "coordinator cleaned up");
-    assert_eq!(cosigner_handler.live_session_count(), 0, "cosigner cleaned up");
+    assert_eq!(
+        coord_handler.live_session_count(),
+        0,
+        "coordinator cleaned up"
+    );
+    assert_eq!(
+        cosigner_handler.live_session_count(),
+        0,
+        "cosigner cleaned up"
+    );
 
     // ----- Cleanup -----
     for l in [coord_listener, cosigner_proto_listener] {

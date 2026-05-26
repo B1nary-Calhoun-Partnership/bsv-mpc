@@ -954,9 +954,7 @@ pub fn serialize_presig_public_data(
 /// Inverse of [`serialize_presig_public_data`] — reconstruct the public data
 /// from CBOR (via the public struct fields) so a coordinator that only holds the
 /// stored bundle can run `PartialSignature::combine`.
-pub fn deserialize_presig_public_data(
-    bytes: &[u8],
-) -> Result<PresignaturePublicData<Secp256k1>> {
+pub fn deserialize_presig_public_data(bytes: &[u8]) -> Result<PresignaturePublicData<Secp256k1>> {
     let wire: PublicDataWire = ciborium::de::from_reader(bytes)
         .map_err(|e| MpcError::Signing(format!("deserialize PresignaturePublicData: {e}")))?;
     Ok(PresignaturePublicData {

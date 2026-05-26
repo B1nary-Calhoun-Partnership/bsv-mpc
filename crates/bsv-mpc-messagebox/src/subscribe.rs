@@ -611,7 +611,8 @@ async fn run_loop(
         // backfill row from the same gap. Bounded best-effort (same reason as the
         // post-join re-drain above): a hung BRC-104 `/listMessages` must not block
         // the reconnect's `pump` from re-establishing WS live-push.
-        match tokio::time::timeout(BACKFILL_TIMEOUT, drain_backfill(&auth, &boxes, &inbound)).await {
+        match tokio::time::timeout(BACKFILL_TIMEOUT, drain_backfill(&auth, &boxes, &inbound)).await
+        {
             Ok(true) => {}
             Ok(false) => return, // consumer gone
             Err(_) => warn!(
