@@ -20,6 +20,7 @@ mod error;
 mod keystore;
 mod signer;
 mod storage;
+mod transport;
 pub mod txbuild;
 
 /// wasm-bindgen skin (web client). Only compiled on `wasm32`.
@@ -39,3 +40,7 @@ pub use error::ClientError;
 pub use keystore::{InMemoryKeyStore, KeyStore};
 pub use signer::unseal_signing_scalar;
 pub use storage::{StoredShare, WalletStorage};
+pub use transport::RoundTransport;
+
+// Re-export the signing result type so callers don't need a direct bsv-mpc-core dep.
+pub use bsv_mpc_core::SigningResult;

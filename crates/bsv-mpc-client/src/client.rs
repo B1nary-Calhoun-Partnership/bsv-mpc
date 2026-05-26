@@ -11,6 +11,7 @@ use crate::chain::{ChainServices, Utxo};
 use crate::error::ClientError;
 use crate::keystore::KeyStore;
 use crate::storage::{StoredShare, WalletStorage};
+use crate::transport::RoundTransport;
 
 /// A threshold wallet for one agent, composed over three host-injected seams.
 pub struct WalletClient {
@@ -88,15 +89,72 @@ impl WalletClient {
         Ok(child.address)
     }
 
-    /// Biometric-gated threshold signature over a sighash. **Staged — Phase 3**
-    /// (unseal → `bsv_mpc_core::signing`, `Zeroizing` end-to-end).
+    /// Live 2-party threshold ECDSA over `sighash`, driving the ceremony with the
+    /// cosigner across the injected `relay`.
+    ///
+    /// Biometric-gated: the device-sealed cggmp24 key share is unsealed (fresh
+    /// prompt) only for this call and the plaintext is held as `Zeroizing`; it is
+    /// handed to an ephemeral [`SigningCoordinator`] for the ceremony and dropped
+    /// when this returns. `brc42_offset` applies a BRC-42 additive shift for
+    /// derived-key signing.
     pub async fn sign(
         &self,
-        _sighash_hex: &str,
-        _brc42_offset_hex: Option<&str>,
-        _reason: &str,
-    ) -> Result<String, ClientError> {
-        Err(ClientError::NotImplemented("sign (Phase 3)"))
+        relay: &dyn RoundTransport,
+        sighash: &[u8; 32],
+        reason: &str,
+        brc42_offset: Option<[u8; 32]>,
+    ) -> Result<bsv_mpc_core::SigningResult, ClientError> {
+        use bsv_mpc_core::signing::{SigningCoordinator, SigningRoundResult};
+        use bsv_mpc_core::{
+            EncryptedShare, JointPublicKey, SessionId, ShareIndex, ThresholdConfig,
+        };
+
+        let stored = self
+            .storage
+            .get_share(&self.agent_id)
+            .await?
+            .ok_or_else(|| ClientError::Host {
+                seam: "storage",
+                reason: format!("no share provisioned for agent '{}'", self.agent_id),
+            })?;
+        let joint: JointPublicKey = serde_json::from_slice(&stored.joint_pubkey)?;
+        let config = ThresholdConfig::new(stored.threshold, stored.parties)?;
+        let sid_bytes: [u8; 32] =
+            stored.session_id.as_slice().try_into().map_err(|_| {
+                ClientError::Serialization("stored session_id must be 32 bytes".into())
+            })?;
+        let session = SessionId::from_bytes(sid_bytes);
+
+        // Biometric-gated unseal of the device-sealed cggmp24 key-share JSON.
+        let share_json = self.keystore.unseal_share(&self.agent_id, reason).await?;
+        let share = EncryptedShare {
+            // The device KeyStore is the at-rest protection; `ciphertext` here is
+            // the plaintext cggmp24 KeyShare JSON (no core AES layer → nonce unused).
+            // The Zeroizing original is wiped on drop; the coordinator owns this
+            // transient copy only for the ceremony.
+            nonce: vec![0u8; 12],
+            ciphertext: share_json.to_vec(),
+            session_id: session,
+            share_index: ShareIndex(stored.share_index),
+            config,
+            joint_pubkey_compressed: joint.compressed.clone(),
+        };
+
+        let participants: Vec<u16> = (0..stored.parties).collect();
+        let mut coord = SigningCoordinator::new(session, share, config, participants);
+
+        let mut outgoing = coord.init_round(sighash, brc42_offset)?;
+        // The interactive path is <= 4 rounds; 20 is the same guard core uses.
+        for _ in 0..20 {
+            let incoming = relay.exchange(outgoing).await?;
+            match coord.process_round(incoming)? {
+                SigningRoundResult::Complete(result) => return Ok(result),
+                SigningRoundResult::NextRound(next) => outgoing = next,
+            }
+        }
+        Err(ClientError::Core(
+            "signing did not complete within 20 rounds".into(),
+        ))
     }
 }
 
@@ -154,7 +212,10 @@ mod tests {
             "agent-1".into(),
             StoredShare {
                 agent_id: "agent-1".into(),
-                encrypted_share: vec![],
+                share_index: 0,
+                threshold: 2,
+                parties: 2,
+                session_id: vec![0u8; 32],
                 joint_pubkey: serde_json::to_vec(&joint).unwrap(),
             },
         );

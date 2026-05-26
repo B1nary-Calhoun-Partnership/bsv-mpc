@@ -45,8 +45,9 @@ required-features = ["native"]
 [dev-dependencies]
 # Native-only test executor for the async trait round-trips (not in the wasm lib build).
 tokio = { version = "1", default-features = false, features = ["rt", "macros"] }
-# Used by the tests/ integration binaries (hex-encode the golden vectors).
+# Used by the tests/ integration binaries (hex-encode goldens; serde for shares).
 hex.workspace = true
+serde_json.workspace = true
 
 # Native-only: the signer hot-path test builds a REAL cggmp24 2-of-2 share via
 # trusted_dealer (fast — no DKG/Paillier) to prove unseal → parse_share_scalar.
@@ -57,6 +58,12 @@ hex.workspace = true
 cggmp24 = { git = "https://github.com/LFDT-Lockness/cggmp21", features = ["curve-secp256k1", "hd-wallet", "hd-slip10", "spof"] }
 generic-ec.workspace = true
 rand.workspace = true
+# The hermetic 2-party sign test (tests/hermetic_sign.rs) runs a real DKG+aux via
+# the round_based simulator and verifies the resulting signature with the BSV SDK.
+round-based = { workspace = true, features = ["sim"] }
+futures.workspace = true
+pin-project.workspace = true
+bsv = { workspace = true }
 
 # wasm-bindgen skin (web client). wasm32-only — the native build never sees it,
 # so no feature flag is needed; the `wasm` module is `cfg(target_arch="wasm32")`.

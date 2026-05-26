@@ -8,14 +8,21 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::ClientError;
 
-/// A persisted, device-sealed share record.
+/// Per-agent share **metadata**. The secret share material itself lives
+/// device-sealed in the [`KeyStore`](crate::KeyStore); this record holds only
+/// what's needed to reconstruct the signing context around it.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct StoredShare {
     pub agent_id: String,
-    /// Serialized `bsv_mpc_core::EncryptedShare` (core AES-256-GCM sealed). The
-    /// [`KeyStore`](crate::KeyStore) adds the device biometric seal on top.
-    pub encrypted_share: Vec<u8>,
-    /// Serialized `bsv_mpc_core::JointPublicKey` (33-byte compressed pubkey + config).
+    /// This party's share index in `[0, parties)`.
+    pub share_index: u16,
+    /// Group threshold config.
+    pub threshold: u16,
+    pub parties: u16,
+    /// 32-byte MPC session id (the cggmp24 ExecutionId seed); both parties agree.
+    pub session_id: Vec<u8>,
+    /// Serialized `bsv_mpc_core::JointPublicKey` (group pubkey) — used by
+    /// `derive_address` and as the signing pubkey.
     pub joint_pubkey: Vec<u8>,
 }
 
