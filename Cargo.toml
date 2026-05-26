@@ -41,7 +41,7 @@ round-based = { version = "0.4.1", features = ["sim", "state-machine"] }
 generic-ec = { version = "0.5", features = ["curve-secp256k1", "serde"] }
 
 # BSV SDK
-bsv = { package = "bsv-rs", version = "0.3.12", features = ["transaction", "wallet"] }
+bsv = { package = "bsv-rs", version = "0.3.13", features = ["transaction", "wallet"] }
 
 # HTTP + async
 axum = { version = "0.8" }
@@ -90,7 +90,7 @@ generic-ec = { version = "0.5", features = ["curve-secp256k1", "serde"] }
 generic-ec-zkp = { version = "0.5", features = ["alloc"] }
 
 # BSV
-bsv = { package = "bsv-rs", version = "0.3.12", features = ["transaction", "wallet"] }
+bsv = { package = "bsv-rs", version = "0.3.13", features = ["transaction", "wallet"] }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -151,18 +151,11 @@ tempfile = "3"
 # upstream first. Tracked as follow-up.
 glass_pumpkin = "=1.9.0"
 
-# Override bsv-rs with the Calhooon fork that bounds the BRC-104
-# `SimplifiedFetchTransport` reqwest client (request + connect timeouts +
-# `pool_max_idle_per_host(0)`). Without this, an egress-NAT'd host (the
-# deployed CF Container cosigner) reuses an idle keep-alive socket the NAT
-# silently dropped and the BRC-104 General POST (`/sendMessage`) hangs
-# indefinitely — wedging the throwaway-DKG round-1 ship in reshare-over-relay
-# (issue #58). Pinned by `rev` for reproducibility; remove when published to
-# crates.io (>0.3.12). The build context (Docker, has git) fetches this rev.
-#
-# For local bsv-rs development instead, point this at { path = "../bsv-rs" }.
-[patch.crates-io]
-bsv-rs = { git = "https://github.com/Calhooon/bsv-rs.git", rev = "382282d86c1f69e867493937dde24c651f713c2e" }
+# bsv-rs is the published crate (>= 0.3.13) — it includes the BRC-104
+# `SimplifiedFetchTransport` reqwest timeout + `pool_max_idle_per_host(0)` fix
+# (Calhooon/bsv-rs#5; the crate is Calgooon-owned) that unblocked reshare-over-
+# relay from the egress-NAT'd CF Container (issue #58). For local bsv-rs
+# development, add: [patch.crates-io] bsv-rs = { path = "../bsv-rs" }.
 
 # Override cggmp24 with the upstream PR #200 branch on the PUBLIC Calhooon
 # fork that exposes set_additive_shift() for BRC-42-derived key signing.
