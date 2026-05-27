@@ -30,6 +30,24 @@ use bsv_mpc_core::types::{
 use bsv_mpc_messagebox::types::BOX_SIGN;
 use bsv_mpc_messagebox::MessageBoxClient;
 
+// ─── Shared deployed-cosigner orchestration (issue #63, path a-extended) ─────
+//
+// These were factored out of `bsv-mpc-proxy` so the BRC-100 proxy AND the native
+// `bsv-mpc-client` reuse the EXACT mainnet-proven ceremony: the BRC-31
+// `RelaySession`, the authed DKG-over-HTTP driver, and the §06.17.1 presign-over-
+// relay coordinator (the sign-from-bundle combiner already lived here).
+pub mod dkg;
+pub mod presign;
+pub mod session;
+
+pub use dkg::{run_dkg_over_http, run_dkg_over_http_authed};
+pub use presign::{coordinate_presign_over_relay, CosignerArm};
+pub use session::RelaySession;
+// `RequestSigner` (presign trigger signer) is the SAME shape as
+// [`RelayRequestSigner`] (sign trigger signer); re-export both names so existing
+// proxy `crate::relay_presign::RequestSigner` references resolve unchanged.
+pub use presign::RequestSigner;
+
 /// How the proxy reaches the DO to make it issue + relay its partial.
 pub struct DoTrigger {
     /// The DO's sign-relay endpoint (the deployed `/poc/sign-relay`, or the

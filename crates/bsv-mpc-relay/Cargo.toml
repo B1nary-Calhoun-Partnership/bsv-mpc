@@ -9,8 +9,13 @@ description = "Presigned-1-round relay-sign combiner over MessageBox — shared 
 [dependencies]
 bsv-mpc-core = { path = "../bsv-mpc-core" }
 bsv-mpc-messagebox = { path = "../bsv-mpc-messagebox" }
+# §06.17.1 presign-over-relay coordinator reuses the service's PresignHandler +
+# FileBundleStore + MessageBoxListener (no cycle: service depends on neither
+# relay nor proxy). Both crates are native-only.
+bsv-mpc-service = { path = "../bsv-mpc-service" }
 bsv.workspace = true
 reqwest.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 hex.workspace = true
 tracing.workspace = true

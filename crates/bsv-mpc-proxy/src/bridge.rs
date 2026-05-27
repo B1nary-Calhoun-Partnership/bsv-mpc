@@ -49,7 +49,6 @@
 
 use crate::config::ProxyConfig;
 use bsv::primitives::ec::{PrivateKey, PublicKey};
-use bsv_mpc_core::brc31_client::{self, Brc31Client};
 use bsv_mpc_core::ecdh;
 use bsv_mpc_core::error::MpcError;
 use bsv_mpc_core::hd::{compute_invoice, derive_child_pubkey};
@@ -58,6 +57,14 @@ use bsv_mpc_core::types::*;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex, RwLock};
 use zeroize::Zeroizing;
+
+// The BRC-31 session + the authed DKG-over-HTTP driver were factored into the
+// shared `bsv-mpc-relay` crate (issue #63, path a-extended) so the native client
+// reuses the EXACT mainnet-proven ceremony. Re-exported here so external paths
+// `bsv_mpc_proxy::bridge::{run_dkg_over_http, run_dkg_over_http_authed}` resolve
+// unchanged.
+use bsv_mpc_relay::RelaySession;
+pub use bsv_mpc_relay::{run_dkg_over_http, run_dkg_over_http_authed};
 
 // ============================================================================
 // KSS HTTP API types (compatible with bsv-mpc-worker::api)
@@ -119,41 +126,6 @@ struct EcdhRequest {
 struct EcdhResponse {
     /// The partial ECDH result: counterparty_pub * share_A (33-byte hex).
     partial: String,
-}
-
-/// Request body for `POST /dkg/init` (matches `bsv-mpc-service`).
-#[derive(Serialize, Deserialize, Debug)]
-struct DkgInitRequest {
-    agent_id: String,
-    config: ThresholdConfig,
-    label: Option<String>,
-}
-
-/// Response from `POST /dkg/init`.
-#[derive(Serialize, Deserialize, Debug)]
-struct DkgInitResponse {
-    session_id: String,
-    round_message: RoundMessage,
-    #[allow(dead_code)]
-    total_rounds: u8,
-}
-
-/// Request body for `POST /dkg/round`.
-#[derive(Serialize, Deserialize, Debug)]
-struct DkgRoundRequest {
-    session_id: String,
-    round_message: RoundMessage,
-}
-
-/// Response from `POST /dkg/round`.
-#[derive(Serialize, Deserialize, Debug)]
-struct DkgRoundResponse {
-    #[allow(dead_code)]
-    session_id: String,
-    round_message: Option<RoundMessage>,
-    complete: bool,
-    #[allow(dead_code)]
-    joint_pubkey: Option<JointPublicKey>,
 }
 
 // ============================================================================
@@ -263,149 +235,25 @@ fn resolve_proxy_identity_bytes(share_secret: &[u8]) -> std::result::Result<[u8;
     derive_proxy_identity_bytes(share_secret)
 }
 
-/// Client-side BRC-31 session for proxy → KSS authentication.
-///
-/// Thin proxy-side wrapper over the reusable, transport-agnostic
-/// [`bsv_mpc_core::brc31_client::Brc31Client`] (shared with the native
-/// cosigner/container). This wrapper owns the `reqwest` handshake round-trip and
-/// the proxy's stable-identity derivation; the crypto + header construction live
-/// in core.
-struct BridgeAuth {
-    client: Brc31Client,
+/// Test-only: a [`RelaySession`] with a fresh random identity (replaces the
+/// removed `BridgeAuth::new`).
+#[cfg(test)]
+fn test_relay_session() -> RelaySession {
+    use rand::RngCore;
+    let mut key_bytes = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut key_bytes);
+    // Ensure the scalar is valid (non-zero, in range).
+    key_bytes[0] |= 0x01;
+    RelaySession::from_key_bytes(&key_bytes).expect("test relay session key")
 }
 
-impl BridgeAuth {
-    /// Create a new auth client with a random identity key (tests only).
-    ///
-    /// Production resolves a stable identity via [`resolve_proxy_identity_bytes`]
-    /// (operator-provided `MPC_PROXY_IDENTITY_KEY`, else share-derived) so the
-    /// proxy keeps the same owner identity across restarts.
-    #[cfg(test)]
-    fn new() -> std::result::Result<Self, MpcError> {
-        use rand::RngCore;
-        let mut key_bytes = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut key_bytes);
-        // Ensure the key is valid (non-zero, less than curve order)
-        key_bytes[0] |= 0x01;
-        let auth_key = PrivateKey::from_bytes(&key_bytes)
-            .map_err(|e| MpcError::Protocol(format!("invalid auth key bytes: {e}")))?;
-        Ok(Self {
-            client: Brc31Client::new(auth_key),
-        })
-    }
-
-    /// Derive the proxy's **stable** BRC-31 / relay identity key
-    /// deterministically from secret share material.
-    ///
-    /// §07.4 mandates a *long-lived* identity key: the same key signs BRC-31
-    /// auth to the KSS, the §05 envelope outer-signatures over the relay, and
-    /// is recorded as the share's `owner_identity` at DKG time. A random
-    /// per-process key would orphan the share's ownership after a restart, so
-    /// the key is derived from the secret share material — binding owner
-    /// identity to control of `share_B` (AUTHZ-DESIGN §3c / OQ-A2: derive from
-    /// the share file, zero new config). Production goes through
-    /// [`resolve_proxy_identity_bytes`] + [`BridgeAuth::from_key_bytes`]; this
-    /// thin wrapper exercises the share-derived path directly in tests.
-    #[cfg(test)]
-    fn from_share_seed(share_secret: &[u8]) -> std::result::Result<Self, MpcError> {
-        let bytes = derive_proxy_identity_bytes(share_secret)?;
-        Self::from_key_bytes(&bytes)
-    }
-
-    /// Build a `BridgeAuth` from explicit 32-byte identity-key material. Used to
-    /// (a) honor an operator-provided stable identity (`MPC_PROXY_IDENTITY_KEY`)
-    /// and (b) construct a SECOND session (against `presign_url`) with the SAME
-    /// long-lived identity (§07.4 — one identity, per-server sessions).
-    fn from_key_bytes(bytes: &[u8; 32]) -> std::result::Result<Self, MpcError> {
-        let auth_key = PrivateKey::from_bytes(bytes)
-            .map_err(|e| MpcError::Protocol(format!("invalid auth key bytes: {e}")))?;
-        Ok(Self {
-            client: Brc31Client::new(auth_key),
-        })
-    }
-
-    /// Whether the handshake has been completed.
-    fn is_authenticated(&self) -> bool {
-        self.client.is_authenticated()
-    }
-
-    /// The auth/relay identity key (§07.4 — one key for BRC-31 + envelope sigs).
-    fn auth_key(&self) -> &PrivateKey {
-        self.client.auth_key()
-    }
-
-    /// Our identity key as compressed hex (the BRC-104 identity / owner id).
-    #[cfg(test)]
-    fn identity_hex(&self) -> String {
-        self.client.identity_hex()
-    }
-
-    /// Perform the canonical BRC-31 handshake with the KSS (the `reqwest`
-    /// round-trip; the header/body crypto is the core [`Brc31Client`]). Sends a
-    /// canonical `AuthMessage` InitialRequest body and parses the InitialResponse
-    /// identity + session nonce from the response headers.
-    async fn handshake(
-        &mut self,
-        client: &reqwest::Client,
-        kss_url: &str,
-    ) -> std::result::Result<(), MpcError> {
-        let handshake_url = format!("{kss_url}/.well-known/auth");
-        let init_body = self.client.initial_request_body()?;
-        let mut req = client
-            .post(&handshake_url)
-            .header("content-type", "application/json")
-            .body(init_body);
-        for (name, value) in self.client.initial_request_headers() {
-            req = req.header(name, value);
-        }
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| MpcError::Protocol(format!("BRC-31 handshake failed: {e}")))?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(MpcError::Protocol(format!(
-                "BRC-31 handshake returned {status}: {body}"
-            )));
-        }
-
-        let header = |name: &str| {
-            resp.headers()
-                .get(name)
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.to_string())
-        };
-        let server_identity = header(brc31_client::headers::IDENTITY_KEY).ok_or_else(|| {
-            MpcError::Protocol("BRC-31: missing server identity in handshake response".into())
-        })?;
-        let server_nonce = header(brc31_client::headers::NONCE).ok_or_else(|| {
-            MpcError::Protocol("BRC-31: missing server nonce in handshake response".into())
-        })?;
-
-        tracing::info!(server_identity = %server_identity, "BRC-31: handshake complete with KSS");
-        if !self
-            .client
-            .complete_handshake(server_identity, server_nonce)
-        {
-            return Err(MpcError::Protocol(
-                "BRC-31: handshake response carried an invalid server identity key".into(),
-            ));
-        }
-        Ok(())
-    }
-
-    /// Canonical BRC-104 auth headers (name, value) for a fresh request over
-    /// `(method, path, body)` — owned pairs, usable for a `reqwest` builder and
-    /// for the relay trigger.
-    fn auth_header_pairs(
-        &self,
-        method: &str,
-        path: &str,
-        body: &[u8],
-    ) -> std::result::Result<Vec<(&'static str, String)>, MpcError> {
-        self.client.request_headers(method, path, body)
-    }
+/// Test-only: a [`RelaySession`] whose identity is share-seed-derived (§07.4),
+/// replacing the removed `BridgeAuth::from_share_seed`.
+#[cfg(test)]
+fn relay_session_from_share_seed(
+    share_secret: &[u8],
+) -> std::result::Result<RelaySession, MpcError> {
+    RelaySession::from_key_bytes(&derive_proxy_identity_bytes(share_secret)?)
 }
 
 // ============================================================================
@@ -425,7 +273,7 @@ fn kss_post<Req: Serialize, Resp: serde::de::DeserializeOwned>(
     url: &str,
     path: &str,
     body: &Req,
-    auth: &Mutex<BridgeAuth>,
+    auth: &Mutex<RelaySession>,
 ) -> std::result::Result<Resp, MpcError> {
     handle.block_on(async {
         let body_bytes = serde_json::to_vec(body)
@@ -464,190 +312,6 @@ fn kss_post<Req: Serialize, Resp: serde::de::DeserializeOwned>(
             .await
             .map_err(|e| MpcError::Protocol(format!("KSS response parse error from {url}: {e}")))
     })
-}
-
-// ============================================================================
-// Wire format: bundle / unbundle
-// ============================================================================
-
-/// Bundle multiple outgoing `RoundMessage`s into a single transport `RoundMessage`.
-/// Payload becomes a JSON array of WireMessages.
-fn bundle_messages(messages: &[RoundMessage]) -> std::result::Result<RoundMessage, MpcError> {
-    if messages.is_empty() {
-        return Err(MpcError::Signing("no messages to bundle".into()));
-    }
-    let values: Vec<serde_json::Value> = messages
-        .iter()
-        .map(|m| {
-            serde_json::from_slice(&m.payload).map_err(|e| {
-                MpcError::Serialization(format!("failed to parse wire message for bundling: {e}"))
-            })
-        })
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    let bundled_payload = serde_json::to_vec(&values).map_err(|e| {
-        MpcError::Serialization(format!("failed to serialize bundled messages: {e}"))
-    })?;
-    let first = &messages[0];
-    Ok(RoundMessage {
-        session_id: first.session_id,
-        round: first.round,
-        from: first.from,
-        to: None,
-        payload: bundled_payload,
-    })
-}
-
-// ============================================================================
-// DKG over HTTP (proxy = party 1, holds share_B)
-// ============================================================================
-
-/// POST a JSON body to a KSS endpoint **without** BRC-31 auth and deserialize
-/// the response. Used by [`run_dkg_over_http`] (the unauthenticated variant —
-/// dev / non-enforced cosigners). When the cosigner runs with auth ENFORCED
-/// (§07.6), use [`run_dkg_over_http_authed`], which signs each request so the
-/// cosigner records the caller as the share's `owner_identity` (§08.1).
-fn http_post_json<Req: Serialize, Resp: serde::de::DeserializeOwned>(
-    handle: &tokio::runtime::Handle,
-    client: &reqwest::Client,
-    url: &str,
-    body: &Req,
-) -> std::result::Result<Resp, MpcError> {
-    handle.block_on(async {
-        let resp = client
-            .post(url)
-            .json(body)
-            .send()
-            .await
-            .map_err(|e| MpcError::Protocol(format!("DKG request to {url} failed: {e}")))?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body_text = resp.text().await.unwrap_or_default();
-            return Err(MpcError::Dkg(format!(
-                "KSS returned {status} from {url}: {body_text}"
-            )));
-        }
-        resp.json::<Resp>()
-            .await
-            .map_err(|e| MpcError::Protocol(format!("DKG response parse error from {url}: {e}")))
-    })
-}
-
-/// Run a 2-party CGGMP'24 DKG against a remote heavy-compute cosigner (party 0,
-/// `bsv-mpc-service` / CF Container) over HTTP, as **party 1** — producing this
-/// proxy's `share_B` + the joint key. This is real distributed DKG (no trusted
-/// dealer): neither party ever holds the other's share.
-///
-/// The cosigner stores `share_A` keyed by the joint pubkey on completion; the
-/// returned [`DkgResult`] is the proxy's `share_B`, which the caller persists to
-/// the proxy's share file. Paillier primes are generated inline natively on both
-/// sides (DKG is the heavy off-hot-path ceremony — ADR-018).
-pub async fn run_dkg_over_http(
-    kss_url: &str,
-    config: ThresholdConfig,
-) -> bsv_mpc_core::error::Result<DkgResult> {
-    run_dkg_over_http_inner(kss_url, config, None).await
-}
-
-/// Authenticated variant of [`run_dkg_over_http`]: performs the BRC-31 handshake
-/// with the cosigner using `auth_key` (§07.4 long-lived identity) and signs
-/// every `/dkg/*` request, so a cosigner running with auth ENFORCED (§07.6)
-/// accepts the ceremony and records this identity as the share's
-/// `owner_identity` (§08.1). Subsequent `/sign`, `/presign`, `/ecdh` must then
-/// authenticate as the SAME identity.
-pub async fn run_dkg_over_http_authed(
-    kss_url: &str,
-    config: ThresholdConfig,
-    auth_key: PrivateKey,
-) -> bsv_mpc_core::error::Result<DkgResult> {
-    // Handshake up front (async) so the in-loop authed POSTs have a session.
-    let handshake_client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .map_err(|e| MpcError::Protocol(format!("failed to create HTTP client: {e}")))?;
-    let mut auth = BridgeAuth {
-        client: Brc31Client::new(auth_key),
-    };
-    auth.handshake(&handshake_client, kss_url).await?;
-    run_dkg_over_http_inner(kss_url, config, Some(Arc::new(Mutex::new(auth)))).await
-}
-
-/// Shared DKG-over-HTTP driver. When `auth` is `Some`, every `/dkg/*` request is
-/// BRC-31-signed (the cosigner records the owner); when `None`, requests are
-/// unauthenticated (dev / non-enforced cosigners).
-async fn run_dkg_over_http_inner(
-    kss_url: &str,
-    config: ThresholdConfig,
-    auth: Option<Arc<Mutex<BridgeAuth>>>,
-) -> bsv_mpc_core::error::Result<DkgResult> {
-    use bsv_mpc_core::dkg::{DkgCoordinator, DkgRoundResult};
-
-    let kss_url = kss_url.to_string();
-    // DKG is a one-time, off-hot-path ceremony; a remote cosigner on a
-    // constrained instance generates Paillier primes inline (tens of seconds to
-    // minutes), so allow a generous per-round budget. Overridable via
-    // `MPC_DKG_TIMEOUT_SECS`.
-    let dkg_timeout = std::env::var("MPC_DKG_TIMEOUT_SECS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(600);
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(dkg_timeout))
-        .build()
-        .map_err(|e| MpcError::Protocol(format!("failed to create HTTP client: {e}")))?;
-    let handle = tokio::runtime::Handle::current();
-
-    tokio::task::spawn_blocking(move || {
-        let init_url = format!("{kss_url}/dkg/init");
-        let init_req = DkgInitRequest {
-            agent_id: String::new(),
-            config,
-            label: Some("proxy-dkg-over-http".into()),
-        };
-        // Start the cosigner's DKG session FIRST (party 0). The cosigner picks
-        // the session id; the proxy MUST adopt it so both derive the SAME
-        // canonical cggmp24 ExecutionId (eid = f(session_id)) — a mismatch makes
-        // keygen fail to complete.
-        let init_resp: DkgInitResponse = match &auth {
-            Some(a) => kss_post(&handle, &client, &init_url, "/dkg/init", &init_req, a)?,
-            None => http_post_json(&handle, &client, &init_url, &init_req)?,
-        };
-        let session_id = SessionId::from_str_hash(&init_resp.session_id);
-
-        let mut dkg = DkgCoordinator::new(session_id, config, ShareIndex(1));
-        let proxy_r1 = dkg.init()?;
-
-        let round_url = format!("{kss_url}/dkg/round");
-        let mut kss_msg = init_resp.round_message;
-        let mut proxy_bundle = bundle_messages(&proxy_r1)?;
-
-        loop {
-            let round_req = DkgRoundRequest {
-                session_id: init_resp.session_id.clone(),
-                round_message: proxy_bundle,
-            };
-            let round_resp: DkgRoundResponse = match &auth {
-                Some(a) => kss_post(&handle, &client, &round_url, "/dkg/round", &round_req, a)?,
-                None => http_post_json(&handle, &client, &round_url, &round_req)?,
-            };
-
-            match dkg.process_round(vec![kss_msg])? {
-                DkgRoundResult::NextRound(next) => {
-                    if round_resp.complete {
-                        return Err(MpcError::Dkg(
-                            "cosigner completed DKG but proxy has more rounds".into(),
-                        ));
-                    }
-                    kss_msg = round_resp.round_message.ok_or_else(|| {
-                        MpcError::Dkg("cosigner returned no message but DKG not complete".into())
-                    })?;
-                    proxy_bundle = bundle_messages(&next)?;
-                }
-                DkgRoundResult::Complete(result) => return Ok(result),
-            }
-        }
-    })
-    .await
-    .map_err(|e| MpcError::Dkg(format!("DKG task panicked: {e}")))?
 }
 
 // ============================================================================
@@ -743,7 +407,7 @@ pub struct MpcBridge {
 
     /// BRC-31 Authrite client for authenticated KSS (DO `kss_url`) communication.
     /// Arc<Mutex> for sharing across spawn_blocking closures.
-    auth: Arc<Mutex<BridgeAuth>>,
+    auth: Arc<Mutex<RelaySession>>,
 
     /// BRC-31 session for the heavy-compute cosigner (`presign_url`). When
     /// `presign_url == kss_url` this is the same `Arc` as `auth`; otherwise it is
@@ -751,7 +415,7 @@ pub struct MpcBridge {
     /// because a BRC-31 session is per-server (signature is derived against the
     /// server's identity; the session nonce is server-issued), so presig against
     /// an enforced container needs its own handshake.
-    presign_auth: Arc<Mutex<BridgeAuth>>,
+    presign_auth: Arc<Mutex<RelaySession>>,
 
     /// MessageBox relay URL for the ADR-018 relay sign path (#12).
     relay_url: String,
@@ -929,7 +593,7 @@ impl MpcBridge {
         //    (zero-config, stable across restarts).
         let identity_bytes = resolve_proxy_identity_bytes(&dkg_result.share.ciphertext)
             .map_err(|e| anyhow::anyhow!("failed to resolve proxy auth identity: {e}"))?;
-        let mut bridge_auth = BridgeAuth::from_key_bytes(&identity_bytes)
+        let mut bridge_auth = RelaySession::from_key_bytes(&identity_bytes)
             .map_err(|e| anyhow::anyhow!("failed to build proxy auth identity: {e}"))?;
 
         let presign_url = config
@@ -977,7 +641,7 @@ impl MpcBridge {
             Arc::new(Mutex::new(bridge_auth))
         } else {
             let do_auth = Arc::new(Mutex::new(bridge_auth));
-            let mut cosigner_auth = BridgeAuth::from_key_bytes(&identity_bytes)
+            let mut cosigner_auth = RelaySession::from_key_bytes(&identity_bytes)
                 .map_err(|e| anyhow::anyhow!("failed to build cosigner auth identity: {e}"))?;
             match cosigner_auth.handshake(&client, &presign_url).await {
                 Ok(()) => {
@@ -2711,8 +2375,8 @@ impl MpcBridge {
             participants: vec![0, 1],
             device_shares: vec![test_share],
             agent_id,
-            auth: Arc::new(Mutex::new(BridgeAuth::new().expect("test auth key"))),
-            presign_auth: Arc::new(Mutex::new(BridgeAuth::new().expect("test auth key"))),
+            auth: Arc::new(Mutex::new(test_relay_session())),
+            presign_auth: Arc::new(Mutex::new(test_relay_session())),
             relay_url: "https://rust-message-box.dev-a3e.workers.dev".into(),
             presign_url: "http://localhost:9999".into(),
         }
@@ -2982,8 +2646,8 @@ mod tests {
         // always derive the same long-lived BRC-31 / relay identity key, so a
         // proxy restart keeps the share's `owner_identity`.
         let secret = b"share_B raw cggmp24 key share json bytes".to_vec();
-        let a = BridgeAuth::from_share_seed(&secret).unwrap();
-        let b = BridgeAuth::from_share_seed(&secret).unwrap();
+        let a = relay_session_from_share_seed(&secret).unwrap();
+        let b = relay_session_from_share_seed(&secret).unwrap();
         assert_eq!(
             a.identity_hex(),
             b.identity_hex(),
@@ -2997,8 +2661,8 @@ mod tests {
     fn proxy_identity_differs_per_share() {
         // Distinct share secrets (distinct owners) must derive distinct
         // identities — owner identity is bound to control of that share.
-        let a = BridgeAuth::from_share_seed(b"share for agent one").unwrap();
-        let b = BridgeAuth::from_share_seed(b"share for agent two").unwrap();
+        let a = relay_session_from_share_seed(b"share for agent one").unwrap();
+        let b = relay_session_from_share_seed(b"share for agent two").unwrap();
         assert_ne!(a.identity_hex(), b.identity_hex());
     }
 }

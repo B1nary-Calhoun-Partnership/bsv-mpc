@@ -65,7 +65,11 @@ pub mod error;
 pub mod fee_injector;
 pub mod presign_manager;
 pub mod relay_approval;
-pub mod relay_presign;
+// `relay_presign` (the §06.17.1 presign-over-relay coordinator) was factored into
+// the shared `bsv-mpc-relay` crate (issue #63) so the native client reuses the
+// exact coordinator. Re-exported under the old path so existing
+// `crate::relay_presign::…` references resolve unchanged.
+pub use bsv_mpc_relay::presign as relay_presign;
 pub mod relay_refresh;
 pub mod relay_reshare;
 // `relay_sign` was factored into the shared `bsv-mpc-relay` crate (issue #63) so

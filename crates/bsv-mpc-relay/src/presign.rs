@@ -1,26 +1,26 @@
-//! Proxy-side **coordinator** for §06.17.1 presign-over-the-relay (issue #30 /
-//! #25c Stage 2, CONTAINER target).
+//! **Coordinator** for §06.17.1 presign-over-the-relay (issue #30 / #25c Stage 2,
+//! CONTAINER target). Factored out of the proxy `relay_presign.rs` (issue #63,
+//! path a-extended) so the BRC-100 proxy AND the native client run the EXACT same
+//! presign-over-relay coordinator.
 //!
-//! The deployed CF **Container** cosigner now runs `PresignHandler` as a
-//! presign cosigner over the relay (`POST /presign-relay/init`): it generates +
-//! BRC-2 self-encrypts its OWN presig share and ships the ciphertext to this
-//! coordinator. This module is the matching **coordinator** half, run by the
-//! proxy:
+//! The deployed CF **Container** cosigner runs `PresignHandler` as a presign
+//! cosigner over the relay (`POST /presign-relay/init`): it generates + BRC-2
+//! self-encrypts its OWN presig share and ships the ciphertext to this
+//! coordinator. This module is the matching **coordinator** half:
 //!
 //! 1. Trigger the container to arm itself as the cosigner (it returns its relay
 //!    identity hex).
 //! 2. Run the relay-proven [`PresignHandler`] (coordinator role) + a
-//!    `MessageBoxListener` on the protocol box + the return box; `initiate` runs
-//!    `init_generate` and ships the coordinator's round-1 to the cosigner.
+//!    `MessageBoxListener` on the protocol box + the return box.
 //! 3. The 3-round presign completes over the relay; on round-3 the coordinator
 //!    keeps its OWN sealed share + collects the cosigner's return ciphertext,
 //!    assembles + persists the [`PresigBundle`] to the durable [`FileBundleStore`].
 //!
 //! The coordinator NEVER holds the cosigner's plaintext presig share — only the
-//! opaque BRC-2 ciphertext in the bundle (the §06.17.1 threshold gain over the
-//! POC proxy-knows-both-shares shortcut). At sign-time, `relay_sign` ships that
-//! ciphertext back to the container's `/sign-relay`, which decrypts it under its
-//! OWN identity and co-signs (see [`crate::relay_sign`]).
+//! opaque BRC-2 ciphertext in the bundle (the §06.17.1 threshold gain). At
+//! sign-time, [`crate::combine_sign_from_bundle_over_relay`] ships that ciphertext
+//! back to the container's `/sign-relay`, which decrypts it under its OWN identity
+//! and co-signs.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -34,9 +34,9 @@ use bsv_mpc_service::{
     FileBundleStore, MessageBoxListener, PresignHandler, PresignHandlerConfig, PresignOutcome,
 };
 
-/// A canonical BRC-31 request signer (same shape as
-/// [`crate::relay_sign::RelayRequestSigner`]) — signs the exact serialized body
-/// for the container's authed `/presign-relay/init` route.
+/// A canonical BRC-31 request signer (same shape as [`crate::RelayRequestSigner`])
+/// — signs the exact serialized body for the container's authed
+/// `/presign-relay/init` route.
 pub type RequestSigner<'a> =
     &'a (dyn Fn(&str, &str, &[u8]) -> Result<Vec<(String, String)>> + Send + Sync);
 
@@ -59,8 +59,8 @@ struct ArmResponse {
 /// Run the §06.17.1 presign over the relay as the coordinator, persisting the
 /// assembled [`PresigBundle`] to `bundle_store`.
 ///
-/// - `share` is the coordinator's (proxy's) DKG key share with its 33-byte joint
-///   pubkey populated.
+/// - `share` is the coordinator's DKG key share with its 33-byte joint pubkey
+///   populated.
 /// - `coordinator_party` / `cosigner_party` are the keygen-subset indices.
 /// - `arm` triggers the container cosigner; `request_signer` BRC-31-signs that
 ///   trigger over the canonical wire.
@@ -110,12 +110,12 @@ pub async fn coordinate_presign_over_relay(
     .await
     .map_err(|e| MpcError::Protocol(format!("coord listener: {e}")))?;
 
-    // 3. Fetch the cosigner's relay identity FIRST (read-only) so the
-    //    coordinator can register its ceremony slot + ship its round-1 BEFORE the
-    //    cosigner ships — otherwise the cosigner's round-1 races ahead of the
-    //    coordinator's slot and is dropped (the §06.17 ordering invariant; the
-    //    relay delivers immediately, and an inbound for an unregistered session is
-    //    discarded, deadlocking the presign).
+    // 3. Fetch the cosigner's relay identity FIRST (read-only) so the coordinator
+    //    can register its ceremony slot + ship its round-1 BEFORE the cosigner
+    //    ships — otherwise the cosigner's round-1 races ahead of the coordinator's
+    //    slot and is dropped (the §06.17 ordering invariant; the relay delivers
+    //    immediately, and an inbound for an unregistered session is discarded,
+    //    deadlocking the presign).
     let cosigner_pub_hex = match fetch_cosigner_identity(&arm).await {
         Ok(h) => h,
         Err(e) => {
@@ -125,16 +125,9 @@ pub async fn coordinate_presign_over_relay(
     };
 
     // 4. Initiate the coordinator's own SM (init_generate) — this REGISTERS the
-    //    ceremony slot but does NOT ship round-1 yet. The cosigner isn't
-    //    subscribed at this point, so shipping now could only reach it via the
-    //    HTTP `/listMessages` backfill — which is unreliable from a CF container
-    //    (it deterministically stalls; that is exactly why the deployed presign
-    //    timed out "awaiting PresigBundle assembly"). We ship round-1 AFTER the
+    //    ceremony slot but does NOT ship round-1 yet. We ship round-1 AFTER the
     //    cosigner has joined (step 6) so it rides the BRC-103 WS live-push, never
-    //    the backfill — the §06.17 ordering invariant the reshare path already
-    //    follows. The coordinator's slot existing first also lets it accept the
-    //    cosigner's round-1 (shipped during arm) immediately; `PresignHandler`
-    //    additionally buffers any early/out-of-order inbound.
+    //    the unreliable HTTP backfill — the §06.17 ordering invariant.
     let peers = vec![(cosigner_party, cosigner_pub_hex.clone())];
     let (rx, round1_out) = match handler.initiate(session_id, share, peers).await {
         Ok(v) => v,
@@ -146,10 +139,9 @@ pub async fn coordinate_presign_over_relay(
 
     // 5. Arm the cosigner — it subscribes (joining its protocol box), runs
     //    init_generate, and ships its OWN round-1 to the coordinator (whose slot
-    //    now exists and which subscribed in step 2, so that round-1 arrives via
-    //    live-push). `/presign-relay/init` returns 200 only AFTER the cosigner has
-    //    subscribed, so on return we know it is live on the relay. Verify its
-    //    relay identity matches what we fetched.
+    //    now exists and which subscribed in step 2). `/presign-relay/init` returns
+    //    200 only AFTER the cosigner has subscribed. Verify its relay identity
+    //    matches what we fetched.
     let armed_pub_hex = match arm_cosigner(
         &arm,
         &session_id,
@@ -178,7 +170,7 @@ pub async fn coordinate_presign_over_relay(
     // 6. NOW ship the coordinator's round-1 — the cosigner has joined its box, so
     //    the relay delivers this by WS live-push (NOT the unreliable HTTP
     //    backfill). The cosigner's SM buffers it in order even if the
-    //    coordinator's round-2 (produced from the cosigner's round-1) races ahead.
+    //    coordinator's round-2 races ahead.
     for out in &round1_out {
         if let Err(e) = coord_client
             .send_round_message(
@@ -220,8 +212,8 @@ pub async fn coordinate_presign_over_relay(
     }
 }
 
-/// GET the container's `/presign-relay/identity` (read-only) → its relay /
-/// BRC-2 identity-key hex. Derived from the `/presign-relay/init` URL.
+/// GET the container's `/presign-relay/identity` (read-only) → its relay / BRC-2
+/// identity-key hex. Derived from the `/presign-relay/init` URL.
 async fn fetch_cosigner_identity(arm: &CosignerArm) -> Result<String> {
     #[derive(serde::Deserialize)]
     struct IdResponse {
