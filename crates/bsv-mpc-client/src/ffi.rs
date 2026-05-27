@@ -38,6 +38,339 @@ pub fn ffi_tx_output_sats(raw_tx_hex: String) -> Result<Vec<u64>, FfiError> {
     Ok(outs.into_iter().map(|(sats, _script)| sats).collect())
 }
 
+// ── Send-path FFI (issue #68) ─────────────────────────────────────────────────
+//
+// Rust owns ALL tx-serialization + sighash + encoding (load-bearing rule: Swift
+// never reimplements BIP-143 / tx assembly / base58 / secp256k1). These are pure,
+// deterministic wrappers around `txbuild` + `bsv_mpc_core::approval` + bsv-rs — no
+// network, no funds. Golden-vector tests assert FFI output == in-crate output
+// byte-for-byte. All txids cross the FFI in **display** (big-endian) hex — the same
+// order 100cash sees in `createAction` / BEEF — and are reversed to the internal
+// (little-endian) wire order INSIDE Rust, so the host never byte-swaps.
+
+/// Decode hex, mapping failure to a clear FFI error.
+fn dehex(s: &str, what: &str) -> Result<Vec<u8>, FfiError> {
+    hex::decode(s).map_err(|e| FfiError::Client(format!("{what}: bad hex: {e}")))
+}
+
+/// Decode a 32-byte **display** (big-endian) txid hex into the internal
+/// (little-endian) `[u8; 32]` the wire format uses.
+fn txid_display_to_internal(txid_hex: &str) -> Result<[u8; 32], FfiError> {
+    let mut v = dehex(txid_hex, "txid")?;
+    if v.len() != 32 {
+        return Err(FfiError::Client(format!(
+            "txid must be 32 bytes (64 hex chars), got {}",
+            v.len()
+        )));
+    }
+    v.reverse();
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&v);
+    Ok(arr)
+}
+
+/// An output: satoshis + locking-script hex.
+#[derive(uniffi::Record)]
+pub struct FfiTxOutput {
+    pub satoshis: u64,
+    pub locking_script_hex: String,
+}
+
+/// One input for the BIP-143 sighash preimage (no scripts — only the outpoint +
+/// sequence; the spent UTXO's script/value are `subscript_hex`/`input_satoshis`).
+#[derive(uniffi::Record)]
+pub struct FfiSighashInput {
+    /// Previous txid in **display** (big-endian) hex.
+    pub prev_txid_hex: String,
+    pub vout: u32,
+    pub sequence: u32,
+}
+
+/// Everything needed to recompute one input's BIP-143 (FORKID) sighash locally.
+#[derive(uniffi::Record)]
+pub struct FfiSighashRequest {
+    pub version: u32,
+    pub inputs: Vec<FfiSighashInput>,
+    pub outputs: Vec<FfiTxOutput>,
+    pub locktime: u32,
+    /// Which input this sighash is for.
+    pub input_index: u32,
+    /// Locking script of the UTXO being spent (hex).
+    pub subscript_hex: String,
+    pub input_satoshis: u64,
+    /// e.g. `0x41` = SIGHASH_ALL | FORKID.
+    pub sighash_type: u32,
+}
+
+/// Recompute an input's BIP-143 (FORKID) sighash — the device MUST derive this
+/// locally from the `createAction` template, never trust a server-supplied digest.
+#[uniffi::export]
+pub fn ffi_bip143_sighash(req: FfiSighashRequest) -> Result<Vec<u8>, FfiError> {
+    let inputs: Vec<([u8; 32], u32, u32)> = req
+        .inputs
+        .iter()
+        .map(|i| {
+            Ok((
+                txid_display_to_internal(&i.prev_txid_hex)?,
+                i.vout,
+                i.sequence,
+            ))
+        })
+        .collect::<Result<_, FfiError>>()?;
+    // Decode output scripts into owned buffers, then borrow them for SighashParams.
+    let out_scripts: Vec<Vec<u8>> = req
+        .outputs
+        .iter()
+        .map(|o| dehex(&o.locking_script_hex, "output locking_script"))
+        .collect::<Result<_, FfiError>>()?;
+    let outputs: Vec<(u64, &[u8])> = req
+        .outputs
+        .iter()
+        .zip(&out_scripts)
+        .map(|(o, s)| (o.satoshis, s.as_slice()))
+        .collect();
+    let subscript = dehex(&req.subscript_hex, "subscript")?;
+    let input_index = req.input_index as usize;
+    if input_index >= inputs.len() {
+        return Err(FfiError::Client(format!(
+            "input_index {input_index} out of range for {} inputs",
+            inputs.len()
+        )));
+    }
+    let sighash = txbuild::compute_bip143_sighash(&txbuild::SighashParams {
+        version: req.version,
+        inputs: &inputs,
+        outputs: &outputs,
+        locktime: req.locktime,
+        input_index,
+        subscript: &subscript,
+        input_satoshis: req.input_satoshis,
+        sighash_type: req.sighash_type,
+    });
+    Ok(sighash.to_vec())
+}
+
+/// One fully-signed input.
+#[derive(uniffi::Record)]
+pub struct FfiSignedInput {
+    /// Previous txid in **display** (big-endian) hex.
+    pub prev_txid_hex: String,
+    pub vout: u32,
+    /// The complete unlocking script (scriptSig) hex (e.g. `<sig+0x41> <pubkey>`).
+    pub unlocking_script_hex: String,
+    pub sequence: u32,
+}
+
+/// A fully-signed transaction to assemble into raw bytes for `processAction`.
+#[derive(uniffi::Record)]
+pub struct FfiSignedTxRequest {
+    pub version: u32,
+    pub inputs: Vec<FfiSignedInput>,
+    pub outputs: Vec<FfiTxOutput>,
+    pub locktime: u32,
+}
+
+/// Assemble the fully-signed rawTx (hex) from the MPC-produced unlocking scripts.
+#[uniffi::export]
+pub fn ffi_serialize_signed_tx(req: FfiSignedTxRequest) -> Result<String, FfiError> {
+    let inputs: Vec<([u8; 32], u32, Vec<u8>, u32)> = req
+        .inputs
+        .iter()
+        .map(|i| {
+            Ok((
+                txid_display_to_internal(&i.prev_txid_hex)?,
+                i.vout,
+                dehex(&i.unlocking_script_hex, "unlocking_script")?,
+                i.sequence,
+            ))
+        })
+        .collect::<Result<_, FfiError>>()?;
+    let outputs: Vec<(u64, Vec<u8>)> = req
+        .outputs
+        .iter()
+        .map(|o| {
+            Ok((
+                o.satoshis,
+                dehex(&o.locking_script_hex, "output locking_script")?,
+            ))
+        })
+        .collect::<Result<_, FfiError>>()?;
+    let raw = txbuild::serialize_signed_tx(req.version, &inputs, &outputs, req.locktime);
+    Ok(hex::encode(raw))
+}
+
+/// Recipient descriptor for the WYSIWYS view-hash — mirrors
+/// [`bsv_mpc_core::approval::Recipient`].
+#[derive(uniffi::Enum)]
+pub enum FfiRecipient {
+    /// A single recipient (CBOR text string).
+    Single { address: String },
+    /// Multiple recipients (CBOR array of text strings).
+    Multi { addresses: Vec<String> },
+}
+
+/// Inputs to the §09.5.1 WYSIWYS canonical-CBOR request-view-hash (keys 1..8). All
+/// text MUST already be NFC-normalized UTF-8.
+#[derive(uniffi::Record)]
+pub struct FfiViewHashRequest {
+    pub amount: u64,
+    pub recipient: FfiRecipient,
+    pub sighash_hex: String,
+    pub execution_id_hex: String,
+    pub policy_id_hex: String,
+    pub manifest_ack_hex: String,
+    pub human_locale: String,
+    pub rendered_text: String,
+}
+
+/// The WYSIWYS digest + the exact canonical-CBOR preimage that was hashed.
+#[derive(uniffi::Record)]
+pub struct FfiViewHash {
+    pub hash: Vec<u8>,
+    pub preimage: Vec<u8>,
+}
+
+/// Compute the §09.5.1 WYSIWYS request-view-hash the approval (#43) binds to.
+#[uniffi::export]
+pub fn ffi_request_view_hash(req: FfiViewHashRequest) -> Result<FfiViewHash, FfiError> {
+    use bsv_mpc_core::approval::{request_view_hash, Recipient};
+    let recipient = match req.recipient {
+        FfiRecipient::Single { address } => Recipient::Single(address),
+        FfiRecipient::Multi { addresses } => Recipient::Multi(addresses),
+    };
+    let rvh = request_view_hash(
+        req.amount,
+        &recipient,
+        &req.sighash_hex,
+        &req.execution_id_hex,
+        &req.policy_id_hex,
+        &req.manifest_ack_hex,
+        &req.human_locale,
+        &req.rendered_text,
+    );
+    Ok(FfiViewHash {
+        hash: rvh.hash.to_vec(),
+        preimage: rvh.preimage,
+    })
+}
+
+/// One parsed input from a BEEF: the outpoint + its prev-output (value + script) so
+/// the device can build the sighash without trusting server-supplied values.
+#[derive(uniffi::Record)]
+pub struct FfiParsedInput {
+    /// Source txid in **display** (big-endian) hex.
+    pub prev_txid_hex: String,
+    pub vout: u32,
+    pub sequence: u32,
+    /// The spent output's value (`0` if the BEEF lacked the source tx).
+    pub prev_satoshis: u64,
+    /// The spent output's locking script hex (empty if absent).
+    pub prev_locking_script_hex: String,
+}
+
+/// A BEEF-parsed transaction: version/locktime + inputs (with prev-outputs) +
+/// outputs — everything needed to recompute each input's BIP-143 sighash.
+#[derive(uniffi::Record)]
+pub struct FfiParsedTx {
+    pub version: u32,
+    pub locktime: u32,
+    pub inputs: Vec<FfiParsedInput>,
+    pub outputs: Vec<FfiTxOutput>,
+}
+
+/// Independently re-parse the unsigned tx + its input prev-outputs from a BEEF
+/// (`createAction.inputBeef`), so the device recomputes sighashes from first
+/// principles. Accepts AtomicBEEF or BEEF v1/v2.
+#[uniffi::export]
+pub fn ffi_parse_beef_tx(beef_hex: String) -> Result<FfiParsedTx, FfiError> {
+    let beef_bytes = dehex(&beef_hex, "beef")?;
+    // `Beef::from_binary` parses BEEF v1/v2 AND AtomicBEEF (it strips the atomic
+    // prefix). The subject (the new/unsigned tx) is the last tx (BEEF orders
+    // ancestors first); each input's prev-output is resolved from the BEEF's own tx
+    // set by source txid — `find_transaction_for_signing` does NOT link sources.
+    let beef = bsv::transaction::Beef::from_binary(&beef_bytes)
+        .map_err(|e| FfiError::Client(format!("parse BEEF: {e}")))?;
+    let subject = beef
+        .txs
+        .last()
+        .and_then(|t| t.tx())
+        .ok_or_else(|| FfiError::Client("BEEF has no subject transaction".into()))?
+        .clone();
+
+    let mut inputs = Vec::with_capacity(subject.inputs.len());
+    for inp in &subject.inputs {
+        let prev_txid_hex = inp.get_source_txid().unwrap_or_default();
+        let vout = inp.source_output_index;
+        // Resolve the prev-output: from the BEEF tx set first, else a linked
+        // source_transaction if present.
+        let prevout = beef
+            .find_txid(&prev_txid_hex)
+            .and_then(|bt| bt.tx())
+            .or(inp.source_transaction.as_deref())
+            .and_then(|src| src.outputs.get(vout as usize))
+            .map(|o| (o.satoshis.unwrap_or(0), o.locking_script.to_hex()));
+        let (prev_satoshis, prev_locking_script_hex) = prevout.unwrap_or((0, String::new()));
+        inputs.push(FfiParsedInput {
+            prev_txid_hex,
+            vout,
+            sequence: inp.sequence,
+            prev_satoshis,
+            prev_locking_script_hex,
+        });
+    }
+    let outputs = subject
+        .outputs
+        .iter()
+        .map(|o| FfiTxOutput {
+            satoshis: o.satoshis.unwrap_or(0),
+            locking_script_hex: o.locking_script.to_hex(),
+        })
+        .collect();
+    Ok(FfiParsedTx {
+        version: subject.version,
+        locktime: subject.lock_time,
+        inputs,
+        outputs,
+    })
+}
+
+/// Derive the P2PKH locking-script hex from a base58check address — the encoding
+/// the device must NOT hand-roll in Swift. Validates the base58check checksum and
+/// the 25-byte `version ‖ hash160 ‖ checksum` layout.
+#[uniffi::export]
+pub fn ffi_address_to_locking_script_hex(address: String) -> Result<String, FfiError> {
+    // `Address::new_from_string` validates the base58check checksum + layout.
+    let addr = bsv::script::Address::new_from_string(&address)
+        .map_err(|e| FfiError::Client(format!("invalid BSV address '{address}': {e}")))?;
+    let hash = addr.public_key_hash();
+    let mut hash20 = [0u8; 20];
+    if hash.len() != 20 {
+        return Err(FfiError::Client(format!(
+            "address pubkey-hash must be 20 bytes, got {}",
+            hash.len()
+        )));
+    }
+    hash20.copy_from_slice(hash);
+    Ok(hex::encode(txbuild::p2pkh_locking_script_from_hash(
+        &hash20,
+    )))
+}
+
+/// Compressed (33-byte, `02`/`03`-prefixed) public-key hex for a BRC-31 device
+/// identity private key (32-byte hex) — for device enrollment. Swift never touches
+/// secp256k1.
+#[uniffi::export]
+pub fn ffi_identity_pubkey_compressed_hex(priv_hex: String) -> Result<String, FfiError> {
+    let bytes = dehex(&priv_hex, "identity priv")?;
+    let arr: [u8; 32] = bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| FfiError::Client("identity priv must be 32 bytes".into()))?;
+    let sk = bsv::primitives::ec::PrivateKey::from_bytes(&arr)
+        .map_err(|e| FfiError::Client(format!("identity priv: {e}")))?;
+    Ok(hex::encode(sk.public_key().to_compressed()))
+}
+
 // ── Host-driven signing session (the proven `sans-io` FFI pattern) ────────────
 //
 // The native shell (Swift/Kotlin) owns all I/O and the biometric unseal; it
@@ -590,5 +923,322 @@ impl WalletStorageConn {
             .await
             .map_err(|e| FfiError::Client(e.to_string()))?;
         serde_json::to_string(&result).map_err(|e| FfiError::Client(format!("encode result: {e}")))
+    }
+}
+
+// ── #68 send-path golden-vector tests (FFI == in-crate, byte-for-byte) ─────────
+#[cfg(test)]
+mod send_path_tests {
+    use super::*;
+    use crate::txbuild;
+
+    fn p2pkh_hex(hash: [u8; 20]) -> String {
+        hex::encode(txbuild::p2pkh_locking_script_from_hash(&hash))
+    }
+
+    /// The FFI sighash MUST equal the in-crate `demo_sighash()` byte-for-byte for the
+    /// same logical tx (display txid "11"*32 reverses to the demo's internal [0x11;32]).
+    #[test]
+    fn ffi_sighash_matches_in_crate_golden() {
+        let req = FfiSighashRequest {
+            version: 1,
+            inputs: vec![FfiSighashInput {
+                prev_txid_hex: hex::encode([0x11u8; 32]),
+                vout: 0,
+                sequence: 0xffff_ffff,
+            }],
+            outputs: vec![
+                FfiTxOutput {
+                    satoshis: 50_000,
+                    locking_script_hex: p2pkh_hex([0x33u8; 20]),
+                },
+                FfiTxOutput {
+                    satoshis: 49_000,
+                    locking_script_hex: p2pkh_hex([0x44u8; 20]),
+                },
+            ],
+            locktime: 0,
+            input_index: 0,
+            subscript_hex: p2pkh_hex([0x22u8; 20]),
+            input_satoshis: 100_000,
+            sighash_type: 0x41,
+        };
+        let got = ffi_bip143_sighash(req).expect("ffi sighash");
+        assert_eq!(
+            got,
+            txbuild::demo_sighash().to_vec(),
+            "FFI sighash != in-crate golden"
+        );
+    }
+
+    /// Prove the FFI reverses display→internal txid: a NON-palindrome txid through the
+    /// FFI must equal the in-crate sighash computed with the REVERSED (internal) bytes.
+    #[test]
+    fn ffi_sighash_reverses_display_txid() {
+        let display: [u8; 32] = core::array::from_fn(|i| i as u8); // 00,01,..,1f — not a palindrome
+        let mut internal = display;
+        internal.reverse();
+        let subscript = txbuild::p2pkh_locking_script_from_hash(&[0x22u8; 20]);
+        let out0 = txbuild::p2pkh_locking_script_from_hash(&[0x33u8; 20]);
+        let in_crate = txbuild::compute_bip143_sighash(&txbuild::SighashParams {
+            version: 1,
+            inputs: &[(internal, 0, 0xffff_ffff)],
+            outputs: &[(50_000, out0.as_slice())],
+            locktime: 0,
+            input_index: 0,
+            subscript: &subscript,
+            input_satoshis: 100_000,
+            sighash_type: 0x41,
+        });
+        let got = ffi_bip143_sighash(FfiSighashRequest {
+            version: 1,
+            inputs: vec![FfiSighashInput {
+                prev_txid_hex: hex::encode(display),
+                vout: 0,
+                sequence: 0xffff_ffff,
+            }],
+            outputs: vec![FfiTxOutput {
+                satoshis: 50_000,
+                locking_script_hex: p2pkh_hex([0x33u8; 20]),
+            }],
+            locktime: 0,
+            input_index: 0,
+            subscript_hex: p2pkh_hex([0x22u8; 20]),
+            input_satoshis: 100_000,
+            sighash_type: 0x41,
+        })
+        .expect("ffi sighash");
+        assert_eq!(
+            got,
+            in_crate.to_vec(),
+            "FFI must reverse display txid to internal"
+        );
+    }
+
+    /// The FFI serialized rawTx MUST equal the in-crate `demo_serialized()` hex.
+    #[test]
+    fn ffi_serialize_matches_in_crate_golden() {
+        let unlocking = txbuild::build_p2pkh_unlocking_script(&[0x55u8; 72], &[0x02u8; 33]);
+        let req = FfiSignedTxRequest {
+            version: 1,
+            inputs: vec![FfiSignedInput {
+                prev_txid_hex: hex::encode([0x11u8; 32]),
+                vout: 0,
+                unlocking_script_hex: hex::encode(&unlocking),
+                sequence: 0xffff_ffff,
+            }],
+            outputs: vec![
+                FfiTxOutput {
+                    satoshis: 50_000,
+                    locking_script_hex: p2pkh_hex([0x33u8; 20]),
+                },
+                FfiTxOutput {
+                    satoshis: 49_000,
+                    locking_script_hex: p2pkh_hex([0x44u8; 20]),
+                },
+            ],
+            locktime: 0,
+        };
+        let got = ffi_serialize_signed_tx(req).expect("ffi serialize");
+        assert_eq!(
+            got,
+            hex::encode(txbuild::demo_serialized()),
+            "FFI rawTx != in-crate golden"
+        );
+    }
+
+    /// The FFI view-hash MUST equal `bsv_mpc_core::approval::request_view_hash` exactly
+    /// (digest AND canonical-CBOR preimage).
+    #[test]
+    fn ffi_view_hash_matches_core() {
+        use bsv_mpc_core::approval::{request_view_hash, Recipient};
+        let in_crate = request_view_hash(
+            12_345,
+            &Recipient::Single("1RecipientAddrXXXXXXXXXXXXXXXXXXXXX".into()),
+            "aa".repeat(32).as_str(),
+            "bb".repeat(16).as_str(),
+            "cc".repeat(32).as_str(),
+            "dd".repeat(32).as_str(),
+            "en-US",
+            "Send 12345 sats",
+        );
+        let got = ffi_request_view_hash(FfiViewHashRequest {
+            amount: 12_345,
+            recipient: FfiRecipient::Single {
+                address: "1RecipientAddrXXXXXXXXXXXXXXXXXXXXX".into(),
+            },
+            sighash_hex: "aa".repeat(32),
+            execution_id_hex: "bb".repeat(16),
+            policy_id_hex: "cc".repeat(32),
+            manifest_ack_hex: "dd".repeat(32),
+            human_locale: "en-US".into(),
+            rendered_text: "Send 12345 sats".into(),
+        })
+        .expect("ffi view hash");
+        assert_eq!(
+            got.hash,
+            in_crate.hash.to_vec(),
+            "view-hash digest mismatch"
+        );
+        assert_eq!(
+            got.preimage, in_crate.preimage,
+            "view-hash CBOR preimage mismatch"
+        );
+    }
+
+    /// Known mainnet address (Satoshi's genesis P2PKH) → its known P2PKH script.
+    #[test]
+    fn ffi_address_to_script_golden() {
+        // 1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa → hash160 62e907b15cbf27d5425399ebf6f0fb50ebb88f18
+        let script = ffi_address_to_locking_script_hex("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa".into())
+            .expect("address decode");
+        assert_eq!(
+            script, "76a91462e907b15cbf27d5425399ebf6f0fb50ebb88f1888ac",
+            "P2PKH script for the genesis address must match the known vector"
+        );
+    }
+
+    /// priv = 1 → the secp256k1 generator point G (a canonical golden vector).
+    #[test]
+    fn ffi_identity_pubkey_generator_vector() {
+        let mut priv_bytes = [0u8; 32];
+        priv_bytes[31] = 1;
+        let got = ffi_identity_pubkey_compressed_hex(hex::encode(priv_bytes)).expect("pubkey");
+        assert_eq!(
+            got, "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+            "priv=1 must yield the secp256k1 generator G"
+        );
+    }
+
+    /// BEEF round-trip: a spend tx whose input carries its source tx → `ffi_parse_beef_tx`
+    /// recovers version/locktime/outputs + the input's prev-output (value + script).
+    #[test]
+    fn ffi_parse_beef_round_trips_prevouts() {
+        use bsv::script::LockingScript;
+        use bsv::transaction::{Transaction, TransactionInput, TransactionOutput};
+
+        let prev_script_hex = p2pkh_hex([0x33u8; 20]);
+        let mut src = Transaction::new();
+        src.add_output(TransactionOutput {
+            satoshis: Some(100_000),
+            locking_script: LockingScript::from_hex(&prev_script_hex).unwrap(),
+            change: false,
+        })
+        .unwrap();
+        let src_txid = src.id();
+
+        let mut spend = Transaction::new();
+        spend.version = 1;
+        spend.lock_time = 0;
+        spend
+            .add_input(TransactionInput::with_source_transaction(src, 0))
+            .unwrap();
+        spend
+            .add_output(TransactionOutput {
+                satoshis: Some(99_000),
+                locking_script: LockingScript::from_hex(&p2pkh_hex([0x44u8; 20])).unwrap(),
+                change: false,
+            })
+            .unwrap();
+
+        let beef = spend.to_beef_v1(true).expect("to_beef_v1");
+        let parsed = ffi_parse_beef_tx(hex::encode(&beef)).expect("parse beef");
+
+        assert_eq!(parsed.version, 1);
+        assert_eq!(parsed.locktime, 0);
+        assert_eq!(parsed.outputs.len(), 1);
+        assert_eq!(parsed.outputs[0].satoshis, 99_000);
+        assert_eq!(
+            parsed.outputs[0].locking_script_hex,
+            p2pkh_hex([0x44u8; 20])
+        );
+        assert_eq!(parsed.inputs.len(), 1);
+        assert_eq!(parsed.inputs[0].vout, 0);
+        assert_eq!(
+            parsed.inputs[0].prev_satoshis, 100_000,
+            "prev-output value from BEEF"
+        );
+        assert_eq!(
+            parsed.inputs[0].prev_locking_script_hex, prev_script_hex,
+            "prev-output script"
+        );
+        assert_eq!(
+            parsed.inputs[0].prev_txid_hex, src_txid,
+            "prev txid (display order)"
+        );
+    }
+
+    // ── rejection paths (validate-don't-skip) ────────────────────────────────
+    #[test]
+    fn ffi_sighash_rejects_bad_txid_and_oob_index() {
+        let base_in = || FfiSighashInput {
+            prev_txid_hex: hex::encode([0x11u8; 32]),
+            vout: 0,
+            sequence: 0,
+        };
+        let out = || FfiTxOutput {
+            satoshis: 1,
+            locking_script_hex: p2pkh_hex([0x33u8; 20]),
+        };
+        // Bad txid hex.
+        let bad_hex = ffi_bip143_sighash(FfiSighashRequest {
+            version: 1,
+            inputs: vec![FfiSighashInput {
+                prev_txid_hex: "zz".into(),
+                vout: 0,
+                sequence: 0,
+            }],
+            outputs: vec![out()],
+            locktime: 0,
+            input_index: 0,
+            subscript_hex: "00".into(),
+            input_satoshis: 1,
+            sighash_type: 0x41,
+        });
+        assert!(
+            matches!(bad_hex, Err(FfiError::Client(m)) if m.contains("txid")),
+            "bad txid must reject"
+        );
+        // input_index out of range.
+        let oob = ffi_bip143_sighash(FfiSighashRequest {
+            version: 1,
+            inputs: vec![base_in()],
+            outputs: vec![out()],
+            locktime: 0,
+            input_index: 5,
+            subscript_hex: "00".into(),
+            input_satoshis: 1,
+            sighash_type: 0x41,
+        });
+        assert!(
+            matches!(oob, Err(FfiError::Client(m)) if m.contains("out of range")),
+            "oob index must reject"
+        );
+    }
+
+    #[test]
+    fn ffi_address_rejects_garbage_and_bad_checksum() {
+        // Non-base58 garbage.
+        assert!(ffi_address_to_locking_script_hex("not_a_valid_address".into()).is_err());
+        // The genesis address with its last char mutated (Na -> Nb) → checksum fails.
+        assert!(
+            ffi_address_to_locking_script_hex("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNb".into()).is_err(),
+            "a corrupted-checksum address must reject"
+        );
+        // Sanity: the UNcorrupted genesis address still decodes (guards against a
+        // false-positive where everything rejects).
+        assert!(
+            ffi_address_to_locking_script_hex("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa".into()).is_ok(),
+            "the valid genesis address must decode"
+        );
+    }
+
+    #[test]
+    fn ffi_identity_pubkey_rejects_wrong_length() {
+        let short = ffi_identity_pubkey_compressed_hex(hex::encode([0u8; 31]));
+        assert!(
+            matches!(short, Err(FfiError::Client(m)) if m.contains("32 bytes")),
+            "31-byte priv must reject"
+        );
     }
 }
