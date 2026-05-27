@@ -146,6 +146,62 @@ MessageBox relay** → WoC-confirmed TXID. No in-process stand-in. **Verify loca
 
 ---
 
+## 4.5 — 100cash integration seam: GOD-TIER ARCHITECTURE DECISIONS (locked 2026-05-27)
+
+> 100cash (the **Calhoun** iOS app, `~/bsv/mpc/100cash`) has **already switched off `rust-mpc` onto our
+> `bsv-mpc-client`** (its `HANDOFF.md`: "regenerated `MpcNative.xcframework` from `bsv-mpc-client`",
+> `MpcSigner` drives the real `FfiSigningSession`; keygen server-side). So `research/20`'s `mpc-native`
+> references now mean **`bsv-mpc-client`**. These two decisions are confirmed by **both** `100cash/research/20-real-backend-wiring.md`
+> AND 100cash's current code state.
+
+### THE PRINCIPLE (single source of truth)
+**Rust (`bsv-mpc-client`) owns ALL crypto + auth + protocol orchestration. Swift owns ONLY the Secure
+Enclave (the hardware biometric — the one thing Rust physically cannot do) + UI.** Every FFI seam is
+**high-level** (`sign(sighash)->sig`, `rpc(method,params)->json`), never low-level crypto/auth in Swift.
+No Swift secp256k1, no Swift BRC-31. This minimizes the Swift surface, prevents crypto duplication/divergence,
+and the shipped XCFramework already carries the pure-Rust `k256` stack on `aarch64-apple-ios`.
+
+### Decision 1 — the sign FFI shape (#41-4d + #63 converge here)
+`RealMpcCeremonyService.sign()` binds to a **high-level async `sign(sighash, protocol?, key_id?, reason) ->
+signature`** exported over UniFFI, which runs the **full deployed-cosigner ceremony INTERNALLY in Rust**
+(unseal via KeyStore → presigned §06.17.1 relay sign-from-bundle → combine), with the relay/HTTP **transport
+Rust-owned** (the #63 native `MessageBoxRoundTransport` / `MpcBridge` orchestration). This is `WalletClient::sign`
+with a *real* transport, exported async via UniFFI.
+- ❌ NOT the sans-io `FfiSigningSession` for this seam. That stays as the **lower-level primitive** (what
+  `MpcSigner` drives today, host-pumps round messages) — kept for hosts that want full control, but
+  `RealMpcCeremonyService` does NOT bind to it. (100cash HANDOFF §53: "full ceremony needs transport / §4 / #63".)
+- The host injects **only** the `KeyStore` (Secure Enclave seal/unseal) as a UniFFI callback interface.
+
+### Decision 2 — storage/chain ownership (research/20 option (a))
+**Rust does BRC-31/103/104, not Swift.** Port `WorkerStorageClient` (`rust-middleware/bsv-auth-cloudflare/
+src/client/storage.rs` — a complete, tested BRC-103/104 client: handshake + per-request BRC-104 signed
+General messages + JSON-RPC, on bsv-rs `k256`) into `bsv-mpc-client`, swapping its transport from
+`worker::Fetch` to portable HTTP (reqwest native / host-fetch wasm). Expose **`rpc(method, paramsJson) ->
+json`** over UniFFI. `RealWalletStorageService` (Swift) binds to `rpc()`.
+- ❌ Swift does NOT implement `ChainServices`/`WalletStorage` with secp256k1/BRC-31 — that would reimplement
+  the proven Rust client (the "Swift has no secp256k1" blocker is *already solved* by the Rust client).
+- The injected `ChainServices`/`WalletStorage`/`RoundTransport` traits in `bsv-mpc-client` remain the
+  **generic/web/test** seam (host-injected JS on wasm); the **native/100cash default = the Rust-shipped
+  clients** (a `native-io`-style feature). One trait surface, two backings.
+
+### Net FFI surface 100cash binds to (the contract)
+| Swift type | binds to (UniFFI) | runs where |
+|---|---|---|
+| `RealMpcCeremonyService.sign()` | `async sign(sighash,…) -> signature` (#41-4d/#63) | **Rust** (relay orchestration internal) |
+| `RealWalletStorageService` | `rpc(method, paramsJson) -> json` (research/20) | **Rust** (`WorkerStorageClient`, BRC-31) |
+| (Secure Enclave) | `KeyStore` callback interface `seal_share`/`unseal_share` | **Swift** (the ONLY native crypto-adjacent code) |
+| address/tx utils | `derive_address`, `ffi_tx_txid`, … (already shipped) | Rust |
+
+### Concrete work this implies (add to #41-4d / #63)
+1. **#63 / #41-4d:** finish the Rust-owned relay orchestration (this doc §4), then export a **high-level async
+   `sign()`** over UniFFI (relay transport constructed internally; KeyStore the only host callback). Keygen
+   stays server-side (ceremony svc); `MpcSigner.generateKey()` currently `notImplemented` is correct.
+2. **New (storage seam):** port `WorkerStorageClient` → `bsv-mpc-client` (portable HTTP) + `#[uniffi::export]
+   rpc(method, paramsJson) -> json`. Likely its own focused issue under #41/#37; references research/20.
+3. **DKG-over-FFI is intentionally NOT exposed** (keygen is server-side via the ceremony service).
+
+---
+
 ## 5. Deployed infra (confirmed live 2026-05-26) + access
 
 | Thing | URL / value |
