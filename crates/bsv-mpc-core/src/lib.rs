@@ -64,6 +64,7 @@ pub mod policy;
 pub mod presig_at_rest;
 pub mod presig_encryption;
 pub mod presigning;
+pub mod primes_at_rest;
 pub mod proof;
 pub mod recovery;
 pub mod recovery_health;

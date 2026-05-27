@@ -182,6 +182,20 @@ impl CosignerSessionDo {
         Ok(bsv_mpc_core::presig_encryption::wallet_from_identity(&key))
     }
 
+    /// Derive the at-rest KEK for the seeded-primes blob (#5) from
+    /// `SERVER_PRIVATE_KEY` + `session_id`. The seed-primes route is BRC-31-authed
+    /// whenever a key is set; in dev mode (no secret) the root falls back to zero —
+    /// dev primes are not real secrets, so there's nothing to protect there.
+    fn primes_kek(&self, session_id: &str) -> [u8; 32] {
+        let root = match self.env.secret("SERVER_PRIVATE_KEY") {
+            Ok(s) => PrivateKey::from_hex(&s.to_string())
+                .map(|k| k.to_bytes())
+                .unwrap_or([0u8; 32]),
+            Err(_) => [0u8; 32],
+        };
+        bsv_mpc_core::primes_at_rest::derive_primes_at_rest_key(&root, session_id)
+    }
+
     /// Build the DO-SQLite-backed KSS store (schema ensured) for the KSS
     /// handlers. The store's tables are co-located in this DO's SQLite, so a
     /// DKG-completed share persists durably (survives eviction).
@@ -609,11 +623,17 @@ impl CosignerSessionDo {
         }
 
         let store = self.kss_store()?;
-        let already_existed = store.get_primes(&body.session_id)?.is_some();
+        // #5: the blob is sealed AES-256-GCM at rest under a KEK the DO never holds
+        // persistently (derived per-call from SERVER_PRIVATE_KEY + session_id).
+        let kek = self.primes_kek(&body.session_id);
+        let already_existed = store.get_primes(&body.session_id, &kek)?.is_some();
         if !already_existed {
-            store.store_primes(&body.session_id, &body.primes_json)?;
+            store.store_primes(&body.session_id, &body.primes_json, &kek)?;
         }
-        let reloaded = store.get_primes(&body.session_id)?;
+        // `reloaded` is the UNSEALED plaintext — `reload_matches` proves the
+        // seal→store→fetch→unseal round-trip recovers the exact primes (the at-rest
+        // encryption is transparent to the consumer; the column holds only ciphertext).
+        let reloaded = store.get_primes(&body.session_id, &kek)?;
         let reload_matches = reloaded.as_deref() == Some(body.primes_json.as_str());
 
         Response::from_json(&serde_json::json!({
@@ -622,6 +642,7 @@ impl CosignerSessionDo {
             "already_existed": already_existed,
             "stored": reloaded.is_some(),
             "reload_matches": reload_matches,
+            "at_rest_sealed": true,
             "primes_len": body.primes_json.len(),
             "instance_constructed_at_ms": self.instance_constructed_at_ms,
         }))

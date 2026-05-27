@@ -480,20 +480,29 @@ impl<'a> DoSqlStorage<'a> {
     // call survive an eviction in between. (Validated by deserialization at
     // consumption time, in the I-4b.2 cosigner loop.)
 
-    /// Store (upsert) the serialized pregenerated primes for a DKG session.
-    pub fn store_primes(&self, session_id: &str, primes_json: &str) -> Result<()> {
+    /// Store (upsert) the pregenerated primes for a DKG session, **sealed at rest**
+    /// (issue #5): AES-256-GCM under `kek` (derived from `SERVER_PRIVATE_KEY` +
+    /// session_id), hex-encoded into the TEXT column. The DO never holds the KEK or
+    /// the plaintext primes. `primes_json` is the plaintext serialized
+    /// `PregeneratedPrimes`; the column stores only ciphertext.
+    pub fn store_primes(&self, session_id: &str, primes_json: &str, kek: &[u8; 32]) -> Result<()> {
+        let sealed = bsv_mpc_core::primes_at_rest::seal_primes_bytes(primes_json.as_bytes(), kek)
+            .map_err(|e| Error::RustError(format!("seal primes: {e}")))?;
+        let sealed_hex = hex::encode(&sealed);
         self.sql().exec(
             "INSERT INTO mpc_primes (session_id, primes_json, created_at) \
              VALUES (?, ?, ?) \
              ON CONFLICT(session_id) DO UPDATE SET \
                primes_json = excluded.primes_json, created_at = excluded.created_at",
-            vec![session_id.into(), primes_json.into(), Self::now_ms().into()],
+            vec![session_id.into(), sealed_hex.into(), Self::now_ms().into()],
         )?;
         Ok(())
     }
 
-    /// Read the serialized primes for a session, if seeded.
-    pub fn get_primes(&self, session_id: &str) -> Result<Option<String>> {
+    /// Read + unseal the primes for a session, if seeded. Inverse of
+    /// [`store_primes`](Self::store_primes); fails (AES-GCM tag) on the wrong `kek`
+    /// or a tampered blob. Returns the plaintext serialized `PregeneratedPrimes`.
+    pub fn get_primes(&self, session_id: &str, kek: &[u8; 32]) -> Result<Option<String>> {
         #[derive(Deserialize)]
         struct PrimesRow {
             primes_json: String,
@@ -505,7 +514,16 @@ impl<'a> DoSqlStorage<'a> {
                 vec![session_id.into()],
             )?
             .to_array()?;
-        Ok(rows.into_iter().next().map(|r| r.primes_json))
+        let Some(row) = rows.into_iter().next() else {
+            return Ok(None);
+        };
+        let sealed = hex::decode(&row.primes_json)
+            .map_err(|e| Error::RustError(format!("primes blob hex: {e}")))?;
+        let plaintext = bsv_mpc_core::primes_at_rest::unseal_primes_bytes(&sealed, kek)
+            .map_err(|e| Error::RustError(format!("unseal primes: {e}")))?;
+        let json = String::from_utf8(plaintext)
+            .map_err(|e| Error::RustError(format!("primes utf8: {e}")))?;
+        Ok(Some(json))
     }
 
     /// Delete the primes for a session (consume-once after the ceremony).
