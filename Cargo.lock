@@ -165,6 +165,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "async-compat"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a1ba85bc55464dcbf728b56d97e119d673f4cf9062be330a9a26f3acf504a590"
+dependencies = [
+ "futures-core",
+ "futures-io",
+ "once_cell",
+ "pin-project-lite",
+ "tokio",
+]
+
+[[package]]
 name = "async-trait"
 version = "0.1.89"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -398,6 +411,9 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "bsv-mpc-core",
+ "bsv-mpc-messagebox",
+ "bsv-mpc-relay",
+ "bsv-mpc-service",
  "bsv-rs",
  "cggmp24",
  "futures",
@@ -548,9 +564,11 @@ version = "0.1.0"
 dependencies = [
  "bsv-mpc-core",
  "bsv-mpc-messagebox",
+ "bsv-mpc-service",
  "bsv-rs",
  "hex",
  "reqwest",
+ "serde",
  "serde_json",
  "tokio",
  "tracing",
@@ -3759,6 +3777,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bc7687007d2546c454d8ae609b105daceb88175477dac280707ad6d95bcd6f1f"
 dependencies = [
  "anyhow",
+ "async-compat",
  "bytes",
  "log",
  "once_cell",

@@ -28,7 +28,10 @@ zeroize.workspace = true
 async-trait = "0.1"
 
 # UniFFI skin (native feature only). 0.28 proc-macro mode — no .udl file.
-uniffi = { version = "0.28", features = ["cli"], optional = true }
+# `tokio` enables the async-runtime adapter for `#[uniffi::export(async_runtime =
+# "tokio")]` on the high-level async `sign()` (#63) + the BRC-103/104 storage conn
+# (#64), whose transports need a real reactor; the native shells link a tokio rt.
+uniffi = { version = "0.28", features = ["cli", "tokio"], optional = true }
 
 serde.workspace = true
 serde_json.workspace = true
@@ -42,9 +45,30 @@ name = "uniffi-bindgen"
 path = "src/bin/uniffi-bindgen.rs"
 required-features = ["native"]
 
+# ─── Native-io: the deployed-cosigner sign ceremony (#63) ────────────────────
+# The native default backing of the injected seams (handoff §4.5 Decision 2):
+# the §06.17.1 presign-over-relay + sign-from-bundle ceremony against the deployed
+# cosigner, reusing the EXACT mainnet-proven shared crates. Native-only (gated
+# `cfg(not(target_arch="wasm32"))` in `src/native_io/`), so the wasm build never
+# pulls tokio/reqwest/tokio-tungstenite.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# #63 sign seam — the deployed-cosigner ceremony reuses the shared crates.
+bsv-mpc-messagebox = { path = "../bsv-mpc-messagebox" }
+bsv-mpc-relay = { path = "../bsv-mpc-relay" }
+bsv-mpc-service = { path = "../bsv-mpc-service" }
+# bsv-rs with `auth` (= wallet+messages+tokio) for the #64 BRC-103/104 storage
+# client; `wallet`/`transaction` for the #63 EC primitives + tx + pre-flight verify.
+bsv = { package = "bsv-rs", version = "0.3.13", features = ["auth", "wallet", "transaction"] }
+# Portable native HTTP — replaces worker::Fetch (#64) + drives the relay triggers
+# (#63). rustls-tls (no OpenSSL) for a clean iOS/Android cross-build.
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+rand = { workspace = true }
+
 [dev-dependencies]
-# Native-only test executor for the async trait round-trips (not in the wasm lib build).
-tokio = { version = "1", default-features = false, features = ["rt", "macros"] }
+# Test executor. `rt-multi-thread`/`time`/`net` are needed by the deployed-cosigner
+# E2E (the relay WebSocket + ceremony timers run on the ambient runtime); the
+# lighter async-trait round-trips use the same runtime.
+tokio = { version = "1", features = ["rt-multi-thread", "rt", "macros", "time", "net", "sync"] }
 # Used by the tests/ integration binaries (hex-encode goldens; serde for shares).
 hex.workspace = true
 serde_json.workspace = true

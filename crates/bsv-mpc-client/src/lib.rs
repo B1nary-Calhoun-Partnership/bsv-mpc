@@ -23,6 +23,12 @@ mod storage;
 mod transport;
 pub mod txbuild;
 
+/// Native-io: the native-default backings of the injected seams — the §06.17.1
+/// deployed-cosigner SIGN seam (#63) + the BRC-103/104 STORAGE seam (#64). Native
+/// only (`Send + Sync`, reqwest/tokio); never enters the wasm build.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod native_io;
+
 /// wasm-bindgen skin (web client). Only compiled on `wasm32`.
 #[cfg(target_arch = "wasm32")]
 pub mod wasm;
