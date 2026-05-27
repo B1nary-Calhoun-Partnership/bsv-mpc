@@ -30,6 +30,23 @@
 //! Identity is loaded from the `SERVER_PRIVATE_KEY` secret on EVERY call
 //! (never held in memory only) — the load-bearing piece that makes the
 //! cosigner identity stable across hibernation (poc17 lesson).
+//!
+//! ## `/poc/*` retirement plan (#5 de-POC)
+//!
+//! The `/poc/*` routes (`/poc/identity`, `/poc/persist`, `/poc/share-roundtrip`,
+//! `/poc/auth-session-roundtrip`, `/poc/dkg-bench`, …) + the legacy `shares` table
+//! are **intentionally retained** as deterministic, deployable proof endpoints
+//! (THREAT-MODEL §4.1 A7: they MUST NOT be a production path — they round-trip test
+//! blobs, never real `share_A`). The production path is the `mpc_*` tables + the
+//! authed `/dkg`, `/presign`, `/sign-relay`, `/custody/*`, `/ceremony/*` routes.
+//!
+//! **Retirement = post-GA**, gated on: (1) the deployed deterministic proofs are no
+//! longer referenced by any live gate or runbook, and (2) the production routes have
+//! a standalone deploy smoke-test that does not lean on `/poc/*`. At that point:
+//! delete the `/poc/*` handlers + their route arms (lib.rs), drop the legacy `shares`
+//! table from the schema, and rename the `cosigner-poc-2` instance. Until then they
+//! stay (deleting them now would remove the only deployed deterministic-proof
+//! surface). Tracked under #5.
 
 use bsv::primitives::ec::PrivateKey;
 use sha2::{Digest, Sha256};

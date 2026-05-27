@@ -304,6 +304,16 @@ Shares are never stored in plaintext. The encryption chain:
 
 The root_key itself must be protected. In the proxy, it comes from `MPC_ENCRYPTION_KEY` env var. In the KSS worker, the share is encrypted by the agent's root key -- the KSS never possesses the root key.
 
+#### 6.2.1 Share-Encryption-Key Compromise — Blast Radius (#5)
+
+What an attacker gains by compromising an at-rest encryption key, and why it is bounded:
+
+- **Two-factor precondition.** Decrypting a stored secret requires BOTH the derived key (or the `root_key` it derives from) AND the at-rest ciphertext. These live on **separate infrastructure** (§6.1): the ciphertext sits in the KSS/worker DO-SQLite; the `root_key` (`MPC_ENCRYPTION_KEY` / the worker's `SERVER_PRIVATE_KEY`) is a deployment secret on a different account. Compromising the storage backend alone yields only opaque ciphertext.
+- **Bounded impact — still 1-of-2.** Even with `root_key` + ciphertext, the attacker recovers `share_A` (the KSS half) **only**. Moving funds still requires the threshold quorum (the device's `share_B`), the per-spend biometric, and the §09 policy/approval gate. One exposed at-rest key ≠ fund loss.
+- **No cascade — per-domain, per-session key scope.** Every at-rest key is `HMAC-SHA256(root_key, DOMAIN ‖ id)` under a **distinct domain tag** that cannot collide: `"bsv-mpc-share"` (DKG shares, per `session_id`), `"bsv-mpc-presig-at-rest"` (presig bytes, per `presig_id`), `"bsv-mpc-primes-at-rest"` (seeded primes, per `session_id`, #5). A leaked derived key decrypts exactly its one blob; it does not unlock other shares, presigs, or primes.
+- **Rotation effectively zeroizes prior generations.** Key refresh (§6.3 / §06.18) reshares onto fresh material; because at-rest data is ciphertext under a key the storage backend never holds, rotating the key renders the prior generation's stored bytes undecryptable — a conformant best-effort erase even on a backend without secure-delete.
+- **Residual risk (disclosed).** Keys and unsealed secrets are software-resident, so an attacker with **live process-memory access** on the holding host can capture them within the in-use window. This is the disclosed in-memory exposure (the client's biometric-unseal window is per-op; `Zeroizing` wipes on drop — `docs/41-AUDIT-FINDINGS.md` F2 / Finding 4). Hardware key custody (HSM/enclave) is the GA mitigation; secp256k1 is not enclave-resident on current mobile (F2), so the wrap-key pattern + minimal exposure window is the Alpha/Beta posture.
+
 ### 6.3 Key Refresh Cadence
 
 Key refresh (threshold resharing, POC 13) rotates all shares while preserving the joint public key and BSV address. Recommended cadence:

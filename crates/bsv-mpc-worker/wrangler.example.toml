@@ -1,0 +1,36 @@
+name = "bsv-mpc-kss"
+main = "build/worker/shim.mjs"
+compatibility_date = "2025-05-01"
+account_id = "<your-cloudflare-account-id>"
+
+[build]
+# Self-heal worker-build to 0.8.3 (MUST match `worker = "0.8"`); some environments
+# intermittently downgrade the global worker-build to 0.7.5, which rejects worker
+# 0.8.3. Pinning the install makes every deploy idempotently ensure the right
+# version (a no-op when already 0.8.3).
+command = "cargo install -q worker-build --version 0.8.3 --locked || true; worker-build --release"
+
+# Existing stub DO (transactional-KV class).
+[[durable_objects.bindings]]
+name = "MPC_STORAGE"
+class_name = "MpcStorage"
+
+# Per-identity cosigner DO — uses DO SQLite (state.storage().sql()) for shares,
+# presig pool, auth sessions, KEK-sealed custody, and at-rest-sealed seed-primes.
+[[durable_objects.bindings]]
+name = "COSIGNER_DO"
+class_name = "CosignerSessionDo"
+
+[[migrations]]
+tag = "v1"
+new_classes = ["MpcStorage"]
+
+# SQLite-backed DO MUST use new_sqlite_classes (not new_classes).
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["CosignerSessionDo"]
+
+# Enforce BRC-31 owner-authz (§07.6/§08.1): set the server identity secret with
+#   wrangler secret put SERVER_PRIVATE_KEY
+# When unset, the worker runs in dev mode (auth disabled). Rate limiting (#5) +
+# owner-authz only engage once a server identity is configured.
