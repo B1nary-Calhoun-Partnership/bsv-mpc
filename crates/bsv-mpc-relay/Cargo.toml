@@ -1,0 +1,17 @@
+[package]
+name = "bsv-mpc-relay"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Presigned-1-round relay-sign combiner over MessageBox — shared by bsv-mpc-proxy + bsv-mpc-client (issue #63)."
+
+[dependencies]
+bsv-mpc-core = { path = "../bsv-mpc-core" }
+bsv-mpc-messagebox = { path = "../bsv-mpc-messagebox" }
+bsv.workspace = true
+reqwest.workspace = true
+serde_json.workspace = true
+hex.workspace = true
+tracing.workspace = true
+tokio = { workspace = true }

@@ -9,6 +9,7 @@ description = "BRC-100 compatible MPC signing proxy — drop-in replacement for 
 [dependencies]
 bsv-mpc-core = { path = "../bsv-mpc-core" }
 bsv-mpc-messagebox = { path = "../bsv-mpc-messagebox" }
+bsv-mpc-relay = { path = "../bsv-mpc-relay" }
 # §06.17.1 (#30, CONTAINER target): the proxy = coordinator reuses the
 # relay-proven `PresignHandler` (cosigner-collect + PresigBundle assembly) +
 # `FileBundleStore` from the native service crate, rather than reimplementing the

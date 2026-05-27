@@ -517,6 +517,7 @@ dependencies = [
  "base64 0.22.1",
  "bsv-mpc-core",
  "bsv-mpc-messagebox",
+ "bsv-mpc-relay",
  "bsv-mpc-service",
  "bsv-rs",
  "cggmp24",
@@ -539,6 +540,20 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "zeroize",
+]
+
+[[package]]
+name = "bsv-mpc-relay"
+version = "0.1.0"
+dependencies = [
+ "bsv-mpc-core",
+ "bsv-mpc-messagebox",
+ "bsv-rs",
+ "hex",
+ "reqwest",
+ "serde_json",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

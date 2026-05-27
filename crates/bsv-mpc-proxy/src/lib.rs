@@ -68,7 +68,10 @@ pub mod relay_approval;
 pub mod relay_presign;
 pub mod relay_refresh;
 pub mod relay_reshare;
-pub mod relay_sign;
+// `relay_sign` was factored into the shared `bsv-mpc-relay` crate (issue #63) so
+// the native client reuses the exact mainnet-proven combiner. Re-exported under
+// the old path so existing `crate::relay_sign::…` references resolve unchanged.
+pub use bsv_mpc_relay as relay_sign;
 pub mod server;
 pub mod storage;
 pub mod utxo_tracker;

@@ -1,3 +1,9 @@
+//! `bsv-mpc-relay` — the presigned-1-round relay-sign **combiner**, shared by
+//! the BRC-100 proxy and the native client. Drives a local `SigningCoordinator`
+//! (with a presignature) while HTTP-triggering the cosigner DO and folding its
+//! relayed partial in to combine. Factored out of `bsv-mpc-proxy::relay_sign` so
+//! `bsv-mpc-client` reuses the EXACT mainnet-proven combiner (issue #63).
+
 //! #12 (I-4c) — proxy-side **relay combiner**.
 //!
 //! ADR-018 splits the online sign: the deployed wasm DO holds `share_A` and
