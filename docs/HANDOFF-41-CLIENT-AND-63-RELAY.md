@@ -197,7 +197,7 @@ json`** over UniFFI. `RealWalletStorageService` (Swift) binds to `rpc()`.
    `sign()`** over UniFFI (relay transport constructed internally; KeyStore the only host callback). Keygen
    stays server-side (ceremony svc); `MpcSigner.generateKey()` currently `notImplemented` is correct.
 2. **New (storage seam):** port `WorkerStorageClient` → `bsv-mpc-client` (portable HTTP) + `#[uniffi::export]
-   rpc(method, paramsJson) -> json`. Likely its own focused issue under #41/#37; references research/20.
+   rpc(method, paramsJson) -> json`. **Tracked as #64** (filed); references research/20 + handoff §4.5.
 3. **DKG-over-FFI is intentionally NOT exposed** (keygen is server-side via the ceremony service).
 
 ---
