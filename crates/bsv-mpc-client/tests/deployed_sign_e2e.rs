@@ -8,14 +8,12 @@
 //! client seam + presig pool.
 //!
 //! Two gates:
-//!  - `CLIENT_DEPLOYED_SIGN=1` — **free** (no sats): real DKG + presig + sign over a
-//!    dummy sighash; asserts the combined signature verifies under the joint key.
-//!    This is the local-verify-equivalent (point the URLs at a local `bsv-mpc-service`
-//!    + relay, or the deployed infra — either way no chain spend) and the
-//!    protocol-asterisk killer.
-//!  - `CLIENT_DEPLOYED_SIGN_MAINNET=1` — **REAL SATS**: funds the joint P2PKH via
-//!    wallet:3321, signs a spend through `DeployedSigner::sign`, broadcasts via ARC →
-//!    WoC-confirmed TXID. Fail-closed pre-flight is INSIDE `sign()`.
+//!
+//! - `CLIENT_DEPLOYED_SIGN=1` — free (no sats): real DKG + presig + sign over a dummy
+//!   sighash; asserts the combined signature verifies under the joint key. The
+//!   local-verify-equivalent + protocol-asterisk killer.
+//! - `CLIENT_DEPLOYED_SIGN_MAINNET=1` — REAL SATS: funds the joint P2PKH via
+//!   wallet:3321, signs through `DeployedSigner::sign`, broadcasts via ARC → WoC TXID.
 //!
 //! ```bash
 //! # free ceremony verify (deployed infra, no sats):
@@ -31,7 +29,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bsv::primitives::ec::{PrivateKey, PublicKey, Signature};
-use bsv_mpc_client::native_io::ceremony::DeployedCosigner;
 use bsv_mpc_client::native_io::keystore::MemNativeKeyStore;
 use bsv_mpc_client::native_io::signer::{DeployedSigner, DeployedSignerConfig, WalletMeta};
 use bsv_mpc_core::types::{PolicyId, ThresholdConfig};
@@ -47,29 +44,36 @@ fn relay_url() -> String {
     std::env::var("MESSAGEBOX_RELAY_URL").unwrap_or_else(|_| DEFAULT_RELAY.to_string())
 }
 
-/// Provision a real 2-of-2 with the deployed cosigner + build a connected
-/// `DeployedSigner` with the device share sealed in the in-memory keystore.
+/// Provision a real 2-of-2 with the deployed cosigner via the **#65 provisioning
+/// seam** (`provision_wallet` → DKG + `seal_share`), then build a connected
+/// `DeployedSigner` from the returned wallet metadata. Exercises #65 + #63 together.
 async fn provision_and_connect() -> (DeployedSigner, PublicKey, Vec<u8>, String) {
     // Stable device identity (recorded as owner at DKG time, reused for presign+sign).
     let identity = PrivateKey::from_bytes(&[0x37u8; 32]).expect("identity key");
+    let keystore = Arc::new(MemNativeKeyStore::new());
 
-    eprintln!("(real distributed DKG against the deployed cosigner — minutes)");
+    eprintln!("(real distributed DKG via the #65 provisioning seam — minutes)");
     let config = ThresholdConfig::new(2, 2).expect("2-of-2");
-    let dkg = DeployedCosigner::provision_via_dkg(&container_url(), config, identity.clone())
-        .await
-        .expect("authed DKG against the deployed cosigner");
-    let joint = dkg.joint_key.clone();
-    let agent_id = hex::encode(&joint.compressed);
+    let w = bsv_mpc_client::native_io::provision_wallet(
+        &container_url(),
+        identity.clone(),
+        config,
+        keystore.as_ref(),
+    )
+    .await
+    .expect("provision_wallet (DKG + seal) against the deployed cosigner");
+
+    let joint = w.joint_key.clone();
     let mut joint_arr = [0u8; 33];
     joint_arr.copy_from_slice(&joint.compressed);
     let joint_pub = PublicKey::from_bytes(&joint_arr).expect("joint pubkey");
-    eprintln!("✔ DKG joint_pubkey={agent_id} address={}", joint.address);
+    eprintln!(
+        "✔ provisioned: agent_id={} address={} (share sealed via seal_share)",
+        w.agent_id, joint.address
+    );
 
-    // Seal the device's share (cggmp24 KeyShare JSON plaintext) in the keystore.
-    let keystore = Arc::new(MemNativeKeyStore::new());
-    keystore.put(&agent_id, dkg.share.ciphertext.clone());
-
-    let bundle_dir = std::env::temp_dir().join(format!("bsvmpc-client-bundles-{}", std::process::id()));
+    let bundle_dir =
+        std::env::temp_dir().join(format!("bsvmpc-client-bundles-{}", std::process::id()));
     let signer = DeployedSigner::connect(
         DeployedSignerConfig {
             relay_url: relay_url(),
@@ -79,22 +83,22 @@ async fn provision_and_connect() -> (DeployedSigner, PublicKey, Vec<u8>, String)
             bundle_dir,
             policy_id: PolicyId([0u8; 32]),
             meta: WalletMeta {
-                agent_id: agent_id.clone(),
+                agent_id: w.agent_id.clone(),
                 joint_key: joint.clone(),
-                config,
-                participants: vec![0, 1],
-                device_share_index: dkg.share.share_index.0,
-                cosigner_party: 0,
-                dkg_session_id: dkg.session_id,
+                config: w.config,
+                participants: w.participants,
+                device_share_index: w.device_share_index,
+                cosigner_party: w.cosigner_party,
+                dkg_session_id: w.dkg_session_id,
             },
         },
         keystore,
     )
     .await
     .expect("connect deployed signer");
-    eprintln!("✔ connected to deployed cosigner (share sealed, pool ready)");
+    eprintln!("✔ connected to deployed cosigner (pool ready)");
 
-    (signer, joint_pub, joint.compressed.clone(), agent_id)
+    (signer, joint_pub, joint.compressed.clone(), w.agent_id)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -117,7 +121,13 @@ async fn ceremony_verify_signs_vs_deployed_cosigner_no_sats() {
     // internally; we ALSO independently verify here under the joint key.
     let sighash = [0x9bu8; 32];
     let sig = signer
-        .sign(&sighash, "Approve test", None, Duration::from_secs(60), Duration::from_secs(180))
+        .sign(
+            &sighash,
+            "Approve test",
+            None,
+            Duration::from_secs(60),
+            Duration::from_secs(180),
+        )
         .await
         .expect("deployed-cosigner sign over the live relay");
     assert_eq!(signer.pool_len(), 0, "bundle must be consumed single-use");
@@ -132,12 +142,18 @@ async fn ceremony_verify_signs_vs_deployed_cosigner_no_sats() {
         joint_pub.verify(&sighash, &bsv_sig),
         "the deployed-cosigner combined signature MUST verify under the joint key"
     );
-    eprintln!("✔ deployed-cosigner ceremony verified under the joint key (no sats) — asterisk killed");
+    eprintln!(
+        "✔ deployed-cosigner ceremony verified under the joint key (no sats) — asterisk killed"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn real_mainnet_tx_signed_by_client_vs_deployed_cosigner() {
-    if std::env::var("CLIENT_DEPLOYED_SIGN_MAINNET").ok().as_deref() != Some("1") {
+    if std::env::var("CLIENT_DEPLOYED_SIGN_MAINNET")
+        .ok()
+        .as_deref()
+        != Some("1")
+    {
         eprintln!(
             "CLIENT_DEPLOYED_SIGN_MAINNET=1 not set — skipping the REAL-SATS mainnet gate.\n\
              To run (BURNS SATS, needs wallet:3321): CLIENT_DEPLOYED_SIGN_MAINNET=1 cargo test \\\n\
@@ -181,7 +197,10 @@ async fn real_mainnet_tx_signed_by_client_vs_deployed_cosigner() {
             .unwrap_or_default();
         let fund_json: serde_json::Value =
             serde_json::from_str(&fund_text).unwrap_or_else(|_| panic!("fund JSON: {fund_text}"));
-        let txid = fund_json["txid"].as_str().expect("createAction txid").to_string();
+        let txid = fund_json["txid"]
+            .as_str()
+            .expect("createAction txid")
+            .to_string();
         if let Some(beef_hex) = broadcast_hex_from_create_action(&fund_json) {
             if broadcast_via_arc(&http, &beef_hex).await {
                 eprintln!("✔ funded joint address: txid={txid} (attempt {attempt})");
@@ -192,7 +211,10 @@ async fn real_mainnet_tx_signed_by_client_vs_deployed_cosigner() {
         eprintln!("  funding attempt {attempt} ({txid}) did NOT broadcast; retrying");
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
-    assert!(!fund_txid.is_empty(), "could not broadcast a funding tx after 8 attempts");
+    assert!(
+        !fund_txid.is_empty(),
+        "could not broadcast a funding tx after 8 attempts"
+    );
 
     // Find the UTXO on WoC; build the BIP-143 sighash (drain to a wallet:3321 addr).
     let locking_hex = hex::encode(&joint_locking);
@@ -222,12 +244,14 @@ async fn real_mainnet_tx_signed_by_client_vs_deployed_cosigner() {
         .expect("publicKey")
         .to_string();
     let change_script = bsv_mpc_client::txbuild::p2pkh_locking_script_from_hash(
-        &PublicKey::from_hex(&wallet_pub_hex).expect("wallet pub").hash160(),
+        &PublicKey::from_hex(&wallet_pub_hex)
+            .expect("wallet pub")
+            .hash160(),
     );
 
     let sighash_type: u32 = 0x41; // SIGHASH_ALL | FORKID
-    let sighash = bsv_mpc_client::txbuild::compute_bip143_sighash(
-        &bsv_mpc_client::txbuild::SighashParams {
+    let sighash =
+        bsv_mpc_client::txbuild::compute_bip143_sighash(&bsv_mpc_client::txbuild::SighashParams {
             version: 1,
             inputs: &[(prev_txid, vout, 0xFFFFFFFF)],
             outputs: &[(change, change_script.as_slice())],
@@ -236,23 +260,32 @@ async fn real_mainnet_tx_signed_by_client_vs_deployed_cosigner() {
             subscript: &joint_locking,
             input_satoshis: value,
             sighash_type,
-        },
-    );
+        });
     eprintln!("✔ sighash: {}", hex::encode(sighash));
 
     // THE GATE: sign via the deployed cosigner over the live relay (pre-flight inside).
     let sig = signer
-        .sign(&sighash, "Approve mainnet spend", None, Duration::from_secs(60), Duration::from_secs(180))
+        .sign(
+            &sighash,
+            "Approve mainnet spend",
+            None,
+            Duration::from_secs(60),
+            Duration::from_secs(180),
+        )
         .await
         .expect("deployed-cosigner sign over the live relay");
-    eprintln!("✔ co-signed via deployed cosigner: DER {} bytes", sig.signature.len());
+    eprintln!(
+        "✔ co-signed via deployed cosigner: DER {} bytes",
+        sig.signature.len()
+    );
 
     // Assemble (DER + 0x41 sig, 33-byte joint pubkey unlocking) + broadcast.
     let mut sig_checksig = sig.signature.clone();
     sig_checksig.push(sighash_type as u8);
     let mut joint_arr = [0u8; 33];
     joint_arr.copy_from_slice(&joint_compressed);
-    let unlocking = bsv_mpc_client::txbuild::build_p2pkh_unlocking_script(&sig_checksig, &joint_arr);
+    let unlocking =
+        bsv_mpc_client::txbuild::build_p2pkh_unlocking_script(&sig_checksig, &joint_arr);
     let raw_tx = bsv_mpc_client::txbuild::serialize_signed_tx(
         1,
         &[(prev_txid, vout, unlocking, 0xFFFFFFFF)],
@@ -264,7 +297,10 @@ async fn real_mainnet_tx_signed_by_client_vs_deployed_cosigner() {
     eprintln!("✔ assembled tx {} bytes — TXID={txid_hex}", raw_tx.len());
 
     let ok = broadcast_via_arc(&http, &raw_tx_hex).await;
-    assert!(ok, "ARC broadcast MUST succeed — TXID={txid_hex} rawTx={raw_tx_hex}");
+    assert!(
+        ok,
+        "ARC broadcast MUST succeed — TXID={txid_hex} rawTx={raw_tx_hex}"
+    );
 
     eprintln!();
     eprintln!("╔══════════════════════════════════════════════════════════════╗");
@@ -308,7 +344,10 @@ async fn broadcast_via_arc(http: &reqwest::Client, raw_tx_hex: &str) -> bool {
         let Ok(resp) = req.send().await else { continue };
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        eprintln!("  broadcast {url}: status={status} body={}", text.chars().take(300).collect::<String>());
+        eprintln!(
+            "  broadcast {url}: status={status} body={}",
+            text.chars().take(300).collect::<String>()
+        );
         if status.is_success()
             || text.contains("SEEN_ON_NETWORK")
             || text.contains("STORED")
@@ -329,12 +368,18 @@ async fn find_utxo_on_woc(
     for attempt in 1..=20 {
         eprintln!("  WoC attempt {attempt}: waiting 15s for indexing...");
         tokio::time::sleep(Duration::from_secs(15)).await;
-        let Ok(resp) = http.get(&url).send().await else { continue };
+        let Ok(resp) = http.get(&url).send().await else {
+            continue;
+        };
         if !resp.status().is_success() {
             continue;
         }
-        let Ok(json) = resp.json::<serde_json::Value>().await else { continue };
-        let Some(vouts) = json["vout"].as_array() else { continue };
+        let Ok(json) = resp.json::<serde_json::Value>().await else {
+            continue;
+        };
+        let Some(vouts) = json["vout"].as_array() else {
+            continue;
+        };
         for vout in vouts {
             if vout["scriptPubKey"]["hex"].as_str().unwrap_or("") == expected_locking_hex {
                 let n = vout["n"].as_u64().unwrap_or(0) as u32;

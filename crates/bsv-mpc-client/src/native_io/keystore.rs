@@ -19,6 +19,12 @@ use crate::error::ClientError;
 /// runtime and the UniFFI callback interface is thread-safe.
 #[async_trait]
 pub trait NativeKeyStore: Send + Sync {
+    /// Device-seal the freshly-provisioned cggmp24 key-share JSON for `agent_id`
+    /// (the Secure Enclave wrap, write side). Called once at provisioning
+    /// ([`create_wallet`](super::provision::provision_wallet)); the plaintext is
+    /// consumed (not retained) here.
+    async fn seal_share(&self, agent_id: &str, share_plaintext: &[u8]) -> Result<(), ClientError>;
+
     /// Unseal the device-sealed cggmp24 key-share JSON for `agent_id`, presenting
     /// `reason` to the user as the biometric prompt. The plaintext is returned as
     /// `Zeroizing` (wiped on drop); every fund-bearing sign re-prompts (the locked
@@ -56,6 +62,20 @@ impl MemNativeKeyStore {
 
 #[async_trait]
 impl NativeKeyStore for MemNativeKeyStore {
+    async fn seal_share(&self, agent_id: &str, share_plaintext: &[u8]) -> Result<(), ClientError> {
+        self.shares
+            .lock()
+            .map_err(|_| ClientError::Host {
+                seam: "keystore",
+                reason: "mem keystore mutex poisoned".into(),
+            })?
+            .insert(
+                agent_id.to_string(),
+                Zeroizing::new(share_plaintext.to_vec()),
+            );
+        Ok(())
+    }
+
     async fn unseal_share(
         &self,
         agent_id: &str,
@@ -83,7 +103,10 @@ mod tests {
     #[tokio::test]
     async fn unseal_round_trips_and_missing_share_rejects_for_the_right_reason() {
         let ks = MemNativeKeyStore::new();
-        ks.put("agent-1", b"cggmp24-keyshare-json".to_vec());
+        // Exercise the real trait seal/unseal seam (the #65 provisioning write side).
+        ks.seal_share("agent-1", b"cggmp24-keyshare-json")
+            .await
+            .unwrap();
         let got = ks.unseal_share("agent-1", "Approve spend").await.unwrap();
         assert_eq!(&got[..], b"cggmp24-keyshare-json");
 

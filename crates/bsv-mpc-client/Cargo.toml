@@ -65,10 +65,10 @@ reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-feature
 rand = { workspace = true }
 
 [dev-dependencies]
-# Test executor. `rt-multi-thread`/`time`/`net` are needed by the deployed-cosigner
-# E2E (the relay WebSocket + ceremony timers run on the ambient runtime); the
-# lighter async-trait round-trips use the same runtime.
-tokio = { version = "1", features = ["rt-multi-thread", "rt", "macros", "time", "net", "sync"] }
+# wasm-SAFE base executor (the wasm32 test build sees only this — `net`/`mio` would
+# fail to compile to wasm32). The heavy features the deployed-cosigner E2E needs
+# (rt-multi-thread/time/net) are added in the native-only dev-deps below.
+tokio = { version = "1", default-features = false, features = ["rt", "macros"] }
 # Used by the tests/ integration binaries (hex-encode goldens; serde for shares).
 hex.workspace = true
 serde_json.workspace = true
@@ -78,6 +78,10 @@ serde_json.workspace = true
 # Gated to native in-source (`cfg(not(target_arch="wasm32"))`), so they never
 # enter the wasm build.
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+# Heavy native runtime for the deployed-cosigner E2E (relay WebSocket + ceremony
+# timers run on the ambient runtime). Unioned with the wasm-safe base tokio above;
+# kept out of the wasm32 build so `mio`/`net` never have to compile to wasm.
+tokio = { version = "1", features = ["rt-multi-thread", "time", "net", "sync"] }
 # `spof` enables cggmp24::trusted_dealer (mirrors bsv-mpc-core's dev-dep).
 cggmp24 = { git = "https://github.com/LFDT-Lockness/cggmp21", features = ["curve-secp256k1", "hd-wallet", "hd-slip10", "spof"] }
 generic-ec.workspace = true

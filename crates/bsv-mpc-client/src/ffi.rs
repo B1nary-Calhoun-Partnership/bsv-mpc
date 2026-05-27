@@ -181,6 +181,10 @@ impl FfiSigningSession {
 #[uniffi::export(with_foreign)]
 #[async_trait::async_trait]
 pub trait FfiKeyStore: Send + Sync {
+    /// Device-seal the freshly-provisioned share JSON for `agent_id` (write side —
+    /// called once at `create_wallet`). The host wraps it in the Secure Enclave.
+    async fn seal_share(&self, agent_id: String, share: Vec<u8>) -> Result<(), FfiError>;
+
     /// Unseal the device-sealed share JSON for `agent_id`, showing `reason` as the
     /// biometric prompt. Returns the plaintext cggmp24 KeyShare JSON bytes.
     async fn unseal_share(&self, agent_id: String, reason: String) -> Result<Vec<u8>, FfiError>;
@@ -193,6 +197,20 @@ struct FfiKeyStoreAdapter(std::sync::Arc<dyn FfiKeyStore>);
 #[cfg(not(target_arch = "wasm32"))]
 #[async_trait::async_trait]
 impl crate::native_io::keystore::NativeKeyStore for FfiKeyStoreAdapter {
+    async fn seal_share(
+        &self,
+        agent_id: &str,
+        share_plaintext: &[u8],
+    ) -> Result<(), crate::error::ClientError> {
+        self.0
+            .seal_share(agent_id.to_string(), share_plaintext.to_vec())
+            .await
+            .map_err(|e| crate::error::ClientError::Host {
+                seam: "keystore",
+                reason: e.to_string(),
+            })
+    }
+
     async fn unseal_share(
         &self,
         agent_id: &str,
@@ -386,6 +404,72 @@ impl FfiDeployedSigner {
             s: res.s,
         })
     }
+}
+
+// ── Provisioning seam over UniFFI (issue #65) ────────────────────────────────
+//
+// The create side, completing the FFI trio (#63 sign, #64 storage, this =
+// provision). Runs the real distributed DKG vs the deployed cosigner INTERNALLY,
+// device-seals share_B via the host's `FfiKeyStore.seal_share`, and returns the
+// fully-populated `FfiSignerConfig` the host persists + feeds straight to
+// `FfiDeployedSigner::connect`. Keygen-over-FFI is exposed ONLY here (not raw rounds).
+
+/// Provision a new 2-party wallet with the deployed cosigner. The host injects the
+/// Secure Enclave (`FfiKeyStore`); on return the freshly-DKG'd share is sealed and
+/// the returned `FfiSignerConfig` is ready for `FfiDeployedSigner::connect`.
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(clippy::too_many_arguments)]
+#[uniffi::export(async_runtime = "tokio")]
+pub async fn create_wallet(
+    relay_url: String,
+    container_url: String,
+    identity_key_hex: String,
+    at_rest_root_hex: String,
+    bundle_dir: String,
+    policy_id_hex: String,
+    threshold: u16,
+    parties: u16,
+    keystore: std::sync::Arc<dyn FfiKeyStore>,
+) -> Result<FfiSignerConfig, FfiError> {
+    use bsv::primitives::ec::PrivateKey;
+    use bsv_mpc_core::types::ThresholdConfig;
+
+    let identity = {
+        let bytes = hex32(&identity_key_hex, "identity_key")?;
+        PrivateKey::from_bytes(&bytes)
+            .map_err(|e| FfiError::Client(format!("identity key: {e}")))?
+    };
+    let config =
+        ThresholdConfig::new(threshold, parties).map_err(|e| FfiError::Client(e.to_string()))?;
+    let ks: std::sync::Arc<dyn crate::native_io::keystore::NativeKeyStore> =
+        std::sync::Arc::new(FfiKeyStoreAdapter(keystore));
+
+    let w = crate::native_io::provision::provision_wallet(
+        &container_url,
+        identity,
+        config,
+        ks.as_ref(),
+    )
+    .await
+    .map_err(|e| FfiError::Client(e.to_string()))?;
+
+    Ok(FfiSignerConfig {
+        relay_url,
+        container_url,
+        identity_key_hex,
+        at_rest_root_hex,
+        bundle_dir,
+        policy_id_hex,
+        agent_id: w.agent_id,
+        joint_pubkey_hex: hex::encode(&w.joint_key.compressed),
+        joint_address: w.joint_key.address,
+        threshold,
+        parties,
+        participants: w.participants,
+        device_share_index: w.device_share_index,
+        cosigner_party: w.cosigner_party,
+        dkg_session_id_hex: w.dkg_session_id.hex(),
+    })
 }
 
 // ── High-level BRC-103/104 storage seam over UniFFI (issue #64) ───────────────
