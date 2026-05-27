@@ -13,6 +13,7 @@ mod index;
 pub mod messagebox;
 pub mod presign_handler;
 pub mod provision;
+pub mod rate_limit;
 pub mod refresh_handler;
 pub mod refresh_relay_handlers;
 pub mod relay_handlers;

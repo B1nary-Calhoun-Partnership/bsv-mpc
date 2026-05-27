@@ -101,6 +101,9 @@ pub struct AuthState {
     /// Live sessions keyed by `server_nonce` (the handshake-issued nonce the
     /// client echoes back as `x-bsv-auth-your-nonce`).
     sessions: Mutex<HashMap<String, AuthSession>>,
+    /// Per-identity token-bucket DoS guard (#5). Enforced in
+    /// [`verify_or_allow`] keyed by the verified BRC-31 identity.
+    rate_limiter: crate::rate_limit::RateLimiter,
 }
 
 impl AuthState {
@@ -133,6 +136,7 @@ impl AuthState {
             wallet: None,
             session_ttl_ms: DEFAULT_SESSION_TTL_MS,
             sessions: Mutex::new(HashMap::new()),
+            rate_limiter: crate::rate_limit::RateLimiter::from_env(),
         }
     }
 
@@ -142,6 +146,7 @@ impl AuthState {
             wallet: Some(ProtoWallet::new(Some(server_key))),
             session_ttl_ms: DEFAULT_SESSION_TTL_MS,
             sessions: Mutex::new(HashMap::new()),
+            rate_limiter: crate::rate_limit::RateLimiter::from_env(),
         }
     }
 
@@ -284,7 +289,21 @@ pub fn verify_or_allow(
             "Not authenticated: missing BRC-104 auth headers (§07.6)",
         ));
     }
-    verify_request(method, path, headers, body, auth)
+    let caller = verify_request(method, path, headers, body, auth)?;
+    // #5 DoS guard: per-identity token bucket, keyed by the VERIFIED identity so a
+    // spoofed/rotated header can't escape the bucket. Checked after verification +
+    // before the (expensive) handler runs.
+    if auth.rate_limiter.is_enabled() {
+        if let Some(id) = caller.as_opt() {
+            if !auth.rate_limiter.check(id) {
+                return Err(reject(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "rate limit exceeded (§5 DoS guard) — slow down",
+                ));
+            }
+        }
+    }
+    Ok(caller)
 }
 
 /// Verify the canonical BRC-31 signature on an incoming request via
