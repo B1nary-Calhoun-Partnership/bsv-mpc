@@ -30,6 +30,25 @@ use bsv_mpc_core::types::{
 use bsv_mpc_messagebox::types::BOX_SIGN;
 use bsv_mpc_messagebox::MessageBoxClient;
 
+/// Bounded timeout for relay HTTP **triggers** (cosigner/peer identity fetch, arm,
+/// sign-relay trigger). These are quick request/response calls — the heavy MPC work
+/// runs asynchronously over the relay and is bounded separately by each ceremony's
+/// receive timeout. A trigger must NEVER hang forever on a stalled cosigner/relay:
+/// `reqwest::Client::new()` has NO default timeout, which is the #40-class
+/// no-timeout-transport bug (a deployed ceremony observed sitting at 0% CPU for 68
+/// minutes with no timeout firing). Every relay HTTP client is built through
+/// [`bounded_http_client`] so no call can hang indefinitely.
+pub(crate) const RELAY_HTTP_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Build a `reqwest::Client` whose requests are bounded by `timeout` — fail-closed,
+/// never an unbounded hang.
+pub(crate) fn bounded_http_client(timeout: Duration) -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(timeout)
+        .build()
+        .map_err(|e| MpcError::Protocol(format!("build relay http client: {e}")))
+}
+
 // ─── Shared deployed-cosigner orchestration (issue #63, path a-extended) ─────
 //
 // These were factored out of `bsv-mpc-proxy` so the BRC-100 proxy AND the native
@@ -247,7 +266,7 @@ pub async fn combine_sign_over_relay_nparty(
     //    Production: presig is consumed from the DO pool (no `presignature_hex`
     //    in the body), `agent_id` carries the share key for owner-authz, and
     //    BRC-31 auth headers gate the route. POC: presig in body, no auth.
-    let http = reqwest::Client::new();
+    let http = bounded_http_client(RELAY_HTTP_TIMEOUT)?;
     let mut trigger_body = serde_json::json!({
         "sighash_hex": hex::encode(sighash),
         "recipient_pub_hex": combiner_pub,
@@ -430,7 +449,7 @@ pub async fn combine_sign_from_bundle_over_relay(
 
     // 3. Trigger the container's /sign-relay shipping the cosigner's own
     //    ciphertext (the §06.17.1 path).
-    let http = reqwest::Client::new();
+    let http = bounded_http_client(RELAY_HTTP_TIMEOUT)?;
     let mut trigger_body = serde_json::json!({
         "sighash_hex": hex::encode(sighash),
         "recipient_pub_hex": combiner_pub,
@@ -514,5 +533,60 @@ pub async fn combine_sign_from_bundle_over_relay(
         SigningRoundResult::NextRound(_) => Err(MpcError::Signing(
             "combiner did not complete after the cosigner's partial".into(),
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{bounded_http_client, RELAY_HTTP_TIMEOUT};
+    use std::time::{Duration, Instant};
+
+    /// **Regression guard for the #40-class no-timeout hang.** A relay HTTP trigger
+    /// to a cosigner/relay that ACCEPTS the connection then never responds (the exact
+    /// scenario that sat at 0% CPU for 68 minutes) MUST fail-closed at ~the bound, not
+    /// hang. Uses a real local TCP server that accepts + holds the socket open
+    /// forever, so the bound is the only thing that can end the request.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bounded_http_client_fails_fast_against_a_stalled_server() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stall server");
+        let addr = listener.local_addr().expect("local addr");
+        // Accept connections and HOLD them — never send a byte of response.
+        let _server = tokio::spawn(async move {
+            let mut held = Vec::new();
+            // Accept + HOLD each socket (never respond) until the listener errors.
+            while let Ok((sock, _)) = listener.accept().await {
+                held.push(sock);
+            }
+        });
+
+        let client = bounded_http_client(Duration::from_secs(2)).expect("build bounded client");
+        let started = Instant::now();
+        let res = client.get(format!("http://{addr}/")).send().await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            res.is_err(),
+            "a stalled server must produce an error, not a response"
+        );
+        assert!(
+            elapsed >= Duration::from_secs(1) && elapsed < Duration::from_secs(8),
+            "bounded client must fail-closed at ~the 2s timeout (took {elapsed:?}) — \
+             an unbounded reqwest::Client::new() would hang here indefinitely"
+        );
+    }
+
+    /// The shipped default trigger timeout is bounded + sane (not the unbounded
+    /// `reqwest::Client::new()` default of none).
+    #[test]
+    fn relay_http_timeout_is_bounded_and_sane() {
+        assert!(
+            RELAY_HTTP_TIMEOUT >= Duration::from_secs(10)
+                && RELAY_HTTP_TIMEOUT <= Duration::from_secs(120),
+            "relay trigger timeout must be a sane finite bound"
+        );
+        // The client builds (the timeout is accepted by reqwest).
+        assert!(bounded_http_client(RELAY_HTTP_TIMEOUT).is_ok());
     }
 }

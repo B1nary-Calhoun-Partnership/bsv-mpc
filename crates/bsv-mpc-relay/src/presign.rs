@@ -222,7 +222,7 @@ async fn fetch_cosigner_identity(arm: &CosignerArm) -> Result<String> {
     let url = arm
         .url
         .replace("/presign-relay/init", "/presign-relay/identity");
-    let resp = reqwest::Client::new()
+    let resp = crate::bounded_http_client(crate::RELAY_HTTP_TIMEOUT)?
         .get(&url)
         .send()
         .await
@@ -269,7 +269,7 @@ async fn arm_cosigner(
         .map(|u| u.path().to_string())
         .unwrap_or_else(|_| "/presign-relay/init".to_string());
 
-    let http = reqwest::Client::new();
+    let http = crate::bounded_http_client(crate::RELAY_HTTP_TIMEOUT)?;
     let mut builder = http
         .post(&arm.url)
         .header("content-type", "application/json")

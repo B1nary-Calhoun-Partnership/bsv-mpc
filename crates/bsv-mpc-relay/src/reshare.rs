@@ -100,7 +100,7 @@ pub async fn fetch_peer_identity(init_url: &str) -> Result<String> {
         peer_pub_hex: String,
     }
     let url = init_url.replace("/reshare-relay/init", "/reshare-relay/identity");
-    let resp = reqwest::Client::new()
+    let resp = crate::bounded_http_client(crate::RELAY_HTTP_TIMEOUT)?
         .get(&url)
         .send()
         .await
