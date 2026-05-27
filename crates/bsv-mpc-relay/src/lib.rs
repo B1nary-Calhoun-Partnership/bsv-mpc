@@ -38,10 +38,15 @@ use bsv_mpc_messagebox::MessageBoxClient;
 // relay coordinator (the sign-from-bundle combiner already lived here).
 pub mod dkg;
 pub mod presign;
+pub mod reshare;
 pub mod session;
 
 pub use dkg::{run_dkg_over_http, run_dkg_over_http_authed};
 pub use presign::{coordinate_presign_over_relay, CosignerArm};
+pub use reshare::{
+    coordinate_reshare_over_relay, parse_old_share_topology, OldShareTopology, ReshareOutput,
+    ReshareOverRelay,
+};
 pub use session::RelaySession;
 // `RequestSigner` (presign trigger signer) is the SAME shape as
 // [`RelayRequestSigner`] (sign trigger signer); re-export both names so existing

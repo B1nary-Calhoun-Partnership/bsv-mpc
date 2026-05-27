@@ -20,3 +20,8 @@ serde_json.workspace = true
 hex.workspace = true
 tracing.workspace = true
 tokio = { workspace = true }
+# §18.2 reshare-over-relay coordinator (#66): extract the old secret scalar + VSS
+# eval points from a serialized cggmp24 KeyShare + drive the throwaway DKG primes.
+cggmp24 = { workspace = true }
+generic-ec = { workspace = true }
+rand = { workspace = true }
