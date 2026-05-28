@@ -13,6 +13,20 @@
 
 ---
 
+## 🎯 Overarching goal (shared — Person A ⟷ Person B)
+
+**Ship 4-of-6 PRODUCTION god-tier self-custody on 100cash.** The real topology — t=4, n=6: device-held shares + two independent Notary cosigners — NOT the 2-of-2 we used to prove the send chain. Getting 4-of-6 right on iOS also sets up **web** (same Rust core → wasm) and **multi-device** (mirrored shares + coordinated presig checkout, bsv-mpc#56). It is *plumbing over the audited `bsv-mpc-core`* — **no new MPC protocol** — and everything **must conform to mpc-spec** (the §-numbered protocol spec + ADRs in bsv-mpc). Standing up a **2nd cosigner/Notary** (bsv-mpc#70) is acceptable for now so the two mandatory sides are genuinely independent.
+
+**Where we are (2026-05-28):** the genuine 100cash Swift send chain is PROVEN on mainnet end-to-end vs the deployed cosigner + relay + ARC — but at **2-of-2**, because client-side 4-of-6 multi-share isn't wired. The send-path FFIs are threshold-agnostic, so the *only* thing between us and 4-of-6 production is that one piece.
+
+**The two lanes (this is the split):**
+- **Person A → `bsv-mpc`:** the critical path is **#69** — client-side multi-share (device holds t−1 shares, `my_indices: Vec<ShareIndex>`) over the client crate, mpc-spec-conformant; paired with **#70** (deploy the 2nd cosigner so 4-of-6 = two independent Notaries). This is THE unlock.
+- **Person B → `100cash`:** the moment #69 lands, flip `NativeBackendConfig` (already defaults threshold 4 / parties 6) from the 2-of-2 drive to real 4-of-6 and re-prove the mainnet drive → the **capstone #31** (physical device, no mocks, real mainnet send, at 4-of-6; #30 = no-mocks CI guard). In parallel: the remaining hardening + real Google sign-in (#23 — the Account Service `/auth/verify` path is now live & proven).
+
+**Shipped today (both lanes depend on this):** send-path cluster CLOSED via mainnet TXIDs `5e527f27…51abee` + `d3515c50…c395cb` (100cash#13/#14/#15 + bsv-mpc#75); native-tls MessageBox-WS fix on Apple (bsv-mpc `1da783c`); Account Service `/auth/verify` live & proven, 100cash#9 closed. CF deploy creds for the dev-a3e workers (account `ea3e6d…`, dev@calhounjohn.com) are in gitignored `100cash/secrets.md`.
+
+---
+
 ## 🟢 Resume state — 2026-05-28 PM (READ THIS FIRST, then the checklist below)
 
 ### 🎉 The send-path cluster is DONE and CLOSED (other window, 2026-05-28 PM)
@@ -50,25 +64,62 @@ item touches messagebox or anything WebSocket-related, read this first:
   `bsv-mpc-client/src/ffi.rs` — which is part of #69's file surface — so re-diff that
   file before you start #69.
 
-### 🔴 NEXT BIG ITEM — bsv-mpc#69 (4-of-6 client multi-share) — UNBLOCKS APP PARITY
+### 🔴 NEXT BIG ITEM — bsv-mpc#69 (4-of-6 client multi-share) — THE CRITICAL PATH TO THE OVERARCHING GOAL
 
-This is now the highest-value open item in Person A's lane. **Still OPEN, still
-Person A's.** Why it's hot:
+**#69 is THE critical path** — it is the *only* thing between us and the shared goal
+(4-of-6 production self-custody on 100cash; see the goal block at top). Paired with
+**#70** (deploy the 2nd cosigner so 4-of-6 = two **independent** Notaries, per
+**mpc-spec §13 federation** + **direction.md §1** "two mandatory sides"). **Still OPEN,
+still Person A's.** Why it's the unlock:
 
 - The 100cash app config is **4-of-6**, but provisioning 4-of-6 over the deployed
   cosigner currently **FAILS** ("no outgoing messages to bundle") because the client
   multi-share path (device holds **t−1 shares**, `my_indices: Vec<ShareIndex>`) is not
-  wired in `bsv-mpc-client`.
+  wired in `bsv-mpc-client`. The client FFI today (`FfiSigningSession::new`,
+  `ffi.rs:473`) takes a **single** `share_index: u16` — that's literally why it's
+  2-of-2-only. #69 makes the device hold a *set* of indices.
 - Because of that, the mainnet send drive above had to **fall back to 2-of-2**
   (deployed-proven). So the two mainnet TXIDs prove the send-path/render/sign machinery
   end-to-end, but NOT the app's real 4-of-6 topology.
-- **#69 is what unblocks true app-parity (4-of-6) signing.** Until it lands, 100cash
-  cannot provision/sign with its real threshold.
+- **#69 is what unblocks true app-parity (4-of-6) signing**, and after it lands Person B
+  flips `NativeBackendConfig` to real 4-of-6 and re-proves the drive → the capstone
+  100cash#31. Until #69 lands, 100cash cannot provision/sign with its real threshold.
 - The other window did NOT take #69 (prior handoff speculated they "might" — they did
   not; they closed the send-path cluster instead). Treat #69 as un-started Person A work.
-- Crypto is already proven (mainnet TXID `febd2877…`, PR #46) — this is **orchestration
-  only**. Approach (a) new seam vs (b) factor proxy's `DeviceShareBundle` out is still
+- Crypto is already proven — **orchestration only, no new MPC protocol** — at TWO levels:
+  the mainnet TXID `febd2877…` (PR #46), AND the in-core POC
+  `crates/bsv-mpc-core/tests/poc_4of6_device_holds_presig_relay.rs` (keystone
+  `poc_4of6_device_holds_3.rs`) which already proves a 4-of-6 DKG → 6 shares → the device
+  holding `{0,1,2}` (t−1=3) folds parties 1 & 2's partials **locally** (never on the
+  wire) and combines a valid signature, with the NEGATIVE case asserted (device-alone
+  3<t=4 cannot sign). #69 is wiring that exact proven combine through the **client crate
+  FFI**. Approach (a) new seam vs (b) factor proxy's `DeviceShareBundle` out is still
   the open user-decision (see checklist + Owned-scope table).
+
+**mpc-spec conformance for #69 (cite these — keep the wiring spec-conformant):** the
+canonical §-numbered protocol spec lives **outside this repo** at
+`/Users/johncalhoun/bsv/mpc/MPC-Spec/` (files `00-overview.md` … `18-recovery.md`,
+ADRs in `decisions/`, conformance vectors in `conformance/`). There is no single
+`mpc-spec.md`; the governing sections for 4-of-6 / multi-share / share indexing are:
+- **§00 Quorum profile** (`00-overview.md`) — the topology primitive is a
+  `(threshold, n, party_kinds)` tuple; "cosigner" and "party" are interchangeable and
+  the spec is symmetric. The joint pubkey is the same regardless of which threshold
+  subset signs. 4-of-6 is just `(t=4, n=6)` over this.
+- **§18.3 Quorum profiles + §18.2 cross-(t,n) resharing** (`18-recovery.md`) — defines
+  `(t,n)` profiles and the **address-preserving** transition between them
+  (`reshare_change_threshold`, 0 sats on-chain). #69's shares must be the `(t=4,n=6)`
+  output of DKG/reshare here; the joint pubkey is invariant.
+- **§15 Notary product / multi-share tiers** (`15-notary-product.md`) + **direction.md
+  §1.1 flat-threshold realization** — the **multi-share model** #69 implements:
+  `t = w + 1`, where `w` = the user's share count held on the device (mirrored to the
+  passkey), and `#second-factors ≤ w`. For 4-of-6 the device holds `w = t−1 = 3` shares;
+  the network side (the two Notaries) supplies the rest. This is the exact
+  `my_indices: Vec<ShareIndex>` semantics.
+- **§08.8 threshold-subject (nested MPC)** + **ShareIndex type**
+  (`bsv-mpc-core/src/types.rs:103`, `pub struct ShareIndex(pub u16)`) — the share index
+  is the party's position in the Shamir polynomial evaluation and the P2P message route;
+  `ThresholdConfig::new` enforces `2 ≤ threshold ≤ parties`. #69 must route every held
+  index correctly and preserve these invariants.
 
 ### What else the other window still owns (not Person A)
 
@@ -169,24 +220,35 @@ PR → quality gates (one line per gate with GREEN/PENDING + proof link).
 
 ---
 
-## Owned scope (4 open + 1 closed)
+## Owned scope (6 open + 1 closed)
 
 All in `B1nary-Calhoun-Partnership/bsv-mpc`. `gh issue view <num>` for full body.
+The critical path to the overarching goal (4-of-6 production) is **#69 + #70**; everything
+below them is post-critical-path (spec-leaks #73/#74, policy #71, design #67/#56).
 
 | # | Title | Status | Files |
 |---|---|---|---|
-| **69** | Client-side multi-share wiring — device holds t−1 shares | **OPEN — NEXT BIG ITEM** / `step:implement` / unblocks 100cash 4-of-6 (drive fell back to 2-of-2) | `bsv-mpc-client/src/{ffi.rs,native_io/{provision,ceremony,signer}.rs}` + `bsv-mpc-relay/src/dkg.rs` + `bsv-mpc-proxy/src/{bridge,presign_manager,wallet_api}.rs` |
-| **70** | Deploy 2nd cosigner instance (interim) + prod 2-Notary independence | open / `step:investigate` / pairs with #69 for a real 4-of-6 mainnet artifact | CF Worker / container deploy ops, not in-repo code |
+| **69** | Client-side multi-share wiring — device holds t−1 shares (`my_indices: Vec<ShareIndex>`) | **OPEN — ★ CRITICAL PATH to 4-of-6 production** / `step:implement` / unblocks 100cash 4-of-6 (drive fell back to 2-of-2). Conform to mpc-spec §00/§18.3/§15/§08.8 + direction.md §1.1 | `bsv-mpc-client/src/{ffi.rs,native_io/{provision,ceremony,signer}.rs}` + `bsv-mpc-relay/src/dkg.rs` + `bsv-mpc-proxy/src/{bridge,presign_manager,wallet_api}.rs`. POC: `bsv-mpc-core/tests/poc_4of6_device_holds_presig_relay.rs` |
+| **70** | Deploy 2nd cosigner instance (interim) + prod 2-Notary independence (§13) | open / `step:investigate` / **PAIRS with #69** so 4-of-6 = two INDEPENDENT Notaries (mpc-spec §13, direction.md §1) | CF Worker / container deploy ops, not in-repo code |
 | **74** | SPEC LEAK: approval envelope phase + exec_id_prefix | open / `step:investigate` / audit-filed 2026-05-28 | `bsv-mpc-proxy/src/relay_approval.rs:132-133` + `MPC-Spec/decisions/0005*.md` + ADR-0032 |
-| **73** | SPEC LEAK: `ParticipationProof` placeholders → BRC-18 non-conformant | open / `step:implement` / audit-filed 2026-05-28 | `bsv-mpc-core/src/signing.rs:1023, 1028-1047` |
+| **73** | SPEC LEAK: `ParticipationProof` placeholders → BRC-18 non-conformant | open / `step:implement` / audit-filed 2026-05-28 / easy filler, zero #69 overlap | `bsv-mpc-core/src/signing.rs:1023, 1028-1047` |
+| **71** | Post-recovery cooldown / velocity window for high-value spends (direction.md §3) | open / `security` / post-critical-path | policy surface |
+| **67** | Web client custody & threat model — no-enclave browser signing — DESIGN | open / `step:investigate` / sets up the web lane (Rust core → wasm) after 4-of-6 | design doc — untracked draft `docs/67-WEB-CUSTODY-AUDIT.md` MUST NOT be committed |
+| **56** | Concurrent multi-device sessions (mirror + coordinated presig checkout) — DESIGN | open / `step:investigate` / the multi-device lane; after 4-of-6 | design doc |
 | **75** | SPEC LEAK: `canonical_render(intent)` does not exist | **✅ CLOSED 2026-05-28** — co-closed with 100cash#13/#14/#15 via mainnet TXIDs `5e527f27…51abee` + `d3515c50…c395cb` | `bsv-mpc-core/src/approval.rs` + `bsv-mpc-client/src/ffi.rs` + `MPC-Spec/decisions/0044*.md` (PRs #48 + #82 merged) |
 
 ---
 
 ## Reference material (what to read when stuck)
 
-- **MPC-Spec** at `/Users/johncalhoun/bsv/mpc/MPC-Spec/` — the canonical spec. Decisions
-  in `decisions/`. Open questions in `OPEN-QUESTIONS.md`.
+- **MPC-Spec** at `/Users/johncalhoun/bsv/mpc/MPC-Spec/` — **the canonical §-numbered
+  protocol spec** (NOT in this repo; no single `mpc-spec.md` file). Files
+  `00-overview.md` … `18-recovery.md`; ADRs in `decisions/`; conformance vectors in
+  `conformance/`; open questions in `OPEN-QUESTIONS.md`. **For #69 (4-of-6 / multi-share /
+  share indexing) the governing sections are §00 (Quorum profile `(t,n,party_kinds)`),
+  §18.3/§18.2 (quorum profiles + address-preserving cross-(t,n) resharing), §15 +
+  direction.md §1.1 (`t = w+1` multi-share model), §08.8 (threshold-subject).**
+  `bsv-mpc` mirrors the plain-English version in `SPECS.md` (not §-numbered).
 - **Audit knowledge graph** at `/Users/johncalhoun/bsv/mpc/graphify-out/graph.html`
   (693 nodes / 1136 edges / 70 communities). Open in browser; the graph independently
   surfaced `combine_sign_over_relay (2-party)` ↔ `FfiDeployedSigner` as a similar-pair
@@ -226,23 +288,45 @@ FIRST read, in order:
   2. bsv-mpc/PERSON-A-HANDOFF.md   (full context)
   3. The audit issue you're about to start (gh issue view <num>)
 
+THE OVERARCHING GOAL (shared with Person B): ship 4-of-6 PRODUCTION god-tier self-custody
+on 100cash — t=4, n=6, device-held shares + two independent Notary cosigners, plumbing
+over the audited bsv-mpc-core (NO new MPC protocol), mpc-spec-conformant. We are at 2-of-2
+today only because client multi-share isn't wired. #69 is THE critical path; #70 makes
+the two network-side cosigners genuinely independent. See the goal block in PERSON-A-HANDOFF.md.
+
 Your owned issues (rough priority order — #75 is DONE, see below):
-  bsv-mpc#69  — n-party provisioning + sign seam in bsv-mpc-client. LOAD-BEARING for 4-of-6.
-                ★ THIS IS THE NEXT BIG ITEM. The 100cash app is 4-of-6 but the mainnet
-                send drive had to fall back to 2-of-2 because client multi-share isn't
-                wired (provisioning 4-of-6 fails: "no outgoing messages to bundle"). #69
-                unblocks true app-parity signing. Audit comment lays out approach (a) new
-                seam vs (b) factor proxy's DeviceShareBundle out — ASK USER which before
-                coding. Crypto is proven (mainnet TXID febd2877…, PR #46), orchestration
-                only. RE-DIFF bsv-mpc-client/src/ffi.rs first — commit 1da783c added two
-                FFIs there (native-tls WS fix window).
-  bsv-mpc#70  — deploy 2nd Calhoun cosigner. Pairs with #69 (ops not code) so a 4-of-6
-                mainnet artifact uses two independent cosigners, not one twice.
-  bsv-mpc#74  — approval envelope phase + exec_id_prefix. Spec decision needed
+  bsv-mpc#69  — n-party provisioning + sign seam in bsv-mpc-client. ★ THE CRITICAL PATH to
+                4-of-6 production. The 100cash app is 4-of-6 but the mainnet send drive
+                had to fall back to 2-of-2 because client multi-share isn't wired
+                (provisioning 4-of-6 fails: "no outgoing messages to bundle"; the client
+                FFI takes a single share_index — needs my_indices: Vec<ShareIndex>). #69
+                unblocks true app-parity signing → Person B flips NativeBackendConfig to
+                4-of-6 → capstone 100cash#31. Conform to mpc-spec §00 (Quorum profile),
+                §18.3/§18.2 (quorum profiles + address-preserving resharing), §15 +
+                direction.md §1.1 (t=w+1 multi-share), §08.8 (threshold-subject). Audit
+                comment lays out approach (a) new seam vs (b) factor proxy's
+                DeviceShareBundle out — ASK USER which before coding. Crypto is proven at
+                BOTH levels: mainnet TXID febd2877… (PR #46) AND the in-core POC
+                poc_4of6_device_holds_presig_relay.rs (device holds {0,1,2}, folds locally,
+                signs; negative case asserted). Orchestration only. RE-DIFF
+                bsv-mpc-client/src/ffi.rs first — commit 1da783c added two FFIs there
+                (native-tls WS fix window).
+  bsv-mpc#70  — deploy 2nd Calhoun cosigner. PAIRS with #69 (ops not code) so a 4-of-6
+                mainnet artifact uses two INDEPENDENT Notaries (mpc-spec §13 federation,
+                direction.md §1 "two mandatory sides"), not one cosigner twice.
+  bsv-mpc#74  — SPEC LEAK: approval envelope phase + exec_id_prefix. Spec decision needed
                 (add "approval" to ADR-0005 enum?). Sibling thinking to the closed #75.
-  bsv-mpc#73  — ParticipationProof placeholders in signing.rs:1028-1047. Easy same-day
-                ship; zero overlap with the #69 surface — good filler if #69 is blocked
-                on the user's (a)/(b) decision.
+  bsv-mpc#73  — SPEC LEAK: ParticipationProof placeholders in signing.rs:1028-1047. Easy
+                same-day ship; zero overlap with the #69 surface — good filler if #69 is
+                blocked on the user's (a)/(b) decision.
+  bsv-mpc#71  — post-recovery cooldown / velocity window for high-value spends
+                (direction.md §3). Policy/security; pick up after the 4-of-6 critical path.
+  bsv-mpc#67  — web client custody & threat model (no-enclave browser signing,
+                WebAuthn-PRF seal + below-threshold) — DESIGN. Sets up the web lane (same
+                Rust core → wasm) once 4-of-6 lands. NOTE: an untracked draft
+                docs/67-WEB-CUSTODY-AUDIT.md exists — do NOT commit it.
+  bsv-mpc#56  — concurrent multi-device sessions (mirror + coordinated presig checkout) —
+                DESIGN. The multi-device lane the goal block calls out; after 4-of-6.
   bsv-mpc#75  — canonical_render + ffi_canonical_render. ✅ CLOSED 2026-05-28 — co-closed
                 with 100cash#13/#14/#15 via mainnet TXIDs 5e527f27…51abee + d3515c50…c395cb
                 (the other window's send-path drive). Do not re-open. Listed for context.

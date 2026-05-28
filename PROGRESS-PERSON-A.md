@@ -1,7 +1,16 @@
 # Person A — Progress (bsv-mpc, crypto + spec lane)
 
 > Live status. Update after each step. Sibling file:
-> `100cash/PROGRESS-PERSON-B.md`. Full context: `PERSON-A-HANDOFF.md`.
+> `100cash/PROGRESS-PERSON-B.md`. Full context: `PERSON-A-HANDOFF.md`
+> (read its "🎯 Overarching goal" block first — it is the shared truth with Person B).
+
+**🎯 Overarching goal (shared with Person B):** ship **4-of-6 PRODUCTION** god-tier
+self-custody on 100cash — t=4, n=6, device-held shares + **two independent Notary
+cosigners**, plumbing over the audited `bsv-mpc-core` (**no new MPC protocol**),
+**mpc-spec-conformant**. We are at 2-of-2 today only because client multi-share isn't
+wired. **#69 is THE critical path** (client `my_indices: Vec<ShareIndex>`); **#70** makes
+the two network-side cosigners genuinely independent. Once #69 lands, Person B flips
+`NativeBackendConfig` to real 4-of-6 → capstone 100cash#31.
 
 **Started:** 2026-05-28 (4-agent audit; issues #73-#81 filed + comments on #69/#70).
 
@@ -20,16 +29,41 @@
 
 ## Issues (priority order)
 
-### ☐ `NOT STARTED` — bsv-mpc#69 — n-party provisioning + sign seam (LOAD-BEARING) — ★ NEXT BIG ITEM
+### ☐ `NOT STARTED` — bsv-mpc#69 — n-party provisioning + sign seam — ★ THE CRITICAL PATH to 4-of-6 production
 
-**Why this is now the priority (2026-05-28 PM):** the 100cash app config is **4-of-6**,
-but provisioning 4-of-6 over the deployed cosigner **FAILS** ("no outgoing messages to
-bundle") because client multi-share (device holds **t−1 shares**,
-`my_indices: Vec<ShareIndex>`) isn't wired in `bsv-mpc-client`. The send-path mainnet
-drive (#75 / 100cash#15) therefore **fell back to 2-of-2** (deployed-proven). The two
-closing TXIDs prove the render/sign/broadcast machinery end-to-end but NOT the real
-4-of-6 topology. **#69 is what unblocks true app-parity (4-of-6) signing.** The other
-window did NOT pick it up — it remains un-started Person A work.
+**Why this is THE critical path (2026-05-28 PM):** it is the *only* thing between us and
+the overarching goal (4-of-6 production self-custody on 100cash). The 100cash app config
+is **4-of-6**, but provisioning 4-of-6 over the deployed cosigner **FAILS** ("no outgoing
+messages to bundle") because client multi-share (device holds **t−1 shares**,
+`my_indices: Vec<ShareIndex>`) isn't wired in `bsv-mpc-client` — the client FFI
+(`FfiSigningSession::new`, `ffi.rs:473`) takes a **single** `share_index: u16`. The
+send-path mainnet drive (#75 / 100cash#15) therefore **fell back to 2-of-2**
+(deployed-proven). The two closing TXIDs prove the render/sign/broadcast machinery
+end-to-end but NOT the real 4-of-6 topology. **#69 unblocks true app-parity (4-of-6)
+signing → Person B flips `NativeBackendConfig` to 4-of-6 → capstone 100cash#31.** Pairs
+with **#70** (2nd cosigner = two independent Notaries). The other window did NOT pick it
+up — it remains un-started Person A work.
+
+**mpc-spec conformance (cite these — keep #69 spec-conformant):** the canonical
+§-numbered spec lives at `/Users/johncalhoun/bsv/mpc/MPC-Spec/` (NOT in this repo; no
+single `mpc-spec.md`). Governing sections for 4-of-6 / multi-share / share indexing:
+- **§00 Quorum profile** (`(threshold, n, party_kinds)`; party≡cosigner; joint pubkey
+  invariant across signing subset).
+- **§18.3 quorum profiles + §18.2 cross-(t,n) resharing** (address-preserving `(t,n)`
+  transitions, 0 sats on-chain).
+- **§15 multi-share tiers + direction.md §1.1** — the model #69 implements: `t = w + 1`,
+  `w` = device-held share count, `#second-factors ≤ w`; for 4-of-6 the device holds
+  `w = t−1 = 3` (`my_indices`), the two Notaries supply the rest.
+- **§08.8 threshold-subject** + `ShareIndex` type (`bsv-mpc-core/src/types.rs:103`;
+  `ThresholdConfig::new` enforces `2 ≤ t ≤ n`).
+
+**Crypto already proven — orchestration only, no new protocol — at two levels:** mainnet
+TXID `febd2877…` (PR #46) AND the in-core POC
+`crates/bsv-mpc-core/tests/poc_4of6_device_holds_presig_relay.rs` (keystone
+`poc_4of6_device_holds_3.rs`): 4-of-6 DKG → 6 shares, device holds `{0,1,2}` (t−1=3) and
+folds parties 1 & 2's partials **locally** (never on the wire) into a valid signature;
+NEGATIVE case asserted (device-alone 3<t=4 cannot sign). #69 wires that exact combine
+through the **client crate FFI**.
 
 **File:line evidence (from audit):**
 - 2-party today at `bsv-mpc-client/src/ffi.rs:756` → `provision/provision.rs:42` → `bsv-mpc-relay/src/dkg.rs:159, 225` (`ShareIndex(1)` hardcoded).
@@ -50,10 +84,13 @@ window did NOT pick it up — it remains un-started Person A work.
 
 ---
 
-### ☐ `NOT STARTED` — bsv-mpc#70 — deploy 2nd Calhoun cosigner
+### ☐ `NOT STARTED` — bsv-mpc#70 — deploy 2nd Calhoun cosigner (2-Notary independence)
 
-**Co-blocker** with #69. Without two cosigners live, no real 4-of-6 mainnet demo.
-**Last action:** — **Blockers:** none — parallel with #69, ops not code.
+**Pairs with #69** on the critical path. Without two **independent** cosigners live, a
+4-of-6 mainnet demo would just use one cosigner twice — not the real topology. #70 makes
+the two network-side parties genuinely independent (distinct CA / identity key / deploy
+env) per **mpc-spec §13 federation** + **direction.md §1** ("two mandatory sides"). Ops,
+not code. **Last action:** — **Blockers:** none — parallel with #69.
 
 ---
 
@@ -137,6 +174,30 @@ keys + fee_txid, OR patch in proxy. Same file as #69 — consider folding.
 
 ---
 
+### ☐ `NOT STARTED` — bsv-mpc#71 — post-recovery cooldown / velocity window (post-critical-path)
+
+Velocity window for high-value spends after a recovery (direction.md §3). Policy/security
+hardening. Pick up after the 4-of-6 critical path (#69/#70). **Last action:** —
+**Blockers:** none — sequence after critical path.
+
+---
+
+### ☐ `NOT STARTED` — bsv-mpc#67 — web client custody & threat model (DESIGN, post-critical-path)
+
+No-enclave browser signing (WebAuthn-PRF seal + below-threshold). Sets up the **web lane**
+(same Rust core → wasm) the goal block calls out — natural follow-on once 4-of-6 is real.
+⚠️ An untracked draft `docs/67-WEB-CUSTODY-AUDIT.md` exists; **never commit it**.
+**Last action:** — **Blockers:** none — sequence after critical path.
+
+---
+
+### ☐ `NOT STARTED` — bsv-mpc#56 — concurrent multi-device sessions (DESIGN, post-critical-path)
+
+Mirror + coordinated presig checkout — the **multi-device lane** in the goal block.
+Design-only for now; after 4-of-6. **Last action:** — **Blockers:** none.
+
+---
+
 ## Open decisions (waiting on user)
 
 - [ ] **bsv-mpc#69 approach: (a) new seam vs (b) factor proxy out** — ★ the gating
@@ -185,3 +246,16 @@ _(append session-by-session notes here)_
   bundle"). Still un-started Person A work; gated on the (a)/(b) design decision.
 - Remaining Person A queue: #69 (next), #70 (pairs with #69, ops), #73 (easy filler,
   zero #69 overlap), #74 (needs ADR-0005 spec decision).
+
+### 2026-05-28 (goal-alignment doc refresh)
+- Embedded the shared **🎯 Overarching goal** block (byte-identical to Person B's
+  handoff) at the top of `PERSON-A-HANDOFF.md`; added a goal frame to this tracker.
+- Reframed **#69 as THE critical path** to 4-of-6 production (was "next big item") and
+  cited the governing mpc-spec sections: §00 (Quorum profile), §18.3/§18.2 (quorum
+  profiles + address-preserving cross-(t,n) resharing), §15 + direction.md §1.1 (`t=w+1`
+  multi-share), §08.8 (threshold-subject). The §-numbered spec lives **outside this repo**
+  at `/Users/johncalhoun/bsv/mpc/MPC-Spec/` (no single `mpc-spec.md`).
+- Noted the in-core POC `poc_4of6_device_holds_presig_relay.rs` already proves the
+  device-holds-(t−1) combine — #69 is wiring it through the client FFI.
+- Expanded the owned-scope queue to the full open set (added #71 policy, #67 web design,
+  #56 multi-device — all post-critical-path). Docs-only; no code/issue changes.
