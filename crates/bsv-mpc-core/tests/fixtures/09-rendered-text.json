@@ -28,6 +28,7 @@
             "value_sats": 100000000
           }
         ],
+        "human_address": "1A1zP1...EQK...",
         "fee_sats": 333,
         "counterparty_identity": {
           "pubkey": "02abcd123456789012345678901234567890123456789012345678901234567890",

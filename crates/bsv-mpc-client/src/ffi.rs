@@ -926,6 +926,33 @@ impl WalletStorageConn {
     }
 }
 
+// ── ADR-0044 / #75 canonical wallet renderer over FFI ────────────────────────
+//
+// Exposes `bsv_mpc_core::approval::canonical_render` to the native shell so the
+// 100cash send path (Person B's 100cash#15) gets the EXACT same `rendered_text`
+// the cosigner will bind into `request_view_hash` (key 8). The CBOR wire shape
+// matches the serde derives on `Intent` (internally-tagged on `kind`, snake_case,
+// `deny_unknown_fields`) — i.e. a CBOR map with a `kind` text key and per-kind
+// flat fields. We deserialize via ciborium and call the core renderer; any
+// CBOR-shape or schema rejection comes back as `FfiError::Client(...)`.
+
+/// Render an [`Intent`](bsv_mpc_core::approval::Intent) to its canonical
+/// `rendered_text` (ADR-0044 §2). The shell encodes the typed intent as CBOR
+/// matching the serde shape and gets back the WYSIWYS string the cosigner will
+/// bind to via `request_view_hash`.
+///
+/// Returns `Err(FfiError::Client)` if the CBOR is malformed, the `kind` is
+/// unknown, a required field is missing, an unknown field is present, OR a
+/// type mismatches the typed schema. The negative path is asserted in
+/// `ffi_canonical_render_rejects_unknown_kind` below.
+#[uniffi::export]
+pub fn ffi_canonical_render(intent_cbor: Vec<u8>) -> Result<String, FfiError> {
+    use bsv_mpc_core::approval::{canonical_render, Intent};
+    let intent: Intent = ciborium::de::from_reader(intent_cbor.as_slice())
+        .map_err(|e| FfiError::Client(format!("intent CBOR decode: {e}")))?;
+    canonical_render(&intent).map_err(|e| FfiError::Client(e.to_string()))
+}
+
 // ── #68 send-path golden-vector tests (FFI == in-crate, byte-for-byte) ─────────
 #[cfg(test)]
 mod send_path_tests {
@@ -1239,6 +1266,144 @@ mod send_path_tests {
         assert!(
             matches!(short, Err(FfiError::Client(m)) if m.contains("32 bytes")),
             "31-byte priv must reject"
+        );
+    }
+
+    // ── ADR-0044 / #75 `ffi_canonical_render` golden-vector tests ────────────
+    //
+    // FFI byte-equivalence gate: build the Intent in Rust, encode via ciborium,
+    // pass through `ffi_canonical_render`, and assert the returned String
+    // equals the in-crate `canonical_render` output exactly. Negative cases
+    // (malformed CBOR / unknown kind / missing field) assert FfiError carries
+    // the right rejection reason — "skipping is lazy".
+
+    /// Helper: serialize an Intent to CBOR via ciborium for the FFI call.
+    fn intent_to_cbor(intent: &bsv_mpc_core::approval::Intent) -> Vec<u8> {
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(intent, &mut buf).expect("cbor encode");
+        buf
+    }
+
+    #[test]
+    fn ffi_canonical_render_matches_core_payment() {
+        use bsv_mpc_core::approval::{canonical_render, Counterparty, Intent, PaymentOutput};
+        let intent = Intent::Payment {
+            amount_satoshis: 100_000_000,
+            recipient_outputs: vec![PaymentOutput {
+                script: "76a914abcdef...88ac".into(),
+                value_sats: 100_000_000,
+            }],
+            human_address: "1A1zP1...EQK...".into(),
+            fee_sats: 333,
+            counterparty_identity: Counterparty {
+                pubkey: "02abcd123456789012345678901234567890123456789012345678901234567890".into(),
+                cert_name: None,
+            },
+            fiat_estimate: "$50.00".into(),
+            fiat_currency: "USD".into(),
+            human_locale: "en-US".into(),
+        };
+        let in_crate = canonical_render(&intent).expect("in-crate render");
+        let cbor = intent_to_cbor(&intent);
+        let got = ffi_canonical_render(cbor).expect("ffi render");
+        assert_eq!(got, in_crate, "FFI render != in-crate render");
+        assert_eq!(
+            got,
+            "Send 100000000 sats (~$50.00 USD) to 1A1zP1...EQK... with fee 333 sats. Counterparty: anonymous + 0x02abcd12...",
+            "FFI render != locked vector"
+        );
+    }
+
+    #[test]
+    fn ffi_canonical_render_matches_core_multi() {
+        use bsv_mpc_core::approval::{canonical_render, Intent, MultiOutput};
+        let intent = Intent::Multi {
+            outputs: vec![
+                MultiOutput::Payment {
+                    amount_satoshis: 50_000_000,
+                    recipient: "1A...".into(),
+                },
+                MultiOutput::Payment {
+                    amount_satoshis: 25_000_000,
+                    recipient: "1B...".into(),
+                },
+                MultiOutput::Fee {
+                    amount_satoshis: 333,
+                },
+            ],
+            human_locale: "en-US".into(),
+        };
+        let in_crate = canonical_render(&intent).expect("in-crate render");
+        let cbor = intent_to_cbor(&intent);
+        let got = ffi_canonical_render(cbor).expect("ffi render");
+        assert_eq!(got, in_crate, "FFI render != in-crate render");
+        assert_eq!(
+            got,
+            "Compound transaction with 3 outputs: Send 50000000 sats to 1A...; Send 25000000 sats to 1B...; Fee output 333 sats.",
+            "FFI render != locked vector"
+        );
+    }
+
+    #[test]
+    fn ffi_canonical_render_rejects_malformed_cbor() {
+        // 0xFF is a CBOR break stop-code that isn't valid at top level.
+        let err = ffi_canonical_render(vec![0xff]).expect_err("malformed must reject");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("CBOR"),
+            "expected CBOR-decode rejection, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn ffi_canonical_render_rejects_unknown_kind() {
+        // CBOR map {"kind": "airdrop", "amount_satoshis": 1, ...} — an unknown
+        // discriminant value MUST hard-reject per ADR-0044 §2.1.
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(
+            &serde_json::json!({
+                "kind": "airdrop",
+                "amount_satoshis": 1,
+                "recipient": "1X",
+                "human_locale": "en-US"
+            }),
+            &mut buf,
+        )
+        .expect("encode bad cbor");
+        let err = ffi_canonical_render(buf).expect_err("unknown kind must reject");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("unknown variant") && msg.contains("airdrop"),
+            "expected unknown-variant rejection naming `airdrop`, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn ffi_canonical_render_rejects_missing_required_field() {
+        // payment missing `human_address` — the §2.3-amendment required field.
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(
+            &serde_json::json!({
+                "kind": "payment",
+                "amount_satoshis": 100,
+                "recipient_outputs": [{"script": "76a9...", "value_sats": 100}],
+                "fee_sats": 1,
+                "counterparty_identity": {
+                    "pubkey": "02abcd1234567890123456789012345678901234567890123456789012345678",
+                    "cert_name": null
+                },
+                "fiat_estimate": "$1",
+                "fiat_currency": "USD",
+                "human_locale": "en-US"
+            }),
+            &mut buf,
+        )
+        .expect("encode bad cbor");
+        let err = ffi_canonical_render(buf).expect_err("missing field must reject");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("missing field") && msg.contains("human_address"),
+            "expected missing-field rejection naming `human_address`, got: {msg}"
         );
     }
 }

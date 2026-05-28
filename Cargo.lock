@@ -416,6 +416,7 @@ dependencies = [
  "bsv-mpc-service",
  "bsv-rs",
  "cggmp24",
+ "ciborium",
  "futures",
  "generic-ec",
  "getrandom 0.2.17",
