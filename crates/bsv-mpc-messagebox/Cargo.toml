@@ -58,8 +58,28 @@ url = "2"
 bsv = { workspace = true, features = ["auth", "http", "socketio"] }
 tokio.workspace = true
 reqwest.workspace = true
-tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 chrono.workspace = true
+
+# ===========================================================================
+# tokio-tungstenite TLS backend — TARGET-SPLIT.
+#
+# On Apple platforms (iOS/macOS) the WS TLS uses `native-tls` (Security.
+# framework). rustls+ring's TLS setup (`ClientConnection::new` inside
+# `TlsConnector::connect`) crashes with EXC_BAD_ACCESS on the arm64 iOS
+# SIMULATOR — the relay WS never opens, so the deployed-cosigner sign ceremony
+# (`coordinate_presign_over_relay`) aborts. native-tls is exactly what the
+# proven MessageBox WS clients use (bsv-wallet-toolbox-rs, rust-message-box
+# load-gen) and is rock-solid on Apple. `client_async_tls` selects the connector
+# from the enabled feature, so no transport code changes.
+#
+# Everything else non-wasm (the CF Container / bsv-mpc-service on Linux) stays
+# on rustls to keep the deliberate no-OpenSSL cross-build.
+# ===========================================================================
+[target.'cfg(all(not(target_arch = "wasm32"), any(target_os = "ios", target_os = "macos")))'.dependencies]
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+
+[target.'cfg(all(not(target_arch = "wasm32"), not(any(target_os = "ios", target_os = "macos"))))'.dependencies]
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 
 # ===========================================================================
 # wasm32 target — the CF-Worker Socket.IO + BRC-103 path. The

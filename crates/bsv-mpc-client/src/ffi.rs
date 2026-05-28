@@ -199,6 +199,38 @@ pub fn ffi_serialize_signed_tx(req: FfiSignedTxRequest) -> Result<String, FfiErr
     Ok(hex::encode(raw))
 }
 
+/// Assemble a P2PKH unlocking script hex (`<sig‖sighash_flag> <compressed_pubkey>`)
+/// from an MPC-produced DER signature, its sighash flag, and the joint compressed
+/// pubkey. The single-byte `sighash_type` flag (e.g. `0x41` = SIGHASH_ALL|FORKID) is
+/// appended to the DER signature exactly as the scriptSig requires. Swift never
+/// hand-rolls scriptSig assembly (load-bearing rule); it feeds this straight into
+/// [`ffi_serialize_signed_tx`] as each input's `unlocking_script_hex`.
+#[uniffi::export]
+pub fn ffi_p2pkh_unlocking_script_hex(
+    sig_der_hex: String,
+    sighash_type: u32,
+    pubkey_hex: String,
+) -> Result<String, FfiError> {
+    if sighash_type > 0xff {
+        return Err(FfiError::Client(format!(
+            "sighash_type {sighash_type} does not fit in the one scriptSig flag byte"
+        )));
+    }
+    let mut sig_checksig = dehex(&sig_der_hex, "signature DER")?;
+    sig_checksig.push(sighash_type as u8);
+    let pubkey = dehex(&pubkey_hex, "compressed pubkey")?;
+    let pubkey33: [u8; 33] = pubkey.as_slice().try_into().map_err(|_| {
+        FfiError::Client(format!(
+            "compressed pubkey must be 33 bytes (66 hex chars), got {}",
+            pubkey.len()
+        ))
+    })?;
+    Ok(hex::encode(txbuild::build_p2pkh_unlocking_script(
+        &sig_checksig,
+        &pubkey33,
+    )))
+}
+
 /// Recipient descriptor for the WYSIWYS view-hash — mirrors
 /// [`bsv_mpc_core::approval::Recipient`].
 #[derive(uniffi::Enum)]
@@ -332,6 +364,25 @@ pub fn ffi_parse_beef_tx(beef_hex: String) -> Result<FfiParsedTx, FfiError> {
         inputs,
         outputs,
     })
+}
+
+/// Extract the SUBJECT (last) transaction's raw bytes (hex) from a BEEF — e.g.
+/// the wallet-signed funding tx a BRC-100 `createAction` returns as its `tx`
+/// (atomic BEEF). Needed to re-broadcast that funding tx through a public
+/// broadcaster (ARC) when the wallet's own broadcaster doesn't propagate. Swift
+/// never parses BEEF/tx bytes itself (load-bearing rule). Accepts AtomicBEEF or
+/// BEEF v1/v2 (mirrors [`ffi_parse_beef_tx`]'s subject selection).
+#[uniffi::export]
+pub fn ffi_beef_subject_raw_tx_hex(beef_hex: String) -> Result<String, FfiError> {
+    let beef_bytes = dehex(&beef_hex, "beef")?;
+    let beef = bsv::transaction::Beef::from_binary(&beef_bytes)
+        .map_err(|e| FfiError::Client(format!("parse BEEF: {e}")))?;
+    let subject = beef
+        .txs
+        .last()
+        .and_then(|t| t.tx())
+        .ok_or_else(|| FfiError::Client("BEEF has no subject transaction".into()))?;
+    Ok(subject.to_hex())
 }
 
 /// Derive the P2PKH locking-script hex from a base58check address — the encoding
@@ -1116,6 +1167,47 @@ mod send_path_tests {
         );
     }
 
+    /// The FFI unlocking-script MUST equal the in-crate `build_p2pkh_unlocking_script`
+    /// byte-for-byte: a 72-byte DER sig with the `0x41` flag appended + a compressed
+    /// pubkey. This is the assembly Swift drives after the MPC ceremony.
+    #[test]
+    fn ffi_unlocking_script_matches_in_crate_golden() {
+        let der = [0x30u8; 72]; // stand-in DER signature body
+        let pubkey = [0x02u8; 33];
+        // In-crate truth: DER ‖ flag, then the builder.
+        let mut sig_with_flag = der.to_vec();
+        sig_with_flag.push(0x41);
+        let expected = hex::encode(txbuild::build_p2pkh_unlocking_script(&sig_with_flag, &pubkey));
+        let got = ffi_p2pkh_unlocking_script_hex(hex::encode(der), 0x41, hex::encode(pubkey))
+            .expect("ffi unlocking script");
+        assert_eq!(got, expected, "FFI unlocking script != in-crate golden");
+        // And it must round-trip into a serializable rawTx with a valid txid.
+        let raw = ffi_serialize_signed_tx(FfiSignedTxRequest {
+            version: 1,
+            inputs: vec![FfiSignedInput {
+                prev_txid_hex: hex::encode([0x11u8; 32]),
+                vout: 0,
+                unlocking_script_hex: got,
+                sequence: 0xffff_ffff,
+            }],
+            outputs: vec![FfiTxOutput {
+                satoshis: 49_000,
+                locking_script_hex: p2pkh_hex([0x44u8; 20]),
+            }],
+            locktime: 0,
+        })
+        .expect("serialize with assembled unlocking script");
+        assert_eq!(ffi_tx_txid(raw).expect("txid").len(), 64);
+    }
+
+    /// A pubkey that isn't 33 bytes MUST be rejected — never silently truncated.
+    #[test]
+    fn ffi_unlocking_script_rejects_bad_pubkey_len() {
+        let err = ffi_p2pkh_unlocking_script_hex("30".repeat(72), 0x41, "02".repeat(20))
+            .expect_err("must reject 20-byte pubkey");
+        assert!(format!("{err}").contains("33 bytes"), "got: {err}");
+    }
+
     /// The FFI serialized rawTx MUST equal the in-crate `demo_serialized()` hex.
     #[test]
     fn ffi_serialize_matches_in_crate_golden() {
@@ -1243,6 +1335,17 @@ mod send_path_tests {
             .unwrap();
 
         let beef = spend.to_beef_v1(true).expect("to_beef_v1");
+        let spend_hex = spend.to_hex();
+        // The subject raw-tx extracted from the BEEF MUST equal the subject's own
+        // serialization, and its txid must match — the funding-rebroadcast path.
+        let subject_hex =
+            ffi_beef_subject_raw_tx_hex(hex::encode(&beef)).expect("beef subject raw hex");
+        assert_eq!(subject_hex, spend_hex, "BEEF subject raw hex != subject tx hex");
+        assert_eq!(
+            ffi_tx_txid(subject_hex.clone()).unwrap(),
+            spend.id(),
+            "subject raw-tx txid must match"
+        );
         let parsed = ffi_parse_beef_tx(hex::encode(&beef)).expect("parse beef");
 
         assert_eq!(parsed.version, 1);
