@@ -59,6 +59,7 @@ use hmac::{Hmac, Mac};
 use rand::{CryptoRng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::error::{MpcError, Result};
 
@@ -113,7 +114,12 @@ pub fn generate_serialized<R: RngCore + CryptoRng>(
 ///
 /// `nonce` is the random per-`put` AES-GCM nonce; `ciphertext` is
 /// `AES-256-GCM(encryption_key, nonce, serialized_primes)`.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+///
+/// `#[derive(Zeroize, ZeroizeOnDrop)]` (#80): wipe the blob on drop so neither the
+/// nonce nor the encrypted prime bytes linger in freed heap. This also wipes the
+/// at-rest blobs held in [`InMemoryPoolStorage`]'s `Vec` transitively when that
+/// storage drops (a `Mutex<Vec<_>>` can't itself derive `Zeroize`).
+#[derive(Clone, Debug, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 pub struct EncryptedPrimes {
     /// AES-GCM 12-byte nonce.
     pub nonce: [u8; 12],
@@ -196,7 +202,10 @@ impl PrimePoolStorage for InMemoryPoolStorage {
 /// `take` / `put` / `backfill_to_floor` surface.
 pub struct PaillierPool<S: PrimePoolStorage> {
     storage: S,
-    encryption_key: [u8; 32],
+    /// `Zeroizing<[u8; 32]>` (#80 TYPE LOCK): the AES-256-GCM pool key is the one
+    /// plaintext secret this struct holds at rest. Wiped on `Drop`, and a refactor
+    /// can't copy it out to a raw `[u8; 32]` without breaking the build.
+    encryption_key: Zeroizing<[u8; 32]>,
     floor: usize,
 }
 
@@ -239,8 +248,12 @@ impl<S: PrimePoolStorage> PaillierPool<S> {
 
     /// Put a keypair into the pool, encrypting at rest.
     pub fn put(&self, primes: PregeneratedPrimes<SecurityLevel128>) -> Result<()> {
-        let plaintext = serde_json::to_vec(&primes)
-            .map_err(|e| MpcError::Serialization(format!("encode pregenerated primes: {e}")))?;
+        // #80: the serialized prime plaintext is the decrypted secret material —
+        // hold it in `Zeroizing` so it's wiped once encrypted at rest.
+        let plaintext = Zeroizing::new(
+            serde_json::to_vec(&primes)
+                .map_err(|e| MpcError::Serialization(format!("encode pregenerated primes: {e}")))?,
+        );
         let blob = encrypt(&self.encryption_key, &plaintext)?;
         self.storage.put_encrypted(blob)?;
         Ok(())
@@ -285,13 +298,15 @@ impl<S: PrimePoolStorage> PaillierPool<S> {
 
 // ----- crypto helpers (BRC-42 HMAC-SHA256 + AES-256-GCM) -----
 
-fn derive_pool_key(root_key: &[u8; 32], pool_id: &[u8]) -> [u8; 32] {
+fn derive_pool_key(root_key: &[u8; 32], pool_id: &[u8]) -> Zeroizing<[u8; 32]> {
     let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(root_key)
         .expect("HMAC-SHA256 accepts any key length");
     mac.update(POOL_KEY_DOMAIN);
     mac.update(pool_id);
     let result = mac.finalize();
-    let mut key = [0u8; 32];
+    // Build straight into `Zeroizing` (#80) so the derived key never sits in an
+    // un-wiped raw `[u8; 32]`.
+    let mut key = Zeroizing::new([0u8; 32]);
     key.copy_from_slice(&result.into_bytes());
     key
 }
@@ -310,11 +325,14 @@ fn encrypt(key: &[u8; 32], plaintext: &[u8]) -> Result<EncryptedPrimes> {
     })
 }
 
-fn decrypt(key: &[u8; 32], blob: &EncryptedPrimes) -> Result<Vec<u8>> {
+fn decrypt(key: &[u8; 32], blob: &EncryptedPrimes) -> Result<Zeroizing<Vec<u8>>> {
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
     let nonce = Nonce::from_slice(&blob.nonce);
+    // #80: the decrypted prime material is wrapped in `Zeroizing` so it's wiped when
+    // the caller's `plaintext` goes out of scope (mirrors `share::decrypt_share`).
     cipher
         .decrypt(nonce, blob.ciphertext.as_ref())
+        .map(Zeroizing::new)
         .map_err(|e| MpcError::Encryption(format!("pool take decrypt: {e}")))
 }
 
@@ -441,7 +459,8 @@ mod tests {
         let key_a = derive_pool_key(&root_key, b"party-0");
         let key_b = derive_pool_key(&root_key, b"party-1");
         assert_ne!(
-            key_a, key_b,
+            key_a.as_slice(),
+            key_b.as_slice(),
             "different pool_ids must derive different encryption keys"
         );
     }
@@ -464,6 +483,38 @@ mod tests {
             pool_key.as_slice(),
             share_result.as_slice(),
             "pool and share key derivations must be domain-separated"
+        );
+    }
+
+    // ----------------------------------------------------------------
+    // Zeroize (#80) — mirror of the `share.rs:568` TYPE-LOCK proof plan.
+    //
+    //   (1) OBSERVABLE: `EncryptedPrimes::zeroize` actually clears the nonce +
+    //       ciphertext bytes — the SAME wipe `ZeroizeOnDrop` runs on drop (and
+    //       transitively on each blob held in `InMemoryPoolStorage`'s `Vec`).
+    //   (2) TYPE LOCK: `PaillierPool::encryption_key` is `Zeroizing<[u8; 32]>`,
+    //       `derive_pool_key` returns `Zeroizing<[u8; 32]>`, and the `decrypt` /
+    //       `put` plaintext is `Zeroizing<Vec<u8>>`. These compile only while the
+    //       wrapper is present, so a refactor cannot silently leak the decrypted
+    //       prime material (or the pool key) into a raw, un-wiped buffer.
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn encrypted_primes_zeroize_clears_nonce_and_ciphertext() {
+        let mut blob = EncryptedPrimes {
+            nonce: [0xABu8; 12],
+            ciphertext: vec![0xCDu8; 64],
+        };
+        // Precondition: the secret bytes are present.
+        assert_ne!(blob.nonce, [0u8; 12]);
+        assert!(!blob.ciphertext.is_empty());
+
+        blob.zeroize(); // the same routine `ZeroizeOnDrop` runs on drop
+
+        assert_eq!(blob.nonce, [0u8; 12], "#80: blob nonce MUST be wiped");
+        assert!(
+            blob.ciphertext.is_empty(),
+            "#80: blob ciphertext MUST be wiped (Zeroize clears + truncates the Vec)"
         );
     }
 }

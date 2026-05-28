@@ -361,7 +361,13 @@ pub struct MpcBridge {
     ///
     /// Behind an `RwLock`: rotated atomically with `share` on a §18 refresh (the
     /// secret share changes, so this derived scalar must too).
-    share_scalar: Arc<RwLock<[u8; 32]>>,
+    ///
+    /// `Zeroizing<[u8; 32]>` (#80 TYPE LOCK): the secret scalar is wiped on `Drop`
+    /// (`ZeroizeOnDrop`), and a future refactor that reads `*lock.read()` and stows
+    /// it elsewhere keeps the `Zeroizing` wrapper — the secret cannot silently
+    /// escape to a raw `[u8; 32]` without breaking the build (mirrors the
+    /// `share.rs:568` TYPE LOCK guarantee).
+    share_scalar: Arc<RwLock<Zeroizing<[u8; 32]>>>,
 
     /// VSS evaluation points for all parties (one 32-byte scalar per party).
     /// Needed for Lagrange interpolation when combining partial ECDH results.
@@ -644,11 +650,10 @@ impl MpcBridge {
                 share: Arc::new(RwLock::new(dkg_result.share)),
                 joint_key: dkg_result.joint_key,
                 root_pub,
-                // `share_scalar` is `Zeroizing<[u8; 32]>` (Finding 4); deref-copy the
-                // bytes into the long-lived `[u8; 32]` field, which has its own manual
-                // wipe on `Drop` + rotation (`zeroize_secret_material` / `apply_refreshed_share`).
-                // The transient `Zeroizing` original is wiped when `new()` returns.
-                share_scalar: Arc::new(RwLock::new(*share_scalar)),
+                // #80 TYPE LOCK: move the parsed `Zeroizing<[u8; 32]>` straight into
+                // the now-`Zeroizing` field — the secret stays wrapped end-to-end
+                // (no transient raw `[u8; 32]` copy) and is wiped on `Drop`/rotation.
+                share_scalar: Arc::new(RwLock::new(share_scalar)),
                 vss_points,
                 client,
                 session_id: dkg_result.session_id,
@@ -667,11 +672,10 @@ impl MpcBridge {
             share: Arc::new(RwLock::new(dkg_result.share)),
             joint_key: dkg_result.joint_key,
             root_pub,
-            // `share_scalar` is `Zeroizing<[u8; 32]>` (Finding 4); deref-copy the
-            // bytes into the long-lived `[u8; 32]` field, which has its own manual
-            // wipe on `Drop` + rotation (`zeroize_secret_material` / `apply_refreshed_share`).
-            // The transient `Zeroizing` original is wiped when `new()` returns.
-            share_scalar: Arc::new(RwLock::new(*share_scalar)),
+            // #80 TYPE LOCK: move the parsed `Zeroizing<[u8; 32]>` straight into the
+            // now-`Zeroizing` field — the secret stays wrapped end-to-end (no
+            // transient raw `[u8; 32]` copy) and is wiped on `Drop`/rotation.
+            share_scalar: Arc::new(RwLock::new(share_scalar)),
             vss_points,
             client,
             session_id: dkg_result.session_id,
@@ -692,9 +696,11 @@ impl MpcBridge {
         self.share.read().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
-    /// Current share scalar (Copy) for local partial ECDH.
+    /// Current share scalar (Copy) for local partial ECDH. Deliberately copies the
+    /// raw bytes OUT of the `Zeroizing` lock for the ECDH primitive — the type lock
+    /// guards the long-lived FIELD; this transient copy is the documented ECDH boundary.
     fn current_share_scalar(&self) -> [u8; 32] {
-        *self.share_scalar.read().unwrap_or_else(|p| p.into_inner())
+        **self.share_scalar.read().unwrap_or_else(|p| p.into_inner())
     }
 
     /// **§18 rotation-on-commit (hot-swap).** Atomically replace the in-memory
@@ -708,8 +714,9 @@ impl MpcBridge {
         rotated: &EncryptedShare,
     ) -> bsv_mpc_core::error::Result<()> {
         use zeroize::Zeroize;
-        // Re-derive the local share scalar from the rotated KeyShare JSON.
-        let mut new_scalar = bsv_mpc_core::ecdh::parse_share_scalar(&rotated.ciphertext)
+        // Re-derive the local share scalar from the rotated KeyShare JSON. Stays a
+        // `Zeroizing<[u8; 32]>` so it can be moved straight into the field below.
+        let new_scalar = bsv_mpc_core::ecdh::parse_share_scalar(&rotated.ciphertext)
             .map_err(|e| MpcError::Protocol(format!("refresh hot-swap: bad rotated share: {e}")))?;
         // Carry the invariant joint pubkey forward if the rotated share omitted it.
         let mut next = rotated.clone();
@@ -728,11 +735,11 @@ impl MpcBridge {
         }
         {
             let mut sc = self.share_scalar.write().unwrap_or_else(|p| p.into_inner());
-            sc.zeroize(); // the old secret scalar
-            *sc = *new_scalar; // deref-copy out of `Zeroizing` (field is `[u8; 32]`)
+            // `*sc = …` drops the OLD `Zeroizing<[u8; 32]>` first (`ZeroizeOnDrop`
+            // wipes the dead scalar), then moves the rotated scalar in — it stays
+            // inside the `Zeroizing` type lock, never copied out to a raw `[u8; 32]`.
+            *sc = new_scalar;
         }
-        // The transient copy of the new scalar on the stack is no longer needed.
-        new_scalar.zeroize();
         Ok(())
     }
 
@@ -2007,7 +2014,7 @@ impl MpcBridge {
             share: Arc::new(RwLock::new(test_share.clone())),
             joint_key,
             root_pub,
-            share_scalar: Arc::new(RwLock::new([0u8; 32])),
+            share_scalar: Arc::new(RwLock::new(Zeroizing::new([0u8; 32]))),
             vss_points: vec![[0u8; 32]; 2],
             client: reqwest::Client::new(),
             session_id: SessionId::from_str_hash("test"),
@@ -2056,7 +2063,7 @@ mod tests {
             s.ciphertext = vec![0xAB; 96];
             s.nonce = vec![0xCD; 12];
         }
-        *bridge.share_scalar.write().unwrap() = [0xEF; 32];
+        *bridge.share_scalar.write().unwrap() = Zeroizing::new([0xEF; 32]);
 
         bridge.zeroize_secret_material();
 
@@ -2070,7 +2077,7 @@ mod tests {
             "#44: nonce MUST be zeroized"
         );
         assert_eq!(
-            *bridge.share_scalar.read().unwrap(),
+            **bridge.share_scalar.read().unwrap(),
             [0u8; 32],
             "#44: derived secret scalar MUST be zeroized"
         );
