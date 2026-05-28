@@ -1,45 +1,130 @@
-# bsv-mpc — Person A Handoff (post-audit, 2026-05-28)
+# bsv-mpc — Person A Handoff (post-audit, 2026-05-28; updated post-#75-ship)
 
 > For a NEW session to drive **Person A's** lane on the Calhoun-side BSV-MPC partnership.
 > Person A owns the **load-bearing 4-of-6 seam + spec-level decisions**.
-> Person B has the parallel lane (god-tier security hardening + 100cash Swift wiring) —
-> see `/Users/johncalhoun/bsv/mpc/100cash/ROADMAP-HANDOFF.md` §"Post-audit work split".
+> Person B has the parallel lane (god-tier security hardening + 100cash Swift wiring +
+> they're currently driving the 100cash#15 mainnet TXID that closes #75, and they may
+> also be in flight on #69 in their window) — see
+> `/Users/johncalhoun/bsv/mpc/100cash/ROADMAP-HANDOFF.md` §"Post-audit work split".
 > Repo: `B1nary-Calhoun-Partnership/bsv-mpc` (branch `main`), local at
-> `/Users/johncalhoun/bsv/mpc/bsv-mpc/`. Created 2026-05-28.
+> `/Users/johncalhoun/bsv/mpc/bsv-mpc/`. Created 2026-05-28; resume-state rewritten
+> after #75 shipped + Person B picked up the closing TXID + #69.
 
 ---
 
-## 🟢 Resume state — 2026-05-28 (read this first)
+## 🟢 Resume state — 2026-05-28 PM (READ THIS FIRST, then the checklist below)
 
-A 4-agent cross-repo coherence audit ran today. Findings:
+### What just shipped from the Person A window
 
-- **4-of-6 status:** the crypto is proven (mainnet TXID `febd2877…`, PR #46). 100cash already
-  threads `(t=4, n=6)` end-to-end. **But** `bsv-mpc-client/src/ffi.rs:756 create_wallet` →
-  `provision::provision_wallet` (`native_io/provision.rs:42`) → `run_dkg_over_http_authed`
-  (`bsv-mpc-relay/src/dkg.rs:159, 225`) is a **2-party** driver with `ShareIndex(1)`
-  hardcoded. `FfiDeployedSigner.sign` calls the 2-party combine. **The n-party
-  device-holds-(t-1) machinery lives only in `bsv-mpc-proxy`.** Filed as **bsv-mpc#69**
-  (comment + two-approach analysis).
-- **Spec drift:** 8 leak items + 6 spec gaps catalogued. Three filed as new issues
-  (`#73 ParticipationProof placeholders`, `#74 approval envelope phase + exec_id`,
-  `#75 canonical_render missing`).
-- **Single load-bearing handoff:** Person A's `#75` → Person B's `100cash#15`. Everything
-  else is parallel.
+- **bsv-mpc#75 (canonical_render + ffi_canonical_render)** — code + tests + spec amendment
+  ALL SHIPPED. **Issue stays OPEN until Person B's mainnet TXID lands** (no asterisks).
+  - MPC-Spec PR #48 → merged to main (commit `a140bd7`). ADR-0044 amendment §2.1 (intent
+    classifier shape — tagged sum + deny-unknown-fields), §2.2 (pre-resolved string
+    fields + punctuation tie-break normative), §2.3 (per-kind required fields — payment
+    gains `human_address`). Fixture: payment vector gains `intent.human_address`. Python
+    `canonical_render` reference impl in `runner-python/runner.py`.
+  - bsv-mpc PR #82 → merged to main (commit `0e90fbe`, squashed). `Intent` enum +
+    `canonical_render` in `bsv-mpc-core::approval` + `ffi_canonical_render(intent_cbor)`
+    in `bsv-mpc-client::ffi`. 18 new tests (13 unit + 5 FFI) + new conformance test +
+    existing `conformance_09_rendered_text.rs` byte-locks preimage/view_hash unchanged.
+  - Status comments posted on bsv-mpc#75, Calgooon/100cash#15, bsv-mpc#69 / #73 / #74 /
+    #70. No issues closed.
+- **`PROGRESS-PERSON-A.md` + `PERSON-A-HANDOFF.md`** committed to bsv-mpc main as
+  commit `5481e51` (separate from the #75 PR per "tracker docs go direct to main").
 
-**Next actions** in priority order (your call which first):
-1. **bsv-mpc#69** — pick approach (a) new `provision_wallet_nparty` seam in `bsv-mpc-client`
-   vs (b) factor proxy's `DeviceShareBundle`/`DevicePresigSetPool` out. Ask user before
-   coding — design choice has DRY-vs-complexity trade-off.
-2. **bsv-mpc#70** — runs in parallel with #69 (deploy ops, not crypto code).
-3. **bsv-mpc#75** — unblocks Person B's `100cash#15`. Spec-level: pick intent classifier
-   shape + per-kind formatters from ADR-0044 §2. Then expose as `ffi_canonical_render`.
-4. **bsv-mpc#74** — spec decision: add `"approval"` to ADR-0005 enum, or repurpose a
-   field? Same neighborhood as #75.
-5. **bsv-mpc#73** — `ParticipationProof.agent_identity` + `fee_txid` are placeholders in
-   `bsv-mpc-core/src/signing.rs:1028-1047`. Thread caller-supplied identity keys OR patch
-   in proxy. Same file as #69 — fold into that PR if natural.
+### What the other window is driving right now (per user, 2026-05-28 PM)
 
-Update **`PROGRESS-PERSON-A.md`** after each step.
+- **100cash#15** — Person B is wiring `ffi_canonical_render` into the 100cash send path
+  and intends to land the **mainnet TXID that closes bsv-mpc#75 + 100cash#15**.
+- **bsv-mpc#69** — Person B is reportedly "almost done" in their window. This was
+  originally a Person A item per the audit; appears the other window picked it up.
+  **DO NOT touch #69 files** until this is verified — see the checklist below.
+- Person B also still owns: bsv-mpc#76/#77/#78 (policy gate RED cluster), #79
+  (unbounded HTTP), #80 (Zeroize), #81 (share-metadata auth), 100cash#13/#14/#19/#25.
+
+### File-scope guards — DO NOT TOUCH (other window has uncommitted work)
+
+Last `git status` on local main showed Person B uncommitted in these paths. Re-verify
+with `git status` BEFORE editing anything — Person B may have committed or shifted
+since this doc was written:
+
+- `bsv-mpc-proxy/src/{bridge,config,server,wallet_api,policy}.rs`
+- `bsv-mpc-proxy/tests/*` (most files modified, plus `policy_gate_red_e2e.rs`,
+  `policy_loader_red_e2e.rs` untracked)
+- `bsv-mpc-core/Cargo.toml`, `bsv-mpc-core/src/policy.rs`
+- `bsv-mpc-core/tests/policy_mainnet_strict_red.rs` (untracked)
+- `.github/workflows/ci.yml`
+- `tests/e2e.rs`
+- Anywhere in `/Users/johncalhoun/bsv/mpc/100cash/` (Person B's entire repo)
+
+**If you commit to any file in their working tree, you cause a pull-conflict in
+their window.** The cost is real — they have to rebase + resolve. Do not introduce
+that friction.
+
+### First-action checklist for the new window (run BEFORE picking up any work)
+
+Execute these in order; the decision tree at the bottom tells you what to do based
+on what you find.
+
+1. **Pull latest:** `cd /Users/johncalhoun/bsv/mpc/bsv-mpc && git fetch && git log --oneline origin/main -10`. Note any commits since `5481e51` — that's whether
+   Person B has merged anything new (their policy cluster, #69, etc.).
+2. **Check the other window's working tree:** `git status --short` (same disk = same
+   working tree). The file-scope guard list above is a SNAPSHOT from this doc's write
+   time; the LIVE state is what `git status` shows now. Update your file-avoidance
+   list accordingly.
+3. **Check 100cash progress:**
+   - `cd /Users/johncalhoun/bsv/mpc/100cash && git log --oneline -10` (Person B's
+     activity)
+   - `git status --short` (Person B's in-flight work)
+   - `cat PROGRESS-PERSON-B.md` (their live tracker — sibling to ours)
+   - `gh issue view 15 --repo Calgooon/100cash` (look for closing comment + mainnet TXID)
+4. **Check bsv-mpc#75 closure:** `gh issue view 75 --comments` — if the mainnet TXID
+   has been posted, the issue should close. If it's still open without the TXID, the
+   send-path hasn't landed yet.
+5. **Check bsv-mpc#69 status:** `gh issue view 69 --comments` and `gh pr list --state
+   all --search "in:title 69"` — see if Person B opened a PR or commented progress.
+   The user said "almost done" — confirm what state it's actually in before treating
+   it as taken.
+6. **Build + test still green on main:** `cargo build -p bsv-mpc-core && cargo test
+   -p bsv-mpc-core --lib approval::` — sanity-check that #75 still works (only takes a
+   few seconds; the workspace is cached). If #75 broke, escalate to user before doing
+   anything else.
+
+### Decision tree based on what step 1-6 found
+
+- **#75 closed + #69 closed** → both load-bearing items done; pick from #74 (spec PR
+  first) or #73 (isolated single file). #73 is the easier same-day ship.
+- **#75 closed + #69 OPEN with Person B in flight** → STAY OUT of #69 files
+  (`bsv-mpc-client/src/{ffi.rs,native_io/*}`, `bsv-mpc-relay/src/dkg.rs`,
+  `bsv-mpc-proxy/src/{bridge,presign_manager,wallet_api}.rs`). Pick up #73 — it's in
+  `bsv-mpc-core/src/signing.rs:1028-1047` which has no overlap with the #69 surface.
+- **#75 OPEN + Person B working it** → #75 closure is the priority for them, not us.
+  Don't touch the FFI / approval surface (`bsv-mpc-core/src/approval.rs`,
+  `bsv-mpc-client/src/ffi.rs`'s `ffi_canonical_render` region). Pick up #73 (safe) or
+  #70 (deploy ops, no code), or wait if you want to be on call for FFI clarifications.
+- **#75 OPEN AND #69 OPEN AND Person B working both** → pick up #73 OR #70. Both are
+  zero-collision. If you can't be productive without colliding, the right move is to
+  hand back to the user with a status update.
+- **#74 spec PR still needed** → can start anytime — needs the user's ADR-0005
+  decision (add `"approval"` to enum vs different field) + ADR-0032's `exec_id_prefix`
+  rule. Spec PR lands first (per quality-gate-4), then the 2-line code fix in
+  `bsv-mpc-proxy/src/relay_approval.rs:132-133`. Note: that file isn't in Person B's
+  current touch list, but it IS in the same crate. Confirm via step 2 before editing.
+
+### Quality-gates rule (still applies, no exceptions)
+
+Every issue closed ships with UNIT + VECTOR/GOLDEN + E2E + SPEC PR (if applicable) +
+PROOF ARTIFACT (mainnet TXID + WoC URL or test names + CI run link) + CI INTEGRATION +
+ZERO-DRIFT all GREEN. "Skipping is lazy." "No asterisks." Open a follow-up issue
+instead of asterisking the parent. See the full quality gates section in the
+session-opener prompt below.
+
+### After picking up work
+
+Update `PROGRESS-PERSON-A.md` (live tracker — gets committed direct to main as
+sibling housekeeping). Use the existing entries for #73 / #74 / #69 / #70 as the
+slot for new status. Pattern: status → locked decisions → spec PR (if any) → code
+PR → quality gates (one line per gate with GREEN/PENDING + proof link).
 
 ---
 
