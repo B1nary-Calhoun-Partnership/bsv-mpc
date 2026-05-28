@@ -981,9 +981,13 @@ pub struct FfiPaymentOutput {
 /// - `recipient_outputs`: each pair carried verbatim as `PaymentOutput`
 /// - `human_address`: pre-resolved address text the wallet displays
 /// - `fee_sats`: pre-resolved miner fee (caller's fee derivation)
-/// - `counterparty_pubkey_hex`: optional 66-char compressed-secp256k1 pubkey;
-///   `None` → `cert_name: None` rendering as `"anonymous"`
-/// - `fiat_estimate` / `fiat_currency`: optional pair (both Some, or both None)
+/// - `counterparty_pubkey_hex`: 66-char compressed-secp256k1 pubkey if known;
+///   pass empty string for anonymous (renders as `"anonymous"` per ADR-0044
+///   when `cert_name: None`)
+/// - `fiat_estimate` / `fiat_currency`: REQUIRED by `Intent::Payment` (e.g.
+///   `"$50.00"` + `"USD"`). Callers without a fiat source can pass placeholder
+///   strings (e.g. `"—"` + `""`) — the values are opaque text the renderer
+///   substitutes verbatim into `rendered_text`.
 /// - `human_locale`: BCP-47 tag (e.g. `"en-US"`)
 #[allow(clippy::too_many_arguments)]
 #[uniffi::export]
@@ -992,9 +996,9 @@ pub fn ffi_build_payment_intent_cbor(
     recipient_outputs: Vec<FfiPaymentOutput>,
     human_address: String,
     fee_sats: u64,
-    counterparty_pubkey_hex: Option<String>,
-    fiat_estimate: Option<String>,
-    fiat_currency: Option<String>,
+    counterparty_pubkey_hex: String,
+    fiat_estimate: String,
+    fiat_currency: String,
     human_locale: String,
 ) -> Result<Vec<u8>, FfiError> {
     use bsv_mpc_core::approval::{Counterparty, Intent, PaymentOutput};
@@ -1010,7 +1014,7 @@ pub fn ffi_build_payment_intent_cbor(
         human_address,
         fee_sats,
         counterparty_identity: Counterparty {
-            pubkey: counterparty_pubkey_hex.unwrap_or_default(),
+            pubkey: counterparty_pubkey_hex,
             cert_name: None,
         },
         fiat_estimate,
