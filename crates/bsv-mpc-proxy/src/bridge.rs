@@ -222,8 +222,8 @@ fn resolve_proxy_identity_bytes(share_secret: &[u8]) -> std::result::Result<[u8;
 }
 
 /// Test-only: a [`RelaySession`] with a fresh random identity (replaces the
-/// removed `BridgeAuth::new`).
-#[cfg(test)]
+/// removed `BridgeAuth::new`). Available to integration tests via
+/// `MpcBridge::new_for_test`.
 fn test_relay_session() -> RelaySession {
     use rand::RngCore;
     let mut key_bytes = [0u8; 32];
@@ -1982,7 +1982,11 @@ impl MpcBridge {
     /// Create a bridge with a known joint key for testing.
     /// No KSS connection is established — only `joint_public_key()` and local
     /// derivation methods are usable. Partial ECDH (requiring KSS) will fail.
-    #[cfg(test)]
+    ///
+    /// Available to integration tests (`tests/*.rs`) and downstream test
+    /// fixtures. `#[doc(hidden)]` keeps it out of the public rustdoc surface
+    /// without forcing a feature flag.
+    #[doc(hidden)]
     pub fn new_for_test(joint_key: JointPublicKey) -> Self {
         let agent_id = hex_encode(&joint_key.compressed);
         let root_pub =
@@ -2182,6 +2186,9 @@ mod tests {
             relay_url: "https://rust-message-box.dev-a3e.workers.dev".into(),
             relay_sign: false,
             presign_url: None,
+        approval_recv_timeout_secs: 60,
+        network: None,
+        policy_manifest_path: None,
         };
 
         let bridge = MpcBridge::new(&config).await.unwrap();
@@ -2215,6 +2222,9 @@ mod tests {
             relay_url: "https://rust-message-box.dev-a3e.workers.dev".into(),
             relay_sign: false,
             presign_url: None,
+        approval_recv_timeout_secs: 60,
+        network: None,
+        policy_manifest_path: None,
         };
 
         let result = MpcBridge::new(&config).await;
@@ -2266,6 +2276,9 @@ mod tests {
             relay_url: "https://rust-message-box.dev-a3e.workers.dev".into(),
             relay_sign: false,
             presign_url: None,
+        approval_recv_timeout_secs: 60,
+        network: None,
+        policy_manifest_path: None,
         };
 
         let bridge = MpcBridge::new(&config).await.unwrap();
@@ -2471,6 +2484,9 @@ mod refresh_rotation_tests {
             relay_url: "https://rust-message-box.dev-a3e.workers.dev".into(),
             relay_sign: false,
             presign_url: None,
+        approval_recv_timeout_secs: 60,
+        network: None,
+        policy_manifest_path: None,
         }
     }
 

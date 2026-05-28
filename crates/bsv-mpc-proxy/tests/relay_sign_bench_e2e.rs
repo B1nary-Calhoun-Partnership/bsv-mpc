@@ -206,6 +206,9 @@ async fn relay_online_sign_latency() {
         relay_url,
         relay_sign: true,
         presign_url: None,
+        approval_recv_timeout_secs: 60,
+        network: None,
+        policy_manifest_path: None,
     };
     let bridge = MpcBridge::new(&config).await.expect("bridge handshake");
 

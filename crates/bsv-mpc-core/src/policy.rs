@@ -478,7 +478,24 @@ impl PolicyManifest {
 
     /// Validate every rule's `protocol_pattern` (§09.7) at load time. Invalid
     /// globs are rejected here, never at evaluation time.
+    ///
+    /// **Audit #78 — `mainnet-strict` interlock.** When the crate is built with
+    /// the `mainnet-strict` cargo feature, `dry_run: true` is a HARD REJECT
+    /// at validate-time: a mainnet binary will refuse to construct a
+    /// `PolicyEngine` from a shadow-mode manifest. This closes the audit's
+    /// "RED #3" silent-neutralization gap at the binary level (in addition to
+    /// the HTTP `would_have_denied` surface, which catches the same drift in
+    /// non-strict builds).
     pub fn validate(&self) -> Result<()> {
+        #[cfg(feature = "mainnet-strict")]
+        if self.dry_run {
+            return Err(MpcError::Policy(
+                "dry_run=true is forbidden under feature mainnet-strict — \
+                 a mainnet binary refuses to load a shadow-mode policy manifest \
+                 (audit bsv-mpc#78)"
+                    .into(),
+            ));
+        }
         for rule in &self.rules {
             validate_pattern(&rule.protocol_pattern)?;
         }

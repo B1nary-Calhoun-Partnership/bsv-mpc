@@ -337,6 +337,9 @@ async fn container_reshare_2of2_to_2of3_deployed_real_mainnet() {
         relay_url: relay_url.clone(),
         relay_sign: false,
         presign_url: Some(container_url.clone()),
+        approval_recv_timeout_secs: 60,
+        network: None,
+        policy_manifest_path: None,
     };
     let bridge = MpcBridge::new(&proxy_config)
         .await

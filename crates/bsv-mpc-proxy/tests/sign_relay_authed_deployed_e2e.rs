@@ -160,6 +160,9 @@ fn proxy_config(
         relay_url: relay_url.to_string(),
         relay_sign,
         presign_url: None,
+        approval_recv_timeout_secs: 60,
+        network: None,
+        policy_manifest_path: None,
     }
 }
 

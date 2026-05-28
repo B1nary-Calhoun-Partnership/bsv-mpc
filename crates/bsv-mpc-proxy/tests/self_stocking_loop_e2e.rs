@@ -169,7 +169,10 @@ async fn full_self_stocking_loop() {
         min_balance_sats: None,
         relay_url,
         relay_sign: true,
-        presign_url: Some(svc_url.clone()), // presig + DKG go to the native cosigner
+        presign_url: Some(svc_url.clone()),
+        approval_recv_timeout_secs: 60, // presig + DKG go to the native cosigner
+        network: None,
+        policy_manifest_path: None,
     };
     let bridge = MpcBridge::new(&config)
         .await

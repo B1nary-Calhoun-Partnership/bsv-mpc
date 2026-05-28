@@ -232,19 +232,73 @@ impl ProxyBuilder {
     }
 }
 
+/// Load a `PolicyEngine` for the env-driven binary entry point per audit #77.
+///
+/// Reads `MPC_POLICY_MANIFEST` (path to a CBOR-encoded
+/// [`bsv_mpc_core::policy::PolicyManifest`]) off the config. On
+/// `MPC_NETWORK=mainnet` this MUST be set, otherwise the binary fails fast:
+/// the audit caught that the env-driven entry point at `server.rs:284`
+/// hardcoded `policy_engine: None`, meaning every container/CF deployment of
+/// the proxy historically ran without an enforced policy gate.
+///
+/// Returns:
+/// - `Ok(Some(engine))` when the manifest path is set and loads cleanly.
+/// - `Ok(None)` for testnet/dev when no manifest is configured (prior
+///   behavior preserved for non-mainnet operators).
+/// - `Err(_)` when `MPC_NETWORK=mainnet` AND no manifest is configured, or
+///   when the manifest file cannot be read / parsed.
+pub fn load_policy_engine_from_config(
+    config: &ProxyConfig,
+) -> anyhow::Result<Option<bsv_mpc_core::policy::PolicyEngine>> {
+    let network_is_mainnet = config
+        .network
+        .as_deref()
+        .map(|s| s.eq_ignore_ascii_case("mainnet"))
+        .unwrap_or(false);
+
+    let Some(path) = config.policy_manifest_path.as_deref() else {
+        if network_is_mainnet {
+            return Err(anyhow::anyhow!(
+                "MPC_NETWORK=mainnet but MPC_POLICY_MANIFEST is unset — \
+                 refusing to start a mainnet proxy without an enforced \
+                 PolicyManifest (audit bsv-mpc#77). Provide a CBOR manifest \
+                 path, or set MPC_NETWORK to a non-mainnet value for \
+                 staging/dev runs."
+            ));
+        }
+        return Ok(None);
+    };
+
+    let bytes = std::fs::read(path)
+        .map_err(|e| anyhow::anyhow!("read MPC_POLICY_MANIFEST {path:?}: {e}"))?;
+    let manifest = bsv_mpc_core::policy::PolicyManifest::from_cbor(&bytes)
+        .map_err(|e| anyhow::anyhow!("parse MPC_POLICY_MANIFEST {path:?}: {e}"))?;
+    let engine = bsv_mpc_core::policy::PolicyEngine::new(manifest)
+        .map_err(|e| anyhow::anyhow!("build PolicyEngine from {path:?}: {e}"))?;
+    Ok(Some(engine))
+}
+
 /// Start the BRC-100 HTTP server.
 ///
 /// This function:
 /// 1. Loads and decrypts the key share
 /// 2. Initializes the MPC bridge with the KSS
-/// 3. Starts the background presignature replenishment task
-/// 4. Binds to `0.0.0.0:{port}` and serves BRC-100 endpoints
+/// 3. Loads the env-supplied policy manifest (audit #77; fail-closed on mainnet)
+/// 4. Starts the background presignature replenishment task
+/// 5. Binds to `0.0.0.0:{port}` and serves BRC-100 endpoints
 ///
 /// # Errors
 ///
 /// Returns an error if the share file cannot be loaded, the KSS is
-/// unreachable during initialization, or the TCP listener fails to bind.
+/// unreachable during initialization, the TCP listener fails to bind, or
+/// — per audit #77 — `MPC_NETWORK=mainnet` without `MPC_POLICY_MANIFEST`.
 pub async fn run(config: ProxyConfig) -> anyhow::Result<()> {
+    // Load the policy engine BEFORE we touch the KSS / share / network so a
+    // misconfigured mainnet deployment refuses to start with the clearest
+    // possible error (audit bsv-mpc#77).
+    let policy_engine =
+        load_policy_engine_from_config(&config)?.map(|e| Arc::new(std::sync::Mutex::new(e)));
+
     let bridge = MpcBridge::new(&config).await?;
 
     let fee_injector = FeeInjector::new(
@@ -278,10 +332,11 @@ pub async fn run(config: ProxyConfig) -> anyhow::Result<()> {
         bridge,
         presign_manager: presign_manager.clone(),
         device_presig_pool,
-        // Policy gating is opt-in via the library ProxyBuilder; the env-driven
-        // server entry point runs without a policy engine for now (#43 follow-on:
-        // load the manifest from config / the cosigner cert).
-        policy_engine: None,
+        // §4 policy + approval gate (audit bsv-mpc#77): the engine is loaded
+        // from `MPC_POLICY_MANIFEST` above; `MPC_NETWORK=mainnet` without a
+        // manifest already errored out before this point, so a `None` here
+        // means the operator explicitly chose testnet/dev with no manifest.
+        policy_engine,
         fee_injector,
         storage,
         http_client,

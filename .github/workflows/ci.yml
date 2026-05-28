@@ -53,6 +53,14 @@ jobs:
       # rustdoc examples don't silently rot — they were already broken for
       # anyhow::Result references in bsv-mpc-overlay until 2026-05-17.
       - run: cargo test --workspace --doc
+      # Audit bsv-mpc#78 option 1 (compile-time interlock): mainnet builds are
+      # compiled with `--features mainnet-strict`, under which
+      # `PolicyManifest::validate` refuses `dry_run: true`. We piggyback on
+      # this job (same runner, warm cache) instead of spinning a new one so
+      # the gate adds seconds, not minutes. A regression that re-permits
+      # dry_run in mainnet-strict builds fails this step.
+      - name: mainnet-strict policy gate (audit bsv-mpc#78)
+        run: cargo test --features mainnet-strict -p bsv-mpc-core --test policy_mainnet_strict_red
 
   wasm:
     name: build + test (wasm32)

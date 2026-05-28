@@ -230,6 +230,9 @@ async fn container_refresh_then_sign_deployed_real_mainnet_tx() {
         relay_url: relay_url.clone(),
         relay_sign: false,
         presign_url: Some(container_url.clone()),
+        approval_recv_timeout_secs: 60,
+        network: None,
+        policy_manifest_path: None,
     };
     let bridge = MpcBridge::new(&proxy_config)
         .await

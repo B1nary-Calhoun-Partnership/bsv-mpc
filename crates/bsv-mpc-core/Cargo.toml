@@ -6,6 +6,14 @@ rust-version.workspace = true
 license.workspace = true
 description = "Core MPC threshold ECDSA signing protocol for BSV (wraps cggmp24)"
 
+[features]
+# Audit #78 hard interlock: when compiled with `mainnet-strict`,
+# `PolicyManifest::validate` REFUSES to load a manifest with `dry_run: true`.
+# Mainnet binaries are built with this feature on so a shadow-mode manifest
+# cannot accidentally land in production. Off by default; testnet/dev builds
+# can still load shadow-mode manifests for staging exercises.
+mainnet-strict = []
+
 [dependencies]
 cggmp24.workspace = true
 cggmp24-keygen.workspace = true

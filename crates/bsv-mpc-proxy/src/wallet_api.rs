@@ -1200,6 +1200,51 @@ pub async fn create_signature_impl(state: &AppState, body: Value) -> Value {
         h
     };
 
+    // ── Policy + approval gate (audit #76: RED #1) ─────────────────────────
+    // `create_signature_impl` runs the SAME §4 gate as `create_action_impl`
+    // BEFORE any relay/signing material is consumed. Bypassing it via the
+    // raw-sighash path was the audit's RED #1: any BRC-100 client could hand
+    // over an arbitrary sighash and get a deployed-cosigner signature without
+    // a check_signing / approval-quorum hook firing.
+    //
+    // For createSignature, the binding is the sighash + the BRC-42
+    // protocol/key identifiers (not amount + recipient — those are N/A for
+    // a raw sign). The approval rendered_text reflects that.
+    let (sighash_protocol, sighash_key) = match parse_protocol_params(&body) {
+        Ok((_level, proto, key, _cp)) => (proto, key),
+        // Base-key (no BRC-42 protocolID): gate under the createSignature
+        // intent with empty protocol/key strings — the rule engine evaluates
+        // against an empty `protocol_id`, which falls through to default_action.
+        Err(_) => (String::new(), String::new()),
+    };
+    let sighash_hex = hex::encode(msg_hash);
+    let intent = SigningIntent::CreateSignature {
+        sighash_hex: &sighash_hex,
+        protocol_id: &sighash_protocol,
+        key_id: &sighash_key,
+    };
+    match enforce_policy_and_approval(state, intent).await {
+        EnforceOutcome::Allow => {}
+        EnforceOutcome::Denied(reason) => {
+            return json!({
+                "error": format!("policy/approval gate refused the signature: {reason}"),
+                "enforced": true,
+                "would_have_denied": false,
+                HTTP_STATUS_SENTINEL: 403,
+            });
+        }
+        EnforceOutcome::WouldHaveDenied(reason) => {
+            return json!({
+                "error": format!(
+                    "policy/approval gate refused the signature (dry-run): {reason}"
+                ),
+                "enforced": false,
+                "would_have_denied": true,
+                HTTP_STATUS_SENTINEL: 403,
+            });
+        }
+    }
+
     // Compute BRC-42 HMAC offset for derived key signing.
     // For "anyone" counterparty: offset = HMAC(root_pub, invoice) — fully local (0 KSS round-trips).
     // For "self"/"other": 1 partial ECDH round with KSS to compute shared_secret.
@@ -1247,11 +1292,18 @@ pub async fn create_signature_impl(state: &AppState, body: Value) -> Value {
 }
 
 /// Axum handler for `POST /createSignature`. Delegates to [`create_signature_impl`].
+///
+/// Returns `(StatusCode, Json<Value>)` so the policy gate can surface non-2xx
+/// for denial paths (audit bsv-mpc#78 option 2). The impl function records
+/// the intended status via [`HTTP_STATUS_SENTINEL`]; this handler drains it
+/// off the body so library callers see the same JSON shape as before.
 pub async fn create_signature(
     State(state): State<Arc<AppState>>,
     Json(body): Json<Value>,
-) -> Json<Value> {
-    Json(create_signature_impl(&state, body).await)
+) -> (axum::http::StatusCode, Json<Value>) {
+    let mut resp = create_signature_impl(&state, body).await;
+    let status = drain_http_status(&mut resp);
+    (status, Json(resp))
 }
 
 /// `POST /verifySignature`
@@ -1379,39 +1431,165 @@ pub async fn verify_signature(
 /// 7. **Broadcast**: Submit the signed transaction to the BSV network.
 /// 8. **UTXO update**: Mark spent inputs, add new outputs to the local tracker.
 ///
-/// **§4 policy + approval gate (issue #43).** Run the policy `check_signing` hook
-/// for this action; on `RequireApproval`, collect a k-of-m approval over the
-/// relay and proceed only on `Approved`. Returns `Ok(())` to proceed, or
-/// `Err(reason)` to refuse the spend. A `None` policy engine = no gate (Ok).
+/// The signing intent passed into [`enforce_policy_and_approval`] (#76: factored
+/// to a shared enum so both `create_action_impl` AND `create_signature_impl` go
+/// through the same gate with identical verdict handling). Each variant carries
+/// the per-handler context the gate needs to render the approval display +
+/// request_view_hash binding.
+pub(crate) enum SigningIntent<'a> {
+    /// `POST /createAction` — multi-input spend with a known total amount and
+    /// a primary recipient (the first user output's locking script hex).
+    CreateAction {
+        amount_sats: u64,
+        recipient_hex: &'a str,
+    },
+    /// `POST /createSignature` — raw 32-byte sighash signing. Amount and
+    /// recipient are not applicable; the binding is the sighash + the BRC-42
+    /// protocol/key identifiers.
+    CreateSignature {
+        sighash_hex: &'a str,
+        protocol_id: &'a str,
+        key_id: &'a str,
+    },
+}
+
+impl SigningIntent<'_> {
+    fn protocol_id(&self) -> &str {
+        match self {
+            Self::CreateAction { .. } => "createaction",
+            Self::CreateSignature { protocol_id, .. } => protocol_id,
+        }
+    }
+    fn amount_sats(&self) -> u64 {
+        match self {
+            Self::CreateAction { amount_sats, .. } => *amount_sats,
+            Self::CreateSignature { .. } => 0,
+        }
+    }
+    fn recipient(&self) -> bsv_mpc_core::approval::Recipient {
+        use bsv_mpc_core::approval::Recipient;
+        match self {
+            Self::CreateAction { recipient_hex, .. } => Recipient::Single((*recipient_hex).into()),
+            Self::CreateSignature { .. } => Recipient::Single(String::new()),
+        }
+    }
+    fn sighash_hex(&self) -> String {
+        match self {
+            // Multi-input createAction does not bind to a single sighash; the
+            // gate runs over the total action, not per-input.
+            Self::CreateAction { .. } => "00".repeat(32),
+            Self::CreateSignature { sighash_hex, .. } => (*sighash_hex).to_string(),
+        }
+    }
+    fn rendered_text(&self) -> String {
+        match self {
+            Self::CreateAction {
+                amount_sats,
+                recipient_hex,
+            } => format!("Send {amount_sats} sats to {recipient_hex}"),
+            Self::CreateSignature {
+                sighash_hex,
+                protocol_id,
+                key_id,
+            } => format!(
+                "Sign hash {sighash_hex} under protocol {protocol_id}, key {key_id}"
+            ),
+        }
+    }
+    fn session_seed(&self) -> String {
+        match self {
+            Self::CreateAction {
+                amount_sats,
+                recipient_hex,
+            } => format!("approval-createaction-{amount_sats}-{recipient_hex}"),
+            Self::CreateSignature {
+                sighash_hex,
+                protocol_id,
+                key_id,
+            } => format!("approval-createsignature-{protocol_id}-{key_id}-{sighash_hex}"),
+        }
+    }
+}
+
+/// Outcome of [`enforce_policy_and_approval`] (#78: replaces the previous
+/// `Result<(), String>` so `dry_run` denials are observably distinct from
+/// enforced denials). The HTTP layer maps each variant to a response.
+pub(crate) enum EnforceOutcome {
+    /// Verdict was Allow (or no policy engine configured) — proceed to sign.
+    Allow,
+    /// Verdict was Deny / RateLimited / approval-not-reached. Hard block: no
+    /// signing material is consumed.
+    Denied(String),
+    /// `dry_run: true` manifest produced a denial verdict. Per audit #78
+    /// option 2: surface the would-have-denial to the client as a non-2xx
+    /// response with `{would_have_denied: true, enforced: false}` so any
+    /// monitoring catches accidental drift between staging and prod manifests.
+    /// The request is NOT signed.
+    WouldHaveDenied(String),
+}
+
+/// Internal sentinel key on policy-denial response bodies. The axum handler
+/// pops it off and uses it to set the HTTP status; library callers ignore it
+/// (they read `error` / `would_have_denied` / `enforced` directly). Audit
+/// bsv-mpc#78 option 2 — non-2xx surface for denial paths.
+pub(crate) const HTTP_STATUS_SENTINEL: &str = "__http_status";
+
+/// Drain the [`HTTP_STATUS_SENTINEL`] field (if present) from a wallet-api
+/// response body, returning the status the handler should serve. Defaults to
+/// 200 OK when no sentinel is set (the existing convention).
+pub(crate) fn drain_http_status(body: &mut Value) -> axum::http::StatusCode {
+    let Some(obj) = body.as_object_mut() else {
+        return axum::http::StatusCode::OK;
+    };
+    let Some(v) = obj.remove(HTTP_STATUS_SENTINEL) else {
+        return axum::http::StatusCode::OK;
+    };
+    v.as_u64()
+        .and_then(|n| u16::try_from(n).ok())
+        .and_then(|n| axum::http::StatusCode::from_u16(n).ok())
+        .unwrap_or(axum::http::StatusCode::OK)
+}
+
+/// **§4 policy + approval gate (issue #43, refactored per audit #76/#78).** Run
+/// the policy `check_signing` hook for this intent; on `RequireApproval`,
+/// collect a k-of-m approval over the relay and proceed only on `Approved`.
 ///
-/// `dry_run` manifests (§09.10) compute the verdict but never block — the verdict
-/// is logged and the spend proceeds (shadow mode).
-async fn enforce_policy_and_approval(
+/// Returns:
+/// - [`EnforceOutcome::Allow`] when the verdict permits signing (or no policy
+///   engine is configured).
+/// - [`EnforceOutcome::Denied`] for an enforced Deny / RateLimited /
+///   approval-not-reached.
+/// - [`EnforceOutcome::WouldHaveDenied`] when the manifest is in `dry_run: true`
+///   mode AND the verdict was a denial. The caller MUST NOT sign; instead it
+///   surfaces a non-2xx response so the audit's "silent neutralization" gap
+///   (issue #78) cannot recur.
+pub(crate) async fn enforce_policy_and_approval(
     state: &AppState,
-    amount_sats: u64,
-    recipient_hex: &str,
-    protocol_id: &str,
-) -> std::result::Result<(), String> {
-    use bsv_mpc_core::approval::{request_view_hash, Recipient};
+    intent: SigningIntent<'_>,
+) -> EnforceOutcome {
+    use bsv_mpc_core::approval::request_view_hash;
     use bsv_mpc_core::policy::{SigningCheck, Verdict};
 
     let Some(engine) = state.policy_engine.as_ref() else {
-        return Ok(()); // no policy configured → unconditional (prior behavior)
+        return EnforceOutcome::Allow; // no policy configured → unconditional (prior behavior)
     };
 
     // Evaluate the policy (sync; lock not held across the await below).
     let (verdict, policy_id_hex, dry_run) = {
-        let mut eng = engine
-            .lock()
-            .map_err(|_| "policy engine mutex poisoned".to_string())?;
+        let mut eng = match engine.lock() {
+            Ok(g) => g,
+            Err(_) => {
+                return EnforceOutcome::Denied("policy engine mutex poisoned".into());
+            }
+        };
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
         let verdict = eng.check_signing(
             &SigningCheck {
-                protocol_id: protocol_id.to_string(),
-                amount_sats,
+                protocol_id: intent.protocol_id().to_string(),
+                amount_sats: intent.amount_sats(),
                 fee_sats: 0,
                 counterparty: None,
             },
@@ -1420,40 +1598,30 @@ async fn enforce_policy_and_approval(
         (verdict, eng.manifest().policy_id.hex(), eng.is_dry_run())
     };
 
+    let denied = |reason: String| -> EnforceOutcome {
+        if dry_run {
+            tracing::warn!(%reason, "policy DENY (dry-run: surfaced as would_have_denied)");
+            EnforceOutcome::WouldHaveDenied(reason)
+        } else {
+            EnforceOutcome::Denied(reason)
+        }
+    };
+
     match verdict {
-        Verdict::Allow => Ok(()),
-        Verdict::Deny(reason) => {
-            if dry_run {
-                tracing::warn!(%reason, "policy DENY (dry-run: not enforced)");
-                Ok(())
-            } else {
-                Err(format!("policy denied: {reason}"))
-            }
-        }
-        Verdict::RateLimited { retry_after_secs } => {
-            if dry_run {
-                tracing::warn!(
-                    retry_after_secs,
-                    "policy RATE-LIMITED (dry-run: not enforced)"
-                );
-                Ok(())
-            } else {
-                Err(format!(
-                    "policy rate-limited; retry after {retry_after_secs}s"
-                ))
-            }
-        }
+        Verdict::Allow => EnforceOutcome::Allow,
+        Verdict::Deny(reason) => denied(format!("policy denied: {reason}")),
+        Verdict::RateLimited { retry_after_secs } => denied(format!(
+            "policy rate-limited; retry after {retry_after_secs}s"
+        )),
         Verdict::RequireApproval(quorum) => {
-            // Compute request_view_hash (§09.5.1 step 1) over the rendered action.
-            let session = bsv_mpc_core::types::SessionId::from_str_hash(&format!(
-                "approval-{}-{}-{}",
-                protocol_id, amount_sats, recipient_hex
-            ));
-            let rendered_text = format!("Send {amount_sats} sats to {recipient_hex}");
+            // Compute request_view_hash (§09.5.1 step 1) over the rendered intent.
+            let session_seed = intent.session_seed();
+            let session = bsv_mpc_core::types::SessionId::from_str_hash(&session_seed);
+            let rendered_text = intent.rendered_text();
             let rvh = request_view_hash(
-                amount_sats,
-                &Recipient::Single(recipient_hex.to_string()),
-                &"00".repeat(32), // action-level sighash placeholder (multi-input)
+                intent.amount_sats(),
+                &intent.recipient(),
+                &intent.sighash_hex(),
                 &session.hex(),
                 &policy_id_hex,
                 &"00".repeat(64), // manifest_ack placeholder (no user ack in this path)
@@ -1468,17 +1636,21 @@ async fn enforce_policy_and_approval(
                 }
                 a
             };
-            let coordinator_priv = state
-                .bridge
-                .relay_identity_priv()
-                .map_err(|e| format!("approval coordinator identity: {e}"))?;
+            let coordinator_priv = match state.bridge.relay_identity_priv() {
+                Ok(p) => p,
+                Err(e) => {
+                    return denied(format!("approval coordinator identity: {e}"));
+                }
+            };
 
             tracing::info!(
                 k = quorum.k,
                 eligible = quorum.eligible.len(),
                 "policy RequireApproval — collecting approval over the relay"
             );
-            let status = crate::relay_approval::collect_approval_over_relay(
+            let timeout =
+                std::time::Duration::from_secs(state.config.approval_recv_timeout_secs);
+            let status = match crate::relay_approval::collect_approval_over_relay(
                 state.bridge.relay_url(),
                 coordinator_priv,
                 quorum,
@@ -1486,21 +1658,22 @@ async fn enforce_policy_and_approval(
                 session,
                 joint,
                 &rendered_text,
-                std::time::Duration::from_secs(60),
+                timeout,
             )
             .await
-            .map_err(|e| format!("approval collection failed: {e}"))?;
+            {
+                Ok(s) => s,
+                Err(e) => {
+                    return denied(format!("approval collection failed: {e}"));
+                }
+            };
 
             match status {
                 bsv_mpc_core::approval::ApprovalStatus::Approved => {
                     tracing::info!("approval quorum reached — proceeding to sign");
-                    Ok(())
+                    EnforceOutcome::Allow
                 }
-                other if dry_run => {
-                    tracing::warn!(?other, "approval NOT reached (dry-run: not enforced)");
-                    Ok(())
-                }
-                other => Err(format!("approval not granted: {other:?}")),
+                other => denied(format!("approval not granted: {other:?}")),
             }
         }
     }
@@ -1637,19 +1810,39 @@ pub async fn create_action_impl(state: &AppState, body: Value) -> Value {
         input_tuples.push((txid_bytes, utxo.vout, 0xFFFFFFFF));
     }
 
-    // ── 8.5 Policy + approval gate (§4, issue #43) ───────────────────────
+    // ── 8.5 Policy + approval gate (§4, issue #43; refactored per audit #76/#78) ─
     // Run the policy engine for this action BEFORE consuming any presig /
     // signing material; a RequireApproval verdict collects a k-of-m approval
     // over the relay and the spend proceeds only on Approved. No policy engine
-    // configured → no gate.
+    // configured → no gate. Dry-run denials surface as a non-2xx
+    // `would_have_denied` response (audit #78) — the spend is NEVER signed in
+    // dry_run + Deny mode, closing the silent-neutralization gap.
     let recipient_hex = outputs
         .first()
         .map(|(_, script)| hex::encode(script))
         .unwrap_or_default();
-    if let Err(reason) =
-        enforce_policy_and_approval(state, total_user_output, &recipient_hex, "createaction").await
-    {
-        return json!({ "error": format!("policy/approval gate refused the spend: {reason}") });
+    let intent = SigningIntent::CreateAction {
+        amount_sats: total_user_output,
+        recipient_hex: &recipient_hex,
+    };
+    match enforce_policy_and_approval(state, intent).await {
+        EnforceOutcome::Allow => {}
+        EnforceOutcome::Denied(reason) => {
+            return json!({
+                "error": format!("policy/approval gate refused the spend: {reason}"),
+                "enforced": true,
+                "would_have_denied": false,
+                HTTP_STATUS_SENTINEL: 403,
+            });
+        }
+        EnforceOutcome::WouldHaveDenied(reason) => {
+            return json!({
+                "error": format!("policy/approval gate refused the spend (dry-run): {reason}"),
+                "enforced": false,
+                "would_have_denied": true,
+                HTTP_STATUS_SENTINEL: 403,
+            });
+        }
     }
 
     // ── 9. Sign each input ───────────────────────────────────────────────
@@ -1815,11 +2008,17 @@ pub async fn create_action_impl(state: &AppState, body: Value) -> Value {
 }
 
 /// Axum handler for `POST /createAction`. Delegates to [`create_action_impl`].
+///
+/// Returns `(StatusCode, Json<Value>)` so the policy gate can surface non-2xx
+/// for denial paths (audit bsv-mpc#78 option 2). See `create_signature` for
+/// the [`HTTP_STATUS_SENTINEL`] convention.
 pub async fn create_action(
     State(state): State<Arc<AppState>>,
     Json(body): Json<Value>,
-) -> Json<Value> {
-    Json(create_action_impl(&state, body).await)
+) -> (axum::http::StatusCode, Json<Value>) {
+    let mut resp = create_action_impl(&state, body).await;
+    let status = drain_http_status(&mut resp);
+    (status, Json(resp))
 }
 
 /// `POST /internalizeAction`

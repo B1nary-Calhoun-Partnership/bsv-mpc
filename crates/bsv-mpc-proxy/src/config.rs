@@ -117,6 +117,28 @@ pub struct ProxyConfig {
     /// online signing runs against the wasm DO (`kss_url`) over the relay. `None`
     /// → fall back to `kss_url` (single-endpoint dev). Env: `MPC_PRESIGN_URL`.
     pub presign_url: Option<String>,
+
+    /// **Approval-collection receive timeout (#43, audit #76).** Upper bound on
+    /// how long the §4 policy/approval gate waits for k-of-m Allow responses
+    /// over the MessageBox relay before returning `approval not granted`.
+    /// Default 60s. Tests construct with a small value (e.g. 1s) so the
+    /// `RequireApproval` rejection path is fast under no-relay conditions.
+    /// Env: `MPC_APPROVAL_RECV_TIMEOUT_SECS`.
+    pub approval_recv_timeout_secs: u64,
+
+    /// **Network selector (audit #77).** `"mainnet"` → the env-driven binary
+    /// REFUSES to start without `policy_manifest_path` set (fail-closed: every
+    /// real-sats deployment must run under a manifest). `"testnet"` / `"dev"`
+    /// / `None` → no requirement (manifest still loaded if provided). Audit
+    /// finding bsv-mpc#77. Env: `MPC_NETWORK`.
+    pub network: Option<String>,
+
+    /// **Policy manifest path (audit #77).** Path to the CBOR-encoded
+    /// [`bsv_mpc_core::policy::PolicyManifest`] this proxy enforces. Loaded
+    /// at startup by `server::run`; on `MPC_NETWORK=mainnet` this MUST be set,
+    /// otherwise the binary fails fast with a clear error. Env:
+    /// `MPC_POLICY_MANIFEST`.
+    pub policy_manifest_path: Option<String>,
 }
 
 impl ProxyConfig {
@@ -179,6 +201,15 @@ impl ProxyConfig {
             relay_sign: std::env::var("MPC_RELAY_SIGN").as_deref() == Ok("1"),
 
             presign_url: std::env::var("MPC_PRESIGN_URL").ok(),
+
+            approval_recv_timeout_secs: std::env::var("MPC_APPROVAL_RECV_TIMEOUT_SECS")
+                .unwrap_or_else(|_| "60".into())
+                .parse()
+                .map_err(|e| anyhow::anyhow!("Invalid MPC_APPROVAL_RECV_TIMEOUT_SECS: {e}"))?,
+
+            network: std::env::var("MPC_NETWORK").ok(),
+
+            policy_manifest_path: std::env::var("MPC_POLICY_MANIFEST").ok(),
         })
     }
 }

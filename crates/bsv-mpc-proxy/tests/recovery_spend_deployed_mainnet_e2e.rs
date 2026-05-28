@@ -266,6 +266,9 @@ fn proxy_config_2of3(
         relay_url: relay_url.to_string(),
         relay_sign: false,
         presign_url: Some(container_url.to_string()),
+        approval_recv_timeout_secs: 60,
+        network: None,
+        policy_manifest_path: None,
     }
 }
 

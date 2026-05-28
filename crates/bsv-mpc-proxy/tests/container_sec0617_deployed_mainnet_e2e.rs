@@ -255,6 +255,9 @@ async fn container_sec0617_self_presign_deployed_real_mainnet_tx() {
         // The container is the heavy-MPC cosigner — presign + the §06.17.1 routes
         // live there.
         presign_url: Some(container_url.clone()),
+        approval_recv_timeout_secs: 60,
+        network: None,
+        policy_manifest_path: None,
     };
     let bridge = MpcBridge::new(&proxy_config)
         .await
