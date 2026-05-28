@@ -40,6 +40,7 @@
 //! therefore an **input** to this primitive. The deterministic, lockable part
 //! is the CBOR-of-8-fields → SHA-256, which this module owns.
 
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 /// Recipient binding for key 2 of the `request_view_hash` preimage.
@@ -171,6 +172,317 @@ pub fn request_view_hash(
     hash.copy_from_slice(&Sha256::digest(&preimage));
 
     RequestViewHash { hash, preimage }
+}
+
+// ===========================================================================
+// ADR-0044 canonical wallet renderer (issue #75)
+// ===========================================================================
+//
+// `canonical_render(intent)` is the PURE-SUBSTITUTION function that produces
+// the `rendered_text` field consumed at key 8 of the [`request_view_hash`]
+// preimage above. Both bsv-mpc and rust-mpc MUST agree byte-for-byte on the
+// output for the same `Intent`, otherwise WYSIWYS is broken (the wallet would
+// display one string while the cosigner bound to another). ADR-0044 §2.1/§2.2/
+// §2.3 (amended 2026-05-28) locks the shape:
+//
+// - `Intent` is a tagged sum-type with discriminant key `kind`; the five
+//   accepted values are exactly `payment`, `token_transfer`, `script_spend`,
+//   `brc100_internalize`, `multi` (case-sensitive, snake_case, no aliases).
+// - Each variant is a closed flat object: missing OR extra fields MUST reject.
+// - The renderer is PURE SUBSTITUTION over pre-resolved string fields (no
+//   address derivation, no cert-chain lookup, no network, no currency
+//   conversion, no key arithmetic). The ONLY in-renderer algorithmic
+//   transformations are the counterparty truncation (`cert_name + " + 0x" +
+//   pubkey_hex[..8] + "..."`) and the token-contract-hash truncation
+//   (`"0x" + hex_no_0x_prefix[..8] + "..."`).
+//
+// The locked test vectors at `tests/fixtures/09-rendered-text.json` are the
+// schema — `tests/conformance_09_canonical_render.rs` byte-locks them.
+
+/// One output of a payment intent (a `{script, value_sats}` pair). Schema is
+/// closed (`deny_unknown_fields`); any extra field is a HARD reject per
+/// ADR-0044 §2.1.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PaymentOutput {
+    /// Locking-script hex (opaque to the renderer; carried for the
+    /// `request_view_hash` binding upstream).
+    pub script: String,
+    /// Output value in satoshis.
+    pub value_sats: u64,
+}
+
+/// Counterparty identity for a payment intent: a compressed-secp256k1 pubkey
+/// hex (66 chars) and an OPTIONAL BRC-100 cert name. Schema is closed
+/// (`deny_unknown_fields`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Counterparty {
+    /// Full 66-character compressed-secp256k1 pubkey hex. The first 8 chars
+    /// are rendered (after `"0x"`) per ADR-0044 §2.2.
+    pub pubkey: String,
+    /// Optional BRC-100 cert chain root name. `None` → renders as
+    /// `"anonymous"`.
+    pub cert_name: Option<String>,
+}
+
+/// One output of a multi-output intent — itself a tagged sum (`payment` or
+/// `fee`). The `payment` variant carries `{amount_satoshis, recipient}` (the
+/// pre-resolved recipient address is opaque text); the `fee` variant carries
+/// `{amount_satoshis}`. Schema is CLOSED — extra fields hard-reject per
+/// ADR-0044 §2.1 (`deny_unknown_fields` on the outer enum applies to each
+/// variant's body during internally-tagged deserialization).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum MultiOutput {
+    /// A payment output — pre-resolved recipient + sats.
+    Payment {
+        /// Output value in satoshis.
+        amount_satoshis: u64,
+        /// Pre-resolved recipient address string (no derivation in-renderer).
+        recipient: String,
+    },
+    /// A fee output — sats only (no recipient surface).
+    Fee {
+        /// Fee value in satoshis.
+        amount_satoshis: u64,
+    },
+}
+
+/// The canonical wallet-renderer intent (ADR-0044 §2.1, amended 2026-05-28).
+///
+/// Tagged sum on `kind` (snake_case discriminant); each variant is a closed
+/// flat object. `canonical_render` dispatches on the variant and produces the
+/// byte-locked `rendered_text` string the wallet displays AND the cosigner
+/// binds to via `request_view_hash` (key 8).
+///
+/// All string fields are carried PRE-RESOLVED by the caller (BRC-100 cert
+/// name, human address, fiat estimate, locale, …) — the renderer is forbidden
+/// from doing address derivation / cert-chain lookup / network / currency
+/// conversion / key arithmetic. The only algorithmic transformations are the
+/// counterparty truncation (Payment) and the token-contract-hash truncation
+/// (TokenTransfer); see `canonical_render` doc.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum Intent {
+    /// P2PKH / P2MS payment intent. Renders as:
+    /// `"Send {amount_satoshis} sats (~{fiat_estimate} {fiat_currency}) to
+    /// {human_address} with fee {fee_sats} sats. Counterparty: {counterparty}."`
+    Payment {
+        /// Total satoshis being sent (matches `sum(recipient_outputs.value_sats)`).
+        amount_satoshis: u64,
+        /// Per-output `{script, value_sats}` list — carried for upstream
+        /// `request_view_hash` binding; the renderer itself does not iterate.
+        recipient_outputs: Vec<PaymentOutput>,
+        /// Pre-resolved recipient human address (BRC-100 cert name OR
+        /// Base58Check P2PKH address). Substituted at `<human_address>`.
+        human_address: String,
+        /// Network fee in satoshis.
+        fee_sats: u64,
+        /// Counterparty identity (`pubkey` + optional `cert_name`).
+        /// Rendered as `"<cert_name|anonymous> + 0x<pubkey[..8]>..."`.
+        counterparty_identity: Counterparty,
+        /// Pre-formatted fiat estimate (opaque text; locale formatting is the
+        /// caller's job — the renderer does NOT call ICU). e.g. `"$50.00"`.
+        fiat_estimate: String,
+        /// ISO 4217 currency code. e.g. `"USD"`.
+        fiat_currency: String,
+        /// BCP-47 language tag the caller chose for the human strings.
+        human_locale: String,
+    },
+    /// BRC-22/27/76 token transfer intent. Renders as:
+    /// `"Transfer {token_amount} {token_symbol} tokens to {recipient}
+    /// (value ~{fiat_estimate} {fiat_currency}). Token contract: 0x{hash[..8]}..."`
+    TokenTransfer {
+        /// Token amount being transferred (token-native units).
+        token_amount: u64,
+        /// Token symbol (e.g. `"USDT-on-BSV"`).
+        token_symbol: String,
+        /// Pre-resolved recipient address string.
+        recipient: String,
+        /// Pre-formatted fiat estimate (e.g. `"$100.00"`).
+        fiat_estimate: String,
+        /// ISO 4217 currency code.
+        fiat_currency: String,
+        /// Token contract identifier hex. May or may not carry a `"0x"`
+        /// prefix; the renderer strips it then takes the first 8 chars.
+        token_contract_hash: String,
+        /// BCP-47 language tag.
+        human_locale: String,
+    },
+    /// sCrypt covenant spend intent. Renders as:
+    /// `"Execute sCrypt covenant spend at contract {covenant_address}.
+    /// Output value: {amount_satoshis} sats. Covenant function:
+    /// {function_name}. Function args summary: {function_args_hash}."`
+    ScriptSpend {
+        /// Pre-resolved covenant address string.
+        covenant_address: String,
+        /// Output value in satoshis.
+        amount_satoshis: u64,
+        /// Covenant function name being executed.
+        function_name: String,
+        /// Opaque hash summary of the function args (e.g.
+        /// `"sha256:abababab…"`).
+        function_args_hash: String,
+        /// BCP-47 language tag.
+        human_locale: String,
+    },
+    /// BRC-100 `internalizeAction` intent. Renders as:
+    /// `"Internalize action: {action_description}. From: {source}. To:
+    /// {destination}. Notes: {protocol_notes}."`
+    Brc100Internalize {
+        /// Action description (e.g. `"payment-received"`).
+        action_description: String,
+        /// Pre-resolved source identifier.
+        source: String,
+        /// Pre-resolved destination identifier.
+        destination: String,
+        /// Free-text protocol notes.
+        protocol_notes: String,
+        /// BCP-47 language tag.
+        human_locale: String,
+    },
+    /// Compound multi-output intent (mixed payment + fee outputs). Renders as:
+    /// `"Compound transaction with {N} outputs: {output_1_summary};
+    /// {output_2_summary}; …; {output_N_summary}."`
+    ///
+    /// Per-output summaries: Payment → `"Send {amount_satoshis} sats to
+    /// {recipient}"`; Fee → `"Fee output {amount_satoshis} sats"`.
+    Multi {
+        /// Output list (each tagged on `kind`: `payment` or `fee`).
+        outputs: Vec<MultiOutput>,
+        /// BCP-47 language tag.
+        human_locale: String,
+    },
+}
+
+/// Render an [`Intent`] to its canonical `rendered_text` (ADR-0044 §2 + §2.2).
+///
+/// PURE-SUBSTITUTION over the pre-resolved string fields on the intent. The
+/// only in-renderer algorithmic transformations are:
+///
+/// 1. **Payment counterparty truncation** — `"<cert_name|anonymous> + 0x<pubkey_hex[..8]>..."`.
+///    `cert_name == None` → `"anonymous"`. `pubkey_hex` is the full 66-char
+///    compressed-secp256k1 hex; first 8 chars are appended.
+/// 2. **TokenTransfer contract-hash truncation** — strip any leading `"0x"`
+///    from `token_contract_hash`, take the first 8 chars, render as
+///    `"0x<hex8>..."`.
+///
+/// No address derivation, no cert-chain lookup, no network call, no currency
+/// conversion, no key arithmetic. Locale-aware decimal/currency formatting is
+/// the CALLER's job — `fiat_estimate` is treated as opaque text.
+///
+/// Returns `Err(MpcError::Protocol)` if a required slice transformation would
+/// panic (e.g. `pubkey` shorter than 8 chars OR `token_contract_hash` shorter
+/// than 8 chars after stripping `"0x"`). The serde layer guarantees the field
+/// shape, so the only ways to reach those errors are malformed (post-deser)
+/// data — not a normal path, but we surface them as `Protocol(...)` instead
+/// of panicking.
+pub fn canonical_render(intent: &Intent) -> crate::error::Result<String> {
+    match intent {
+        Intent::Payment {
+            amount_satoshis,
+            recipient_outputs: _,
+            human_address,
+            fee_sats,
+            counterparty_identity,
+            fiat_estimate,
+            fiat_currency,
+            human_locale: _,
+        } => {
+            if counterparty_identity.pubkey.len() < 8 {
+                return Err(crate::error::MpcError::Protocol(format!(
+                    "payment.counterparty_identity.pubkey too short: \
+                     expected ≥ 8 hex chars, got {}",
+                    counterparty_identity.pubkey.len()
+                )));
+            }
+            let cert = counterparty_identity
+                .cert_name
+                .as_deref()
+                .unwrap_or("anonymous");
+            let pub8 = &counterparty_identity.pubkey[..8];
+            let counterparty = format!("{cert} + 0x{pub8}...");
+            // No trailing period after `{counterparty}` — the counterparty
+            // string already ends with the truncation marker `...`, and the
+            // locked fixture renders it without an additional period.
+            Ok(format!(
+                "Send {amount_satoshis} sats (~{fiat_estimate} {fiat_currency}) \
+                 to {human_address} with fee {fee_sats} sats. \
+                 Counterparty: {counterparty}"
+            ))
+        }
+        Intent::TokenTransfer {
+            token_amount,
+            token_symbol,
+            recipient,
+            fiat_estimate,
+            fiat_currency,
+            token_contract_hash,
+            human_locale: _,
+        } => {
+            let stripped = token_contract_hash.trim_start_matches("0x");
+            if stripped.len() < 8 {
+                return Err(crate::error::MpcError::Protocol(format!(
+                    "token_transfer.token_contract_hash too short: \
+                     expected ≥ 8 hex chars (after stripping any 0x prefix), \
+                     got {}",
+                    stripped.len()
+                )));
+            }
+            let hash8 = &stripped[..8];
+            Ok(format!(
+                "Transfer {token_amount} {token_symbol} tokens to {recipient} \
+                 (value ~{fiat_estimate} {fiat_currency}). \
+                 Token contract: 0x{hash8}..."
+            ))
+        }
+        Intent::ScriptSpend {
+            covenant_address,
+            amount_satoshis,
+            function_name,
+            function_args_hash,
+            human_locale: _,
+        } => Ok(format!(
+            "Execute sCrypt covenant spend at contract {covenant_address}. \
+             Output value: {amount_satoshis} sats. \
+             Covenant function: {function_name}. \
+             Function args summary: {function_args_hash}."
+        )),
+        Intent::Brc100Internalize {
+            action_description,
+            source,
+            destination,
+            protocol_notes,
+            human_locale: _,
+        } => Ok(format!(
+            "Internalize action: {action_description}. \
+             From: {source}. To: {destination}. \
+             Notes: {protocol_notes}."
+        )),
+        Intent::Multi {
+            outputs,
+            human_locale: _,
+        } => {
+            let summaries: Vec<String> = outputs
+                .iter()
+                .map(|o| match o {
+                    MultiOutput::Payment {
+                        amount_satoshis,
+                        recipient,
+                    } => format!("Send {amount_satoshis} sats to {recipient}"),
+                    MultiOutput::Fee { amount_satoshis } => {
+                        format!("Fee output {amount_satoshis} sats")
+                    }
+                })
+                .collect();
+            let n = outputs.len();
+            Ok(format!(
+                "Compound transaction with {n} outputs: {}.",
+                summaries.join("; ")
+            ))
+        }
+    }
 }
 
 // ===========================================================================
@@ -723,5 +1035,299 @@ mod tests {
             a
         };
         assert!(verify_webauthn_approval(&cdj, &ad, &vh).is_err());
+    }
+
+    // ── ADR-0044 canonical wallet renderer (#75) ─────────────────────────────
+    //
+    // Per-kind positive cases here mirror the locked fixture vectors inline so
+    // these unit tests stay self-contained; the byte-locked sweep over the full
+    // fixture lives in `tests/conformance_09_canonical_render.rs`. Negative
+    // cases assert the RIGHT rejection reason (not just any error) per the
+    // partnership "validate, don't skip" rule.
+
+    #[test]
+    fn canonical_render_payment_matches_fixture() {
+        let intent = Intent::Payment {
+            amount_satoshis: 100_000_000,
+            recipient_outputs: vec![PaymentOutput {
+                script: "76a914abcdef...88ac".into(),
+                value_sats: 100_000_000,
+            }],
+            human_address: "1A1zP1...EQK...".into(),
+            fee_sats: 333,
+            counterparty_identity: Counterparty {
+                pubkey: "02abcd123456789012345678901234567890123456789012345678901234567890"
+                    .into(),
+                cert_name: None,
+            },
+            fiat_estimate: "$50.00".into(),
+            fiat_currency: "USD".into(),
+            human_locale: "en-US".into(),
+        };
+        let got = canonical_render(&intent).expect("render");
+        assert_eq!(
+            got,
+            "Send 100000000 sats (~$50.00 USD) to 1A1zP1...EQK... with fee 333 sats. Counterparty: anonymous + 0x02abcd12..."
+        );
+    }
+
+    #[test]
+    fn canonical_render_payment_uses_cert_name_when_present() {
+        // When `cert_name` is Some, it MUST be substituted in place of "anonymous".
+        let intent = Intent::Payment {
+            amount_satoshis: 100_000_000,
+            recipient_outputs: vec![PaymentOutput {
+                script: "76a914abcdef...88ac".into(),
+                value_sats: 100_000_000,
+            }],
+            human_address: "1A1zP1...EQK...".into(),
+            fee_sats: 333,
+            counterparty_identity: Counterparty {
+                pubkey: "02abcd123456789012345678901234567890123456789012345678901234567890"
+                    .into(),
+                cert_name: Some("alice@example".into()),
+            },
+            fiat_estimate: "$50.00".into(),
+            fiat_currency: "USD".into(),
+            human_locale: "en-US".into(),
+        };
+        let got = canonical_render(&intent).expect("render");
+        assert_eq!(
+            got,
+            "Send 100000000 sats (~$50.00 USD) to 1A1zP1...EQK... with fee 333 sats. Counterparty: alice@example + 0x02abcd12..."
+        );
+    }
+
+    #[test]
+    fn canonical_render_token_transfer_matches_fixture() {
+        let intent = Intent::TokenTransfer {
+            token_amount: 100,
+            token_symbol: "USDT-on-BSV".into(),
+            recipient: "1B2y3z4a5b6c...K".into(),
+            fiat_estimate: "$100.00".into(),
+            fiat_currency: "USD".into(),
+            token_contract_hash:
+                "0x123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0".into(),
+            human_locale: "en-US".into(),
+        };
+        let got = canonical_render(&intent).expect("render");
+        assert_eq!(
+            got,
+            "Transfer 100 USDT-on-BSV tokens to 1B2y3z4a5b6c...K (value ~$100.00 USD). Token contract: 0x12345678..."
+        );
+    }
+
+    #[test]
+    fn canonical_render_token_transfer_strips_only_one_0x_prefix() {
+        // A token_contract_hash carrying NO "0x" prefix must still render
+        // identically — `trim_start_matches("0x")` strips only the prefix, the
+        // first 8 hex chars are taken verbatim from the remainder.
+        let intent = Intent::TokenTransfer {
+            token_amount: 1,
+            token_symbol: "TOK".into(),
+            recipient: "1X".into(),
+            fiat_estimate: "$1".into(),
+            fiat_currency: "USD".into(),
+            // no "0x" prefix
+            token_contract_hash: "deadbeefcafebabe1234".into(),
+            human_locale: "en-US".into(),
+        };
+        let got = canonical_render(&intent).expect("render");
+        assert!(
+            got.contains("Token contract: 0xdeadbeef..."),
+            "without 0x prefix, first 8 chars are taken from the start: {got}"
+        );
+    }
+
+    #[test]
+    fn canonical_render_script_spend_matches_fixture() {
+        let intent = Intent::ScriptSpend {
+            covenant_address: "1C3z4a5b6c7d...K".into(),
+            amount_satoshis: 10_000,
+            function_name: "settle".into(),
+            function_args_hash: "sha256:abababababababababababababababababababababababababababababababab".into(),
+            human_locale: "en-US".into(),
+        };
+        let got = canonical_render(&intent).expect("render");
+        assert_eq!(
+            got,
+            "Execute sCrypt covenant spend at contract 1C3z4a5b6c7d...K. Output value: 10000 sats. Covenant function: settle. Function args summary: sha256:abababababababababababababababababababababababababababababababab."
+        );
+    }
+
+    #[test]
+    fn canonical_render_brc100_internalize_matches_fixture() {
+        let intent = Intent::Brc100Internalize {
+            action_description: "payment-received".into(),
+            source: "payee@example.com".into(),
+            destination: "1D4y5z6a7b8c...K".into(),
+            protocol_notes: "invoice 12345 paid".into(),
+            human_locale: "en-US".into(),
+        };
+        let got = canonical_render(&intent).expect("render");
+        assert_eq!(
+            got,
+            "Internalize action: payment-received. From: payee@example.com. To: 1D4y5z6a7b8c...K. Notes: invoice 12345 paid."
+        );
+    }
+
+    #[test]
+    fn canonical_render_multi_matches_fixture() {
+        let intent = Intent::Multi {
+            outputs: vec![
+                MultiOutput::Payment {
+                    amount_satoshis: 50_000_000,
+                    recipient: "1A...".into(),
+                },
+                MultiOutput::Payment {
+                    amount_satoshis: 25_000_000,
+                    recipient: "1B...".into(),
+                },
+                MultiOutput::Fee {
+                    amount_satoshis: 333,
+                },
+            ],
+            human_locale: "en-US".into(),
+        };
+        let got = canonical_render(&intent).expect("render");
+        assert_eq!(
+            got,
+            "Compound transaction with 3 outputs: Send 50000000 sats to 1A...; Send 25000000 sats to 1B...; Fee output 333 sats."
+        );
+    }
+
+    // ── Negative cases — assert the RIGHT rejection reason ───────────────────
+
+    /// A `kind` value that isn't one of the five MUST hard-reject — there is
+    /// no fallback / default kind / partial-render mode (ADR-0044 §2.1).
+    #[test]
+    fn intent_deser_rejects_unknown_kind() {
+        let bad = r#"{"kind":"airdrop","amount_satoshis":1,"recipient":"1X","human_locale":"en-US"}"#;
+        let err = serde_json::from_str::<Intent>(bad).expect_err("unknown kind must reject");
+        let msg = format!("{err}");
+        // serde's tagged-enum error wording is "unknown variant `airdrop`".
+        assert!(
+            msg.contains("unknown variant") && msg.contains("airdrop"),
+            "expected unknown-variant rejection, got: {msg}"
+        );
+    }
+
+    /// A payment intent missing the required `human_address` field MUST
+    /// hard-reject (ADR-0044 §2.3 amendment — `human_address` is required).
+    #[test]
+    fn intent_deser_rejects_missing_required_field() {
+        let bad = r#"{
+            "kind": "payment",
+            "amount_satoshis": 100,
+            "recipient_outputs": [{"script": "76a9...", "value_sats": 100}],
+            "fee_sats": 1,
+            "counterparty_identity": {"pubkey": "02abcd1234567890123456789012345678901234567890123456789012345678", "cert_name": null},
+            "fiat_estimate": "$1",
+            "fiat_currency": "USD",
+            "human_locale": "en-US"
+        }"#;
+        let err = serde_json::from_str::<Intent>(bad).expect_err("missing field must reject");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("missing field") && msg.contains("human_address"),
+            "expected missing-field rejection naming `human_address`, got: {msg}"
+        );
+    }
+
+    /// A payment intent carrying an extra field MUST hard-reject — silent
+    /// ignore-extra is forbidden because cross-impl drift hides behind it
+    /// (ADR-0044 §2.1).
+    #[test]
+    fn intent_deser_rejects_extra_field() {
+        let bad = r#"{
+            "kind": "payment",
+            "amount_satoshis": 100,
+            "recipient_outputs": [{"script": "76a9...", "value_sats": 100}],
+            "human_address": "1X",
+            "fee_sats": 1,
+            "counterparty_identity": {"pubkey": "02abcd1234567890123456789012345678901234567890123456789012345678", "cert_name": null},
+            "fiat_estimate": "$1",
+            "fiat_currency": "USD",
+            "human_locale": "en-US",
+            "extra_field": "drift"
+        }"#;
+        let err = serde_json::from_str::<Intent>(bad).expect_err("extra field must reject");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("unknown field") && msg.contains("extra_field"),
+            "expected unknown-field rejection naming `extra_field`, got: {msg}"
+        );
+    }
+
+    /// A payment intent whose `amount_satoshis` is a string (not a u64) MUST
+    /// hard-reject with a type-mismatch error from serde — there is no
+    /// silent coercion.
+    #[test]
+    fn intent_deser_rejects_wrong_field_type() {
+        let bad = r#"{
+            "kind": "payment",
+            "amount_satoshis": "100",
+            "recipient_outputs": [{"script": "76a9...", "value_sats": 100}],
+            "human_address": "1X",
+            "fee_sats": 1,
+            "counterparty_identity": {"pubkey": "02abcd1234567890123456789012345678901234567890123456789012345678", "cert_name": null},
+            "fiat_estimate": "$1",
+            "fiat_currency": "USD",
+            "human_locale": "en-US"
+        }"#;
+        let err = serde_json::from_str::<Intent>(bad).expect_err("wrong type must reject");
+        let msg = format!("{err}");
+        // serde's wording: "invalid type: string \"100\", expected u64".
+        assert!(
+            msg.contains("invalid type") && msg.contains("u64"),
+            "expected type-mismatch rejection naming u64, got: {msg}"
+        );
+    }
+
+    /// A multi-output intent with a fee output carrying an unknown field MUST
+    /// reject — the per-variant `deny_unknown_fields` applies inside the
+    /// nested `MultiOutput` enum as well, not just on the top-level `Intent`.
+    #[test]
+    fn intent_deser_multi_rejects_extra_field_in_nested_output() {
+        let bad = r#"{
+            "kind": "multi",
+            "outputs": [
+                {"kind": "fee", "amount_satoshis": 333, "extra": "drift"}
+            ],
+            "human_locale": "en-US"
+        }"#;
+        let err = serde_json::from_str::<Intent>(bad)
+            .expect_err("nested extra field must reject");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("unknown field") && msg.contains("extra"),
+            "expected nested unknown-field rejection naming `extra`, got: {msg}"
+        );
+    }
+
+    /// Sanity: a successfully-deserialized payment intent round-trips back to
+    /// JSON without losing fields. This guards against accidental
+    /// `#[serde(skip)]` regressions.
+    #[test]
+    fn intent_serde_round_trip_preserves_payment_fields() {
+        let original = Intent::Payment {
+            amount_satoshis: 12_345,
+            recipient_outputs: vec![PaymentOutput {
+                script: "76a9...".into(),
+                value_sats: 12_345,
+            }],
+            human_address: "1A...".into(),
+            fee_sats: 7,
+            counterparty_identity: Counterparty {
+                pubkey: "02".to_string() + &"ab".repeat(32),
+                cert_name: Some("carol".into()),
+            },
+            fiat_estimate: "$0.01".into(),
+            fiat_currency: "USD".into(),
+            human_locale: "en-US".into(),
+        };
+        let json = serde_json::to_string(&original).expect("serialize");
+        let back: Intent = serde_json::from_str(&json).expect("deserialize round-trip");
+        assert_eq!(original, back);
     }
 }
