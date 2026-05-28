@@ -860,9 +860,23 @@ pub async fn handle_health(State(state): State<Arc<AppState>>) -> impl IntoRespo
 /// `GET /shares/:agent_id` — Get share metadata (no secrets).
 pub async fn handle_get_share_metadata(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Path(agent_id): Path<String>,
 ) -> impl IntoResponse {
-    // TODO: Verify BRC-31 auth, check requester == agent_id
+    // §07: authenticate the caller (dev mode allows). A GET has no body, so the
+    // canonical signed payload is over ("GET", path, b""); the path-param agent_id
+    // is part of that signed request path. §08.1: share metadata is owner-only —
+    // reject any caller that is not the share's recorded owner (403) BEFORE we
+    // reveal whether/what metadata exists. (`handle_dkg_init` + `handle_ecdh` were
+    // already gated; this closes the last #81 TODO.)
+    let path = format!("/shares/{agent_id}");
+    let caller = match crate::auth::verify_or_allow("GET", &path, &headers, b"", &state.auth) {
+        Ok(id) => id,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = authz_owner(&state, &caller, &agent_id) {
+        return resp;
+    }
     match state.storage.read() {
         Ok(storage) => match storage.get_share_metadata(&agent_id) {
             Ok(Some(metadata)) => (
