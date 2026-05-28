@@ -250,10 +250,10 @@ impl<S: PrimePoolStorage> PaillierPool<S> {
     pub fn put(&self, primes: PregeneratedPrimes<SecurityLevel128>) -> Result<()> {
         // #80: the serialized prime plaintext is the decrypted secret material —
         // hold it in `Zeroizing` so it's wiped once encrypted at rest.
-        let plaintext = Zeroizing::new(
-            serde_json::to_vec(&primes)
-                .map_err(|e| MpcError::Serialization(format!("encode pregenerated primes: {e}")))?,
-        );
+        let plaintext =
+            Zeroizing::new(serde_json::to_vec(&primes).map_err(|e| {
+                MpcError::Serialization(format!("encode pregenerated primes: {e}"))
+            })?);
         let blob = encrypt(&self.encryption_key, &plaintext)?;
         self.storage.put_encrypted(blob)?;
         Ok(())

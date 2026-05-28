@@ -21,9 +21,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use bsv::primitives::ec::PrivateKey;
-use bsv_mpc_core::policy::{
-    ApprovalSpec, DefaultAction, PolicyEngine, PolicyManifest, Rule,
-};
+use bsv_mpc_core::policy::{ApprovalSpec, DefaultAction, PolicyEngine, PolicyManifest, Rule};
 use bsv_mpc_core::types::{JointPublicKey, PolicyId};
 use bsv_mpc_proxy::config::ProxyConfig;
 use bsv_mpc_proxy::fee_injector::FeeInjector;
@@ -37,9 +35,8 @@ use serde_json::json;
 
 /// Reusable 32-byte private-key seed for a deterministic joint pubkey.
 const TEST_KEY_BYTES: [u8; 32] = [
-    0x0b, 0x1e, 0x2c, 0x3d, 0x4e, 0x5f, 0x6a, 0x7b, 0x8c, 0x9d, 0xae, 0xbf, 0xc0, 0xd1, 0xe2,
-    0xf3, 0x14, 0x25, 0x36, 0x47, 0x58, 0x69, 0x7a, 0x8b, 0x9c, 0xad, 0xbe, 0xcf, 0xd0, 0xe1,
-    0xf2, 0x03,
+    0x0b, 0x1e, 0x2c, 0x3d, 0x4e, 0x5f, 0x6a, 0x7b, 0x8c, 0x9d, 0xae, 0xbf, 0xc0, 0xd1, 0xe2, 0xf3,
+    0x14, 0x25, 0x36, 0x47, 0x58, 0x69, 0x7a, 0x8b, 0x9c, 0xad, 0xbe, 0xcf, 0xd0, 0xe1, 0xf2, 0x03,
 ];
 
 fn test_joint_key() -> JointPublicKey {
@@ -282,7 +279,10 @@ async fn red_78_dry_run_deny_surfaces_would_have_denied() {
         .get("would_have_denied")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    let enforced = resp.get("enforced").and_then(|v| v.as_bool()).unwrap_or(true);
+    let enforced = resp
+        .get("enforced")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
 
     assert!(
         would_have_denied,

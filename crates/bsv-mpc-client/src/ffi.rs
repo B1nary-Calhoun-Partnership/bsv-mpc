@@ -1177,7 +1177,10 @@ mod send_path_tests {
         // In-crate truth: DER ‖ flag, then the builder.
         let mut sig_with_flag = der.to_vec();
         sig_with_flag.push(0x41);
-        let expected = hex::encode(txbuild::build_p2pkh_unlocking_script(&sig_with_flag, &pubkey));
+        let expected = hex::encode(txbuild::build_p2pkh_unlocking_script(
+            &sig_with_flag,
+            &pubkey,
+        ));
         let got = ffi_p2pkh_unlocking_script_hex(hex::encode(der), 0x41, hex::encode(pubkey))
             .expect("ffi unlocking script");
         assert_eq!(got, expected, "FFI unlocking script != in-crate golden");
@@ -1340,7 +1343,10 @@ mod send_path_tests {
         // serialization, and its txid must match — the funding-rebroadcast path.
         let subject_hex =
             ffi_beef_subject_raw_tx_hex(hex::encode(&beef)).expect("beef subject raw hex");
-        assert_eq!(subject_hex, spend_hex, "BEEF subject raw hex != subject tx hex");
+        assert_eq!(
+            subject_hex, spend_hex,
+            "BEEF subject raw hex != subject tx hex"
+        );
         assert_eq!(
             ffi_tx_txid(subject_hex.clone()).unwrap(),
             spend.id(),

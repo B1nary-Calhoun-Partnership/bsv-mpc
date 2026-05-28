@@ -1491,9 +1491,7 @@ impl SigningIntent<'_> {
                 sighash_hex,
                 protocol_id,
                 key_id,
-            } => format!(
-                "Sign hash {sighash_hex} under protocol {protocol_id}, key {key_id}"
-            ),
+            } => format!("Sign hash {sighash_hex} under protocol {protocol_id}, key {key_id}"),
         }
     }
     fn session_seed(&self) -> String {
@@ -1648,8 +1646,7 @@ pub(crate) async fn enforce_policy_and_approval(
                 eligible = quorum.eligible.len(),
                 "policy RequireApproval — collecting approval over the relay"
             );
-            let timeout =
-                std::time::Duration::from_secs(state.config.approval_recv_timeout_secs);
+            let timeout = std::time::Duration::from_secs(state.config.approval_recv_timeout_secs);
             let status = match crate::relay_approval::collect_approval_over_relay(
                 state.bridge.relay_url(),
                 coordinator_priv,
