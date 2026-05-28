@@ -17,6 +17,7 @@
 //! as long as it takes to construct the in-memory `ProtoWallet`.
 
 use std::sync::Mutex;
+use std::time::Duration;
 
 use bsv::auth::transports::HttpRequest;
 use bsv::auth::types::{AuthMessage, MessageType, AUTH_PROTOCOL_ID};
@@ -243,7 +244,11 @@ impl StorageClient {
             .map_err(|e| host("storage", format!("bad identity key: {e}")))?;
         let wallet = ProtoWallet::new(Some(private_key));
 
+        // #79: bound the BRC-103/104 handshake transport — `Client::builder().build()`
+        // has NO default timeout (the #40-class no-timeout hang). 30s matches the
+        // sibling native_io handshake clients (`recover.rs`, `ceremony.rs`).
         let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
             .build()
             .map_err(|e| host("storage", e))?;
 

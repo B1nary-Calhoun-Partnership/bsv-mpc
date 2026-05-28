@@ -38,11 +38,16 @@ use bsv_mpc_messagebox::MessageBoxClient;
 /// no-timeout-transport bug (a deployed ceremony observed sitting at 0% CPU for 68
 /// minutes with no timeout firing). Every relay HTTP client is built through
 /// [`bounded_http_client`] so no call can hang indefinitely.
-pub(crate) const RELAY_HTTP_TIMEOUT: Duration = Duration::from_secs(60);
+///
+/// `pub` because the BRC-100 proxy's `relay_refresh` coordinator (a separate crate)
+/// is itself a relay trigger ("peer identity fetch, arm" above) and routes through
+/// this same bound — see `bsv-mpc-proxy::relay_refresh` (issue #79).
+pub const RELAY_HTTP_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Build a `reqwest::Client` whose requests are bounded by `timeout` — fail-closed,
-/// never an unbounded hang.
-pub(crate) fn bounded_http_client(timeout: Duration) -> Result<reqwest::Client> {
+/// never an unbounded hang. Shared across crates (the proxy's `relay_refresh`
+/// reuses it, #79) so every relay HTTP trigger inherits the same fail-fast bound.
+pub fn bounded_http_client(timeout: Duration) -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .timeout(timeout)
         .build()
