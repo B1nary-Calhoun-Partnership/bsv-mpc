@@ -953,6 +953,76 @@ pub fn ffi_canonical_render(intent_cbor: Vec<u8>) -> Result<String, FfiError> {
     canonical_render(&intent).map_err(|e| FfiError::Client(e.to_string()))
 }
 
+/// **100cash#15 enabler.** A Payment-output pair (`{script, value_sats}`) the
+/// helper below assembles into the recipient_outputs list. Mirrors the Rust
+/// `PaymentOutput` schema 1:1 so the encoded CBOR is byte-identical.
+#[derive(uniffi::Record)]
+pub struct FfiPaymentOutput {
+    pub script_hex: String,
+    pub value_sats: u64,
+}
+
+/// **100cash#15 enabler — build the CBOR for the `payment` Intent.**
+///
+/// 100cash (Swift) MUST NOT hand-roll the CBOR encoding because Person A's
+/// `canonical_render` requires byte-for-byte agreement with Rust's serde-CBOR
+/// emission (any divergence breaks WYSIWYS: device shows one rendered_text,
+/// cosigner binds to another). This helper assembles a typed Rust `Intent::Payment`
+/// from primitives the Swift side already has and serializes it through the
+/// same `ciborium` path `ffi_canonical_render` deserializes — closing the
+/// circle so the two ends cannot disagree.
+///
+/// Returns the CBOR bytes to feed straight into [`ffi_canonical_render`].
+/// Used by 100cash's `WalletStore.approval(...)` to compute the real
+/// `request_view_hash` for the §43 approval gate.
+///
+/// Schema (ADR-0044 §2.1):
+/// - `amount_satoshis`: total spend in sats
+/// - `recipient_outputs`: each pair carried verbatim as `PaymentOutput`
+/// - `human_address`: pre-resolved address text the wallet displays
+/// - `fee_sats`: pre-resolved miner fee (caller's fee derivation)
+/// - `counterparty_pubkey_hex`: optional 66-char compressed-secp256k1 pubkey;
+///   `None` → `cert_name: None` rendering as `"anonymous"`
+/// - `fiat_estimate` / `fiat_currency`: optional pair (both Some, or both None)
+/// - `human_locale`: BCP-47 tag (e.g. `"en-US"`)
+#[allow(clippy::too_many_arguments)]
+#[uniffi::export]
+pub fn ffi_build_payment_intent_cbor(
+    amount_satoshis: u64,
+    recipient_outputs: Vec<FfiPaymentOutput>,
+    human_address: String,
+    fee_sats: u64,
+    counterparty_pubkey_hex: Option<String>,
+    fiat_estimate: Option<String>,
+    fiat_currency: Option<String>,
+    human_locale: String,
+) -> Result<Vec<u8>, FfiError> {
+    use bsv_mpc_core::approval::{Counterparty, Intent, PaymentOutput};
+    let intent = Intent::Payment {
+        amount_satoshis,
+        recipient_outputs: recipient_outputs
+            .into_iter()
+            .map(|o| PaymentOutput {
+                script: o.script_hex,
+                value_sats: o.value_sats,
+            })
+            .collect(),
+        human_address,
+        fee_sats,
+        counterparty_identity: Counterparty {
+            pubkey: counterparty_pubkey_hex.unwrap_or_default(),
+            cert_name: None,
+        },
+        fiat_estimate,
+        fiat_currency,
+        human_locale,
+    };
+    let mut buf = Vec::new();
+    ciborium::ser::into_writer(&intent, &mut buf)
+        .map_err(|e| FfiError::Client(format!("intent CBOR encode: {e}")))?;
+    Ok(buf)
+}
+
 // ── #68 send-path golden-vector tests (FFI == in-crate, byte-for-byte) ─────────
 #[cfg(test)]
 mod send_path_tests {
