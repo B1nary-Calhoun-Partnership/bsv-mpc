@@ -851,6 +851,83 @@ impl SigningCoordinator {
 }
 
 // ---------------------------------------------------------------------------
+// §1 device-holds-(t−1) combine kernel (issue #69)
+// ---------------------------------------------------------------------------
+
+/// **Relay-free device-holds-(t−1) combine (issue #69).**
+///
+/// The pure combine that `bsv_mpc_relay::combine_sign_over_relay_nparty` performs
+/// once the EXTERNAL cosigner's partial has arrived over the relay: a single
+/// device holding `t−1` of the `n` shares primes the combiner for its PRIMARY
+/// co-located party (`primary_share` / `primary_presig`), issues EACH OTHER
+/// co-located party's partial locally from its correlated presig
+/// (`extra_local_presigs`, never crossing the wire), then folds the one external
+/// `cosigner_partial` round message and combines all `t` partials in commitment
+/// order into the final ECDSA signature.
+///
+/// Factoring this out of the relay path means the DEPLOYED relay sign AND
+/// hermetic tests drive EXACTLY this code — no re-implementation that could
+/// drift from the mainnet-proven path (PR #46, TXID `febd2877…`). The relay
+/// caller does steps 1/3/4 (subscribe, trigger the cosigner, receive its
+/// partial) and hands the received `cosigner_partial` here for steps 2/5.
+///
+/// `brc42_offset` (§06.20): when `Some`, the SAME 32-byte additive shift is
+/// applied to the primary's presig + shared public data and to every extra
+/// co-located party's presig; the caller MUST have triggered the cosigner with
+/// the identical offset so its `cosigner_partial` matches. The combined
+/// signature then verifies under `child_pub = joint + offset·G`.
+///
+/// # Errors
+/// Returns [`MpcError::Signing`] if priming/adding a partial fails, or — the
+/// load-bearing threshold guard — if after folding the cosigner's partial the
+/// combiner holds FEWER than `t` partials and so "did not complete": a
+/// sub-threshold set (e.g. a single-index device, or a device under-contributing
+/// its `t−1` locals) can NEVER yield a signature here.
+///
+/// # Arguments
+/// * `session_id` — the per-sign session id (must match the cosigner's partial).
+/// * `primary_share` — the device's PRIMARY co-located party's [`EncryptedShare`]
+///   (its `share_index` is the primary signing index that primes the combiner).
+/// * `config` / `participants` — the signing subset (`participants.len() == t`).
+/// * `sighash` — the 32-byte prehashed BSV sighash.
+/// * `primary_presig` — the primary party's boxed `(Presignature,
+///   PresignaturePublicData)` from the correlated presign.
+/// * `extra_local_presigs` — `(signing_index, boxed presig)` for EACH OTHER
+///   co-located party the device holds (the `t−2` extras beyond the primary).
+/// * `cosigner_partial` — the external cosigner's partial as a relayed
+///   [`RoundMessage`] (from [`issue_partial_signature_json`] on its side).
+#[allow(clippy::too_many_arguments)]
+pub fn device_holds_combine(
+    session_id: SessionId,
+    primary_share: EncryptedShare,
+    config: ThresholdConfig,
+    participants: Vec<u16>,
+    sighash: &[u8; 32],
+    primary_presig: Box<dyn std::any::Any + Send>,
+    extra_local_presigs: Vec<(u16, Box<dyn std::any::Any + Send>)>,
+    cosigner_partial: RoundMessage,
+    brc42_offset: Option<[u8; 32]>,
+) -> Result<SigningResult> {
+    let mut coord = SigningCoordinator::new(session_id, primary_share, config, participants);
+    // 2a. Prime the PRIMARY co-located party (issues its partial; installs the
+    //     shared public data, applying the offset once).
+    coord.sign_with_presignature_with_offset(sighash, primary_presig, brc42_offset)?;
+    // 2b. Issue EACH OTHER co-located party's partial locally — never on the wire.
+    for (party_signing_index, presig_box) in extra_local_presigs {
+        coord.add_local_presig_partial(party_signing_index, presig_box, brc42_offset)?;
+    }
+    // 5. Fold the external cosigner's relayed partial and combine all t.
+    match coord.process_round(vec![cosigner_partial])? {
+        SigningRoundResult::Complete(sig) => Ok(sig),
+        SigningRoundResult::NextRound(_) => Err(MpcError::Signing(
+            "device_holds_combine: combine did not complete after the cosigner's partial \
+             — fewer than t partials present (sub-threshold)"
+                .into(),
+        )),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Light issue-only path (ADR-018: the wasm DO cosigner)
 // ---------------------------------------------------------------------------
 
