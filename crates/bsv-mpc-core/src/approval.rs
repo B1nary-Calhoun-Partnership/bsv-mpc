@@ -1056,8 +1056,7 @@ mod tests {
             human_address: "1A1zP1...EQK...".into(),
             fee_sats: 333,
             counterparty_identity: Counterparty {
-                pubkey: "02abcd123456789012345678901234567890123456789012345678901234567890"
-                    .into(),
+                pubkey: "02abcd123456789012345678901234567890123456789012345678901234567890".into(),
                 cert_name: None,
             },
             fiat_estimate: "$50.00".into(),
@@ -1083,8 +1082,7 @@ mod tests {
             human_address: "1A1zP1...EQK...".into(),
             fee_sats: 333,
             counterparty_identity: Counterparty {
-                pubkey: "02abcd123456789012345678901234567890123456789012345678901234567890"
-                    .into(),
+                pubkey: "02abcd123456789012345678901234567890123456789012345678901234567890".into(),
                 cert_name: Some("alice@example".into()),
             },
             fiat_estimate: "$50.00".into(),
@@ -1145,7 +1143,8 @@ mod tests {
             covenant_address: "1C3z4a5b6c7d...K".into(),
             amount_satoshis: 10_000,
             function_name: "settle".into(),
-            function_args_hash: "sha256:abababababababababababababababababababababababababababababababab".into(),
+            function_args_hash:
+                "sha256:abababababababababababababababababababababababababababababababab".into(),
             human_locale: "en-US".into(),
         };
         let got = canonical_render(&intent).expect("render");
@@ -1202,7 +1201,8 @@ mod tests {
     /// no fallback / default kind / partial-render mode (ADR-0044 §2.1).
     #[test]
     fn intent_deser_rejects_unknown_kind() {
-        let bad = r#"{"kind":"airdrop","amount_satoshis":1,"recipient":"1X","human_locale":"en-US"}"#;
+        let bad =
+            r#"{"kind":"airdrop","amount_satoshis":1,"recipient":"1X","human_locale":"en-US"}"#;
         let err = serde_json::from_str::<Intent>(bad).expect_err("unknown kind must reject");
         let msg = format!("{err}");
         // serde's tagged-enum error wording is "unknown variant `airdrop`".
@@ -1296,8 +1296,7 @@ mod tests {
             ],
             "human_locale": "en-US"
         }"#;
-        let err = serde_json::from_str::<Intent>(bad)
-            .expect_err("nested extra field must reject");
+        let err = serde_json::from_str::<Intent>(bad).expect_err("nested extra field must reject");
         let msg = format!("{err}");
         assert!(
             msg.contains("unknown field") && msg.contains("extra"),

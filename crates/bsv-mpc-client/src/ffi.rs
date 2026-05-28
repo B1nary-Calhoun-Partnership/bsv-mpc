@@ -1286,9 +1286,7 @@ mod send_path_tests {
 
     #[test]
     fn ffi_canonical_render_matches_core_payment() {
-        use bsv_mpc_core::approval::{
-            canonical_render, Counterparty, Intent, PaymentOutput,
-        };
+        use bsv_mpc_core::approval::{canonical_render, Counterparty, Intent, PaymentOutput};
         let intent = Intent::Payment {
             amount_satoshis: 100_000_000,
             recipient_outputs: vec![PaymentOutput {
@@ -1298,9 +1296,7 @@ mod send_path_tests {
             human_address: "1A1zP1...EQK...".into(),
             fee_sats: 333,
             counterparty_identity: Counterparty {
-                pubkey:
-                    "02abcd123456789012345678901234567890123456789012345678901234567890"
-                        .into(),
+                pubkey: "02abcd123456789012345678901234567890123456789012345678901234567890".into(),
                 cert_name: None,
             },
             fiat_estimate: "$50.00".into(),
