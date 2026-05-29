@@ -19,7 +19,7 @@
 //! an enforced server identity (`MPC_SERVER_PRIVATE_KEY`). Heavy MPC — container
 //! only, NOT the worker isolate.
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex};
 
 use axum::{
     body::Bytes,
@@ -50,6 +50,72 @@ fn relay_url() -> String {
     std::env::var("RELAY_URL")
         .or_else(|_| std::env::var("MESSAGEBOX_RELAY_URL"))
         .unwrap_or_else(|_| "https://rust-message-box.dev-a3e.workers.dev".to_string())
+}
+
+// ── #58-style checkpoint trail (mirrors /reshare-relay/debug) ────────────────────
+//
+// `/dkg-relay/init` does real work SYNCHRONOUSLY before returning 200 (subscribe,
+// initiate, ship round-1) then spawns a completion task. `wrangler tail` does not
+// surface the container's `tracing`, so a hang inside a deployed 6-party arm is
+// otherwise invisible. This records timestamped checkpoints into an in-memory
+// trail exposed at `/dkg-relay/debug`: the LAST checkpoint pinpoints the stuck
+// step (the exact technique that debugged the reshare #58 hang). Relay→container
+// connectivity is already probed by the existing `/reshare-relay/egress-test`
+// (same container, same relay), so no separate dkg egress route is needed.
+static DKG_RELAY_CHECKPOINTS: LazyLock<Mutex<Vec<(u64, String)>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
+
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Record a dkg-relay-arm checkpoint. `reset` clears the trail (call at arm start).
+fn checkpoint(label: &str, reset: bool) {
+    if let Ok(mut cps) = DKG_RELAY_CHECKPOINTS.lock() {
+        if reset {
+            cps.clear();
+        }
+        cps.push((now_millis(), label.to_string()));
+        if cps.len() > 256 {
+            let drop_n = cps.len() - 256;
+            cps.drain(0..drop_n);
+        }
+    }
+    info!(checkpoint = label, "dkg-relay: checkpoint");
+}
+
+/// `GET /dkg-relay/debug` — the in-memory checkpoint trail of the LAST dkg-relay
+/// arm, so a hang inside the (synchronous) init path or the completion task is
+/// observable over HTTP even when container stdout is not surfaced.
+pub async fn handle_dkg_relay_debug(State(_state): State<Arc<AppState>>) -> impl IntoResponse {
+    let cps = DKG_RELAY_CHECKPOINTS
+        .lock()
+        .map(|c| c.clone())
+        .unwrap_or_default();
+    let first = cps.first().map(|(t, _)| *t).unwrap_or(0);
+    let steps: Vec<serde_json::Value> = cps
+        .iter()
+        .map(|(t, label)| {
+            serde_json::json!({
+                "t_ms": t,
+                "since_start_ms": t.saturating_sub(first),
+                "label": label,
+            })
+        })
+        .collect();
+    let now = now_millis();
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "now_ms": now,
+            "last_checkpoint_age_ms": cps.last().map(|(t, _)| now.saturating_sub(*t)),
+            "count": cps.len(),
+            "steps": steps,
+        })),
+    )
 }
 
 // ── /dkg-relay/identity ────────────────────────────────────────────────────────
@@ -121,6 +187,7 @@ pub async fn handle_dkg_relay_init(
     headers: HeaderMap,
     raw: Bytes,
 ) -> impl IntoResponse {
+    checkpoint("init:start", true);
     // §07 auth over the RAW body; the authed caller becomes the share owner (§08.1).
     let caller = match crate::auth::verify_or_allow(
         "POST",
@@ -220,6 +287,7 @@ pub async fn handle_dkg_relay_init(
             return err_response(StatusCode::BAD_GATEWAY, format!("ship dkg round-1: {e}"));
         }
     }
+    checkpoint("init:round1_shipped", false);
 
     // §06.17 ordering: round-1 is shipped (we are NOT late on the relay); now
     // generate the slow safe primes off the hot path and late-seed them before the
@@ -254,6 +322,7 @@ pub async fn handle_dkg_relay_init(
                 return;
             }
         };
+        checkpoint("task:dkg_complete", false);
         dkg_listener.shutdown().await;
         // Persistence-before-funding: the composite share for our held index MUST be
         // durably present (finish_complete already wrote it). The device gates a
@@ -266,12 +335,15 @@ pub async fn handle_dkg_relay_init(
             .and_then(|s| s.get_share_at_index(&agent_id, my_index).ok().flatten())
             .is_some();
         if present {
+            checkpoint("task:share_persisted", false);
             info!(agent_id = %agent_id, my_index, "dkg-relay: ceremony complete — share durably persisted");
         } else {
+            checkpoint("task:share_MISSING", false);
             warn!(agent_id = %agent_id, my_index, "dkg-relay: ceremony complete but share NOT durably persisted — investigate");
         }
     });
 
+    checkpoint("init:returning_200", false);
     info!(
         my_index = body.my_index,
         threshold = body.threshold,

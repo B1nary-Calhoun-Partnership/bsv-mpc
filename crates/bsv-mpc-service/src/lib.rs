@@ -168,6 +168,12 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/dkg-relay/init",
             post(dkg_relay_handlers::handle_dkg_relay_init),
         )
+        // #58-style checkpoint trail of the LAST dkg-relay arm (debug a hung 6-party
+        // arm over HTTP; relay connectivity reuses /reshare-relay/egress-test).
+        .route(
+            "/dkg-relay/debug",
+            get(dkg_relay_handlers::handle_dkg_relay_debug),
+        )
         // Read-only
         .route("/health", get(handlers::handle_health))
         .route(
