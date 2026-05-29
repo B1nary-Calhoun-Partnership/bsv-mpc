@@ -85,6 +85,13 @@ struct DkgHandlerInner {
     /// coordinator is registered in `initiate`. cggmp24's SM already buffers
     /// out-of-order rounds internally, so replay order across rounds is safe.
     pending_inbound: Mutex<HashMap<SessionId, Vec<DecodedRoundMessage>>>,
+    /// Composite-persist override (ADR-0052). `None` → the completed share is
+    /// persisted under the legacy session-hex key (the HTTP `/dkg` path). `Some(owner)`
+    /// → it is persisted under the composite key `"{joint_pubkey_hex}#{share_index}"`
+    /// recording `owner` (§08.1), so a cosigner holding `w > 1` indices of one
+    /// ceremony does not overwrite. Set via [`DkgHandler::use_composite_persist`]
+    /// by the `/dkg-relay/init` route before `initiate`.
+    persist_override: Mutex<Option<String>>,
 }
 
 /// Clone-able handle. Cheap (`Arc`-shared inside); the handler closure
@@ -117,8 +124,24 @@ impl DkgHandler {
                 primes_pool: Mutex::new(HashMap::new()),
                 late_prime_cells: Mutex::new(HashMap::new()),
                 pending_inbound: Mutex::new(HashMap::new()),
+                persist_override: Mutex::new(None),
             }),
         }
+    }
+
+    /// Persist completed shares under the COMPOSITE key
+    /// `"{joint_pubkey_hex}#{share_index}"` recording `owner` (§08.1), instead of
+    /// the legacy session-hex key (ADR-0052). This is what lets a cosigner — or
+    /// the device — hold `w > 1` indices of ONE ceremony without overwriting
+    /// (every held share has the same joint pubkey, hence the same `agent_id`).
+    /// Call BEFORE [`initiate`](Self::initiate); used by the `/dkg-relay/init`
+    /// route. The legacy HTTP `/dkg` path leaves it unset (session-hex keying).
+    pub fn use_composite_persist(&self, owner: String) {
+        *self
+            .inner
+            .persist_override
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(owner);
     }
 
     /// Pre-stash a set of pregenerated primes for a specific session.
@@ -404,6 +427,37 @@ async fn dispatch_one(
     Ok(all_outgoing)
 }
 
+/// Persist a completed DKG share, honoring the composite-persist override
+/// (ADR-0052). When set (via [`DkgHandler::use_composite_persist`], the
+/// `/dkg-relay` path), the share is stored under `"{joint_pubkey_hex}#{index}"`
+/// with the recorded owner (§08.1) so a multi-index cosigner never overwrites;
+/// otherwise it falls back to the legacy session-hex key (the HTTP `/dkg` path),
+/// byte-for-byte unchanged.
+fn persist_completed_share(inner: &Arc<DkgHandlerInner>, dkg_result: &DkgResult) {
+    let override_owner = inner
+        .persist_override
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone();
+    let Ok(mut storage) = inner.storage.write() else {
+        warn!("DkgHandler: storage RwLock poisoned; share not persisted");
+        return;
+    };
+    let result = match override_owner {
+        Some(owner) => {
+            // FRESH DKG: the joint pubkey is the agent_id, known now at completion
+            // (user-decision: re-key at completion). Index = this party's held index.
+            let agent_id = hex::encode(&dkg_result.joint_key.compressed);
+            let index = dkg_result.share.share_index.0;
+            storage.store_share_at_index(&agent_id, index, &dkg_result.share, &owner)
+        }
+        None => storage.store_share(&dkg_result.session_id.hex(), &dkg_result.share),
+    };
+    if let Err(e) = result {
+        warn!("DkgHandler: failed to persist completed share: {e}");
+    }
+}
+
 /// Finalize a completed DKG ceremony: persist the share, clean up per-session
 /// state, fire the completion notifier, and drop the coordinator.
 fn finish_complete(
@@ -413,14 +467,7 @@ fn finish_complete(
     dkg_result: DkgResult,
     all_outgoing: Vec<OutgoingRoundMessage>,
 ) -> anyhow::Result<Vec<OutgoingRoundMessage>> {
-    let share_session_hex = dkg_result.session_id.hex();
-    if let Ok(mut storage) = inner.storage.write() {
-        if let Err(e) = storage.store_share(&share_session_hex, &dkg_result.share) {
-            warn!("DkgHandler: failed to persist share for session {share_session_hex}: {e}");
-        }
-    } else {
-        warn!("DkgHandler: storage RwLock poisoned; share not persisted");
-    }
+    persist_completed_share(inner, &dkg_result);
     info!(
         "DkgHandler: ceremony complete — session={} joint_pubkey={}",
         hex::encode(session_id.as_bytes()),
@@ -534,6 +581,83 @@ mod tests {
             ThresholdConfig::new(2, 2).unwrap(),
             2, // parties=2 means valid indices are 0..2
             fresh_storage(),
+        );
+    }
+
+    use bsv_mpc_core::types::{EncryptedShare, JointPublicKey};
+
+    /// Fabricate a completed-DKG result for the persist-keying tests (no relay).
+    fn fake_result(joint_byte: u8, idx: u16, ct: u8, sess: u8) -> DkgResult {
+        let joint = vec![joint_byte; 33];
+        DkgResult {
+            joint_key: JointPublicKey {
+                compressed: joint.clone(),
+                address: "1Test".into(),
+            },
+            share: EncryptedShare {
+                nonce: vec![0u8; 12],
+                ciphertext: vec![ct; 8],
+                session_id: SessionId([sess; 32]),
+                share_index: ShareIndex(idx),
+                config: ThresholdConfig::new(4, 6).unwrap(),
+                joint_pubkey_compressed: joint,
+            },
+            session_id: SessionId([sess; 32]),
+        }
+    }
+
+    /// ADR-0052: with the composite-persist override set, a completed share lands
+    /// under `"{joint_pubkey_hex}#{index}"` with the recorded owner — NOT the
+    /// legacy session-hex key — so a cosigner holding >1 index never overwrites.
+    #[test]
+    fn composite_persist_override_keys_by_joint_pubkey_and_index() {
+        let storage = fresh_storage();
+        let h = DkgHandler::new(ThresholdConfig::new(4, 6).unwrap(), 4, storage.clone());
+        h.use_composite_persist("owner-XYZ".to_string());
+
+        let result = fake_result(0x02, 4, 0x44, 0x99);
+        let agent_id = hex::encode(&result.joint_key.compressed);
+        persist_completed_share(&h.inner, &result);
+
+        let st = storage.read().unwrap_or_else(|p| p.into_inner());
+        let got = st
+            .get_share_at_index(&agent_id, 4)
+            .unwrap()
+            .expect("composite (agent_id,4) share present");
+        assert_eq!(got.share_index, ShareIndex(4));
+        assert_eq!(got.ciphertext, vec![0x44u8; 8]);
+        assert_eq!(
+            st.get_share_owner_at_index(&agent_id, 4)
+                .unwrap()
+                .as_deref(),
+            Some("owner-XYZ"),
+        );
+        // MUST NOT also write the legacy session-hex key (no double-key).
+        assert!(
+            st.get_share(&result.session_id.hex()).unwrap().is_none(),
+            "composite-persist must not also write the legacy session-hex key"
+        );
+    }
+
+    /// Without the override (legacy HTTP `/dkg` path) the share persists under the
+    /// session-hex key exactly as before — byte-for-byte unchanged.
+    #[test]
+    fn legacy_persist_unchanged_when_override_unset() {
+        let storage = fresh_storage();
+        let h = DkgHandler::new(ThresholdConfig::new(2, 2).unwrap(), 1, storage.clone());
+        // no use_composite_persist() → legacy path.
+        let result = fake_result(0x03, 1, 0x77, 0x88);
+        persist_completed_share(&h.inner, &result);
+
+        let st = storage.read().unwrap_or_else(|p| p.into_inner());
+        assert!(
+            st.get_share(&result.session_id.hex()).unwrap().is_some(),
+            "legacy persist must write the session-hex key (unchanged)"
+        );
+        let agent_id = hex::encode(&result.joint_key.compressed);
+        assert!(
+            st.get_share_at_index(&agent_id, 1).unwrap().is_none(),
+            "legacy path must not touch the composite namespace"
         );
     }
 
