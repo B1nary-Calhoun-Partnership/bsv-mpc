@@ -83,6 +83,18 @@ one-DkgHandler-per-index discipline.
 - ✅ **Diagnostics** — `/dkg-relay/debug` checkpoint trail (reuse reshare #58
   observability); egress reuses `/reshare-relay/egress-test`. `2b8bd0c`.
 
+**➡️ NEW WINDOW: read `PERSON-A-HANDOFF.md` "🟢🟢 RESUME — 2026-05-29" block FIRST** — it has
+the full locked design + exact remaining steps (the design workflow output lives only in ephemeral
+`/tmp`, so the handoff is the durable record).
+
+**🔴 TRACKED GATE — bsv-mpc#85** (security, HIGH, pre-existing): cosigner identity fetched over
+UNAUTH HTTP → MITM can steer DKG to an attacker co-party. MUST close before god-tier-production
+4-of-6 funding (pin master identity out-of-band + sign the fetch + signed co-party challenge).
+
+**🔒 Per-index relay identity = ONE-WAY HMAC, NOT additive** (adversary killed additive: it leaks
+`server_priv`, which is also the BRC-31 auth + BRC-2 sealing key). Topology = **2 cosigners, one
+holds 2 indices**. See handoff for the exact derivation fn + driver spec.
+
 **CLIENT SIDE — remaining (the next push):**
 - ☐ **Step 5** — client `provision_wallet_nparty` driver (mirrors the mainnet-proven
   `coordinate_reshare_over_relay`: w DkgHandlers, one session, collect w shares,

@@ -1,5 +1,87 @@
 # bsv-mpc — Person A Handoff (post-audit, 2026-05-28; updated post-#75-CLOSE)
 
+---
+
+## 🟢🟢 RESUME — 2026-05-29 (READ THIS FIRST; supersedes the older resume block below)
+
+**Owned critical path = #69 (client 4-of-6) + #70 (2nd cosigner). Goal = god-tier 4-of-6
+production self-custody on 100cash, mpc-spec-conformant, no asterisks.**
+
+### ✅ MERGED to main this session (all proven, zero asterisks)
+- **bsv-mpc PR #83** (`8c8c7bb`) — `device_holds_combine` kernel in `bsv-mpc-core/src/signing.rs`
+  (relay-free device-holds-(t−1) combine) + `combine_sign_over_relay_nparty` routes through it
+  (zero-drift). Hermetic 3-of-3 + #[ignore] 4-of-6 proof.
+- **MPC-Spec PR #49** — ADR-0052 (device-holds-(t−1) multishare + genuine n-party DKG over relay,
+  **Model B**: one ceremony identity per held index, wire 1:1 unchanged) + §06.22 + §15.2.4 +
+  `conformance/test-vectors/15-device-holds-quorum.json` + Python runner gate.
+- **MPC-Spec PR #50** — §13.7.1/§18.2 cross-impl Notary swap (replace-party reshare, vector-gated).
+- **bsv-mpc PR #84** (`e2dc5cf`) — **PR-2 SERVICE SIDE**: composite `(agent_id,share_index)`
+  storage (`storage.rs`); `DkgHandler::use_composite_persist` + re-provision guard
+  (`dkg_handler.rs`); `POST /dkg-relay/{identity,init}` + `/dkg-relay/debug`
+  (`dkg_relay_handlers.rs`, `lib.rs`); `AppState.storage`→`Arc<RwLock>`.
+  **🟢 PROVEN: genuine 6-party 4-of-6 DKG agreed a byte-identical joint key over the LIVE relay**
+  (`tests/dkg_4of6_via_messagebox_e2e.rs`, env-gated `MESSAGEBOX_RELAY_URL`; ~6 min; joint_pubkey
+  `029b846a…`, addr `15naugTY2FycKX5BtpndLkVfGkou5jFaVP`). Container concern SETTLED (standard-4 +
+  reshare relay-DKG patterns scale).
+
+### 🔴 TRACKED GATE — bsv-mpc#85 (security, HIGH, pre-existing)
+Cosigner identity is fetched over UNAUTH HTTP (`/dkg-relay/identity`, `/reshare-relay/identity`,
+`reshare::fetch_peer_identity`) → MITM can steer DKG to an attacker co-party (defeats threshold
+independence). **MUST close before god-tier-production 4-of-6 funding:** pin the cosigner master
+identity out-of-band + BRC-31-sign the fetch + gate funding on a signed co-party challenge.
+
+### 🔒 LOCKED design decisions (user-approved this session)
+1. **(a) new seam in `bsv-mpc-client`** (n-party machinery already shared in `bsv-mpc-relay`).
+2. **Provisioning = genuine 6-party DKG over relay** (NOT 2-of-2+reshare). Model B.
+3. **Topology = 2 cosigners, one holds 2 indices** (matches "two Notaries" goal) → needs per-index
+   relay identity.
+4. **Per-index relay identity = ONE-WAY HMAC, NOT additive.** (Adversary killed the additive idea:
+   `relay_priv_i = server_priv + H(pub‖i)` LEAKS server_priv if any relay key leaks — and server_priv
+   is also the BRC-31 auth + BRC-2 share-sealing key. Catastrophic.) **Use:**
+   `relay_priv_i = reduce_mod_n( HMAC-SHA256(key = server_priv_bytes, msg = b"bsv-mpc dkg-relay identity v1" ‖ session_id(32) ‖ index_be_u16) )`
+   → leak-safe (one-way) + ceremony-scoped. Device CANNOT derive the pub (one-way) → device FETCHES
+   each container index's relay pub (read-only GET, per (session,index)); #85 hardens that fetch.
+   This is container-internal → **zero new cross-impl wire surface** (better than additive).
+
+### ▶️ REMAINING (PR-2 client side + close). Branch off main: `person-a/69-pr2-clientNN-...`
+- **5a-i** core: add `derive_relay_index_privkey(server_priv, session_id, index) -> PrivateKey` to
+  `bsv-mpc-core/src/hd.rs` (one-way HMAC above; `sha256_hmac` + `Scalar::<Secp256k1>::from_be_bytes_mod_order`
+  + `PrivateKey::from_bytes`). Hermetic unit test: deterministic, distinct per (session,index),
+  distinct from server_priv, valid key. (I had just read hd.rs to write this when we wrapped.)
+- **5a-ii** route: in `dkg_relay_handlers.rs::handle_dkg_relay_init`, replace the single
+  `server_identity_priv_from_env()` MessageBoxClient identity with
+  `derive_relay_index_privkey(&server_priv, &dkg_session, body.my_index)` (DISTINCT per index →
+  distinct relay room → clean delivery; relay routes by `{identity}-{box}` room, verified). Add a
+  read-only `GET /dkg-relay/peer-identity?session&index` → relay_pub for the device to fetch.
+- **5b** driver: `provision_wallet_nparty` in `bsv-mpc-client/src/native_io/provision.rs`, mirroring
+  the mainnet-proven `bsv_mpc_relay::reshare::coordinate_reshare_over_relay` (reshare.rs:290-567)
+  PHASE A ONLY (keep+seal shares, no PSS/combine): device mints w fresh identities for {0,1,2};
+  fetch+arm the cosigner's {3,4,5} (once per index, per user-decision #2); peers_for over all 6;
+  initiate all device parties then ship round-1; late-seed primes; await w completions; assert
+  byte-identical joint key; composite-seal w shares via keystore. Invariant: arm-response pub ==
+  device-fetched relay_pub (catches index mis-derivation).
+- **5b test**: `tests/dkg_4of6_multiindex_relay_e2e.rs` — device {0,1,2} + ONE in-process container
+  holding {3,4,5} via 3 one-way-derived identities, over the live relay → joint key agreed + 3
+  distinct composite shares (proves the multi-index-on-one-container path the step-4 test doesn't).
+  Run with `MESSAGEBOX_RELAY_URL=https://rust-message-box.dev-a3e.workers.dev ... --test-threads=1`.
+- **6** FFI: `device_share_index`→`my_indices: Vec<u16>` on `FfiSignerConfig`/`WalletMeta`/
+  `DeployedSigner` + `create_wallet_nparty` (single-index default keeps 2-of-2 compiling).
+- **7** sign: `DeployedSigner::sign` iterates `my_indices` → primary + extras → the merged
+  `device_holds_combine` (reuse PR #83 kernel, do NOT reimplement).
+- **8** mainnet 4-of-6 genuine-DKG E2E (with #70 deploy + sats) — the audit-closing artifact.
+  Mirror `bsv-mpc-proxy/tests/createaction_4of6_device_holds_relay_mainnet_e2e.rs` but provision via
+  genuine relay DKG. ADD a new test; keep the local-sim one as a fast regression.
+
+### Discipline reminders
+No commit/push without user OK (they've been fast-shipping: "push to main" = merge). NO `cargo fmt`
+on crate roots — but the workspace IS fmt-clean now; run `cargo fmt --all -- --check` +
+`cargo clippy --workspace --all-targets -- -D warnings` BEFORE any push (the AppState→Arc<RwLock>
+change taught us to verify workspace-wide, not just the edited crate). Don't commit the two
+untracked `docs/*AUDIT*.md`. The deployed relay works from this env (step-4 ran green against it).
+
+---
+
+
 > For a NEW session to drive **Person A's** lane on the Calhoun-side BSV-MPC partnership.
 > Person A owns the **load-bearing 4-of-6 seam + spec-level decisions**.
 > Person B has the parallel lane (god-tier security hardening + 100cash Swift wiring).
