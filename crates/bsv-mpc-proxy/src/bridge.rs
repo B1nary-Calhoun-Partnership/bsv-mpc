@@ -2193,9 +2193,9 @@ mod tests {
             relay_url: "https://rust-message-box.dev-a3e.workers.dev".into(),
             relay_sign: false,
             presign_url: None,
-        approval_recv_timeout_secs: 60,
-        network: None,
-        policy_manifest_path: None,
+            approval_recv_timeout_secs: 60,
+            network: None,
+            policy_manifest_path: None,
         };
 
         let bridge = MpcBridge::new(&config).await.unwrap();
@@ -2229,9 +2229,9 @@ mod tests {
             relay_url: "https://rust-message-box.dev-a3e.workers.dev".into(),
             relay_sign: false,
             presign_url: None,
-        approval_recv_timeout_secs: 60,
-        network: None,
-        policy_manifest_path: None,
+            approval_recv_timeout_secs: 60,
+            network: None,
+            policy_manifest_path: None,
         };
 
         let result = MpcBridge::new(&config).await;
@@ -2283,9 +2283,9 @@ mod tests {
             relay_url: "https://rust-message-box.dev-a3e.workers.dev".into(),
             relay_sign: false,
             presign_url: None,
-        approval_recv_timeout_secs: 60,
-        network: None,
-        policy_manifest_path: None,
+            approval_recv_timeout_secs: 60,
+            network: None,
+            policy_manifest_path: None,
         };
 
         let bridge = MpcBridge::new(&config).await.unwrap();
@@ -2491,9 +2491,9 @@ mod refresh_rotation_tests {
             relay_url: "https://rust-message-box.dev-a3e.workers.dev".into(),
             relay_sign: false,
             presign_url: None,
-        approval_recv_timeout_secs: 60,
-        network: None,
-        policy_manifest_path: None,
+            approval_recv_timeout_secs: 60,
+            network: None,
+            policy_manifest_path: None,
         }
     }
 

@@ -305,10 +305,10 @@ mod tests {
             url: format!("http://{addr}/refresh-relay/init"),
             agent_id: "deadbeef".into(),
         };
-        let signer_fn =
-            |_method: &str, _path: &str, _body: &[u8]| -> Result<Vec<(String, String)>> {
-                Ok(Vec::new())
-            };
+        let signer_fn = |_method: &str,
+                         _path: &str,
+                         _body: &[u8]|
+         -> Result<Vec<(String, String)>> { Ok(Vec::new()) };
         let signer: RequestSigner = &signer_fn;
         let session_id = SessionId::from_str_hash("test");
 

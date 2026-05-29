@@ -29,7 +29,37 @@ the two network-side cosigners genuinely independent. Once #69 lands, Person B f
 
 ## Issues (priority order)
 
-### ☐ `NOT STARTED` — bsv-mpc#69 — n-party provisioning + sign seam — ★ THE CRITICAL PATH to 4-of-6 production
+### ☐ `IN PROGRESS` — bsv-mpc#69 — n-party provisioning + sign seam — ★ THE CRITICAL PATH to 4-of-6 production
+
+**Locked decisions (2026-05-28, user):** (a) NEW seam in `bsv-mpc-client` (the n-party
+SIGNING machinery is already shared in `bsv-mpc-relay`, so (b)'s extraction is redundant);
+provisioning = **genuine 6-party DKG over relay** (device drives 3 logical parties,
+cosigner(s) drive the other 3) — bigger than reshare + not yet mainnet-proven, chosen for
+the strongest entropy/topology story. Phased to keep each PR independently green
+(no asterisks). Quality bar (user): **prove 110% at each step, zero caveats.**
+
+**PR-1a — device-holds combine kernel — `READY FOR PR` (branch `person-a/69-device-holds-combine-kernel`):**
+- `bsv-mpc-core/src/signing.rs`: extracted `device_holds_combine` — the relay-free
+  device-holds-(t−1) combine (prime PRIMARY → `add_local_presig_partial` for each
+  co-located extra → fold the cosigner's relayed partial → combine all t).
+- `bsv-mpc-relay/src/lib.rs`: `combine_sign_over_relay_nparty` now CALLS that kernel
+  (zero-drift: deployed relay path + tests run byte-identical combine code).
+- `bsv-mpc-core/tests/device_holds_combine_kernel.rs`: hermetic proof.
+- Gates: UNIT/VECTOR **GREEN** — 3-of-3 device-holds-2 verifies under joint pubkey
+  (CI-gated) + BRC-42-offset verifies under child key, NOT base key; NEGATIVE
+  single-index/sub-threshold → "did not complete" (right reason); 4-of-6 real-topology
+  `#[ignore]` proof staged. clippy clean, fmt-clean (edited files), workspace + wasm32
+  core build green. E2E (mainnet 4-of-6) deferred to PR-3 (#70 pairing) — NOT an asterisk
+  on PR-1a (kernel is hermetically + zero-drift proven; mainnet is the PR-3 close).
+
+**PR-1b (next) — client multi-share signing seam:** `device_share_index: u16` →
+`my_indices: Vec<u16>` on `FfiSignerConfig`/`WalletMeta`/`DeployedSigner`; the device's
+presig SET stays **durable + single-use + at-rest-sealed** (extend `PresigBundle` to carry
+t−1 own-presigs — NOT a regression to the proxy's in-memory set; preserves the
+CVE-2025-66017 mitigation with no asterisk); `DeployedSigner::sign` → `combine_sign_over_relay_nparty`.
+
+**PR-2 — genuine 6-party DKG over relay** (spec PR + `/dkg-relay` route + redeploy);
+**PR-3/#70 — 2nd cosigner + mainnet 4-of-6 E2E** (the audit-closing artifact).
 
 **Why this is THE critical path (2026-05-28 PM):** it is the *only* thing between us and
 the overarching goal (4-of-6 production self-custody on 100cash). The 100cash app config

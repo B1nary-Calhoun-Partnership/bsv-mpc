@@ -94,8 +94,8 @@ fn red_77_mainnet_without_manifest_is_refused() {
     config.network = Some("mainnet".into());
     config.policy_manifest_path = None;
 
-    let err = load_policy_engine_from_config(&config)
-        .expect_err("mainnet + no manifest MUST be refused");
+    let err =
+        load_policy_engine_from_config(&config).expect_err("mainnet + no manifest MUST be refused");
     let s = format!("{err}");
     assert!(
         s.contains("MPC_NETWORK=mainnet") && s.contains("MPC_POLICY_MANIFEST"),
@@ -148,8 +148,8 @@ fn red_77_no_network_without_manifest_is_allowed() {
     assert!(config.network.is_none());
     assert!(config.policy_manifest_path.is_none());
 
-    let engine = load_policy_engine_from_config(&config)
-        .expect("unset network + no manifest is permitted");
+    let engine =
+        load_policy_engine_from_config(&config).expect("unset network + no manifest is permitted");
     assert!(engine.is_none());
 }
 

@@ -256,16 +256,14 @@ pub async fn combine_sign_over_relay_nparty(
         .await
         .map_err(proto)?;
 
-    // 2. Prime our coordinator for the PRIMARY co-located party (issues its
-    //    partial; installs the shared public data), then issue EACH OTHER
-    //    co-located party's partial locally — the device's `t−1` partials never
-    //    cross the wire.
+    // 2. Compute our signing-time index for the trigger body. The actual combine
+    //    — prime the PRIMARY co-located party, add EACH OTHER co-located party's
+    //    partial locally (the device's `t−1` partials never cross the wire), then
+    //    fold the cosigner's relayed partial — runs in the shared, hermetically-
+    //    tested `bsv_mpc_core::signing::device_holds_combine` kernel below, AFTER
+    //    the cosigner's partial arrives. The deployed relay path and the in-core
+    //    tests therefore drive EXACTLY the same combine code (issue #69, zero drift).
     let my_index = signing_index(&share, &participants)?;
-    let mut coord = SigningCoordinator::new(session_id, share, config, participants);
-    coord.sign_with_presignature_with_offset(sighash, my_presig_box, brc42_offset)?;
-    for (extra_idx, extra_box) in extra_local_presigs {
-        coord.add_local_presig_partial(extra_idx, extra_box, brc42_offset)?;
-    }
 
     // 3. Trigger the DO to issue + relay its partial to us.
     //    Production: presig is consumed from the DO pool (no `presignature_hex`
@@ -369,14 +367,25 @@ pub async fn combine_sign_over_relay_nparty(
         );
     };
 
-    let result = coord.process_round(vec![round_msg])?;
     sub.shutdown().await;
-    match result {
-        SigningRoundResult::Complete(sig) => Ok(sig),
-        SigningRoundResult::NextRound(_) => Err(MpcError::Signing(
-            "combiner did not complete after the DO's partial".into(),
-        )),
-    }
+
+    // Combine via the shared device-holds kernel (issue #69): prime the PRIMARY
+    // co-located party, add each OTHER co-located partial locally, fold the
+    // cosigner's relayed `round_msg`, and combine all `t` in commitment order.
+    // Hermetically proven in bsv-mpc-core `tests/device_holds_combine_kernel.rs`
+    // (3-of-3 fast + 4-of-6 real topology), so this deployed path inherits that
+    // proof byte-for-byte.
+    bsv_mpc_core::signing::device_holds_combine(
+        session_id,
+        share,
+        config,
+        participants,
+        sighash,
+        my_presig_box,
+        extra_local_presigs,
+        round_msg,
+        brc42_offset,
+    )
 }
 
 /// **§06.17.1 sign-from-bundle over the relay (issue #30, CONTAINER target).**
