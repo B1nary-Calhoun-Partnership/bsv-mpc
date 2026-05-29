@@ -26,8 +26,8 @@ pub use ceremony::DeployedCosigner;
 pub use keystore::{MemNativeKeyStore, NativeKeyStore};
 pub use multipresig::{DeviceMultiPresig, MultiPresigStore};
 pub use provision::{
-    provision_wallet, provision_wallet_nparty, NpartyCosigner, ProvisionedWallet,
-    ProvisionedWalletNparty,
+    provision_wallet, provision_wallet_nparty, NpartyCosigner, ProvisionPrimePool,
+    ProvisionedWallet, ProvisionedWalletNparty,
 };
 pub use recover::recover_wallet;
 pub use signer::{DeployedSigner, DeployedSignerConfig, WalletMeta};

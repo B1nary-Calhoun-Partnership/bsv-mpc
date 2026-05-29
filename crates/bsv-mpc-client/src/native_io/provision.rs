@@ -135,6 +135,18 @@ pub struct ProvisionedWalletNparty {
 /// MUST hold exactly `w = t−1` indices and the device + cosigner indices MUST
 /// partition `0..n` with no gaps or duplicates (validate-don't-skip — a malformed
 /// topology rejects fast and fail-closed, nothing handshaked or sealed).
+/// Optional device Paillier prime pool (Lever B / #99) threaded into the n-party
+/// DKG. `storage` is the host-owned encrypted-blob persistence; `at_rest_root` +
+/// `pool_id` BRC-42-derive the pool key. `None` ⇒ today's always-inline behavior.
+pub struct ProvisionPrimePool {
+    /// Host-owned encrypted-blob persistence (FIFO).
+    pub storage: Arc<dyn bsv_mpc_core::paillier_pool::PrimePoolStorage>,
+    /// 32-byte at-rest root deriving the pool encryption key.
+    pub at_rest_root: [u8; 32],
+    /// Domain-separation bytes (e.g. device identity pubkey).
+    pub pool_id: Vec<u8>,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn provision_wallet_nparty(
     relay_url: &str,
@@ -144,6 +156,7 @@ pub async fn provision_wallet_nparty(
     cosigners: Vec<NpartyCosigner>,
     timeout: Duration,
     keystore: &dyn NativeKeyStore,
+    prime_pool: Option<ProvisionPrimePool>,
 ) -> Result<ProvisionedWalletNparty, ClientError> {
     // ── Validate topology at the client boundary (fail-closed, pre-network). ──
     let w = config.threshold - 1;
@@ -209,6 +222,12 @@ pub async fn provision_wallet_nparty(
     }
 
     // ── Run the genuine n-party DKG over the relay. ──
+    // Lever B (#99): split the optional pool into the relay struct's fields
+    // (storage / at_rest_root / pool_id). Absent ⇒ inline-gen as before.
+    let (pool_storage, pool_root, pool_pid) = match prime_pool {
+        Some(p) => (Some(p.storage), p.at_rest_root, p.pool_id),
+        None => (None, [0u8; 32], Vec::new()),
+    };
     let out = coordinate_dkg_over_relay(
         DkgOverRelay {
             relay_url: relay_url.to_string(),
@@ -217,6 +236,9 @@ pub async fn provision_wallet_nparty(
             local_indices: device_indices.clone(),
             cosigners: endpoints,
             provisional_agent_id: identity.public_key().to_hex(),
+            prime_pool: pool_storage,
+            at_rest_root: pool_root,
+            pool_id: pool_pid,
         },
         timeout,
     )
@@ -274,6 +296,7 @@ mod tests {
             }],
             Duration::from_secs(1),
             &ks,
+            None,
         )
         .await;
         let Err(err) = res else {
@@ -309,6 +332,7 @@ mod tests {
             }],
             Duration::from_secs(1),
             &ks,
+            None,
         )
         .await;
         let Err(err) = res else {

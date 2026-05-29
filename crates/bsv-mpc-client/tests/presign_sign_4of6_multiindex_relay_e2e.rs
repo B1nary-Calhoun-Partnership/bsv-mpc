@@ -144,6 +144,9 @@ async fn presign_then_sign_4of6_device_holds_over_relay() {
                 ),
             }],
             provisional_agent_id: "step7a-presign-sign".into(),
+            prime_pool: None,
+            at_rest_root: [0u8; 32],
+            pool_id: Vec::new(),
         },
         Duration::from_secs(600),
     )

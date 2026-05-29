@@ -142,6 +142,24 @@ pub trait PrimePoolStorage: Send + Sync {
     fn count(&self) -> Result<usize>;
 }
 
+/// Forward through smart pointers so a `PaillierPool` can be parameterized over an
+/// `Arc<dyn PrimePoolStorage>` (the device-pool path threads a host-owned trait
+/// object down via FFI — issue #99). Additive, behavior-preserving: each call just
+/// delegates to the pointee.
+impl<T: PrimePoolStorage + ?Sized> PrimePoolStorage for std::sync::Arc<T> {
+    fn put_encrypted(&self, blob: EncryptedPrimes) -> Result<()> {
+        (**self).put_encrypted(blob)
+    }
+
+    fn take_encrypted(&self) -> Result<Option<EncryptedPrimes>> {
+        (**self).take_encrypted()
+    }
+
+    fn count(&self) -> Result<usize> {
+        (**self).count()
+    }
+}
+
 /// In-memory FIFO pool storage. Suitable for `bsv-mpc-service`
 /// (in-process daemon) and tests. Not durable across restarts —
 /// production CF Worker deployments use `D1PoolStorage` (Phase I).

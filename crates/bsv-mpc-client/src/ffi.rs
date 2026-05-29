@@ -609,6 +609,137 @@ impl crate::native_io::keystore::NativeKeyStore for FfiKeyStoreAdapter {
     }
 }
 
+// ── Device Paillier prime pool (Lever B / ADR-0041 / issue #100) ──────────────
+//
+// The device pre-generates Paillier safe-prime sets in the BACKGROUND and stores
+// them encrypted-at-rest, so signup's aux-info phase consumes a warm pooled set
+// instead of grinding ~250s of inline safe-prime gen on the critical path. The
+// host owns ONLY opaque-ciphertext persistence; the primes are AES-256-GCM-sealed
+// by `bsv_mpc_core::paillier_pool` (key BRC-42-derived from the at-rest root,
+// never persisted), so the host never sees plaintext primes and never derives the
+// pool key. PERFORMANCE-only: byte-equivalent to inline gen, no protocol change.
+
+/// One at-rest-encrypted Paillier safe-prime set blob — FFI-friendly 1:1 mirror of
+/// [`bsv_mpc_core::paillier_pool::EncryptedPrimes`] (which uses `nonce: [u8; 12]`).
+/// Opaque to the host: it stores/returns these bytes verbatim and never decrypts.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(uniffi::Record)]
+pub struct FfiEncryptedPrimes {
+    /// AES-GCM 12-byte nonce.
+    pub nonce: Vec<u8>,
+    /// AES-GCM ciphertext + 16-byte authentication tag (appended).
+    pub ciphertext: Vec<u8>,
+}
+
+/// Host-implemented FIFO encrypted-prime-pool store — the device-side persistence
+/// for Lever B. Mirrors the [`FfiKeyStore`] foreign-callback pattern. SYNC: the
+/// underlying [`bsv_mpc_core::paillier_pool::PrimePoolStorage`] is sync and the
+/// calls are infrequent (backfill / one take per held index) + fast (a queue
+/// push/pop on the host), so no async bridge is needed. Implementations MUST
+/// preserve FIFO ordering (oldest-first drain).
+#[cfg(not(target_arch = "wasm32"))]
+#[uniffi::export(with_foreign)]
+pub trait FfiPrimePoolStore: Send + Sync {
+    /// Append an encrypted blob to the end of the queue.
+    fn put_encrypted(&self, blob: FfiEncryptedPrimes) -> Result<(), FfiError>;
+
+    /// Remove and return the oldest encrypted blob, or `None` if empty.
+    fn take_encrypted(&self) -> Result<Option<FfiEncryptedPrimes>, FfiError>;
+
+    /// Number of blobs currently stored.
+    fn count(&self) -> Result<u32, FfiError>;
+}
+
+/// Adapts the foreign [`FfiPrimePoolStore`] to the core
+/// [`bsv_mpc_core::paillier_pool::PrimePoolStorage`] (sync ↔ sync). Converts
+/// between [`FfiEncryptedPrimes`] (Vec-backed nonce) and the core
+/// [`bsv_mpc_core::paillier_pool::EncryptedPrimes`] (`[u8; 12]` nonce).
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) struct FfiPrimePoolStoreAdapter(pub std::sync::Arc<dyn FfiPrimePoolStore>);
+
+#[cfg(not(target_arch = "wasm32"))]
+impl bsv_mpc_core::paillier_pool::PrimePoolStorage for FfiPrimePoolStoreAdapter {
+    fn put_encrypted(
+        &self,
+        blob: bsv_mpc_core::paillier_pool::EncryptedPrimes,
+    ) -> bsv_mpc_core::error::Result<()> {
+        self.0
+            .put_encrypted(FfiEncryptedPrimes {
+                nonce: blob.nonce.to_vec(),
+                ciphertext: blob.ciphertext.clone(),
+            })
+            .map_err(|e| bsv_mpc_core::error::MpcError::ShareStorage(e.to_string()))
+    }
+
+    fn take_encrypted(
+        &self,
+    ) -> bsv_mpc_core::error::Result<Option<bsv_mpc_core::paillier_pool::EncryptedPrimes>> {
+        let Some(blob) = self
+            .0
+            .take_encrypted()
+            .map_err(|e| bsv_mpc_core::error::MpcError::ShareStorage(e.to_string()))?
+        else {
+            return Ok(None);
+        };
+        let nonce: [u8; 12] = blob.nonce.as_slice().try_into().map_err(|_| {
+            bsv_mpc_core::error::MpcError::ShareStorage(format!(
+                "prime-pool nonce must be 12 bytes, got {}",
+                blob.nonce.len()
+            ))
+        })?;
+        Ok(Some(bsv_mpc_core::paillier_pool::EncryptedPrimes {
+            nonce,
+            ciphertext: blob.ciphertext,
+        }))
+    }
+
+    fn count(&self) -> bsv_mpc_core::error::Result<usize> {
+        self.0
+            .count()
+            .map(|c| c as usize)
+            .map_err(|e| bsv_mpc_core::error::MpcError::ShareStorage(e.to_string()))
+    }
+}
+
+/// Background safe-prime backfill (Lever C pre-warm entrypoint). Fills the device
+/// prime pool up to `floor` sets, generating any shortfall on a blocking thread
+/// (safe-prime gen is CPU-bound — must NOT block the async runtime). Idempotent /
+/// skip-if-full and best-effort: if the pool is already at `floor` it returns 0.
+/// Returns the number of new sets added.
+///
+/// * `at_rest_root_hex` — the device's 32-byte at-rest root (same value carried in
+///   [`FfiSignerConfig::at_rest_root_hex`]); BRC-42-derives the pool encryption key.
+/// * `pool_id_hex` — domain-separation bytes (e.g. the device identity pubkey hex).
+/// * `floor` — minimum pool size to maintain (device recommendation: `2 * w`).
+#[cfg(not(target_arch = "wasm32"))]
+#[uniffi::export(async_runtime = "tokio")]
+pub async fn ffi_prime_pool_backfill(
+    at_rest_root_hex: String,
+    pool_id_hex: String,
+    floor: u32,
+    store: std::sync::Arc<dyn FfiPrimePoolStore>,
+) -> Result<u32, FfiError> {
+    let root = hex32(&at_rest_root_hex, "at_rest_root")?;
+    let pool_id = dehex(&pool_id_hex, "pool_id")?;
+    // Safe-prime gen has a multi-GiB transient RSS peak and is CPU-bound for
+    // seconds-to-minutes per set — run it on a blocking thread so the async
+    // runtime workers stay free (the core `generate_serialized` RSS gate still
+    // serializes against any concurrent inline gen in this process).
+    let added = tokio::task::spawn_blocking(move || {
+        let pool = bsv_mpc_core::paillier_pool::PaillierPool::new(
+            FfiPrimePoolStoreAdapter(store),
+            &root,
+            &pool_id,
+            floor as usize,
+        );
+        pool.backfill_to_floor(&mut rand::rngs::OsRng)
+    })
+    .await
+    .map_err(|e| FfiError::Client(format!("prime-pool backfill task panicked: {e}")))?
+    .map_err(|e| FfiError::Client(format!("prime-pool backfill: {e}")))?;
+    Ok(added as u32)
+}
+
 /// FFI config for a provisioned wallet's deployed signer (all hex/primitive — no
 /// FFI-opaque crypto types crossing the boundary).
 #[cfg(not(target_arch = "wasm32"))]
@@ -928,6 +1059,14 @@ pub async fn create_wallet_nparty(
     device_indices: Vec<u16>,
     cosigners: Vec<FfiNpartyCosigner>,
     keystore: std::sync::Arc<dyn FfiKeyStore>,
+    // Lever B (#99) — OPTIONAL device Paillier prime pool. When the host supplies a
+    // pool store, the device draws its `w` aux-info safe-prime sets from the warm
+    // on-device pool (microseconds) instead of grinding them inline (~250s for
+    // 4-of-6). A miss/empty pool falls back to inline gen, so this is strictly
+    // Pareto. `None` ⇒ today's always-inline behavior. The pool seals at rest under
+    // a key BRC-42-derived from `at_rest_root_hex` + the device identity pubkey (the
+    // `pool_id`); the host stores only opaque ciphertext.
+    prime_pool_store: Option<std::sync::Arc<dyn FfiPrimePoolStore>>,
 ) -> Result<FfiSignerConfig, FfiError> {
     use bsv::primitives::ec::PrivateKey;
     use bsv_mpc_core::types::ThresholdConfig;
@@ -978,6 +1117,25 @@ pub async fn create_wallet_nparty(
         })
         .collect();
 
+    // Lever B (#99): if the host supplied a prime-pool store, wrap it in the core
+    // adapter + carry the at-rest root and pool_id (the device identity pubkey
+    // bytes) so the relay path draws warm sets per held index. `None` ⇒ inline gen.
+    let prime_pool = match prime_pool_store {
+        Some(store) => {
+            let at_rest_root = hex32(&at_rest_root_hex, "at_rest_root")?;
+            // pool_id = device identity pubkey bytes (domain separation). `to_hex`
+            // is the canonical compressed-pubkey hex; decode it back to bytes.
+            let pool_id = hex::decode(identity.public_key().to_hex())
+                .map_err(|e| FfiError::Client(format!("identity pubkey hex: {e}")))?;
+            Some(crate::native_io::provision::ProvisionPrimePool {
+                storage: std::sync::Arc::new(FfiPrimePoolStoreAdapter(store)),
+                at_rest_root,
+                pool_id,
+            })
+        }
+        None => None,
+    };
+
     let w = crate::native_io::provision::provision_wallet_nparty(
         &relay_url,
         identity,
@@ -986,6 +1144,7 @@ pub async fn create_wallet_nparty(
         cosigner_endpoints,
         std::time::Duration::from_secs(NPARTY_PROVISION_TIMEOUT_SECS),
         ks.as_ref(),
+        prime_pool,
     )
     .await
     .map_err(|e| FfiError::Client(e.to_string()))?;
@@ -1765,5 +1924,116 @@ mod send_path_tests {
             msg.contains("missing field") && msg.contains("human_address"),
             "expected missing-field rejection naming `human_address`, got: {msg}"
         );
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod prime_pool_adapter_tests {
+    //! Lever B (#100) — the FFI adapter bridges a foreign `FfiPrimePoolStore` to the
+    //! core `PrimePoolStorage`, converting `FfiEncryptedPrimes` (Vec nonce) ↔ core
+    //! `EncryptedPrimes` ([u8;12] nonce). These are fast (no safe-prime gen): a fake
+    //! in-memory `FfiPrimePoolStore` proves a `PaillierPool` built on the adapter
+    //! drains pre-seeded sets FIFO before it would inline-generate.
+
+    use super::*;
+    use bsv_mpc_core::paillier_pool::{PaillierPool, PrimePoolStorage};
+    use std::sync::{Arc, Mutex};
+
+    /// Minimal FIFO fake of the host's `FfiPrimePoolStore` (mirrors what Swift's
+    /// keychain queue does), so the adapter + pool path can be tested in isolation.
+    struct FakeFfiStore(Mutex<Vec<FfiEncryptedPrimes>>);
+
+    impl FfiPrimePoolStore for FakeFfiStore {
+        fn put_encrypted(&self, blob: FfiEncryptedPrimes) -> Result<(), FfiError> {
+            self.0.lock().unwrap().push(blob);
+            Ok(())
+        }
+        fn take_encrypted(&self) -> Result<Option<FfiEncryptedPrimes>, FfiError> {
+            let mut g = self.0.lock().unwrap();
+            Ok(if g.is_empty() { None } else { Some(g.remove(0)) })
+        }
+        fn count(&self) -> Result<u32, FfiError> {
+            Ok(self.0.lock().unwrap().len() as u32)
+        }
+    }
+
+    /// The adapter round-trips a core `EncryptedPrimes` through the foreign store
+    /// byte-for-byte (the 12-byte nonce survives the Vec↔array conversion).
+    #[test]
+    fn adapter_round_trips_encrypted_blob_byte_for_byte() {
+        let fake: Arc<dyn FfiPrimePoolStore> = Arc::new(FakeFfiStore(Mutex::new(Vec::new())));
+        let adapter = FfiPrimePoolStoreAdapter(fake);
+
+        let original = bsv_mpc_core::paillier_pool::EncryptedPrimes {
+            nonce: [7u8; 12],
+            ciphertext: vec![1, 2, 3, 4, 5, 6, 7, 8, 9],
+        };
+        adapter.put_encrypted(original.clone()).unwrap();
+        assert_eq!(adapter.count().unwrap(), 1);
+
+        let back = adapter.take_encrypted().unwrap().expect("non-empty after put");
+        assert_eq!(back.nonce, original.nonce, "nonce must round-trip exactly");
+        assert_eq!(back.ciphertext, original.ciphertext, "ciphertext must round-trip");
+        assert_eq!(adapter.count().unwrap(), 0, "FIFO drained");
+        assert!(adapter.take_encrypted().unwrap().is_none(), "empty ⇒ None (miss → fallback)");
+    }
+
+    /// A non-12-byte nonce from a buggy/hostile host is rejected as a storage error
+    /// (treated as a miss by the caller, never a panic / silent wrong-length nonce).
+    #[test]
+    fn adapter_rejects_bad_nonce_length() {
+        let fake = Arc::new(FakeFfiStore(Mutex::new(vec![FfiEncryptedPrimes {
+            nonce: vec![0u8; 8], // wrong: must be 12
+            ciphertext: vec![1, 2, 3],
+        }])));
+        let adapter = FfiPrimePoolStoreAdapter(fake);
+        assert!(adapter.take_encrypted().is_err(), "11≠12 byte nonce must error");
+    }
+
+    /// A `PaillierPool` built on the adapter drains real (Blum-fast) pre-seeded sets
+    /// FIFO — the warm-pool path the device's `coordinate_dkg_over_relay` consumes.
+    #[test]
+    fn pool_over_adapter_drains_seeded_sets() {
+        use cggmp24::security_level::{SecurityLevel, SecurityLevel128};
+        use cggmp24::PregeneratedPrimes;
+        use rand::RngCore;
+
+        fn gen_blum<R: RngCore>(rng: &mut R, bits: u32) -> cggmp24::backend::Integer {
+            use cggmp24::backend::Integer;
+            loop {
+                let n = Integer::generate_prime(rng, bits);
+                if n.mod_u(4) == 3 {
+                    break n;
+                }
+            }
+        }
+        fn fast_primes<R: RngCore>(rng: &mut R) -> PregeneratedPrimes<SecurityLevel128> {
+            let bits = SecurityLevel128::RSA_PRIME_BITLEN;
+            PregeneratedPrimes::try_from([
+                gen_blum(rng, bits),
+                gen_blum(rng, bits),
+                gen_blum(rng, bits),
+                gen_blum(rng, bits),
+            ])
+            .expect("Blum primes have correct bit size")
+        }
+
+        let mut rng = rand::rngs::OsRng;
+        let fake: Arc<dyn FfiPrimePoolStore> = Arc::new(FakeFfiStore(Mutex::new(Vec::new())));
+        let adapter = FfiPrimePoolStoreAdapter(fake);
+        let pool = PaillierPool::new(adapter, &[0x33u8; 32], b"adapter-seam", 2);
+
+        let a = fast_primes(&mut rng);
+        let a_bytes = serde_json::to_vec(&a).unwrap();
+        pool.put(a).unwrap();
+        assert_eq!(pool.storage().count().unwrap(), 1);
+
+        let drawn = pool.take().unwrap().expect("warm pool yields the seeded set");
+        assert_eq!(
+            serde_json::to_vec(&drawn).unwrap(),
+            a_bytes,
+            "pooled set must round-trip through the FFI adapter byte-for-byte"
+        );
+        assert!(pool.take().unwrap().is_none(), "drained ⇒ None (caller falls back to inline)");
     }
 }
