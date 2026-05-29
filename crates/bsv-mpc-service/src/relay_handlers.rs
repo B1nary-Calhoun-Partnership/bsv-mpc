@@ -167,6 +167,23 @@ pub struct PresignRelayInitRequest {
     /// 32-byte policy id hex (§09 binding). Defaults to all-zero when omitted.
     #[serde(default)]
     pub policy_id_hex: Option<String>,
+    /// **N-party device-holds presign (#69 / #86).** Every OTHER party as
+    /// `(index, relay/BRC-2 identity-key hex)`. When present, this cosigner
+    /// addresses its broadcasts + p2p MtA traffic + return ciphertext across ALL
+    /// of these (the `w` co-located device parties + any other cosigner). When
+    /// omitted, falls back to the single `[(coordinator_party, coordinator_pub_hex)]`
+    /// peer — byte-identical to the mainnet-proven 2-of-2 deployment. The
+    /// coordinator (where the return ciphertext goes) MUST appear in this list.
+    #[serde(default)]
+    pub peers: Option<Vec<PresignRelayPeer>>,
+}
+
+/// One peer entry for the n-party `/presign-relay/init` `peers` list (mirrors the
+/// `/dkg-relay/init` peer shape: `{ index, pub_hex }`).
+#[derive(Debug, Deserialize)]
+pub struct PresignRelayPeer {
+    pub index: u16,
+    pub pub_hex: String,
 }
 
 /// Response from `POST /presign-relay/init`.
@@ -213,12 +230,28 @@ pub async fn handle_presign_relay_init(
         }
     };
 
-    // Load share (+ recover from custody on a cold miss) BEFORE the owner check.
-    let mut share = match crate::handlers::load_share_or_recover_pub(&state, &body.agent_id).await {
+    // Load THIS party's share (+ recover from custody on a cold miss) BEFORE the
+    // owner check. N-party device-holds (#69/#86): the container holds several
+    // composite shares `{agent_id}#{index}`, so load the one for THIS cosigner's
+    // `my_party_index` (the helper falls back to the bare 2-party share).
+    let mut share = match crate::handlers::load_share_or_recover_at_index_pub(
+        &state,
+        &body.agent_id,
+        body.my_party_index,
+    )
+    .await
+    {
         Ok(s) => s,
         Err(resp) => return resp,
     };
-    if let Some(resp) = crate::handlers::authz_owner_pub(&state, &caller, &body.agent_id) {
+    // §08.1 owner-authz against THIS held index's composite owner (n-party);
+    // falls back to the bare-agent_id owner for the 2-party deployment.
+    if let Some(resp) = crate::handlers::authz_owner_at_index_pub(
+        &state,
+        &caller,
+        &body.agent_id,
+        body.my_party_index,
+    ) {
         return resp;
     }
 
@@ -317,11 +350,21 @@ pub async fn handle_presign_relay_init(
     };
     let protocol_box = presign_protocol_box(&sid_hex);
 
+    // Resolve the cosigner's peer set (n-party list or 2-party fallback; fail fast
+    // if it omits the coordinator — see [`resolve_presign_peers`]).
+    let peers = match resolve_presign_peers(
+        &body.peers,
+        body.coordinator_party,
+        &body.coordinator_pub_hex,
+    ) {
+        Ok(p) => p,
+        Err(msg) => return err_response(StatusCode::BAD_REQUEST, msg),
+    };
+
     // Initiate FIRST (registers the ceremony slot via init_generate) — BEFORE the
     // listener subscribes — so the coordinator's round-1, backfilled by the relay
     // the instant we subscribe, finds the slot already present (an inbound for an
     // unregistered session is dropped, deadlocking the presign).
-    let peers = vec![(body.coordinator_party, body.coordinator_pub_hex.clone())];
     let (_rx, round1_out) = match handler.initiate(session_id, share, peers).await {
         Ok(v) => v,
         Err(e) => {
@@ -343,7 +386,8 @@ pub async fn handle_presign_relay_init(
         Err(e) => return err_response(StatusCode::BAD_GATEWAY, format!("listener start: {e}")),
     };
 
-    // Ship our round-1 to the coordinator (its only peer).
+    // Ship our round-1 to every peer (`wrap_protocol` already addressed each
+    // outbound to its recipient: broadcasts fan out to all peers, p2p to one).
     for out in &round1_out {
         if let Err(e) = client
             .send_round_message(
@@ -546,6 +590,62 @@ pub async fn handle_sign_relay(
     )
 }
 
+// ── /identity-challenge ──────────────────────────────────────────────────────
+
+/// Request body for `POST /identity-challenge` (#85 funding gate).
+#[derive(Debug, Deserialize)]
+pub struct IdentityChallengeRequest {
+    /// The wallet's 33-byte joint pubkey hex (binds the proof to THIS wallet).
+    pub joint_pubkey_hex: String,
+    /// A fresh 32-byte device nonce hex (anti-replay).
+    pub nonce_hex: String,
+}
+
+/// `POST /identity-challenge` — the cosigner proves it is LIVE and controls its
+/// MASTER identity for a SPECIFIC wallet (#85). The device sends a fresh nonce +
+/// the joint pubkey; the cosigner signs `(master, joint, nonce)` with its master
+/// key; the device verifies the signature against the master it PINNED out-of-band,
+/// gating funding on this independent confirmation. Read-only (no share access) and
+/// self-authenticating (the master signature), so no BRC-31 auth is required.
+pub async fn handle_identity_challenge(
+    State(_state): State<Arc<AppState>>,
+    Json(req): Json<IdentityChallengeRequest>,
+) -> impl IntoResponse {
+    let server_priv = match crate::auth::server_identity_priv_from_env() {
+        Ok(k) => k,
+        Err(e) => {
+            return err_response(
+                StatusCode::PRECONDITION_FAILED,
+                format!("no server identity: {e}"),
+            )
+        }
+    };
+    let joint = match hex::decode(&req.joint_pubkey_hex) {
+        Ok(b) if b.len() == 33 => b,
+        _ => return err_response(StatusCode::BAD_REQUEST, "joint_pubkey_hex must be 33 bytes"),
+    };
+    let nonce = match decode_32(&req.nonce_hex) {
+        Ok(n) => n,
+        Err(e) => return err_response(StatusCode::BAD_REQUEST, format!("nonce_hex: {e}")),
+    };
+    let sig = match bsv_mpc_core::hd::sign_cosigner_challenge(&server_priv, &joint, &nonce) {
+        Ok(s) => hex::encode(s),
+        Err(e) => {
+            return err_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("sign challenge: {e}"),
+            )
+        }
+    };
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "master_pub_hex": server_priv.public_key().to_hex(),
+            "challenge_sig_hex": sig,
+        })),
+    )
+}
+
 fn decode_32(hex_str: &str) -> anyhow::Result<[u8; 32]> {
     let b = hex::decode(hex_str)?;
     if b.len() != 32 {
@@ -562,4 +662,116 @@ fn relay_url() -> String {
     std::env::var("RELAY_URL")
         .or_else(|_| std::env::var("MESSAGEBOX_RELAY_URL"))
         .unwrap_or_else(|_| "https://rust-message-box.dev-a3e.workers.dev".to_string())
+}
+
+/// Resolve the cosigner's peer set for `/presign-relay/init`.
+///
+/// - **N-party (#69/#86):** the explicit `peers` list (every OTHER party — the
+///   `w` co-located device parties + any other cosigner) when present + non-empty.
+/// - **2-party fallback:** the single `[(coordinator_party, coordinator_pub_hex)]`
+///   — byte-identical to the mainnet-proven 2-of-2 deployment.
+///
+/// Errors (with the reason) if the resolved set omits `coordinator_party`: the
+/// cosigner's return ciphertext is addressed there, so its absence would deadlock
+/// the presign. Surfacing it here turns a silent late stall into a fast 400.
+pub(crate) fn resolve_presign_peers(
+    peers: &Option<Vec<PresignRelayPeer>>,
+    coordinator_party: u16,
+    coordinator_pub_hex: &str,
+) -> std::result::Result<Vec<(u16, String)>, String> {
+    let resolved: Vec<(u16, String)> = match peers {
+        Some(list) if !list.is_empty() => {
+            list.iter().map(|p| (p.index, p.pub_hex.clone())).collect()
+        }
+        _ => vec![(coordinator_party, coordinator_pub_hex.to_string())],
+    };
+    if !resolved.iter().any(|(i, _)| *i == coordinator_party) {
+        return Err(format!(
+            "peers must include coordinator_party {} (the return-ciphertext recipient); got {:?}",
+            coordinator_party,
+            resolved.iter().map(|(i, _)| *i).collect::<Vec<_>>()
+        ));
+    }
+    Ok(resolved)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn peer(index: u16) -> PresignRelayPeer {
+        PresignRelayPeer {
+            index,
+            pub_hex: format!("02{:064x}", index),
+        }
+    }
+
+    #[test]
+    fn resolve_peers_2party_fallback_when_omitted() {
+        // No `peers` field → the single coordinator peer (byte-identical 2-of-2).
+        let got = resolve_presign_peers(&None, 0, "02abc").expect("fallback resolves");
+        assert_eq!(got, vec![(0u16, "02abc".to_string())]);
+        // An empty list is treated the same as omitted.
+        let got_empty = resolve_presign_peers(&Some(vec![]), 0, "02abc").expect("empty → fallback");
+        assert_eq!(got_empty, vec![(0u16, "02abc".to_string())]);
+    }
+
+    #[test]
+    fn resolve_peers_nparty_uses_explicit_list() {
+        // Device holds {0,1,2}; this cosigner (party 3) sees all three as peers.
+        let peers = Some(vec![peer(0), peer(1), peer(2)]);
+        let got = resolve_presign_peers(&peers, 0, "02ignored-fallback").expect("n-party resolves");
+        assert_eq!(got.len(), 3);
+        assert_eq!(
+            got.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        // The explicit list wins — the fallback pub is NOT used.
+        assert_eq!(got[0].1, format!("02{:064x}", 0));
+    }
+
+    #[test]
+    fn resolve_peers_rejects_missing_coordinator() {
+        // Coordinator is party 0 but it is absent from the peer list → fail fast.
+        let peers = Some(vec![peer(1), peer(2)]);
+        let err = resolve_presign_peers(&peers, 0, "02fallback")
+            .expect_err("must reject peers omitting the coordinator");
+        assert!(
+            err.contains("must include coordinator_party 0"),
+            "error must name the missing coordinator: {err}"
+        );
+    }
+
+    #[test]
+    fn presign_relay_init_request_parses_with_and_without_peers() {
+        // N-party body (with peers) parses + populates the list.
+        let with_peers = serde_json::json!({
+            "agent_id": "02aa",
+            "session_id": "ab".repeat(32),
+            "coordinator_pub_hex": "02cc",
+            "coordinator_party": 0,
+            "my_party_index": 3,
+            "parties_at_keygen": [0, 1, 2, 3],
+            "peers": [
+                {"index": 0, "pub_hex": "02d0"},
+                {"index": 1, "pub_hex": "02d1"},
+                {"index": 2, "pub_hex": "02d2"}
+            ]
+        });
+        let req: PresignRelayInitRequest =
+            serde_json::from_value(with_peers).expect("parse n-party");
+        assert_eq!(req.peers.as_ref().map(|p| p.len()), Some(3));
+
+        // 2-party body (no peers) parses, leaving `peers` = None (back-compat).
+        let no_peers = serde_json::json!({
+            "agent_id": "02aa",
+            "session_id": "ab".repeat(32),
+            "coordinator_pub_hex": "02cc",
+            "coordinator_party": 0,
+            "my_party_index": 1
+        });
+        let req2: PresignRelayInitRequest =
+            serde_json::from_value(no_peers).expect("parse 2-party");
+        assert!(req2.peers.is_none());
+    }
 }

@@ -211,6 +211,7 @@ async fn service_provisions_do_pool_proxy_combines() {
         auth_headers: vec![],
         cosigner_encrypted_share: None,
         brc42_offset: None,
+        presig_id: None,
     };
     let sig: SigningResult = bridge
         .sign_over_relay(&sighash, box_b, None, trigger, Duration::from_secs(60))

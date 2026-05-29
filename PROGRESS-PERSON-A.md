@@ -136,18 +136,58 @@ holds 2 indices**. See handoff for the exact derivation fn + driver spec.
   trigger cosigner). 2-of-2 back-compat GREEN (client lib 41 + hermetic_sign 3); clippy clean
   default **and** `--features native`. Full deployed proof of `create_wallet_nparty` = step 8
   (mirrors how `create_wallet`/`recover_wallet` are proven by their deployed e2e).
-- ⏳ **Step 7 (IN PROGRESS) — SCOPE FINDING: bigger than "wire the combine".** The combine/sign
-  CONSUME side EXISTS + is proven: `combine_sign_over_relay_nparty` (relay) + the merged
-  `device_holds_combine` kernel (#83) + the proxy's `sign_over_relay_device_holds`. **But the
-  multi-index presig GENERATION over the relay does NOT exist anywhere** — the proxy's
-  `DevicePresigSetPool::add_set` is only ever called by its mainnet E2E, which generates the
-  correlated `{0,1,2}` presigs via a LOCAL test helper (`gen_presig_set`, having all 6 shares) —
-  a within-stack shortcut, NOT a production path. A REAL client multi-index sign needs the device
-  to obtain `w` CORRELATED presigs from a genuine n-party presign-over-relay ceremony (device's
-  `w` parties + cosigner) — a new `coordinate_presign_over_relay_nparty` coordinator, ~5b-sized.
-  So Step 7 = (a) build that n-party presign coordinator + (b) the client `DeployedSigner`
-  multi-index presig pool + multi-index unseal (composite `{agent_id}#{index}`) + (c) wire the
-  sign → `combine_sign_over_relay_nparty`. Checkpoint surfaced to user.
+- ⏳ **Step 7 (IN PROGRESS) — SCOPE FINDING confirmed + filed as [bsv-mpc#86].** The combine/sign
+  CONSUME side EXISTS + is proven (`combine_sign_over_relay_nparty` + the #83 `device_holds_combine`
+  kernel + the proxy's `sign_over_relay_device_holds`). **The multi-index presig GENERATION over the
+  relay did NOT exist** — the proxy's `DevicePresigSetPool::add_set` is fed ONLY by the test-only
+  `gen_presig_set` (holds all 6 shares). Filed #86 (affects client + proxy); user said file-first.
+  - **🔒 LOCKED design (Arch 2 — "PresignHandler-everywhere + reconstruct-from-bundle"):** keeps the
+    deployed cosigner's presign RUNTIME byte-identical (only `/presign-relay/init` gains a `peers`
+    list). Device runs `w` PresignHandlers (primary=coordinator, others=cosigner) + ONE external
+    cosigner over the relay → the proven `PresigBundle`; device RECONSTRUCTS its `w` raw boxes from
+    the bundle (unseal own + BRC-2-decrypt co-located, paired with shared `commitments`) + keeps the
+    external ct for the sign-time trigger. Rejected the "local-raw PresignHandler role" alt (mutates
+    the mainnet-proven completion path → asterisk).
+  - **✅ Step 7a sub-steps 1–3 GREEN (branch `person-a/69-pr2-client-multishare`):**
+    (1) core `deserialize_party_presig_with_public_data` inverse + round-trip gate (reconstructed box
+    drives a BSV-valid 2-of-2 sig; byte-stable; negative) — `bsv-mpc-core` presigning 10/10.
+    (2) `/presign-relay/init` n-party `peers` list (mirror `/dkg-relay/init`, back-compat fallback to
+    single coordinator, fail-fast if coordinator absent) + composite share load at `my_party_index`
+    (`load_share_or_recover_at_index_pub`) — `bsv-mpc-service` 55/55 (4 new `resolve_presign_peers`).
+    (3) `bsv_mpc_relay::coordinate_presign_over_relay_nparty` (new `provision_presign.rs`, mirrors
+    `coordinate_dkg_over_relay`) + `DoTrigger.presig_id` shipped by `combine_sign_over_relay_nparty`
+    (additive; 12 existing literals get `None`) — `bsv-mpc-relay` 6/6 (4 hermetic topology guards).
+    fmt+workspace clippy + `-p bsv-mpc-client --features native` clippy all GREEN.
+  - **✅ Step 7a sub-step 4 (keystone E2E) PROVEN GREEN ON THE LIVE RELAY:**
+    `presign_sign_4of6_multiindex_relay_e2e.rs` — device {0,1,2} + ONE in-process container cosigner
+    {3} over the deployed relay: genuine 4-of-6 DKG (joint
+    `02c709186cbe1ac811a2f7eb39e17dfeeca4ce7465f009592d300494df981cc32f`, addr
+    `1nec9An3paL7P4S19MPzjNntMd5Vk2r1a`, 464s) → genuine n-party presign (3 correlated device presigs +
+    438-byte cosigner ct, 521s) → device-holds combine → **BSV-valid signature under the joint key**
+    (`1 passed`, 524s). The cosigner generated its OWN presig as a genuine protocol party — no process
+    ever held > t−1 shares. This validates the generation half (#86) feeding the proven #83 combine.
+  - **🛡 Two production-correct service-side fixes the E2E forced out (n-party path only; 2-party
+    deployed runtime byte-identical):** (1) **composite owner-authz** on `/presign-relay/init`
+    (`authz_owner_at_index_pub`) — a multi-index wallet records its owner at `{joint}#{idx}`, so the
+    old bare-key check was a §08.1 BYPASS; now enforced (composite owner preferred, bare fallback),
+    positive+negative unit-tested. (2) **race-closing retry** on the composite share load
+    (`load_share_or_recover_at_index_pub`) — a presign armed immediately after provisioning could 404
+    before the cosigner's DKG persist landed; bounded retry closes it (genuine miss still 404s).
+  - **✅ Step 7b/7c BUILT + GREEN** (unit + both clippy gates + fmt; underlying crypto live-proven by 7a):
+    `DeviceMultiPresig` + durable `MultiPresigStore` (atomic single-use consume = CVE-2025-66017
+    mitigation; persist/rehydrate/single-use unit-tested) in `native_io/multipresig.rs`;
+    `DeployedCosigner::{coordinate_presig_nparty, sign_nparty}` (wrap the proven relay fns with the
+    session arm/request signer); `DeployedSigner` multi-index branch — `is_multi()` gate,
+    `unseal_device_shares_multi` (composite `{agent_id}#{idx}`), pool + on-demand fallback, reconstruct
+    → `sign_nparty` → fail-closed pre-flight. 2-of-2 back-compat intact (client lib 26 default / 43
+    native). DECISION: `coordinate_presign_over_relay_nparty` returns raw boxes (proven); the client
+    re-serializes to the durable `DeviceMultiPresig` + reconstructs at sign time via the proven core
+    inverse (no E2E re-prove needed; the FFI sign auto-routes n-party via the `is_multi()` branch).
+  - **⏳ Step 8 — deployed mainnet 4-of-6. BLOCKED on external gates:** (1) DEPLOY the updated
+    `bsv-mpc-service` to the CF Container (it runs pre-#86 code — no `peers` list / composite load /
+    composite authz); (2) #70 for two INDEPENDENT cosigners (one container holding 3 indices is an
+    interim); (3) #85 (MITM) blocks real-sats FUNDING. A deployed NO-SATS 4-of-6 sign (real BRC-31,
+    dummy hash) proves the full client wrapper without #70/#85; the real spend → WoC TXID is gated.
 - ☐ **Step 8** — mainnet 4-of-6 genuine-DKG E2E (with #70). `provision_wallet_nparty` +
   `create_wallet_nparty` full deployed proof (real BRC-31 + seal) lands here (in-process service
   auth is a dev stub), mirroring how `recover_wallet`'s full proof is its deployed E2E.
@@ -352,6 +392,31 @@ Design-only for now; after 4-of-6. **Last action:** — **Blockers:** none.
 ## Daily log
 
 _(append session-by-session notes here)_
+
+### 2026-05-29 LATE PM — #69 step 7 PROVEN + #85 MITM gate built (branch `person-a/69-pr2-client-multishare`, NOT pushed)
+- **#69 step 7a LIVE-PROVEN** — genuine n-party presign generation over the relay
+  (`coordinate_presign_over_relay_nparty`, new `provision_presign.rs`) feeding the proven #83
+  combine → BSV-valid 4-of-6 sig (joint `02c70918…`). Filed [#86] for the gap (file-first, user call).
+- **#69 step 7b/7c BUILT+GREEN** — client `DeviceMultiPresig` + durable `MultiPresigStore`
+  (atomic single-use) + `DeployedCosigner::{coordinate_presig_nparty, sign_nparty}` + `DeployedSigner`
+  multi-index branch (composite unseal + pool + reconstruct → sign). 2-of-2 back-compat intact.
+- **2 production-correct service fixes (n-party only; 2-party byte-identical):** composite owner-authz
+  (`authz_owner_at_index_pub`, closed a §08.1 BYPASS) + race-closing composite-load retry with a
+  fast-path bare read (no 2-party latency regression). Both unit-tested (incl. negatives).
+- **#85 MITM gate BUILT+PROVEN (DKG funding path + presign path):** core attestation + funding-challenge
+  sign/verify (`hd.rs`, frozen RFC-6979 golden vectors + 5 negatives each); service signs
+  `/dkg-relay/peer-identity` (master attestation) + new `POST /identity-challenge`; client
+  `coordinate_dkg_over_relay` verifies every per-index attestation vs the PINNED master + runs a
+  post-DKG liveness challenge before returning a fundable wallet; presign pins the cosigner master;
+  pin threaded through `NpartyCosigner`/`CosignerEndpoint`/`PresignCosignerArm`/`WalletMeta`/FFI.
+  Fast HTTP proof `mitm_gate_85_signed_identity` (in-process container; signed responses + MITM
+  negatives). Live e2e now PIN the master (proves verify+challenge end-to-end).
+- **All gates GREEN** workspace-wide: fmt + `clippy --workspace -D warnings` + `clippy -p bsv-mpc-client
+  --features native -D warnings`; unit: core 41 (incl. #85) / relay 6 / service 59 / client-native 43 /
+  mitm_gate_85 2 / multipresig store 2.
+- **REMAINING #85 surface (recovery flow, not 4-of-6 funding):** reshare-relay + refresh-relay identity
+  fetches still unsigned — harden for full closure. **REMAINING capstone:** deploy hardened container(s)
+  → #70 (2nd independent Notary) → deployed no-sats 4-of-6 → funded mainnet → WoC TXID.
 
 ### 2026-05-28
 - Audit landed. 5 issues assigned to Person A (#69, #70, #73, #74, #75). Awaiting first

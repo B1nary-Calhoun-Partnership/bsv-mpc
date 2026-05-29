@@ -248,6 +248,7 @@ async fn relay_online_sign_latency() {
             auth_headers: vec![],
             cosigner_encrypted_share: None,
             brc42_offset: None,
+            presig_id: None,
         };
         let t = Instant::now();
         let sig = bridge

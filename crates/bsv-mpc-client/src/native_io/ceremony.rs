@@ -19,10 +19,14 @@ use bsv_mpc_core::types::{
     DkgResult, EncryptedShare, JointPublicKey, PolicyId, PresigBundle, SessionId, SigningResult,
     ThresholdConfig,
 };
+use std::any::Any;
+
 use bsv_mpc_relay::presign::CosignerArm;
+use bsv_mpc_relay::reshare::ArmRequestSigner;
 use bsv_mpc_relay::{
-    combine_sign_from_bundle_over_relay, coordinate_presign_over_relay, run_dkg_over_http_authed,
-    DoTrigger, RelaySession,
+    combine_sign_from_bundle_over_relay, combine_sign_over_relay_nparty,
+    coordinate_presign_over_relay, coordinate_presign_over_relay_nparty, run_dkg_over_http_authed,
+    DoTrigger, PresignCosignerArm, PresignOverRelay, PresignOverRelayOutput, RelaySession,
 };
 use bsv_mpc_service::FileBundleStore;
 
@@ -42,6 +46,23 @@ fn request_signer_over(
         }
         guard.auth_header_pairs(method, path, body)
     }
+}
+
+/// Build an OWNED (`'static`) canonical BRC-31 arm signer over the container
+/// session — the `Arc` form [`coordinate_presign_over_relay_nparty`] needs (it arms
+/// the cosigner in a spawned task). Mirrors [`request_signer_over`] but boxed.
+fn arm_signer_over(session: Arc<Mutex<RelaySession>>) -> ArmRequestSigner {
+    Arc::new(
+        move |method: &str, path: &str, body: &[u8]| -> Result<Vec<(String, String)>> {
+            let guard = session
+                .lock()
+                .map_err(|_| MpcError::Protocol("container auth mutex poisoned".into()))?;
+            if !guard.is_authenticated() {
+                return Ok(vec![]);
+            }
+            guard.auth_header_pairs(method, path, body)
+        },
+    )
 }
 
 /// A fresh canonical 32-byte session id, salted with random bytes + a label.
@@ -205,6 +226,7 @@ impl DeployedCosigner {
             // apply this BRC-42 offset → the signature verifies under
             // child_pub = joint + offset·G. None = base key.
             brc42_offset: brc42_offset.map(hex::encode),
+            presig_id: None,
         };
 
         combine_sign_from_bundle_over_relay(
@@ -220,6 +242,132 @@ impl DeployedCosigner {
             cosigner_ct,
             &bundle.presig_id,
             joint_key,
+            trigger,
+            Some(&request_signer),
+            recv_timeout,
+        )
+        .await
+    }
+
+    /// **Device-holds n-party presign over the relay (#69/#86).** Drive the device's
+    /// `w = t−1` co-located parties + ONE external cosigner → a correlated presig set
+    /// (raw boxes + the cosigner's sealed ct). The caller converts it into a durable
+    /// [`DeviceMultiPresig`](super::multipresig::DeviceMultiPresig).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn coordinate_presig_nparty(
+        &self,
+        config: ThresholdConfig,
+        local_shares: Vec<(u16, EncryptedShare)>,
+        cosigner_index: u16,
+        policy_id: PolicyId,
+        at_rest_root: [u8; 32],
+        // #85: the cosigner's PINNED master pub (verify the fetched identity == pin).
+        expected_master_pub: Option<String>,
+        timeout: Duration,
+    ) -> Result<PresignOverRelayOutput> {
+        let arm_signer = arm_signer_over(self.session.clone());
+        coordinate_presign_over_relay_nparty(
+            PresignOverRelay {
+                relay_url: self.relay_url.clone(),
+                config,
+                local_shares,
+                cosigner: PresignCosignerArm {
+                    init_url: format!("{}/presign-relay/init", self.container_url),
+                    index: cosigner_index,
+                    arm_signer,
+                    expected_master_pub,
+                },
+                agent_id: self.agent_id.clone(),
+                policy_id,
+                at_rest_root,
+            },
+            timeout,
+        )
+        .await
+    }
+
+    /// **Device-holds n-party online sign over the relay (#69/#86).** Fold the
+    /// device's `w` reconstructed presig boxes locally (the primary primed +
+    /// extras added via `device_holds_combine`) and trigger the ONE external
+    /// cosigner — shipping back its sealed ciphertext under the PRESIGN `presig_id`
+    /// (§06.17.1). `device_presigs` is party-indexed; this re-keys the non-primary
+    /// boxes to signing indices for the combine. Not yet pre-flight-verified — the
+    /// caller ([`DeployedSigner`](super::signer::DeployedSigner)) fail-closes.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn sign_nparty(
+        &self,
+        primary_share: EncryptedShare,
+        device_presigs: Vec<(u16, Box<dyn Any + Send>)>,
+        participants: &[u16],
+        config: ThresholdConfig,
+        joint_key: &JointPublicKey,
+        primary_index: u16,
+        cosigner_index: u16,
+        sighash: &[u8; 32],
+        presig_id: &str,
+        cosigner_encrypted_share: Vec<u8>,
+        recv_timeout: Duration,
+        brc42_offset: Option<[u8; 32]>,
+    ) -> Result<SigningResult> {
+        // Split into the primary box + the extras (re-keyed party → signing index).
+        let mut my_presig_box: Option<Box<dyn Any + Send>> = None;
+        let mut extras: Vec<(u16, Box<dyn Any + Send>)> = Vec::new();
+        for (party, raw) in device_presigs {
+            if party == primary_index {
+                my_presig_box = Some(raw);
+            } else {
+                let sig_idx = participants
+                    .iter()
+                    .position(|&p| p == party)
+                    .ok_or_else(|| {
+                        MpcError::Protocol(format!(
+                            "device party {party} not in participants {participants:?}"
+                        ))
+                    })? as u16;
+                extras.push((sig_idx, raw));
+            }
+        }
+        let my_presig_box = my_presig_box.ok_or_else(|| {
+            MpcError::Protocol(format!(
+                "primary party {primary_index} not among the device presig set"
+            ))
+        })?;
+
+        let do_index = participants
+            .iter()
+            .position(|&p| p == cosigner_index)
+            .ok_or_else(|| {
+                MpcError::Protocol(format!(
+                    "cosigner {cosigner_index} not in participants {participants:?}"
+                ))
+            })? as u16;
+
+        let request_signer = request_signer_over(self.session.clone());
+        let trigger = DoTrigger {
+            url: format!("{}/sign-relay", self.container_url),
+            presig_a_json: vec![],
+            do_index,
+            agent_id: Some(self.agent_id.clone()),
+            auth_headers: vec![],
+            cosigner_encrypted_share: Some(cosigner_encrypted_share),
+            brc42_offset: brc42_offset.map(hex::encode),
+            // §06.17.1 key_id = the PRESIGN session hex (DISTINCT from the per-sign
+            // relay-correlation session the combiner picks below).
+            presig_id: Some(presig_id.to_string()),
+        };
+
+        combine_sign_over_relay_nparty(
+            &self.relay_url,
+            self.identity.clone(),
+            primary_share,
+            extras,
+            participants.to_vec(),
+            config,
+            fresh_session("relay-sign-nparty"),
+            sighash,
+            my_presig_box,
+            joint_key,
+            brc42_offset,
             trigger,
             Some(&request_signer),
             recv_timeout,

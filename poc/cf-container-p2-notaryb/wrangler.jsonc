@@ -1,0 +1,28 @@
+{
+  // #70 — NotaryB: a 2nd INDEPENDENT bsv-mpc-service container (distinct worker +
+  // DO + a DISTINCT MPC_SERVER_PRIVATE_KEY secret) so a 4-of-6 uses two genuinely
+  // independent Notaries. Same image as NotaryA (workspace-root Dockerfile); the
+  // ONLY difference is the name + the master-identity secret.
+  "name": "bsv-mpc-service-container-b",
+  "main": "worker.js",
+  "compatibility_date": "2025-05-01",
+  "containers": [
+    {
+      "class_name": "BsvMpcServiceContainer",
+      "image": "../../Dockerfile",
+      "image_build_context": "../../",
+      "max_instances": 1,
+      "instance_type": "standard-4",
+      "rollout_active_grace_period": 0
+    }
+  ],
+  "observability": { "enabled": true },
+  "durable_objects": {
+    "bindings": [
+      { "class_name": "BsvMpcServiceContainer", "name": "BSV_MPC_SERVICE" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["BsvMpcServiceContainer"] }
+  ]
+}

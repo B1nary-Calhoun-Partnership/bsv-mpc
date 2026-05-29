@@ -114,6 +114,7 @@ async fn coordinator_rejects_device_not_holding_t_minus_1_no_network() {
                 init_url: "https://cosigner.invalid/dkg-relay/init".into(),
                 indices: vec![2, 3, 4, 5],
                 arm_signer: noop_signer(),
+                expected_master_pub: None,
             }],
             provisional_agent_id: "provisional".into(),
         },
@@ -170,6 +171,14 @@ async fn multiindex_4of6_dkg_over_relay_one_container_holds_three() {
                 init_url: format!("{container_url}/dkg-relay/init"),
                 indices: CONTAINER_INDICES.to_vec(),
                 arm_signer: noop_signer(),
+                // #85: pin the container master so this live DKG also verifies the
+                // per-index attestations + the post-DKG liveness challenge.
+                expected_master_pub: Some(
+                    PrivateKey::from_hex(SERVER_KEY_HEX)
+                        .unwrap()
+                        .public_key()
+                        .to_hex(),
+                ),
             }],
             provisional_agent_id: "step5b-multiindex".into(),
         },

@@ -230,6 +230,7 @@ async fn proxy_cosigns_through_authed_sign_relay() {
         auth_headers: vec![], // filled by sign_over_relay from the bridge session
         cosigner_encrypted_share: None,
         brc42_offset: None,
+        presig_id: None,
     };
     let sig: SigningResult = bridge
         .sign_over_relay(&sighash, box_b, None, trigger, Duration::from_secs(60))

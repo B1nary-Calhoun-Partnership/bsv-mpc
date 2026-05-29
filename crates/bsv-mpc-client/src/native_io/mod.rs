@@ -16,6 +16,7 @@
 
 pub mod ceremony;
 pub mod keystore;
+pub mod multipresig;
 pub mod provision;
 pub mod recover;
 pub mod signer;
@@ -23,6 +24,7 @@ pub mod storage;
 
 pub use ceremony::DeployedCosigner;
 pub use keystore::{MemNativeKeyStore, NativeKeyStore};
+pub use multipresig::{DeviceMultiPresig, MultiPresigStore};
 pub use provision::{
     provision_wallet, provision_wallet_nparty, NpartyCosigner, ProvisionedWallet,
     ProvisionedWalletNparty,

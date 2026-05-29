@@ -31,6 +31,7 @@ use bsv_mpc_service::{BundleStore, FileBundleStore};
 
 use super::ceremony::DeployedCosigner;
 use super::keystore::NativeKeyStore;
+use super::multipresig::{DeviceMultiPresig, MultiPresigStore};
 use crate::error::ClientError;
 
 /// Static metadata for a provisioned 2-party wallet (no secrets). The share itself
@@ -58,6 +59,11 @@ pub struct WalletMeta {
     /// The cosigner keygen index that co-signs to complete the quorum (the relay
     /// trigger target). `0` in the proven 2-of-2 flow.
     pub cosigner_party: u16,
+    /// **#85 MITM gate.** The completing cosigner's MASTER identity pubkey hex,
+    /// PINNED out-of-band. When `Some`, the n-party presign verifies the cosigner's
+    /// fetched identity equals this pin (a MITM substitution → reject). `None` =
+    /// unpinned (2-of-2 / dev). Set from the chosen Notary's identity at provisioning.
+    pub cosigner_master_pub: Option<String>,
     /// The DKG session id (carried on the device's `EncryptedShare`).
     pub dkg_session_id: SessionId,
 }
@@ -83,9 +89,13 @@ pub struct DeployedSigner {
     cosigner: DeployedCosigner,
     keystore: Arc<dyn NativeKeyStore>,
     bundle_store: Arc<FileBundleStore>,
-    /// In-memory FIFO of available (persisted) bundle ids — the pool. The durable
-    /// JSON files are the source of truth; `consume` removes one single-use at sign
-    /// time.
+    /// **N-party device-holds pool (#69/#86).** Durable [`DeviceMultiPresig`] sets
+    /// for a multi-index (`my_indices.len() > 1`) wallet — the 2-party analog of
+    /// `bundle_store`. Unused for a 2-of-2 wallet.
+    multi_store: Arc<MultiPresigStore>,
+    /// In-memory FIFO of available (persisted) presig ids — the pool. The durable
+    /// JSON files (bundle_store for 2-party, multi_store for n-party) are the source
+    /// of truth; `consume` removes one single-use at sign time.
     pool: Mutex<VecDeque<String>>,
     at_rest_root: [u8; 32],
     policy_id: PolicyId,
@@ -106,18 +116,30 @@ impl DeployedSigner {
             config.identity,
         )
         .await?;
+        let bundle_dir = config.bundle_dir.clone();
         let bundle_store =
             Arc::new(
-                FileBundleStore::new(config.bundle_dir).map_err(|e| ClientError::Host {
+                FileBundleStore::new(bundle_dir.clone()).map_err(|e| ClientError::Host {
                     seam: "bundle_store",
                     reason: format!("open bundle store: {e}"),
                 })?,
             );
+        // The n-party pool lives in a sibling subdir so its `.mpresig.json` files
+        // never collide with the 2-party bundle JSONs.
+        let multi_store = Arc::new(MultiPresigStore::new(bundle_dir.join("multi"))?);
+        // Re-hydrate the in-memory id queue from whichever durable store backs this
+        // wallet (so a restart resumes its pool).
+        let pool: VecDeque<String> = if config.meta.my_indices.len() > 1 {
+            multi_store.list_ids().into_iter().collect()
+        } else {
+            VecDeque::new()
+        };
         Ok(Self {
             cosigner,
             keystore,
             bundle_store,
-            pool: Mutex::new(VecDeque::new()),
+            multi_store,
+            pool: Mutex::new(pool),
             at_rest_root: config.at_rest_root,
             policy_id: config.policy_id,
             meta: config.meta,
@@ -147,6 +169,59 @@ impl DeployedSigner {
         })
     }
 
+    /// Whether this is a device-holds-(t−1) multi-index wallet (vs a 2-of-2 wallet).
+    fn is_multi(&self) -> bool {
+        self.meta.my_indices.len() > 1
+    }
+
+    /// Biometric-gated unseal of ALL `w` held composite shares `{agent_id}#{index}`
+    /// (#69/#86), each rebuilt into the transient `EncryptedShare` the n-party
+    /// ceremony consumes. (A production Enclave prompts once per `unseal_share`; a
+    /// future batched callback could fold the `w` prompts into one — UX, not crypto.)
+    async fn unseal_device_shares_multi(
+        &self,
+        reason: &str,
+    ) -> Result<Vec<(u16, EncryptedShare)>, ClientError> {
+        let mut shares = Vec::with_capacity(self.meta.my_indices.len());
+        for &idx in &self.meta.my_indices {
+            let composite = format!("{}#{}", self.meta.agent_id, idx);
+            let share_json = self.keystore.unseal_share(&composite, reason).await?;
+            shares.push((
+                idx,
+                EncryptedShare {
+                    nonce: vec![0u8; 12],
+                    ciphertext: share_json.to_vec(),
+                    session_id: self.meta.dkg_session_id,
+                    share_index: ShareIndex(idx),
+                    config: self.meta.config,
+                    joint_pubkey_compressed: self.meta.joint_key.compressed.clone(),
+                },
+            ));
+        }
+        Ok(shares)
+    }
+
+    /// Pop pool ids until one `consume`s to a present [`DeviceMultiPresig`] (atomic
+    /// single-use); skips ids whose file was already consumed/invalidated.
+    fn take_ready_multipresig(&self) -> Result<Option<DeviceMultiPresig>, ClientError> {
+        loop {
+            let id = {
+                let mut pool = self
+                    .pool
+                    .lock()
+                    .map_err(|_| ClientError::Core("presig pool mutex poisoned".into()))?;
+                match pool.pop_front() {
+                    Some(id) => id,
+                    None => return Ok(None),
+                }
+            };
+            match self.multi_store.consume(&id)? {
+                Some(set) => return Ok(Some(set)),
+                None => continue,
+            }
+        }
+    }
+
     /// **Opportunistic top-up** (the locked policy): one biometric mints `n` durable
     /// §06.17.1 bundles. Heavy (relay 3-round + container self-presign); run within
     /// an already-authed window, NOT on the tap path. Returns how many were minted.
@@ -158,6 +233,30 @@ impl DeployedSigner {
     ) -> Result<usize, ClientError> {
         if n == 0 {
             return Ok(0);
+        }
+        // N-party device-holds top-up (#69/#86): mint correlated multi-index sets.
+        if self.is_multi() {
+            let local_shares = self.unseal_device_shares_multi(reason).await?;
+            let mut minted = 0usize;
+            for _ in 0..n {
+                let out = self
+                    .cosigner
+                    .coordinate_presig_nparty(
+                        self.meta.config,
+                        local_shares.clone(),
+                        self.meta.cosigner_party,
+                        self.policy_id,
+                        self.at_rest_root,
+                        self.meta.cosigner_master_pub.clone(),
+                        timeout,
+                    )
+                    .await?;
+                let set = DeviceMultiPresig::from_output(out)?;
+                self.multi_store.persist(&set)?;
+                self.push_pool(set.presig_id);
+                minted += 1;
+            }
+            return Ok(minted);
         }
         let share = self.unseal_device_share(reason).await?;
         let mut minted = 0usize;
@@ -195,6 +294,64 @@ impl DeployedSigner {
         recv_timeout: Duration,
         presign_timeout: Duration,
     ) -> Result<SigningResult, ClientError> {
+        // N-party device-holds sign (#69/#86): unseal the `w` held shares, fold
+        // their correlated presigs locally, and trigger the ONE external cosigner.
+        if self.is_multi() {
+            let local_shares = self.unseal_device_shares_multi(reason).await?;
+            let primary_share = local_shares
+                .iter()
+                .find(|(i, _)| *i == self.meta.device_share_index)
+                .map(|(_, s)| s.clone())
+                .ok_or_else(|| {
+                    ClientError::Core("primary device share not among the unsealed set".into())
+                })?;
+            // Take a READY set (single-use); on-demand presign if the pool is empty.
+            let set = match self.take_ready_multipresig()? {
+                Some(s) => s,
+                None => {
+                    let out = self
+                        .cosigner
+                        .coordinate_presig_nparty(
+                            self.meta.config,
+                            local_shares.clone(),
+                            self.meta.cosigner_party,
+                            self.policy_id,
+                            self.at_rest_root,
+                            self.meta.cosigner_master_pub.clone(),
+                            presign_timeout,
+                        )
+                        .await?;
+                    DeviceMultiPresig::from_output(out)?
+                }
+            };
+            let device_boxes = set.reconstruct_boxes()?;
+            let participants = set.participants.clone();
+            let primary_index = set.primary_index;
+            let cosigner_index = set.cosigner_index;
+            let presig_id = set.presig_id.clone();
+            let cosigner_ct = set.cosigner_encrypted_share;
+            let sig = self
+                .cosigner
+                .sign_nparty(
+                    primary_share,
+                    device_boxes,
+                    &participants,
+                    self.meta.config,
+                    &self.meta.joint_key,
+                    primary_index,
+                    cosigner_index,
+                    sighash,
+                    &presig_id,
+                    cosigner_ct,
+                    recv_timeout,
+                    brc42_offset,
+                )
+                .await?;
+            // Fail-closed: no malformed / non-verifying signature leaves Rust.
+            self.preflight_verify(sighash, &sig, brc42_offset)?;
+            return Ok(sig);
+        }
+
         // Every fund-bearing spend re-prompts the biometric (locked policy).
         let share = self.unseal_device_share(reason).await?;
 

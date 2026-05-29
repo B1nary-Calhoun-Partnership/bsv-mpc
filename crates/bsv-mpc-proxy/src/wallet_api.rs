@@ -1098,6 +1098,7 @@ async fn relay_sign(
             cosigner_encrypted_share: None,
             // Set by sign_over_relay_device_holds from `hmac_offset`.
             brc42_offset: None,
+            presig_id: None,
         };
 
         return state
@@ -1136,6 +1137,7 @@ async fn relay_sign(
         // Set by sign_over_relay from `hmac_offset` (the combiner applies it
         // locally + ships the hex to the cosigner).
         brc42_offset: None,
+        presig_id: None,
     };
 
     state

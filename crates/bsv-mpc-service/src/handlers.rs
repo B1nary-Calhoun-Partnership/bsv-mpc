@@ -318,11 +318,87 @@ pub fn authz_owner_pub(
     authz_owner(state, caller, agent_id)
 }
 
+/// §08.1 owner-authz for a SPECIFIC held index — the n-party device-holds presign
+/// (#69/#86), where the share + its owner live at the composite key
+/// `{agent_id}#{index}`.
+///
+/// Checks the composite share's owner first; falls back to the bare-`agent_id`
+/// owner (the 2-party deployment). A composite wallet records its owner per held
+/// index and leaves the bare key unowned — so checking only the bare key (as the
+/// plain [`authz_owner_pub`] does) would let ANY authenticated caller arm a presign
+/// on someone else's multi-index wallet (a §08.1 bypass). This closes that.
+pub fn authz_owner_at_index_pub(
+    state: &AppState,
+    caller: &crate::auth::CallerIdentity,
+    agent_id: &str,
+    index: u16,
+) -> Option<(StatusCode, Json<serde_json::Value>)> {
+    let owner = match state.storage.read() {
+        Ok(s) => s
+            .get_share_owner_at_index(agent_id, index)
+            .ok()
+            .flatten()
+            .or_else(|| s.get_share_owner(agent_id).ok().flatten()),
+        Err(e) => {
+            return Some(err_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("owner lookup failed: {e}"),
+            ))
+        }
+    };
+    crate::auth::authz_owner_or_reject(caller.as_opt(), owner.as_deref())
+}
+
 /// `pub` wrapper over [`load_share_or_recover`] for `crate::relay_handlers`.
 pub async fn load_share_or_recover_pub(
     state: &AppState,
     agent_id: &str,
 ) -> Result<bsv_mpc_core::types::EncryptedShare, (StatusCode, Json<serde_json::Value>)> {
+    load_share_or_recover(state, agent_id).await
+}
+
+/// Load the cosigner's share for a SPECIFIC keygen index — the n-party
+/// device-holds presign (#69/#86), where one container holds several composite
+/// shares `{agent_id}#{index}`.
+///
+/// Tries the composite key `{agent_id}#{index}` first (the multi-index wallet),
+/// then falls back to [`load_share_or_recover`] on the bare `agent_id` (the
+/// mainnet-proven 2-party deployment + custody recover). A composite wallet only
+/// ever persists composite keys, so the bare fallback never returns a wrong-index
+/// share for it; a 2-party wallet has only the bare share, which the fallback finds.
+pub async fn load_share_or_recover_at_index_pub(
+    state: &AppState,
+    agent_id: &str,
+    index: u16,
+) -> Result<bsv_mpc_core::types::EncryptedShare, (StatusCode, Json<serde_json::Value>)> {
+    // FAST PATH (no retry): composite hit (n-party), else bare hit (2-party). The
+    // bare read here keeps the 2-party deployed arm BYTE-IDENTICAL — it returns
+    // immediately and never spins the retry below (a 2-party wallet has no composite
+    // key, so without this it would wait the full retry budget before the fallback).
+    if let Ok(s) = state.storage.read() {
+        if let Ok(Some(share)) = s.get_share_at_index(agent_id, index) {
+            return Ok(share);
+        }
+        if let Ok(Some(share)) = s.get_share(agent_id) {
+            return Ok(share);
+        }
+    }
+    // Neither present yet. An n-party presign armed immediately after provisioning
+    // can race the cosigner's DKG persist: `coordinate_dkg_over_relay` returns on the
+    // device's own quorum agreement, while the container finishes its DKG SM +
+    // persists its composite shares a beat later. Retry ONLY the composite read so the
+    // n-party arm doesn't 404 on that window; a genuine miss still falls through to
+    // the custody/404 path after the budget. Budget (~15s) comfortably covers the
+    // SM-completion lag; the arm's HTTP timeout is far larger.
+    const ATTEMPTS: usize = 75;
+    for _ in 0..ATTEMPTS {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        if let Ok(s) = state.storage.read() {
+            if let Ok(Some(share)) = s.get_share_at_index(agent_id, index) {
+                return Ok(share);
+            }
+        }
+    }
     load_share_or_recover(state, agent_id).await
 }
 
@@ -916,5 +992,122 @@ pub async fn handle_authrite(
             (StatusCode::OK, hm, Json(body)).into_response()
         }
         Err(rejection) => rejection.into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::{AuthState, CallerIdentity};
+    use crate::{AppState, SqliteShareStorage};
+    use bsv_mpc_core::types::{EncryptedShare, SessionId, ShareIndex, ThresholdConfig};
+    use std::sync::{Arc, RwLock};
+
+    fn caller(id: &str) -> CallerIdentity {
+        CallerIdentity {
+            identity_key: id.to_string(),
+        }
+    }
+
+    fn dummy_share(index: u16) -> EncryptedShare {
+        EncryptedShare {
+            nonce: vec![0u8; 12],
+            ciphertext: vec![1u8; 16],
+            session_id: SessionId([0u8; 32]),
+            share_index: ShareIndex(index),
+            config: ThresholdConfig::new(4, 6).unwrap(),
+            joint_pubkey_compressed: vec![2u8; 33],
+        }
+    }
+
+    fn state_with(storage: SqliteShareStorage) -> Arc<AppState> {
+        Arc::new(AppState {
+            data_dir: String::new(),
+            storage: Arc::new(RwLock::new(storage)),
+            started_at: chrono::Utc::now(),
+            provision: None,
+            auth: AuthState::dev(),
+            custody: None,
+        })
+    }
+
+    /// §08.1 composite owner-authz (#69/#86): the n-party presign arm MUST authorize
+    /// against the COMPOSITE share's owner, so a bare-key owner cannot bypass it.
+    #[test]
+    fn composite_authz_prefers_composite_owner_over_bare() {
+        let agent = "02".to_string() + &"aa".repeat(32);
+        let mut storage = SqliteShareStorage::open("authz-test-composite").unwrap();
+        // n-party wallet: composite share at #3 owned by ALICE. A stray bare owner BOB.
+        storage
+            .store_share_at_index(&agent, 3, &dummy_share(3), "alice")
+            .unwrap();
+        storage
+            .store_share_with_owner(&agent, &dummy_share(9), "bob")
+            .unwrap();
+        let state = state_with(storage);
+
+        // ALICE (the composite owner) is authorized for index 3.
+        assert!(authz_owner_at_index_pub(&state, &caller("alice"), &agent, 3).is_none());
+        // BOB (only the bare owner) is REJECTED for index 3 — the composite owner
+        // wins, so the bare key cannot be used to bypass §08.1.
+        let rej = authz_owner_at_index_pub(&state, &caller("bob"), &agent, 3)
+            .expect("bare owner must NOT authorize a composite index");
+        assert_eq!(rej.0, StatusCode::FORBIDDEN);
+    }
+
+    /// 2-party back-compat: with no composite key, authz falls back to the bare owner.
+    #[test]
+    fn composite_authz_falls_back_to_bare_for_2party() {
+        let agent = "02".to_string() + &"bb".repeat(32);
+        let mut storage = SqliteShareStorage::open("authz-test-2party").unwrap();
+        // 2-party wallet: only a bare share, owned by BOB. No composite key.
+        storage
+            .store_share_with_owner(&agent, &dummy_share(1), "bob")
+            .unwrap();
+        let state = state_with(storage);
+
+        // BOB (the bare owner) is authorized (composite miss → bare fallback).
+        assert!(authz_owner_at_index_pub(&state, &caller("bob"), &agent, 1).is_none());
+        // EVE is rejected.
+        assert!(authz_owner_at_index_pub(&state, &caller("eve"), &agent, 1).is_some());
+    }
+
+    /// REGRESSION: a 2-party wallet (bare share, no composite) MUST load on the fast
+    /// path — NOT spin the n-party composite-retry budget (~3s). We bound it well
+    /// under that budget to catch the retry leaking into the 2-party deployed arm.
+    #[tokio::test]
+    async fn load_at_index_2party_bare_is_immediate_no_retry() {
+        let agent = "02".to_string() + &"cc".repeat(32);
+        let mut storage = SqliteShareStorage::open("load-2party").unwrap();
+        storage
+            .store_share_with_owner(&agent, &dummy_share(1), "owner")
+            .unwrap();
+        let state = state_with(storage);
+
+        let got = tokio::time::timeout(
+            std::time::Duration::from_millis(800),
+            load_share_or_recover_at_index_pub(&state, &agent, 1),
+        )
+        .await
+        .expect("2-party bare load must NOT wait the composite-retry budget");
+        assert_eq!(got.expect("bare share loads").share_index.0, 1);
+    }
+
+    /// An n-party wallet's composite share loads on the fast path.
+    #[tokio::test]
+    async fn load_at_index_composite_hits_fast() {
+        let agent = "02".to_string() + &"dd".repeat(32);
+        let mut storage = SqliteShareStorage::open("load-nparty").unwrap();
+        storage
+            .store_share_at_index(&agent, 3, &dummy_share(3), "owner")
+            .unwrap();
+        let state = state_with(storage);
+        let got = tokio::time::timeout(
+            std::time::Duration::from_millis(800),
+            load_share_or_recover_at_index_pub(&state, &agent, 3),
+        )
+        .await
+        .expect("composite load is immediate");
+        assert_eq!(got.expect("composite share loads").share_index.0, 3);
     }
 }

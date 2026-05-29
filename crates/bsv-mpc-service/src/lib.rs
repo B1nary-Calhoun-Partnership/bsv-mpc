@@ -121,6 +121,12 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             get(relay_handlers::handle_presign_relay_debug),
         )
         .route("/sign-relay", post(relay_handlers::handle_sign_relay))
+        // #85 MITM gate: signed liveness/funding challenge — the cosigner proves it
+        // controls its PINNED master identity for a specific wallet before funding.
+        .route(
+            "/identity-challenge",
+            post(relay_handlers::handle_identity_challenge),
+        )
         // §18.2 container key-refresh over the relay (#10, CONTAINER target):
         // arm the container as a refresh peer + rotate-on-commit (purges presigs
         // per §18.9). Heavy MPC — container only, NOT the worker isolate.

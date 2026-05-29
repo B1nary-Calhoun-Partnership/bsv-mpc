@@ -25,7 +25,7 @@
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use bsv::primitives::ec::PrivateKey;
+use bsv::primitives::ec::{PrivateKey, PublicKey};
 use bsv_mpc_core::error::{MpcError, Result};
 use bsv_mpc_core::types::{DkgResult, JointPublicKey, SessionId, ThresholdConfig};
 use bsv_mpc_messagebox::types::BOX_DKG;
@@ -49,6 +49,14 @@ pub struct CosignerEndpoint {
     pub indices: Vec<u16>,
     /// BRC-31 request signer for this cosigner's session (arms are POSTed signed).
     pub arm_signer: ArmRequestSigner,
+    /// **#85 MITM gate.** The cosigner's MASTER identity pubkey hex, PINNED
+    /// out-of-band (the device provisions a *named* Notary — it should already know
+    /// its identity, not trust whatever an unauthenticated GET returns). When `Some`,
+    /// every per-index relay pub fetched over `/dkg-relay/peer-identity` MUST carry a
+    /// valid attestation by this master (else fail closed), and a post-DKG liveness
+    /// challenge is verified against it before the wallet is returned. `None` =
+    /// unpinned (hermetic tests / legacy dev only — NOT for funded production).
+    pub expected_master_pub: Option<String>,
 }
 
 /// Inputs for the device side of a genuine n-party DKG over the relay.
@@ -82,6 +90,13 @@ pub struct DkgOverRelayOutput {
 #[derive(serde::Deserialize)]
 struct PeerIdentityResponse {
     relay_pub_hex: String,
+    /// #85: the cosigner's MASTER pub (what the device pins) + its attestation over
+    /// (master, session, index, relay_pub). `Option` so an un-hardened/legacy
+    /// container still parses — but a PINNED device rejects a missing attestation.
+    #[serde(default)]
+    master_pub_hex: Option<String>,
+    #[serde(default)]
+    attestation_hex: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -103,7 +118,18 @@ fn fresh_storage() -> Arc<RwLock<SqliteShareStorage>> {
 
 /// GET the cosigner's `/dkg-relay/peer-identity?session&index` → the per-index
 /// relay pub (read-only; the device cannot recompute the one-way value itself).
-async fn fetch_dkg_peer_identity(init_url: &str, session_hex: &str, index: u16) -> Result<String> {
+///
+/// **#85 MITM gate:** when `expected_master_pub` is `Some`, the response MUST carry
+/// the PINNED master pub + a valid attestation over `(master, session, index,
+/// relay_pub)` — else this fails closed (a network MITM cannot forge the master's
+/// signature, so it cannot substitute an attacker relay identity).
+async fn fetch_dkg_peer_identity(
+    init_url: &str,
+    session: &SessionId,
+    index: u16,
+    expected_master_pub: Option<&str>,
+) -> Result<String> {
+    let session_hex = session.hex();
     let base = init_url.replace("/dkg-relay/init", "/dkg-relay/peer-identity");
     let url = format!("{base}?session={session_hex}&index={index}");
     let resp = crate::bounded_http_client(crate::RELAY_HTTP_TIMEOUT)?
@@ -122,6 +148,45 @@ async fn fetch_dkg_peer_identity(init_url: &str, session_hex: &str, index: u16) 
         .json()
         .await
         .map_err(|e| MpcError::Protocol(format!("parse dkg peer-identity response: {e}")))?;
+
+    if let Some(pinned_hex) = expected_master_pub {
+        // 1. The cosigner must claim to BE the pinned master.
+        let claimed = parsed.master_pub_hex.as_deref().ok_or_else(|| {
+            MpcError::Protocol(format!(
+                "dkg peer-identity (index {index}) returned no master_pub_hex — cannot verify \
+                 against the pinned master (#85); refusing"
+            ))
+        })?;
+        if claimed != pinned_hex {
+            return Err(MpcError::Protocol(format!(
+                "dkg peer-identity (index {index}) master {claimed} != pinned {pinned_hex} (#85 MITM)"
+            )));
+        }
+        // 2. The attestation must verify under the PINNED master.
+        let att_hex = parsed.attestation_hex.as_deref().ok_or_else(|| {
+            MpcError::Protocol(format!(
+                "dkg peer-identity (index {index}) returned no attestation (#85); refusing"
+            ))
+        })?;
+        let master = PublicKey::from_hex(pinned_hex)
+            .map_err(|e| MpcError::Protocol(format!("pinned master pub hex: {e}")))?;
+        let relay_pub = PublicKey::from_hex(&parsed.relay_pub_hex)
+            .map_err(|e| MpcError::Protocol(format!("relay pub hex: {e}")))?;
+        let att: [u8; 64] = hex::decode(att_hex)
+            .map_err(|e| MpcError::Protocol(format!("attestation hex: {e}")))?
+            .try_into()
+            .map_err(|_| {
+                MpcError::Protocol(format!("attestation (index {index}) must be 64 bytes"))
+            })?;
+        if !bsv_mpc_core::hd::verify_relay_identity_attestation(
+            &master, session, index, &relay_pub, &att,
+        ) {
+            return Err(MpcError::Protocol(format!(
+                "dkg peer-identity (index {index}) attestation FAILED under the pinned master \
+                 (#85 MITM) — refusing to route to an unattested relay identity"
+            )));
+        }
+    }
     Ok(parsed.relay_pub_hex)
 }
 
@@ -249,7 +314,14 @@ pub async fn coordinate_dkg_over_relay(
     let mut cosigner_pubs: Vec<(u16, String)> = Vec::new();
     for c in &p.cosigners {
         for &idx in &c.indices {
-            let pub_hex = fetch_dkg_peer_identity(&c.init_url, &session_hex, idx).await?;
+            // #85: verify each per-index relay pub against the PINNED master (when set).
+            let pub_hex = fetch_dkg_peer_identity(
+                &c.init_url,
+                &session,
+                idx,
+                c.expected_master_pub.as_deref(),
+            )
+            .await?;
             cosigner_pubs.push((idx, pub_hex));
         }
     }
@@ -449,6 +521,18 @@ pub async fn coordinate_dkg_over_relay(
         }
     }
 
+    // ── #85 FUNDING GATE: independently confirm each PINNED cosigner is LIVE and
+    //    controls its master identity FOR THIS joint key, before returning a wallet
+    //    that could be funded. A fresh-nonce signed challenge to the pinned master
+    //    catches a cosigner that participated under a MITM'd/wrong identity (its
+    //    challenge fails) — so funds never move to a joint key the real Notary
+    //    doesn't co-hold. Skipped for un-pinned dev/test cosigners. ──
+    for c in &p.cosigners {
+        if let Some(master_hex) = &c.expected_master_pub {
+            challenge_cosigner(&c.init_url, master_hex, &joint_key.compressed).await?;
+        }
+    }
+
     let mut local_shares: Vec<(u16, Vec<u8>)> = results
         .into_iter()
         .map(|(idx, r)| (idx, r.share.ciphertext))
@@ -460,4 +544,65 @@ pub async fn coordinate_dkg_over_relay(
         session_id: session,
         local_shares,
     })
+}
+
+/// #85 funding gate: POST `/identity-challenge` with a fresh nonce + the joint
+/// pubkey, and verify the returned signature against the PINNED master. Proves the
+/// real cosigner is live and controls its pinned identity for THIS wallet. Fails
+/// closed on a master mismatch, a bad signature, or a transport error.
+async fn challenge_cosigner(
+    init_url: &str,
+    master_pub_hex: &str,
+    joint_pubkey_compressed: &[u8],
+) -> Result<()> {
+    let mut nonce = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut nonce);
+    let url = init_url.replace("/dkg-relay/init", "/identity-challenge");
+    let body = serde_json::json!({
+        "joint_pubkey_hex": hex::encode(joint_pubkey_compressed),
+        "nonce_hex": hex::encode(nonce),
+    });
+    let resp = crate::bounded_http_client(crate::RELAY_HTTP_TIMEOUT)?
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| MpcError::Protocol(format!("identity-challenge: {e}")))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let txt = resp.text().await.unwrap_or_default();
+        return Err(MpcError::Protocol(format!(
+            "identity-challenge returned {status}: {txt}"
+        )));
+    }
+    #[derive(serde::Deserialize)]
+    struct ChallengeResp {
+        master_pub_hex: String,
+        challenge_sig_hex: String,
+    }
+    let parsed: ChallengeResp = resp
+        .json()
+        .await
+        .map_err(|e| MpcError::Protocol(format!("parse identity-challenge response: {e}")))?;
+    if parsed.master_pub_hex != master_pub_hex {
+        return Err(MpcError::Protocol(format!(
+            "identity-challenge master {} != pinned {master_pub_hex} (#85)",
+            parsed.master_pub_hex
+        )));
+    }
+    let master = PublicKey::from_hex(master_pub_hex)
+        .map_err(|e| MpcError::Protocol(format!("pinned master pub hex: {e}")))?;
+    let sig: [u8; 64] = hex::decode(&parsed.challenge_sig_hex)
+        .map_err(|e| MpcError::Protocol(format!("challenge sig hex: {e}")))?
+        .try_into()
+        .map_err(|_| MpcError::Protocol("challenge sig must be 64 bytes".into()))?;
+    if !bsv_mpc_core::hd::verify_cosigner_challenge(&master, joint_pubkey_compressed, &nonce, &sig)
+    {
+        return Err(MpcError::Protocol(
+            "identity-challenge signature FAILED under the pinned master (#85) — the cosigner \
+             does not control its pinned identity; refusing to return a fundable wallet"
+                .into(),
+        ));
+    }
+    Ok(())
 }

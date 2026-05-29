@@ -63,6 +63,7 @@ pub fn bounded_http_client(timeout: Duration) -> Result<reqwest::Client> {
 pub mod dkg;
 pub mod presign;
 pub mod provision_dkg;
+pub mod provision_presign;
 pub mod reshare;
 pub mod session;
 
@@ -70,6 +71,10 @@ pub use dkg::{run_dkg_over_http, run_dkg_over_http_authed};
 pub use presign::{coordinate_presign_over_relay, CosignerArm};
 pub use provision_dkg::{
     coordinate_dkg_over_relay, CosignerEndpoint, DkgOverRelay, DkgOverRelayOutput,
+};
+pub use provision_presign::{
+    coordinate_presign_over_relay_nparty, PresignCosignerArm, PresignOverRelay,
+    PresignOverRelayOutput,
 };
 pub use reshare::{
     coordinate_reshare_over_relay, parse_old_share_topology, OldShareTopology, ReshareOutput,
@@ -125,6 +130,13 @@ pub struct DoTrigger {
     /// resulting signature verifies under `child_pub = joint + offset·G`. `None`
     /// = base-key signing (omitted from the body, non-breaking for legacy callers).
     pub brc42_offset: Option<String>,
+    /// **Device-holds n-party sign (#69/#86).** The canonical `presig_id` (= the
+    /// PRESIGN session_id hex) the external cosigner sealed its `cosigner_encrypted_share`
+    /// under — DISTINCT from the per-sign relay-correlation `session_id`. When `Some`,
+    /// shipped in the trigger body so the cosigner re-derives the SAME §06.17.1 BRC-2
+    /// key_id; when `None`, the cosigner falls back to `session_id_hex` (the legacy
+    /// pool/POC path where they coincide). Non-breaking: omitted from the body when `None`.
+    pub presig_id: Option<String>,
 }
 
 /// A canonical BRC-31 request signer: given `(method, path, body_bytes)`, returns
@@ -293,6 +305,13 @@ pub async fn combine_sign_over_relay_nparty(
     // instead of consuming a proxy-provisioned plaintext presig from the pool.
     if let Some(ref ct) = trigger.cosigner_encrypted_share {
         trigger_body["cosigner_encrypted_share"] = serde_json::json!(hex::encode(ct));
+    }
+    // §06.17.1 device-holds (#69/#86): ship the PRESIGN-session presig_id so the
+    // cosigner re-derives the SAME BRC-2 key_id it sealed its ciphertext under
+    // (DISTINCT from the per-sign `session_id_hex`). Omitted when None → the
+    // cosigner falls back to session_id_hex (the legacy pool path where they match).
+    if let Some(ref pid) = trigger.presig_id {
+        trigger_body["presig_id"] = serde_json::json!(pid);
     }
     // §06.20 / issue #26: ship the BRC-42 offset (hex) so the cosigner applies the
     // SAME additive shift in `decrypt_and_issue_partial`. The combiner already

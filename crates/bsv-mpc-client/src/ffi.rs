@@ -640,6 +640,11 @@ pub struct FfiSignerConfig {
     pub my_indices: Vec<u16>,
     /// The cosigner keygen index that co-signs to complete the quorum.
     pub cosigner_party: u16,
+    /// **#85 MITM gate.** The completing cosigner's MASTER identity pubkey hex,
+    /// PINNED out-of-band (empty = unpinned 2-of-2 / dev). The n-party presign
+    /// verifies the cosigner's fetched identity equals this.
+    #[uniffi(default = "")]
+    pub cosigner_master_pub: String,
     /// Share-metadata session id (32-byte hex).
     pub dkg_session_id_hex: String,
 }
@@ -723,6 +728,11 @@ impl FfiDeployedSigner {
                     config.my_indices
                 },
                 cosigner_party: config.cosigner_party,
+                cosigner_master_pub: if config.cosigner_master_pub.is_empty() {
+                    None
+                } else {
+                    Some(config.cosigner_master_pub)
+                },
                 dkg_session_id,
             },
         };
@@ -863,6 +873,7 @@ pub async fn create_wallet(
         device_share_index: w.device_share_index,
         my_indices: vec![w.device_share_index],
         cosigner_party: w.cosigner_party,
+        cosigner_master_pub: String::new(), // 2-party: unpinned (no n-party Notary)
         dkg_session_id_hex: w.dkg_session_id.hex(),
     })
 }
@@ -884,6 +895,12 @@ pub async fn create_wallet(
 pub struct FfiNpartyCosigner {
     pub container_url: String,
     pub indices: Vec<u16>,
+    /// **#85 MITM gate.** This Notary's MASTER identity pubkey hex, PINNED
+    /// out-of-band (the host ships the named Notary's identity). When set, the DKG
+    /// verifies every per-index relay pub's attestation against it + runs a post-DKG
+    /// liveness challenge before returning a fundable wallet. Empty = unpinned
+    /// (dev/test only — NOT for funded production).
+    pub expected_master_pub: String,
 }
 
 /// Generous ceiling for the n-party DKG-over-relay (parallel safe-prime gen
@@ -940,11 +957,24 @@ pub async fn create_wallet_nparty(
             FfiError::Client("create_wallet_nparty: first cosigner has no index".into())
         })?;
 
+    // #85: the completing cosigner (the one driving `cosigner_party`) is the FIRST
+    // Notary — pin its master into the signer config so sign-time presigns verify it.
+    let cosigner_master_pub = cosigners
+        .first()
+        .map(|c| c.expected_master_pub.clone())
+        .unwrap_or_default();
+
     let cosigner_endpoints: Vec<crate::native_io::provision::NpartyCosigner> = cosigners
         .into_iter()
         .map(|c| crate::native_io::provision::NpartyCosigner {
             container_url: c.container_url,
             indices: c.indices,
+            // Empty hex string ⇒ unpinned (dev/test); Some ⇒ #85-verified.
+            expected_master_pub: if c.expected_master_pub.is_empty() {
+                None
+            } else {
+                Some(c.expected_master_pub)
+            },
         })
         .collect();
 
@@ -987,6 +1017,7 @@ pub async fn create_wallet_nparty(
         device_share_index: device_primary,
         my_indices: w.my_indices,
         cosigner_party,
+        cosigner_master_pub,
         dkg_session_id_hex: w.dkg_session_id.hex(),
     })
 }
@@ -1063,6 +1094,7 @@ pub async fn recover_wallet(
         device_share_index: w.device_share_index,
         my_indices: vec![w.device_share_index],
         cosigner_party: w.cosigner_party,
+        cosigner_master_pub: String::new(), // 2-party: unpinned (no n-party Notary)
         dkg_session_id_hex: w.dkg_session_id.hex(),
     })
 }

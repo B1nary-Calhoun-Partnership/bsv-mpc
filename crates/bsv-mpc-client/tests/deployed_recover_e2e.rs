@@ -341,6 +341,7 @@ async fn connect_signer(
                 device_share_index: recovered.device_share_index,
                 my_indices: vec![recovered.device_share_index],
                 cosigner_party: recovered.cosigner_party,
+                cosigner_master_pub: None,
                 dkg_session_id: recovered.dkg_session_id,
             },
         },

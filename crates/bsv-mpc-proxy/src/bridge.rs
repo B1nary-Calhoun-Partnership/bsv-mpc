@@ -1640,6 +1640,7 @@ impl MpcBridge {
             // (decrypt_and_issue_partial) apply this BRC-42 offset → the combined
             // signature verifies under child_pub = joint + offset·G. None = base key.
             brc42_offset: hmac_offset.map(|o| hex_encode(&o)),
+            presig_id: None,
         };
 
         crate::relay_sign::combine_sign_from_bundle_over_relay(

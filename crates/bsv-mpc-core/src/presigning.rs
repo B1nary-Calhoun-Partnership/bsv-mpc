@@ -579,6 +579,34 @@ pub fn serialize_party_presig_with_public_data(
     Ok((presig_json, public_data_cbor, gamma_hex))
 }
 
+/// Inverse of [`serialize_party_presig_with_public_data`]: reconstruct a raw
+/// `PresignOutput` box from a party's serialized presignature JSON + the SHARED
+/// `PresignaturePublicData` CBOR (`PresigBundle.commitments`).
+///
+/// Used by the device-holds-(t−1) client (#69 / #86). After a genuine n-party
+/// presign over the relay assembles a [`crate::types::PresigBundle`], the device
+/// reconstructs the raw `(Presignature, PublicData)` box for EACH of its `w`
+/// co-located parties — pairing that party's presignature (its own from the
+/// unsealed `presig_bytes`, or a co-located party's from a BRC-2-decrypted
+/// `cosigner_encrypted_shares` entry) with the shared public data — so the boxes
+/// feed [`crate::signing::SigningCoordinator::sign_with_presignature`] /
+/// `add_local_presig_partial` (the device-holds combine) byte-identically to a
+/// live [`PresigningManager::take_raw`] box.
+///
+/// The public data is the agreed presign transcript (shared by every party), so a
+/// single `commitments` blob reconstructs every party's box — the same property
+/// [`crate::signing::SigningCoordinator::sign_from_bundle`] relies on.
+pub fn deserialize_party_presig_with_public_data(
+    presig_json: &[u8],
+    public_data_cbor: &[u8],
+) -> Result<Box<dyn std::any::Any + Send>> {
+    let presig: cggmp24::Presignature<Secp256k1> = serde_json::from_slice(presig_json)
+        .map_err(|e| MpcError::Serialization(format!("deserialize presignature: {e}")))?;
+    let public_data = crate::signing::deserialize_presig_public_data(public_data_cbor)?;
+    let output: PresignOutput = (presig, public_data);
+    Ok(Box::new(output))
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1157,5 +1185,139 @@ mod tests {
             bsv_pubkey.verify(&message_hash, &bsv_sig),
             "the helper-serialized Presignature_A MUST drive a BSV-valid 2-of-2 signature"
         );
+    }
+
+    /// **#86 reconstruct gate** — the inverse [`deserialize_party_presig_with_public_data`]
+    /// rebuilds a raw `PresignOutput` box that is FUNCTIONALLY IDENTICAL to a live
+    /// `take_raw()` box: a 2-of-2 combine driven by the RECONSTRUCTED box yields a
+    /// BSV-valid signature under the joint key, and re-serializing it reproduces the
+    /// exact same bytes (zero drift). This is the device-holds reconstruction
+    /// (#69 step 7a): the device rebuilds its co-located parties' raw boxes from the
+    /// assembled `PresigBundle` (presig JSON + shared commitments CBOR) and combines
+    /// locally — never holding a live in-memory presig tuple across the relay.
+    #[tokio::test]
+    async fn deserialize_presig_with_public_data_reconstructs_usable_box() {
+        use crate::signing::{
+            issue_partial_signature_json, SigningCoordinator, SigningRoundResult,
+        };
+
+        let key_shares = run_dkg_2of2().await;
+        let session_id = SessionId::from_str_hash("reconstruct-presig-gate");
+        let config = ThresholdConfig::new(2, 2).unwrap();
+        let participants = vec![0u16, 1u16];
+        let share_0 = wrap_key_share(&key_shares[0], 0, config, &session_id);
+        let share_1 = wrap_key_share(&key_shares[1], 1, config, &session_id);
+
+        // One correlated presignature pair (party 0 = cosigner, party 1 = combiner).
+        let mut mgr_0 = PresigningManager::new(session_id, share_0, participants.clone(), 1);
+        let mut mgr_1 =
+            PresigningManager::new(session_id, share_1.clone(), participants.clone(), 1);
+        let mut out_0 = mgr_0.init_generate().unwrap();
+        let mut out_1 = mgr_1.init_generate().unwrap();
+        for _ in 0..20 {
+            let r0 = mgr_0.process_generate_round(out_1.clone()).unwrap();
+            let r1 = mgr_1.process_generate_round(out_0.clone()).unwrap();
+            match (r0, r1) {
+                (PresigningRoundResult::Complete, PresigningRoundResult::Complete) => break,
+                (PresigningRoundResult::NextRound(m0), PresigningRoundResult::NextRound(m1)) => {
+                    out_0 = m0;
+                    out_1 = m1;
+                }
+                (PresigningRoundResult::Complete, PresigningRoundResult::NextRound(m1)) => {
+                    out_0 = vec![];
+                    out_1 = m1;
+                }
+                (PresigningRoundResult::NextRound(m0), PresigningRoundResult::Complete) => {
+                    out_0 = m0;
+                    out_1 = vec![];
+                }
+            }
+        }
+
+        // Party 0 (cosigner): serialize Presignature_A (presig only).
+        let (_meta_a, raw_a) = mgr_0.take_raw().unwrap();
+        let presig_a_json = super::serialize_party_presignature(raw_a).unwrap();
+
+        // Party 1 (combiner): serialize WITH public data, then RECONSTRUCT the box
+        // from (presig JSON + commitments CBOR) — the device-holds reconstruction.
+        let (_meta_b, raw_b) = mgr_1.take_raw().unwrap();
+        let (presig_b_json, commitments_cbor, gamma_hex) =
+            super::serialize_party_presig_with_public_data(raw_b).unwrap();
+        assert!(!gamma_hex.is_empty());
+        let raw_b_reconstructed =
+            super::deserialize_party_presig_with_public_data(&presig_b_json, &commitments_cbor)
+                .expect("reconstruct combiner raw box from bundle bytes");
+
+        // Re-serializing the reconstructed box reproduces the SAME bytes (zero drift).
+        let (presig_b_json2, commitments_cbor2, gamma_hex2) =
+            super::serialize_party_presig_with_public_data(raw_b_reconstructed)
+                .expect("re-serialize reconstructed box");
+        assert_eq!(
+            presig_b_json, presig_b_json2,
+            "presig JSON round-trips byte-identically"
+        );
+        assert_eq!(
+            commitments_cbor, commitments_cbor2,
+            "commitments CBOR round-trips byte-identically"
+        );
+        assert_eq!(gamma_hex, gamma_hex2, "gamma hex round-trips identically");
+
+        // Reconstruct AGAIN (the first was consumed re-serializing) and drive a real
+        // combine with it → BSV-valid signature under the joint key.
+        let raw_b_for_sign =
+            super::deserialize_party_presig_with_public_data(&presig_b_json, &commitments_cbor)
+                .expect("reconstruct combiner raw box (sign)");
+        let message_hash: [u8; 32] = {
+            let mut h = Sha256::new();
+            h.update(b"#86 reconstruct gate");
+            let mut b = [0u8; 32];
+            b.copy_from_slice(&h.finalize());
+            b
+        };
+        let partial_a_json = issue_partial_signature_json(&presig_a_json, &message_hash).unwrap();
+        let msg_a = RoundMessage {
+            session_id,
+            round: 1,
+            from: ShareIndex(0),
+            to: None,
+            payload: partial_a_json,
+        };
+        let mut combiner = SigningCoordinator::new(session_id, share_1, config, participants);
+        combiner
+            .sign_with_presignature(&message_hash, raw_b_for_sign)
+            .expect("combiner issues its partial from the RECONSTRUCTED box");
+        let sig = match combiner.process_round(vec![msg_a]).unwrap() {
+            SigningRoundResult::Complete(s) => s,
+            _ => panic!("combiner did not complete in 1 round"),
+        };
+        let pubkey_bytes = key_shares[0].core.shared_public_key.to_bytes(true);
+        let bsv_pubkey = bsv::PublicKey::from_bytes(&pubkey_bytes).unwrap();
+        let mut sig_bytes = [0u8; 64];
+        sig_bytes[..32].copy_from_slice(&sig.r);
+        sig_bytes[32..].copy_from_slice(&sig.s);
+        let bsv_sig = bsv::Signature::from_compact(&sig_bytes).unwrap();
+        assert!(
+            bsv_pubkey.verify(&message_hash, &bsv_sig),
+            "a RECONSTRUCTED presig box MUST drive a BSV-valid 2-of-2 signature"
+        );
+    }
+
+    /// NEGATIVE — malformed inputs to the inverse are rejected with the right
+    /// reason, never silently producing a junk box.
+    #[test]
+    fn deserialize_party_presig_rejects_malformed_inputs() {
+        // Presig JSON is parsed FIRST, so a bad presig surfaces as a presignature
+        // serialization error (regardless of the public-data bytes).
+        let err = super::deserialize_party_presig_with_public_data(b"not-json", b"\x80")
+            .expect_err("malformed presig JSON must be rejected");
+        match err {
+            MpcError::Serialization(msg) => assert!(
+                msg.contains("presignature"),
+                "error must name the presignature: {msg}"
+            ),
+            other => panic!("expected Serialization error, got {other:?}"),
+        }
+        // Empty inputs error too — never a silent success.
+        assert!(super::deserialize_party_presig_with_public_data(b"", b"").is_err());
     }
 }

@@ -2,7 +2,93 @@
 
 ---
 
-## 🟢🟢🟢 RESUME — 2026-05-29 PM (READ THIS FIRST; supersedes ALL blocks below)
+## 🟢🟢🟢🟢 RESUME — 2026-05-29 LATE PM — STEP 7a PROVEN (READ THIS FIRST; supersedes ALL below)
+
+**#69 PR-2 step 7a (the SIGNING-side generation half) is BUILT + LIVE-PROVEN. Working on branch
+`person-a/69-pr2-client-multishare` (NOT pushed). Filed the scope gap as [bsv-mpc#86] first
+(user call), then built it.**
+
+### ✅ DONE — genuine n-party presign GENERATION over the relay (the #86 gap)
+- **🔒 Locked design (Arch 2 — "PresignHandler-everywhere + reconstruct-from-bundle"):** keeps the
+  deployed cosigner's presign RUNTIME byte-identical (only `/presign-relay/init` gains a `peers` list).
+  Device runs `w` PresignHandlers (primary=coordinator, others=cosigner) + ONE external cosigner over
+  the relay → the proven `PresigBundle`; the device RECONSTRUCTS its `w` raw boxes from the bundle
+  (unseal own + BRC-2-decrypt the co-located ciphertexts it minted the keys for, each paired with the
+  shared `commitments`), keeping the external cosigner's ct for the sign-time trigger. Rejected the
+  "local-raw PresignHandler role" alt (it mutates the mainnet-proven completion path → asterisk).
+- **🟢🟢 LIVE-PROVEN** `crates/bsv-mpc-client/tests/presign_sign_4of6_multiindex_relay_e2e.rs` (device
+  {0,1,2} + ONE in-process container cosigner {3} over the deployed relay): 4-of-6 DKG → genuine
+  n-party presign → device-holds combine → **BSV-valid signature under the joint key**. joint
+  `02c709186cbe1ac811a2f7eb39e17dfeeca4ce7465f009592d300494df981cc32f`, addr
+  `1nec9An3paL7P4S19MPzjNntMd5Vk2r1a`, ~524s, `1 passed`. The cosigner generated its OWN presig as a
+  genuine protocol party — no process ever held > t−1 shares.
+- **New code (all GREEN, both clippy gates + fmt clean):**
+  - core `bsv_mpc_core::presigning::deserialize_party_presig_with_public_data` (inverse of the forward
+    serializer) — round-trip gate (reconstructed box drives a BSV-valid 2-of-2 sig, byte-stable) + negative.
+  - `bsv_mpc_relay::coordinate_presign_over_relay_nparty` (new `provision_presign.rs`, mirrors
+    `coordinate_dkg_over_relay`) + `PresignOverRelay`/`PresignCosignerArm`/`PresignOverRelayOutput`.
+    4 hermetic topology guards.
+  - `/presign-relay/init` n-party `peers` list (mirror `/dkg-relay/init`, back-compat fallback +
+    fail-fast if coordinator absent; `resolve_presign_peers` 4 unit tests).
+  - `DoTrigger.presig_id` shipped by `combine_sign_over_relay_nparty` (additive; 12 existing literals → None).
+
+### 🛡 Two production-correct service-side fixes the live run forced out (N-PARTY PATH ONLY)
+The 2-party deployed runtime stays byte-identical (it uses `load_share_or_recover_pub` / bare authz).
+1. **Composite owner-authz** on `/presign-relay/init` (`authz_owner_at_index_pub`): a multi-index
+   wallet records its owner at `{joint}#{idx}`, so the prior bare-`agent_id` check was a §08.1 BYPASS
+   (any authed caller could arm a presign on someone else's multishare wallet). Now authz against the
+   composite owner (bare fallback for 2-party). Positive + negative unit-tested.
+2. **Race-closing retry** on the composite share load (`load_share_or_recover_at_index_pub`): a presign
+   armed immediately after provisioning could 404 before the cosigner's DKG persist landed (the device
+   returns on its own quorum agreement; the container persists on its listener pump a beat later).
+   Bounded retry (15×200ms) closes it; a genuine miss still 404s.
+
+### ⏳ NEXT — Step 7b/7c (client wiring) then Step 8 (deployed mainnet)
+- **7b:** client `DeployedSigner` multi-index presig pool + multi-index unseal (composite `{agent_id}#{idx}`
+  shares). DECISION: keep `coordinate_presign_over_relay_nparty` returning raw boxes (proven); the client
+  converts to a durable serializable form for pooling + reconstructs raw boxes at sign time via the proven
+  core inverse — avoids re-running the 8-min E2E.
+- **7c:** wire `DeployedSigner::sign` (when `my_indices.len() > 1`) → `combine_sign_over_relay_nparty`
+  (primary + extras + ONE cosigner trigger w/ `presig_id` + `cosigner_encrypted_share`). Reuse the #83
+  kernel; do NOT reimplement.
+- **8:** deployed mainnet 4-of-6 (with #70): `create_wallet_nparty` + `provision_wallet_nparty` full
+  BRC-31-authed proof + real spend → WoC TXID. FUNDING gated on **#85** (MITM identity-fetch). The
+  composite owner-authz fix above is a prerequisite for step 8's real-BRC-31 owner enforcement.
+
+### ✅✅ UPDATE (2026-05-29 LATE PM) — 7b/7c DONE + #85 (4-of-6 path) DONE; capstone runbook below
+- **7b/7c BUILT+GREEN** (see PROGRESS daily log). 7a LIVE-PROVEN (re-run pending a test-only fix:
+  the e2e used a FIXED `sign_session` → stale-partial cross-run contamination on the shared relay;
+  now keyed off the fresh joint key. The CODE was always correct — DKG+presign+#85 passed live; only
+  the sign combine hit a prior run's stale partial under the fixed session).
+- **#85 (DKG + presign funding path) BUILT+PROVEN** (core golden vectors + fast HTTP proof + live e2e
+  now pins). Pin threaded `NpartyCosigner`→`CosignerEndpoint`→`PresignCosignerArm`→`WalletMeta`→FFI.
+- **REMAINING #85 surface (recovery flow only):** `/reshare-relay/identity` + `/refresh-relay/identity`
+  return the master pub directly → the fix is a CLIENT compare-to-pinned in `coordinate_reshare_over_relay`
+  / `recover_wallet` (mirror the presign pin). Does NOT gate 4-of-6 funding; mechanical follow-up.
+
+### 🎯 CAPSTONE RUNBOOK — the closing TXID (funding via the localhost:3321 MetaNet wallet)
+1. **Deploy NotaryA (hardened #86+#85):** `cd poc/cf-container-p2 && eval "$(grep '^export CLOUDFLARE' ~/bsv/mpc/bsv-mpc/secrets.md)" && npx wrangler deploy` (Docker build ~10 min). Verify:
+   `GET https://bsv-mpc-service-container.dev-a3e.workers.dev/presign-relay/identity` → 200; and
+   `GET …/dkg-relay/peer-identity?session=<64hex>&index=3` now returns `master_pub_hex` + `attestation_hex`.
+   NotaryA master pub = pub of `MPC_SERVER_PRIVATE_KEY=4d4327ab…241af3` (secrets.md:541).
+2. **#70 — NotaryB (2nd INDEPENDENT cosigner):** generate a FRESH master keypair for NotaryB via
+   `~/bsv/rust-wallet-utils` (or a bsv-rs one-off) → **save it to `secrets.md`** (gitignored, e.g.
+   `MPC_SERVER_PRIVATE_KEY_NOTARY_B=…`). New wrangler config (distinct `name`, e.g.
+   `bsv-mpc-service-container-b`) + `wrangler secret put MPC_SERVER_PRIVATE_KEY` with that key → deploy.
+   The 4-of-6 splits device `{0,1,2}` + NotaryA `{3,4}` + NotaryB `{5}` (two `NpartyCosigner`s, each
+   `expected_master_pub` PINNED). worker.js injects the secret into the container (`env.MPC_SERVER_PRIVATE_KEY`).
+3. **Deployed no-sats 4-of-6 capstone** (real BRC-31 + #85 pins + 2 Notaries): `provision_wallet_nparty`
+   → `DeployedSigner` multi-index `sign` of a dummy hash → BSV-valid sig. (Use a UNIQUE per-run sign
+   session — the fixed-session bug above bites the shared relay.)
+4. **FUND** the joint address from `localhost:3321` (MetaNet/BRC-100): `createAction` with a P2PKH output
+   to the 4-of-6 joint address (a few k sats).
+5. **FULL SPEND → WoC TXID:** genuine 4-of-6 `createAction` spending that UTXO (device folds `{0,1,2}` +
+   ONE Notary partial over the relay) → broadcast (ARC/WoC) → `whatsonchain.com/tx/<id>`. **Closes #69,
+   #70, #85, #86.**
+
+---
+
+## 🟢🟢🟢 RESUME — 2026-05-29 PM (earlier; superseded by the LATE PM block above)
 
 **Owned critical path = #69 (client 4-of-6) + #70 (2nd cosigner). The PROVISIONING side
 of #69 PR-2 client is DONE + live-proven + committed. The SIGNING side (step 7) is the

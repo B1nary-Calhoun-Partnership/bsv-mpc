@@ -194,12 +194,34 @@ pub async fn handle_dkg_relay_peer_identity(
                 )
             }
         };
+    let relay_pub = relay_priv.public_key();
+    // #85 MITM gate: ATTEST this per-index relay pub with the MASTER identity so a
+    // device that PINNED our master out-of-band can verify the value over an
+    // otherwise-unauthenticated GET (a MITM cannot forge the master's signature).
+    let attestation = match bsv_mpc_core::hd::sign_relay_identity_attestation(
+        &server_priv,
+        &session,
+        q.index,
+        &relay_pub,
+    ) {
+        Ok(sig) => hex::encode(sig),
+        Err(e) => {
+            return err_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("attest relay identity: {e}"),
+            )
+        }
+    };
     (
         StatusCode::OK,
         Json(serde_json::json!({
             "index": q.index,
             "session": q.session,
-            "relay_pub_hex": relay_priv.public_key().to_hex(),
+            "relay_pub_hex": relay_pub.to_hex(),
+            // The MASTER identity pub (what the device pins) + its attestation over
+            // (master, session, index, relay_pub).
+            "master_pub_hex": server_priv.public_key().to_hex(),
+            "attestation_hex": attestation,
         })),
     )
 }

@@ -35,11 +35,12 @@
 use crate::error::{MpcError, Result};
 use crate::types::{JointPublicKey, SessionId};
 
-use bsv::primitives::ec::{PrivateKey, PublicKey};
+use bsv::primitives::ec::{PrivateKey, PublicKey, Signature};
 use bsv::primitives::hash::sha256_hmac;
 use bsv::Address;
 use cggmp24::supported_curves::Secp256k1;
 use generic_ec::Scalar;
+use sha2::{Digest, Sha256};
 
 /// Derive a BRC-42 child public key from a shared secret and invoice number.
 ///
@@ -297,6 +298,131 @@ pub fn derive_relay_index_privkey(
             "dkg-relay identity derivation produced an invalid scalar (zero key?): {e}"
         ))
     })
+}
+
+// ── #85 MITM gate: pinned-master identity ATTESTATION + liveness CHALLENGE ──────
+//
+// The device discovers a cosigner's per-(session,index) relay identity over an
+// otherwise-unauthenticated GET (the per-index pub is a ONE-WAY HMAC of the master
+// key, so the device cannot recompute it). A network MITM could substitute an
+// attacker pub → the DKG co-holds the joint key with the attacker. The fix: the
+// device PINS the cosigner's master identity out-of-band, the cosigner ATTESTS each
+// relay pub with that master key, and the device VERIFIES every attestation against
+// the PINNED master before routing a single round message — so it only ever
+// federates with the intended Notary. A signed liveness CHALLENGE re-confirms the
+// real master is live + controls its key before any sats move (the funding gate).
+
+/// Domain tag for the relay-identity attestation signature (#85).
+const RELAY_IDENTITY_ATTESTATION_DOMAIN_V1: &[u8] = b"bsv-mpc relay-identity attestation v1";
+/// Domain tag for the cosigner liveness/funding challenge signature (#85).
+const COSIGNER_CHALLENGE_DOMAIN_V1: &[u8] = b"bsv-mpc cosigner liveness challenge v1";
+
+/// The canonical 32-byte message a cosigner's MASTER identity signs to ATTEST that
+/// `relay_pub` is the genuine per-(session, index) relay identity it derived (#85).
+/// Binds `master_pub ‖ session ‖ index ‖ relay_pub` under a domain tag, so an
+/// attestation cannot be replayed across cosigners, sessions, or indices.
+pub fn relay_identity_attestation_msg(
+    master_pub: &PublicKey,
+    session_id: &SessionId,
+    index: u16,
+    relay_pub: &PublicKey,
+) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(RELAY_IDENTITY_ATTESTATION_DOMAIN_V1);
+    h.update(master_pub.to_compressed());
+    h.update(session_id.as_bytes());
+    h.update(index.to_be_bytes());
+    h.update(relay_pub.to_compressed());
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&h.finalize());
+    out
+}
+
+/// Sign a [`relay_identity_attestation_msg`] with the cosigner's MASTER identity
+/// (RFC-6979 → deterministic, low-S). Returns the 64-byte compact `r ‖ s`.
+pub fn sign_relay_identity_attestation(
+    master_priv: &PrivateKey,
+    session_id: &SessionId,
+    index: u16,
+    relay_pub: &PublicKey,
+) -> Result<[u8; 64]> {
+    let msg =
+        relay_identity_attestation_msg(&master_priv.public_key(), session_id, index, relay_pub);
+    let sig = master_priv
+        .sign(&msg)
+        .map_err(|e| MpcError::Protocol(format!("attestation sign: {e}")))?;
+    let mut c = [0u8; 64];
+    c[..32].copy_from_slice(sig.r());
+    c[32..].copy_from_slice(sig.s());
+    Ok(c)
+}
+
+/// Verify a relay-identity attestation against the PINNED master pub (#85). Returns
+/// `true` ONLY if the pinned master signed exactly `(session, index, relay_pub)` —
+/// a MITM-substituted `relay_pub`, a wrong master, or a malformed signature all fail
+/// closed (`false`).
+pub fn verify_relay_identity_attestation(
+    master_pub: &PublicKey,
+    session_id: &SessionId,
+    index: u16,
+    relay_pub: &PublicKey,
+    sig_compact: &[u8; 64],
+) -> bool {
+    let msg = relay_identity_attestation_msg(master_pub, session_id, index, relay_pub);
+    match Signature::from_compact(sig_compact) {
+        Ok(sig) => master_pub.verify(&msg, &sig),
+        Err(_) => false,
+    }
+}
+
+/// The canonical 32-byte message a cosigner's MASTER identity signs to prove it is
+/// LIVE and controls its key for a SPECIFIC wallet, before funding (#85 funding
+/// gate). Binds `master_pub ‖ joint_pubkey ‖ nonce` — the device picks a fresh
+/// `nonce`, so a captured signature cannot be replayed.
+pub fn cosigner_challenge_msg(
+    master_pub: &PublicKey,
+    joint_pubkey_compressed: &[u8],
+    nonce: &[u8; 32],
+) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(COSIGNER_CHALLENGE_DOMAIN_V1);
+    h.update(master_pub.to_compressed());
+    h.update(joint_pubkey_compressed);
+    h.update(nonce);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&h.finalize());
+    out
+}
+
+/// Sign a [`cosigner_challenge_msg`] with the MASTER identity. Returns 64-byte compact.
+pub fn sign_cosigner_challenge(
+    master_priv: &PrivateKey,
+    joint_pubkey_compressed: &[u8],
+    nonce: &[u8; 32],
+) -> Result<[u8; 64]> {
+    let msg = cosigner_challenge_msg(&master_priv.public_key(), joint_pubkey_compressed, nonce);
+    let sig = master_priv
+        .sign(&msg)
+        .map_err(|e| MpcError::Protocol(format!("challenge sign: {e}")))?;
+    let mut c = [0u8; 64];
+    c[..32].copy_from_slice(sig.r());
+    c[32..].copy_from_slice(sig.s());
+    Ok(c)
+}
+
+/// Verify a cosigner liveness/funding challenge against the PINNED master pub (#85).
+/// Fails closed on a wrong master, wrong wallet, replayed/altered nonce, or malformed sig.
+pub fn verify_cosigner_challenge(
+    master_pub: &PublicKey,
+    joint_pubkey_compressed: &[u8],
+    nonce: &[u8; 32],
+    sig_compact: &[u8; 64],
+) -> bool {
+    let msg = cosigner_challenge_msg(master_pub, joint_pubkey_compressed, nonce);
+    match Signature::from_compact(sig_compact) {
+        Ok(sig) => master_pub.verify(&msg, &sig),
+        Err(_) => false,
+    }
 }
 
 /// Convert a PublicKey to a JointPublicKey with BSV address.
@@ -982,5 +1108,171 @@ mod tests {
             "f698e3016303f85f5358e07dbe9b23ae798182cf5d1c5bac93163f6afa40d72d",
             "DKG-relay identity derivation drifted from the frozen vector"
         );
+    }
+
+    // -------------------------------------------------------------------
+    // #85 MITM gate — pinned-master relay-identity ATTESTATION + liveness
+    // CHALLENGE. The device PINS the cosigner master out-of-band and verifies
+    // every fetched relay pub against it, so a MITM-substituted identity fails
+    // closed. Positive round-trip + NEGATIVE (wrong master / tampered field /
+    // replay) + frozen zero-drift vectors.
+    // -------------------------------------------------------------------
+
+    /// The realistic per-index relay pub the master attests to (derived, deterministic).
+    fn attested_relay_pub(index: u16) -> PublicKey {
+        derive_relay_index_privkey(&relay_server_priv(), &relay_session(), index)
+            .unwrap()
+            .public_key()
+    }
+
+    #[test]
+    fn attestation_roundtrips_and_rejects_mitm() {
+        let master = relay_server_priv();
+        let master_pub = master.public_key();
+        let sess = relay_session();
+        let relay_pub = attested_relay_pub(3);
+
+        let sig = sign_relay_identity_attestation(&master, &sess, 3, &relay_pub).unwrap();
+        // Positive: the pinned master verifies its own attestation.
+        assert!(verify_relay_identity_attestation(
+            &master_pub,
+            &sess,
+            3,
+            &relay_pub,
+            &sig
+        ));
+
+        // NEGATIVE 1 — wrong master (the MITM's key): an attacker who returns a
+        // different (or its own) pub is NOT the pinned master → fails closed.
+        let attacker = PrivateKey::from_bytes(&[0x99u8; 32]).unwrap().public_key();
+        assert!(
+            !verify_relay_identity_attestation(&attacker, &sess, 3, &relay_pub, &sig),
+            "an attestation MUST NOT verify under a non-pinned master"
+        );
+
+        // NEGATIVE 2 — tampered relay_pub (MITM swaps the routed identity): the
+        // signature was over the genuine pub, so the swap fails closed.
+        let mitm_pub = attested_relay_pub(4);
+        assert!(
+            !verify_relay_identity_attestation(&master_pub, &sess, 3, &mitm_pub, &sig),
+            "a substituted relay_pub MUST fail the attestation"
+        );
+
+        // NEGATIVE 3/4 — wrong index / wrong session (replay across slots).
+        assert!(!verify_relay_identity_attestation(
+            &master_pub,
+            &sess,
+            4,
+            &relay_pub,
+            &sig
+        ));
+        let other_sess = SessionId::from_bytes([0x77u8; 32]);
+        assert!(!verify_relay_identity_attestation(
+            &master_pub,
+            &other_sess,
+            3,
+            &relay_pub,
+            &sig
+        ));
+
+        // NEGATIVE 5 — malformed signature bytes fail closed (never panic).
+        assert!(!verify_relay_identity_attestation(
+            &master_pub,
+            &sess,
+            3,
+            &relay_pub,
+            &[0u8; 64]
+        ));
+    }
+
+    #[test]
+    fn challenge_roundtrips_and_rejects_replay() {
+        let master = relay_server_priv();
+        let master_pub = master.public_key();
+        let joint = vec![0x02u8; 33];
+        let nonce = [0x5au8; 32];
+
+        let sig = sign_cosigner_challenge(&master, &joint, &nonce).unwrap();
+        assert!(verify_cosigner_challenge(&master_pub, &joint, &nonce, &sig));
+
+        // Wrong master (MITM): fails.
+        let attacker = PrivateKey::from_bytes(&[0x88u8; 32]).unwrap().public_key();
+        assert!(!verify_cosigner_challenge(&attacker, &joint, &nonce, &sig));
+        // Replayed/altered nonce: fails (binds the fresh device nonce).
+        assert!(!verify_cosigner_challenge(
+            &master_pub,
+            &joint,
+            &[0x5bu8; 32],
+            &sig
+        ));
+        // Wrong wallet (different joint pubkey): fails.
+        assert!(!verify_cosigner_challenge(
+            &master_pub,
+            &[0x03u8; 33],
+            &nonce,
+            &sig
+        ));
+        // Malformed sig: fails closed.
+        assert!(!verify_cosigner_challenge(
+            &master_pub,
+            &joint,
+            &nonce,
+            &[0u8; 64]
+        ));
+    }
+
+    #[test]
+    fn attestation_and_challenge_frozen_vectors() {
+        // ZERO-DRIFT vectors. RFC-6979 makes the signatures deterministic, so the
+        // exact bytes are frozen. Inputs: master = [0x11;32], session = [0x22;32],
+        // index = 3, relay_pub = derived per-index pub; challenge joint = [0x02;33],
+        // nonce = [0x5a;32]. ANY change to a domain tag / field order / encoding
+        // flips these.
+        let master = relay_server_priv();
+        let sess = relay_session();
+        let relay_pub = attested_relay_pub(3);
+
+        let att_msg = relay_identity_attestation_msg(&master.public_key(), &sess, 3, &relay_pub);
+        assert_eq!(
+            hex::encode(att_msg),
+            "cf87953527fca68195345eb081128b40f166ff7f0842d01d169c1c9861c014e8",
+            "attestation message preimage drifted"
+        );
+        let att_sig = sign_relay_identity_attestation(&master, &sess, 3, &relay_pub).unwrap();
+        assert_eq!(
+            hex::encode(att_sig),
+            "686f7f8d3dcf01f8066ae5a60c08b48705e58e2105e21f9de86eaedafe559a06\
+             4632a08176aba25986febce2ac73a85e80d17a3c1a54a0ecb96a83dea5fd8432",
+            "attestation signature drifted"
+        );
+        assert!(verify_relay_identity_attestation(
+            &master.public_key(),
+            &sess,
+            3,
+            &relay_pub,
+            &att_sig
+        ));
+
+        let joint = vec![0x02u8; 33];
+        let nonce = [0x5au8; 32];
+        let ch_msg = cosigner_challenge_msg(&master.public_key(), &joint, &nonce);
+        assert_eq!(
+            hex::encode(ch_msg),
+            "46cd4923ce91150d41929ed436456b872a36048c82314ee2a0ede00a457bcee4",
+            "challenge message preimage drifted"
+        );
+        let ch_sig = sign_cosigner_challenge(&master, &joint, &nonce).unwrap();
+        assert_eq!(
+            hex::encode(ch_sig),
+            "cece1794fb42fbc731b896ee0380491a9a9461acb0794d5e5e96ada500f6298e\
+             64251191b7416e0b5cf59b32103cada690ed77cf03441be74923e8862b18b348",
+            "challenge signature drifted"
+        );
+        assert!(verify_cosigner_challenge(
+            &master.public_key(),
+            &joint,
+            &nonce,
+            &ch_sig
+        ));
     }
 }

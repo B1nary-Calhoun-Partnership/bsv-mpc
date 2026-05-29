@@ -92,6 +92,11 @@ pub struct NpartyCosigner {
     pub container_url: String,
     /// The absolute keygen indices this cosigner drives.
     pub indices: Vec<u16>,
+    /// **#85 MITM gate.** This Notary's MASTER identity pubkey hex, PINNED
+    /// out-of-band. When `Some`, the n-party DKG verifies every fetched per-index
+    /// relay pub's attestation against it AND runs a post-DKG liveness challenge
+    /// before returning a fundable wallet. `None` = unpinned (dev/test only).
+    pub expected_master_pub: Option<String>,
 }
 
 /// Public metadata of a freshly provisioned **n-party** (device-holds-(t−1)) wallet
@@ -199,6 +204,7 @@ pub async fn provision_wallet_nparty(
             init_url: format!("{}/dkg-relay/init", c.container_url),
             indices,
             arm_signer,
+            expected_master_pub: c.expected_master_pub.clone(),
         });
     }
 
@@ -264,6 +270,7 @@ mod tests {
             vec![NpartyCosigner {
                 container_url: "https://cosigner.invalid".into(),
                 indices: vec![2, 3, 4, 5],
+                expected_master_pub: None,
             }],
             Duration::from_secs(1),
             &ks,
@@ -298,6 +305,7 @@ mod tests {
             vec![NpartyCosigner {
                 container_url: "https://cosigner.invalid".into(),
                 indices: vec![3, 4, 4], // gap at 5, dupe at 4
+                expected_master_pub: None,
             }],
             Duration::from_secs(1),
             &ks,
