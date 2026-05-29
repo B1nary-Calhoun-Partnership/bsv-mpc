@@ -38,28 +38,35 @@ cosigner(s) drive the other 3) — bigger than reshare + not yet mainnet-proven,
 the strongest entropy/topology story. Phased to keep each PR independently green
 (no asterisks). Quality bar (user): **prove 110% at each step, zero caveats.**
 
-**PR-1a — device-holds combine kernel — `READY FOR PR` (branch `person-a/69-device-holds-combine-kernel`):**
+**PR-1a — device-holds combine kernel — ✅ SHIPPED + MERGED (bsv-mpc PR #83, commit `8c8c7bb`):**
 - `bsv-mpc-core/src/signing.rs`: extracted `device_holds_combine` — the relay-free
-  device-holds-(t−1) combine (prime PRIMARY → `add_local_presig_partial` for each
-  co-located extra → fold the cosigner's relayed partial → combine all t).
-- `bsv-mpc-relay/src/lib.rs`: `combine_sign_over_relay_nparty` now CALLS that kernel
-  (zero-drift: deployed relay path + tests run byte-identical combine code).
-- `bsv-mpc-core/tests/device_holds_combine_kernel.rs`: hermetic proof.
-- Gates: UNIT/VECTOR **GREEN** — 3-of-3 device-holds-2 verifies under joint pubkey
-  (CI-gated) + BRC-42-offset verifies under child key, NOT base key; NEGATIVE
-  single-index/sub-threshold → "did not complete" (right reason); 4-of-6 real-topology
-  `#[ignore]` proof staged. clippy clean, fmt-clean (edited files), workspace + wasm32
-  core build green. E2E (mainnet 4-of-6) deferred to PR-3 (#70 pairing) — NOT an asterisk
-  on PR-1a (kernel is hermetically + zero-drift proven; mainnet is the PR-3 close).
+  device-holds-(t−1) combine. `bsv-mpc-relay`'s `combine_sign_over_relay_nparty` now CALLS
+  it (zero-drift: deployed relay path + tests run byte-identical code).
+- Gates ALL GREEN: 3-of-3 device-holds-2 verifies under joint pubkey + BRC-42-offset under
+  child key (CI-gated); NEGATIVE sub-threshold → "did not complete"; 4-of-6 real-topology
+  `#[ignore]` proof RAN green (joint_pubkey `03e8d7d7…`, 212s). CI: fmt+clippy + native
+  (31m30s) + wasm32 (4m19s) all PASS. Merged to main.
 
-**PR-1b (next) — client multi-share signing seam:** `device_share_index: u16` →
-`my_indices: Vec<u16>` on `FfiSignerConfig`/`WalletMeta`/`DeployedSigner`; the device's
-presig SET stays **durable + single-use + at-rest-sealed** (extend `PresigBundle` to carry
-t−1 own-presigs — NOT a regression to the proxy's in-memory set; preserves the
-CVE-2025-66017 mitigation with no asterisk); `DeployedSigner::sign` → `combine_sign_over_relay_nparty`.
+**SPEC — ✅ MERGED (MPC-Spec PRs #49 + #50):**
+- **ADR-0052** (`#49`) — device-holds-(t−1) multishare + genuine n-party DKG over relay,
+  **Model B** (one ceremony identity per held index → wire unchanged, ADR-0051-consistent);
+  + §06.22 (DKG over relay), §06.17.1 note, §15.2.4 (device-holds vs any-t tiers),
+  `15-device-holds-quorum.json` vector + Python runner gate (24 checks pass). Both stewards
+  signed off (Binary OK relayed by user).
+- **§13.7.1 / §18.2** (`#50`) — cross-implementation Notary swap: a Notary MAY be replaced
+  ACROSS impls (bsv-mpc ↔ rust-mpc) via address-preserving `reshare_replace_party`,
+  vector-gated. (Answers "swap 2nd Calhoun cosigner for rust-mpc?" → yes, normatively.)
 
-**PR-2 — genuine 6-party DKG over relay** (spec PR + `/dkg-relay` route + redeploy);
-**PR-3/#70 — 2nd cosigner + mainnet 4-of-6 E2E** (the audit-closing artifact).
+**PR-2 — `IN PROGRESS` (planning via background workflow `wl5ju8hj2`)** — the big code build,
+absorbs the old PR-1b: device-side driver running w `DkgHandler`s over relay
+(`provision_wallet_nparty`); new `POST /dkg-relay/init` on `bsv-mpc-service` (mirror
+`/reshare-relay/init`) + per-(session,index) storage; durable `PresigBundle` carrying w
+own-presigs (preserves CVE-2025-66017 single-use, no asterisk); `device_share_index` →
+`my_indices` FFI (single-index default keeps 2-of-2). TDD; hermetic 6-party-DKG-over-relay
++ mainnet 4-of-6 E2E. **Workflow producing surface map + TDD plan + risk review; present
+plan before coding.**
+
+**PR-3/#70 — 2nd cosigner + mainnet 4-of-6 E2E** (the audit-closing artifact; pairs with PR-2).
 
 **Why this is THE critical path (2026-05-28 PM):** it is the *only* thing between us and
 the overarching goal (4-of-6 production self-custody on 100cash). The 100cash app config
