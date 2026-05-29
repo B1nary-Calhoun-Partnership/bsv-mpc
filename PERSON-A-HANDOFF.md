@@ -2,7 +2,86 @@
 
 ---
 
-## 🟢🟢 RESUME — 2026-05-29 (READ THIS FIRST; supersedes the older resume block below)
+## 🟢🟢🟢 RESUME — 2026-05-29 PM (READ THIS FIRST; supersedes ALL blocks below)
+
+**Owned critical path = #69 (client 4-of-6) + #70 (2nd cosigner). The PROVISIONING side
+of #69 PR-2 client is DONE + live-proven + committed. The SIGNING side (step 7) is the
+remaining lift — and it is BIGGER than the old handoff implied (see scope finding).**
+
+### ✅ DONE this session — committed `40347af` on branch `person-a/69-pr2-client-multishare`
+**NOT pushed to main yet** (user wanted a clean checkpoint commit first; awaiting push/PR call).
+Working tree clean except the two untracked `docs/*AUDIT*.md` (NEVER commit those).
+
+- **5a-i** `bsv_mpc_core::hd::derive_relay_index_privkey(server_priv, session, index)` —
+  `reduce_mod_n(HMAC-SHA256(key=server_priv, b"bsv-mpc dkg-relay identity v1" ‖ session(32) ‖
+  index_be_u16))`. **ONE-WAY, not additive** (a leaked relay key must not recover server_priv,
+  which is also the BRC-31 auth + BRC-2 sealing key). 8 unit tests + **frozen golden vector**
+  `f698e3016303f85f5358e07dbe9b23ae798182cf5d1c5bac93163f6afa40d72d`.
+- **5a-ii** service `handle_dkg_relay_init` derives a per-index relay identity (distinct relay
+  room per held index) + new read-only `GET /dkg-relay/peer-identity?session&index`. 4 route-unit
+  tests (route↔core golden cross-check).
+- **5b** `bsv_mpc_relay::coordinate_dkg_over_relay` (NEW, in `provision_dkg.rs`, sibling to
+  `coordinate_reshare_over_relay`) + `bsv_mpc_client::native_io::provision_wallet_nparty`
+  (handshake → coordinate → composite-seal `{agent_id}#{index}`). `CosignerEndpoint{init_url,
+  indices,arm_signer}` supports the 2-cosigner / one-holds-two topology.
+  **🟢 PROVEN: live 6-party 4-of-6 DKG agreed a byte-identical joint key over the deployed relay**
+  (`tests/dkg_4of6_multiindex_relay_e2e.rs`): joint_pubkey
+  `027545996f0074c9c3eaf9835c8a53052c4581ed084e3b1222e2d6f72eb9c13798`, addr
+  `1DbuHHwfUVFZxgSfhsNaBM7hQ12EDoFbiG`, 365s; device {0,1,2} + ONE in-process container {3,4,5}
+  via 3 one-way-derived identities; device 3 distinct shares + container 3 distinct composite shares.
+- **6** `my_indices: Vec<u16>` on `WalletMeta` + `FfiSignerConfig` (back-compat: empty →
+  `[device_share_index]`); `create_wallet`/`recover_wallet` set `[device_share_index]`; new
+  `create_wallet_nparty` + `FfiNpartyCosigner`. 2-of-2 back-compat GREEN.
+
+### 🛠 Two production-correct fixes the live run forced out (BOTH touch the deployed path)
+1. **Pre-seed device primes** in `coordinate_dkg_over_relay` (was late-seed). A device backing
+   `w=t−1` parties inline-generated safe primes INSIDE auxinfo `proceed()`, blocking the thread
+   for minutes (would freeze a phone). Pre-seed = step-4's proven ordering; also delays the
+   device's round-1, giving late-seeding cosigner parties a head start.
+2. **Idempotent transport retry** — `MessageBoxClient::send_round_message_reliable` (one stable
+   message_id → relay no-ops re-sends → exactly-once) + the `MessageBoxListener` retries sends 4×
+   w/ backoff. A transient `/sendMessage` blip previously DROPPED a round message → ceremony
+   stall. ⚠️ This hardens EVERY ceremony (DKG/sign/presign/reshare) on the deployed cosigner —
+   additive + safe (idempotency = the relay's existing (recipient,box,message_id) dedup).
+
+### 🔴 STEP 7 — SCOPE FINDING (the next big build; ~5b-sized, NOT "just wire the combine")
+The multi-index SIGN **consume** side EXISTS + is proven: `combine_sign_over_relay_nparty`
+(relay), the merged `device_holds_combine` kernel (#83), the proxy's `sign_over_relay_device_holds`.
+**BUT the multi-index presig GENERATION over the relay does NOT exist anywhere in the repo.** The
+proxy's `DevicePresigSetPool::add_set` is called ONLY by its mainnet E2E, which fabricates the
+correlated `{0,1,2}` presigs with a LOCAL test helper (`gen_presig_set`, holding all 6 shares) —
+a within-stack shortcut, not a production path. A real client multi-index sign needs the device
+to obtain `w` CORRELATED presigs from a genuine n-party presign-over-relay ceremony (device's `w`
+parties + cosigner). **So Step 7 =**
+  (a) build `coordinate_presign_over_relay_nparty` (relay; mirror `coordinate_presign_over_relay`
+      but device drives `w` parties + cosigner → `w` correlated device presigs + cosigner's),
+  (b) client `DeployedSigner`: multi-index presig pool (a `DevicePresigSetPool` analog) +
+      multi-index unseal (composite `{agent_id}#{index}`, `w` shares),
+  (c) wire `DeployedSigner::sign` (when `my_indices.len() > 1`) → `combine_sign_over_relay_nparty`
+      (primary + extras + ONE cosigner trigger); reuse the #83 kernel, do NOT reimplement.
+  Then **Step 8** = deployed mainnet 4-of-6 (with #70): `create_wallet_nparty` +
+  `provision_wallet_nparty`'s full BRC-31-authed proof + a real spend → WoC TXID. (The in-process
+  service auth is a DEV STUB → cannot do a real BRC-31 handshake, so the full client-FFI proof is
+  step-8 against the deployed container, exactly like `recover_wallet`'s deployed e2e.)
+
+### 🔴 TRACKED GATE — bsv-mpc#85 (security, HIGH, still open)
+Cosigner identity fetched over UNAUTH HTTP — now ALSO the new `GET /dkg-relay/peer-identity` (the
+code notes this). MITM can steer DKG to an attacker co-party. MUST close before god-tier-production
+4-of-6 FUNDING: pin the cosigner master identity out-of-band + BRC-31-sign the fetch + signed
+co-party challenge.
+
+### Notes / discipline
+- `~/bsv/mpc/cash100` does NOT exist — the app dir is `~/bsv/mpc/100cash` (Person B's Swift app,
+  the CONSUMER of this 4-of-6 work). Person A's lane is `bsv-mpc` only.
+- Run the EXACT CI gates before any push: `cargo fmt --all -- --check` + `cargo clippy --workspace
+  --all-targets -- -D warnings` AND `cargo clippy -p bsv-mpc-client --features native --all-targets
+  -- -D warnings` (the FFI is native-gated — the plain workspace clippy does NOT lint it).
+- Live relay E2Es: `MESSAGEBOX_RELAY_URL=https://rust-message-box.dev-a3e.workers.dev … --test-threads=1`,
+  ~6 min (Paillier-dominated). NO sats (DKG only).
+
+---
+
+## 🟢🟢 RESUME — 2026-05-29 (earlier; SUPERSEDED by the PM block above)
 
 **Owned critical path = #69 (client 4-of-6) + #70 (2nd cosigner). Goal = god-tier 4-of-6
 production self-custody on 100cash, mpc-spec-conformant, no asterisks.**
