@@ -140,7 +140,7 @@ async fn service_enforces_owner_authz() {
     let storage = SqliteShareStorage::open(data_dir.to_str().unwrap()).unwrap();
     let state = Arc::new(AppState {
         data_dir: data_dir.to_string_lossy().to_string(),
-        storage: RwLock::new(storage),
+        storage: Arc::new(RwLock::new(storage)),
         started_at: chrono::Utc::now(),
         provision: None,
         auth: AuthState::with_key(server_key),

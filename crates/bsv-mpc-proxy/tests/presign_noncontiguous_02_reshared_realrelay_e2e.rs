@@ -375,7 +375,7 @@ async fn run_reshared_presign_over_relay(label: &str) -> bool {
         .expect("seed cosigner share");
     let state = Arc::new(AppState {
         data_dir: data_dir.path().to_str().unwrap().to_string(),
-        storage: RwLock::new(storage),
+        storage: Arc::new(RwLock::new(storage)),
         started_at: chrono::Utc::now(),
         provision: None,
         auth: AuthState::dev(),

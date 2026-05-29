@@ -316,7 +316,7 @@ async fn setup() -> TestEnv {
 
     let kss_state = Arc::new(bsv_mpc_service::AppState {
         data_dir: "/tmp/e2e-kss".to_string(),
-        storage: RwLock::new(kss_storage),
+        storage: Arc::new(RwLock::new(kss_storage)),
         started_at: chrono::Utc::now(),
         provision: None,
         auth: bsv_mpc_service::AuthState::with_key(kss_server_key),
