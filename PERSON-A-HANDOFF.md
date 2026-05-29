@@ -2,7 +2,24 @@
 
 ---
 
-## 🟢🟢🟢🟢 RESUME — 2026-05-29 LATE PM — STEP 7a PROVEN (READ THIS FIRST; supersedes ALL below)
+## 🏁🏁🏁 CAPSTONE ON MAINNET — 2026-05-29 NIGHT (READ THIS FIRST)
+
+**Genuine 4-of-6, TWO INDEPENDENT deployed Notaries, #85 MITM-hardened, funded + spent on mainnet.**
+- **Spending TXID `fe0dc6b78bb100d23a4454a36b37f8f23faa978a068054c18c184c7528e3456a`**
+  (whatsonchain.com/tx/fe0dc6b7… — SEEN_ON_NETWORK; spends the 4-of-6 joint UTXO `7e70197f…:1`).
+- joint `03390c3a…` / addr `1QAE5RccM2eXpRNm9ZfiAjGUrUnyrSy2EB`. Topology device{0,1,2} + NotaryA{3,4}
+  (`0278138e…` @ bsv-mpc-service-container) + NotaryB{5} (`034957e3…` @ bsv-mpc-service-container-b),
+  real BRC-31, #85-pinned. Test `deployed_4of6_capstone_mainnet_e2e.rs` (commit `6860b13`).
+- **CLOSES #69, #70, #86; proves #85's funding-gate purpose.** Branch `person-a/69-pr2-client-multishare`
+  PUSHED (`6860b13`). Both Notaries deployed on dev@calhounjohn.com (account ea3e6d…). NotaryB master in
+  `secrets.md` (`MPC_SERVER_PRIVATE_KEY_NOTARY_B`); config `poc/cf-container-p2-notaryb/`.
+- **Remaining #85 (recovery flow ONLY, does NOT gate funding):** `/reshare-relay/identity` +
+  `/refresh-relay/identity` are unsigned — a CLIENT compare-to-pinned in `coordinate_reshare_over_relay` /
+  `recover_wallet` (mirror the presign pin). Mechanical follow-up.
+
+---
+
+## 🟢🟢🟢🟢 RESUME — 2026-05-29 LATE PM — STEP 7a PROVEN (superseded by the CAPSTONE block above)
 
 **#69 PR-2 step 7a (the SIGNING-side generation half) is BUILT + LIVE-PROVEN. Working on branch
 `person-a/69-pr2-client-multishare` (NOT pushed). Filed the scope gap as [bsv-mpc#86] first

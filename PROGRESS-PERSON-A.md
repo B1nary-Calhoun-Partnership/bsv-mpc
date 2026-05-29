@@ -393,6 +393,22 @@ Design-only for now; after 4-of-6. **Last action:** — **Blockers:** none.
 
 _(append session-by-session notes here)_
 
+### 2026-05-29 NIGHT — 🎉 CAPSTONE ON MAINNET: genuine 4-of-6, two independent Notaries, #85-hardened → WoC TXID
+- **Spending TXID `fe0dc6b78bb100d23a4454a36b37f8f23faa978a068054c18c184c7528e3456a`**
+  (https://whatsonchain.com/tx/fe0dc6b78bb100d23a4454a36b37f8f23faa978a068054c18c184c7528e3456a) —
+  ARC GorillaPool SEEN_ON_NETWORK; WoC confirms it spends the 4-of-6 joint UTXO (`vin 7e70197f…:1`).
+- joint `03390c3acaee688a6a09c464596a2fc3b6a147c9c0b2f993ffbb4b37f5c9b61a51`, addr `1QAE5RccM2eXpRNm9ZfiAjGUrUnyrSy2EB`.
+  funding_txid `7e70197f8353b9bd323b2fc3b86b64fa619a4325214ed31e7d3d3c0b44791ae5` (from wallet:3321).
+- Topology: **device {0,1,2} + NotaryA {3,4} + NotaryB {5}** — two INDEPENDENT deployed containers
+  (NotaryA `0278138e…` @ bsv-mpc-service-container; NotaryB `034957e3…` @ bsv-mpc-service-container-b),
+  #85-pinned (per-index attestation verify + post-DKG liveness challenge against both), real BRC-31,
+  via the client `DeployedSigner`. Sign = device folds {0,1,2} + NotaryA's {3} partial over the relay.
+- Test `crates/bsv-mpc-client/tests/deployed_4of6_capstone_mainnet_e2e.rs`: `ceremony_2notary_4of6_no_sats`
+  (BSV-valid sig under joint key, 350s) + `real_mainnet_2notary_4of6_txid` (the TXID, 398s). Committed `6860b13`.
+- **CLOSES #69 (client 4-of-6 multi-share), #70 (two independent Notaries), #86 (presig generation gap),
+  and proves #85's funding-gate purpose.** Remaining #85 surface (recovery flow only): reshare/refresh
+  identity fetches — a compare-to-pinned mirroring the presign pin; does NOT gate 4-of-6 funding.
+
 ### 2026-05-29 LATE PM — #69 step 7 PROVEN + #85 MITM gate built (branch `person-a/69-pr2-client-multishare`, NOT pushed)
 - **#69 step 7a LIVE-PROVEN** — genuine n-party presign generation over the relay
   (`coordinate_presign_over_relay_nparty`, new `provision_presign.rs`) feeding the proven #83
