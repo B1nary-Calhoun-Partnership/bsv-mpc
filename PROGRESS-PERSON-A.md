@@ -393,6 +393,23 @@ Design-only for now; after 4-of-6. **Last action:** — **Blockers:** none.
 
 _(append session-by-session notes here)_
 
+### 2026-05-29 LATE NIGHT (cont.) — ✅ spec-leak sweep: #73 + #74 CLOSED (god-tier investigate → user-approved fix → green)
+- **#74 (approval envelope `phase="sign"` + `execution_id_prefix=[0u8;8]`) CLOSED.** Option 1 (approved):
+  approval-request/-response envelopes now carry the first 8 bytes of the GATED sign's §02 ExecutionId
+  (`gated_sign_eid_prefix`, `PhaseTag::Sign`); `phase="sign"` kept (consistent w/ the phase byte per §05.4.4).
+  The SAME primitive fixed the sibling SIGN-path leak `sign_relay_handler.rs:139` (the live online-sign path).
+  **NO touch to LOCKED §02** — documenting clarification in ADR-0032 §2 + §09.5.1 + §05.4.9 (MPC-Spec).
+  (The 4-agent audit's "add a phase tag" idea was WRONG — would break LOCKED §02 + P0 vectors + §02.9;
+  verified against primary spec text.) First-class `approval` phase deferred to v2 → **bsv-mpc#88**.
+  2 regression-guard unit tests added (`approval_prefix_*`).
+- **#73 (BRC-18 placeholder proof) CLOSED.** LATENT (fabricated on every sign, but never read/serialized/
+  emitted — zero `.proof` readers, `proof_to_op_return` test-only). Option C (approved): `SigningResult.proof
+  → Option`=`None`, fabrication block deleted; sign output BYTE-IDENTICAL. `recovery_id=0` kept w/ documented
+  cross-chain caveat. Full §10.7 audit substrate (embedded-Rekor + STH-PushDrop) → **bsv-mpc#87**.
+- **Green:** core 297 / proxy 161 / service 59 lib tests + §05 envelope conformance 6/6, `clippy -D warnings`
+  clean. Field 10 is unsigned (BRC-31 covers fields 1–8) + unread in-repo → provably no signing/approval
+  regression. Pushed to main (bsv-mpc + MPC-Spec).
+
 ### 2026-05-29 LATE NIGHT — ✅ #85 FULLY CLOSED (recovery-flow MITM surface) + version-parity redeploy → ALL Person-A tickets closed
 - **#85 CLOSED** — the last identity surface (the recovery flow) is now pinned. `coordinate_reshare_over_relay`
   / `recover_wallet` take `expected_master_pub`: fetch `/reshare-relay/identity` (or `/refresh-relay/identity`),

@@ -63,7 +63,7 @@ pub use types::{
 | `ParticipationProof { session_hash, agent_identity, participating_nodes, signing_hash, fee_txid, timestamp }` | BRC-18 proof for fee distribution |
 | `RoundMessage { session_id, round, from, to, payload }` | Protocol message; `to=None` means broadcast |
 | `DkgResult { joint_key, share, session_id }` | Complete DKG output |
-| `SigningResult { signature, r, s, recovery_id, proof }` | DER sig + raw (r,s) + recovery ID + participation proof |
+| `SigningResult { signature, r, s, recovery_id, proof }` | DER sig + raw (r,s) + recovery ID + `proof: Option<ParticipationProof>` (always `None` from core — a conformant BRC-18/§10.7 proof needs the proxy's BRC-31 identity + post-broadcast fee_txid; core no longer fabricates a placeholder, see bsv-mpc#73/#87) |
 
 ### Errors (`error.rs`)
 

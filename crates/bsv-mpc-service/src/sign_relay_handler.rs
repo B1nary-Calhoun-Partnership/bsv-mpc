@@ -32,6 +32,7 @@
 //! ships ONLY the serialized partial.
 
 use bsv::primitives::ec::PrivateKey;
+use bsv_mpc_core::canonical::{canonical_execution_id, ExecutionParams, PhaseTag};
 use bsv_mpc_core::envelope::WrapParams;
 use bsv_mpc_core::presig_encryption::{decrypt_and_issue_partial, wallet_from_identity};
 use bsv_mpc_core::types::{RoundMessage, SessionId, ShareIndex};
@@ -132,11 +133,21 @@ pub async fn cosign_over_relay(params: SignRelayParams) -> anyhow::Result<SignRe
         to: Some(ShareIndex(params.to_index)),
         payload: partial_json.clone(),
     };
+    // §05.4.9 / §02: field 10 MUST be the first 8 bytes of THIS sign's canonical
+    // ExecutionId (phase tag 0x04), not a `[0u8; 8]` sentinel — otherwise relay
+    // bucket-by-ceremony joins are defeated. Consistent with phase="sign" per §05.4.4.
+    let eid = canonical_execution_id(&ExecutionParams::new_v1(
+        PhaseTag::Sign,
+        params.session_id,
+        params.joint_pubkey,
+    ));
+    let mut execution_id_prefix = [0u8; 8];
+    execution_id_prefix.copy_from_slice(&eid[..8]);
     let wrap = WrapParams {
         to_party: params.to_index,
         joint_pubkey: params.joint_pubkey,
-        phase: "sign".to_string(),
-        execution_id_prefix: [0u8; 8],
+        phase: PhaseTag::Sign.envelope_str().to_string(),
+        execution_id_prefix,
         correlation_id: Some(params.session_id.hex()),
         traceparent: None,
     };

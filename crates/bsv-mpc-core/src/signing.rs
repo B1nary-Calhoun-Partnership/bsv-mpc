@@ -50,7 +50,7 @@ use cggmp24::supported_curves::Secp256k1;
 use cggmp24::ExecutionId;
 use generic_ec::{NonZero, Point, Scalar, SecretScalar};
 use round_based::state_machine::StateMachine;
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
 
 use crate::dkg::{drive_inline, DriveStep, WireMessage};
 use crate::error::{MpcError, Result};
@@ -1084,10 +1084,10 @@ pub fn issue_partial_signature_json_with_offset(
 /// and participation proof.
 fn sig_bytes_to_signing_result(
     sig_bytes: &[u8; 64],
-    session_id: &SessionId,
+    _session_id: &SessionId,
     _share_index: ShareIndex,
-    message_hash: &[u8; 32],
-    participants: &[u16],
+    _message_hash: &[u8; 32],
+    _participants: &[u16],
 ) -> SigningResult {
     let r = sig_bytes[..32].to_vec();
     let s = sig_bytes[32..].to_vec();
@@ -1095,40 +1095,26 @@ fn sig_bytes_to_signing_result(
     // DER encode
     let signature = der_encode_signature(&r, &s);
 
-    // Recovery ID (default 0 -- proper recovery ID computation requires the nonce point,
-    // which cggmp24 does not expose. For BSV OP_CHECKSIG this is not needed.)
+    // Recovery ID hardcoded to 0. Deriving the true recovery_id needs the nonce
+    // point R, which cggmp24 does not expose. BSV OP_CHECKSIG consumes DER (r,s) +
+    // the sighash-type byte and never reads recovery_id, so 0 is correct on every
+    // current path. CROSS-CHAIN CAVEAT: any pubkey-recovery consumer (e.g.
+    // Ethereum-style ecrecover) MUST recover the recid itself — try recid ∈
+    // {0,1,2,3} and match the candidate pubkey against the known joint/child key. (#87)
     let recovery_id = 0;
 
-    // Create a placeholder participation proof.
-    // In production, the proxy layer will provide proper 33-byte agent/node keys.
-    // Here we use a minimal proof since we don't have real identity keys.
-    let proof = crate::types::ParticipationProof {
-        session_hash: {
-            let mut hasher = Sha256::new();
-            hasher.update(b"bsv-mpc-signing-proof-");
-            hasher.update(session_id.as_bytes());
-            hasher.finalize().to_vec()
-        },
-        agent_identity: vec![0x02; 33], // placeholder
-        participating_nodes: participants
-            .iter()
-            .map(|&p| {
-                let mut node_id = vec![0x02; 33];
-                node_id[32] = p as u8;
-                node_id
-            })
-            .collect(),
-        signing_hash: message_hash.to_vec(),
-        fee_txid: None,
-        timestamp: chrono::Utc::now(),
-    };
-
+    // No participation proof is fabricated here (bsv-mpc#73). A conformant BRC-18 /
+    // §10.7 proof needs the real BRC-31 agent identity (proxy-only) + the
+    // post-broadcast fee_txid (known only after createAction broadcasts) — neither
+    // exists in the crypto core, which signs before the tx does. Assembly belongs
+    // in the proxy when the §10 audit substrate lands (bsv-mpc#87); fabricating a
+    // placeholder produced a structurally non-conformant proof, so emit `None`.
     SigningResult {
         signature,
         r,
         s,
         recovery_id,
-        proof,
+        proof: None,
     }
 }
 
@@ -1174,6 +1160,7 @@ fn der_encode_signature(r: &[u8], s: &[u8]) -> Vec<u8> {
 mod tests {
     use super::*;
     use crate::types::ThresholdConfig;
+    use sha2::Digest; // tests below hash with Sha256::new(); lib code no longer does (#73)
     use std::collections::VecDeque;
 
     // ---- Buffered sink for simulation (from POC 1 / dkg.rs tests) ----

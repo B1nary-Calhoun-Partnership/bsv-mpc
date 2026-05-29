@@ -263,7 +263,7 @@ pub struct DkgResult {
 /// Result of a successful threshold signing operation.
 ///
 /// Contains the ECDSA signature in multiple formats (DER, raw r/s, recovery ID)
-/// plus the participation proof for on-chain fee distribution.
+/// plus an OPTIONAL participation proof for on-chain fee distribution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SigningResult {
     /// DER-encoded ECDSA signature (suitable for BSV Script).
@@ -274,8 +274,12 @@ pub struct SigningResult {
     pub s: Vec<u8>,
     /// Recovery ID (0 or 1), used for public key recovery from the signature.
     pub recovery_id: u8,
-    /// Participation proof recording which nodes contributed to this signature.
-    pub proof: ParticipationProof,
+    /// Optional BRC-18 / §10.7 participation proof. `None` today: a conformant
+    /// proof needs the real BRC-31 agent identity + the post-broadcast `fee_txid`,
+    /// both of which only the proxy holds — the crypto core signs before the tx
+    /// exists, so it no longer fabricates a (non-conformant) placeholder here
+    /// (bsv-mpc#73). Real assembly lands with the §10 audit substrate (bsv-mpc#87).
+    pub proof: Option<ParticipationProof>,
 }
 
 /// Canonical policy hash a presig is bound to (per MPC-Spec §09).

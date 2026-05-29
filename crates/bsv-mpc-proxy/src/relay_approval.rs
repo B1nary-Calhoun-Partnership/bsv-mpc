@@ -17,14 +17,21 @@
 //!
 //! The approval signature (not the transport) is the security boundary: a valid
 //! response binds an eligible signer to the exact `request_view_hash` +
-//! `session_id` (see [`bsv_mpc_core::approval`]). The envelope `phase` is set to
-//! `"sign"` (transport metadata only — there is no separate approval phase tag;
-//! approval semantics live entirely in the payload + the BRC-77 signature).
+//! `session_id` (see [`bsv_mpc_core::approval`]). Per ADR-0032 §2 / §09.5.1, the
+//! envelope carries `phase = "sign"` and `execution_id_prefix` = the first 8 bytes
+//! of the GATED sign's canonical ExecutionId (§02; phase tag `0x04`, same
+//! `session_id` + `joint_pubkey`): an approval gates a specific sign, so it buckets
+//! with that ceremony. There is no v1 `approval` phase tag — §02 is LOCKED and
+//! §02.9/§02.3 forbid v1 additions; a first-class `approval` phase is the v2 form
+//! (bsv-mpc#88). `phase = "sign"` stays consistent with the phase byte fed into
+//! that ExecutionId per §05.4.4. Approval traffic is distinguished from sign-round
+//! messages by the dedicated `mpc-approval` box + the inner `kind`, not by phase.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bsv::primitives::ec::PrivateKey;
 use bsv_mpc_core::approval::{sign_approval, ApprovalCollector, ApprovalDecision, ApprovalStatus};
+use bsv_mpc_core::canonical::{canonical_execution_id, ExecutionParams, PhaseTag};
 use bsv_mpc_core::envelope::WrapParams;
 use bsv_mpc_core::error::{MpcError, Result};
 use bsv_mpc_core::policy::ApprovalQuorum;
@@ -40,6 +47,24 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// First 8 bytes of the GATED sign's canonical §02 ExecutionId — the value the
+/// approval envelope's `execution_id_prefix` (field 10) MUST carry per ADR-0032 §2
+/// / §09.5.1. The approval envelope advertises `phase = "sign"`, so field 10 is the
+/// prefix of the sign's ExecutionId (phase tag `0x04`) — consistent with the phase
+/// byte per §05.4.4, and a real "first-8-of-§02-ExecutionId" per §05.4.9 (NOT a
+/// `[0u8; 8]` sentinel). Buckets the approval with the ceremony it gates. (A
+/// first-class `approval` phase is the v2 form — bsv-mpc#88.)
+fn gated_sign_eid_prefix(session_id: SessionId, joint_pubkey: [u8; 33]) -> [u8; 8] {
+    let eid = canonical_execution_id(&ExecutionParams::new_v1(
+        PhaseTag::Sign,
+        session_id,
+        joint_pubkey,
+    ));
+    let mut prefix = [0u8; 8];
+    prefix.copy_from_slice(&eid[..8]);
+    prefix
 }
 
 /// The approval-request payload the coordinator emits (§09.5.1 step 2), carried
@@ -129,8 +154,8 @@ pub async fn collect_approval_over_relay(
         let params = WrapParams {
             to_party: 0,
             joint_pubkey,
-            phase: "sign".to_string(),
-            execution_id_prefix: [0u8; 8],
+            phase: PhaseTag::Sign.envelope_str().to_string(),
+            execution_id_prefix: gated_sign_eid_prefix(session_id, joint_pubkey),
             correlation_id: Some(session_id.hex()),
             traceparent: None,
         };
@@ -290,8 +315,8 @@ pub async fn serve_one_approval(
         let params = WrapParams {
             to_party: 0,
             joint_pubkey,
-            phase: "sign".to_string(),
-            execution_id_prefix: [0u8; 8],
+            phase: PhaseTag::Sign.envelope_str().to_string(),
+            execution_id_prefix: gated_sign_eid_prefix(session_id, joint_pubkey),
             correlation_id: Some(session_id.hex()),
             traceparent: None,
         };
@@ -302,5 +327,50 @@ pub async fn serve_one_approval(
             .map_err(proto)?;
         sub.shutdown().await;
         return Ok((req.request_view_hash, req.session_id));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Regression guard for bsv-mpc#74: an approval envelope's execution_id_prefix
+    // (field 10) MUST be the first 8 bytes of the GATED sign's canonical §02
+    // ExecutionId — never the all-zero sentinel we replaced. Locks the fix against
+    // a silent revert. (sign_relay_handler.rs uses the identical formula inline.)
+    #[test]
+    fn approval_prefix_is_gated_sign_eid_not_zero() {
+        let session = SessionId::from_str_hash("bsv-mpc-74-approval-prefix-test");
+        let joint_pubkey = [0x02u8; 33];
+
+        let prefix = gated_sign_eid_prefix(session, joint_pubkey);
+
+        // Equals the canonical Sign (phase tag 0x04) ExecutionId's first 8 bytes.
+        let eid = canonical_execution_id(&ExecutionParams::new_v1(
+            PhaseTag::Sign,
+            session,
+            joint_pubkey,
+        ));
+        assert_eq!(
+            prefix,
+            eid[..8],
+            "prefix must be the first 8 bytes of the gated Sign ExecutionId"
+        );
+
+        // NOT the old [0u8; 8] leak sentinel.
+        assert_ne!(prefix, [0u8; 8], "execution_id_prefix must not be all-zero");
+
+        // phase advertised is "sign" → consistent with the phase byte (0x04) fed
+        // into that ExecutionId per §05.4.4.
+        assert_eq!(PhaseTag::Sign.envelope_str(), "sign");
+    }
+
+    // Distinct ceremonies bucket to distinct prefixes — the purpose of field 10.
+    #[test]
+    fn approval_prefix_differs_per_ceremony() {
+        let jpk = [0x03u8; 33];
+        let p1 = gated_sign_eid_prefix(SessionId::from_str_hash("ceremony-1"), jpk);
+        let p2 = gated_sign_eid_prefix(SessionId::from_str_hash("ceremony-2"), jpk);
+        assert_ne!(p1, p2, "distinct sessions must bucket to distinct prefixes");
     }
 }
