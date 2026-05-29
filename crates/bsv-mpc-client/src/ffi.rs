@@ -1990,6 +1990,68 @@ mod prime_pool_adapter_tests {
         assert!(adapter.take_encrypted().is_err(), "11≠12 byte nonce must error");
     }
 
+    /// REPRO: the runtime prewarm→createWallet cross-instance round-trip. Pool A
+    /// (prewarm: pool_id from `ffi_identity_pubkey_compressed_hex` → `dehex`) puts; pool B
+    /// (createWallet: pool_id from `identity.public_key().to_hex()` → `hex::decode`) takes.
+    /// If the two pool_ids differ, or the cross-instance key/decrypt fails, this fails —
+    /// exactly the on-device Lever B miss (drained pool, decrypt error, inline fallback).
+    #[test]
+    fn prewarm_createwallet_cross_instance_roundtrip() {
+        use bsv_mpc_core::paillier_pool::InMemoryPoolStorage;
+        use cggmp24::security_level::{SecurityLevel, SecurityLevel128};
+        use cggmp24::PregeneratedPrimes;
+        use rand::RngCore;
+
+        fn gen_blum<R: RngCore>(rng: &mut R, bits: u32) -> cggmp24::backend::Integer {
+            use cggmp24::backend::Integer;
+            loop {
+                let n = Integer::generate_prime(rng, bits);
+                if n.mod_u(4) == 3 {
+                    break n;
+                }
+            }
+        }
+        fn fast_primes<R: RngCore>(rng: &mut R) -> PregeneratedPrimes<SecurityLevel128> {
+            let bits = SecurityLevel128::RSA_PRIME_BITLEN;
+            PregeneratedPrimes::try_from([
+                gen_blum(rng, bits),
+                gen_blum(rng, bits),
+                gen_blum(rng, bits),
+                gen_blum(rng, bits),
+            ])
+            .expect("Blum primes")
+        }
+
+        let priv_hex = hex::encode([0x6du8; 32]);
+        let identity = bsv::primitives::ec::PrivateKey::from_bytes(&[0x6du8; 32]).unwrap();
+        let at_rest = [0x4fu8; 32];
+
+        // The TWO pool_id derivations used at runtime — MUST be byte-equal.
+        let prewarm_poolid =
+            dehex(&ffi_identity_pubkey_compressed_hex(priv_hex).unwrap(), "poolid").unwrap();
+        let createwallet_poolid = hex::decode(identity.public_key().to_hex()).unwrap();
+        assert_eq!(
+            prewarm_poolid, createwallet_poolid,
+            "POOL_ID MISMATCH: prewarm {} vs createWallet {}",
+            hex::encode(&prewarm_poolid),
+            hex::encode(&createwallet_poolid)
+        );
+
+        // Cross-instance round-trip over the REAL FFI-foreign-store path (the iOS path:
+        // two PaillierPools over FfiPrimePoolStoreAdapter wrapping one shared foreign store).
+        let _ = InMemoryPoolStorage::new(); // (kept import honest)
+        let fake: std::sync::Arc<dyn FfiPrimePoolStore> = std::sync::Arc::new(FakeFfiStore(Mutex::new(Vec::new())));
+        let mut rng = rand::rngs::OsRng;
+        let pre_pool = PaillierPool::new(FfiPrimePoolStoreAdapter(fake.clone()), &at_rest, &prewarm_poolid, 1);
+        pre_pool.put(fast_primes(&mut rng)).unwrap();
+        let cw_pool = PaillierPool::new(FfiPrimePoolStoreAdapter(fake.clone()), &at_rest, &createwallet_poolid, 1);
+        let taken = cw_pool.take().expect("take must not error");
+        assert!(
+            taken.is_some(),
+            "createWallet pool MUST take+decrypt prewarm's prime over the FFI adapter (cross-instance)"
+        );
+    }
+
     /// A `PaillierPool` built on the adapter drains real (Blum-fast) pre-seeded sets
     /// FIFO — the warm-pool path the device's `coordinate_dkg_over_relay` consumes.
     #[test]
