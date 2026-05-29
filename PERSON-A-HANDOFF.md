@@ -10,12 +10,17 @@
 - joint `03390c3a…` / addr `1QAE5RccM2eXpRNm9ZfiAjGUrUnyrSy2EB`. Topology device{0,1,2} + NotaryA{3,4}
   (`0278138e…` @ bsv-mpc-service-container) + NotaryB{5} (`034957e3…` @ bsv-mpc-service-container-b),
   real BRC-31, #85-pinned. Test `deployed_4of6_capstone_mainnet_e2e.rs` (commit `6860b13`).
-- **CLOSES #69, #70, #86; proves #85's funding-gate purpose.** Branch `person-a/69-pr2-client-multishare`
-  PUSHED (`6860b13`). Both Notaries deployed on dev@calhounjohn.com (account ea3e6d…). NotaryB master in
-  `secrets.md` (`MPC_SERVER_PRIVATE_KEY_NOTARY_B`); config `poc/cf-container-p2-notaryb/`.
-- **Remaining #85 (recovery flow ONLY, does NOT gate funding):** `/reshare-relay/identity` +
-  `/refresh-relay/identity` are unsigned — a CLIENT compare-to-pinned in `coordinate_reshare_over_relay` /
-  `recover_wallet` (mirror the presign pin). Mechanical follow-up.
+- **CLOSES #69, #70, #85, #86.** Branch `person-a/69-pr2-client-multishare` merged to **main** (`5b5e397`).
+  Both Notaries deployed on dev@calhounjohn.com (account ea3e6d…) — REDEPLOYED from current main to an
+  IDENTICAL `bsv-mpc-service` image, distinct master secrets (NotaryB master in `secrets.md`
+  `MPC_SERVER_PRIVATE_KEY_NOTARY_B`; config `poc/cf-container-p2-notaryb/`).
+- **#85 FULLY CLOSED across every identity surface:** DKG attestation + per-index verify + post-DKG
+  liveness challenge (proven on the mainnet 4-of-6 capstone), presign cosigner pin, AND the recovery
+  flow — `coordinate_reshare_over_relay` / `recover_wallet` pin the master (verify==pinned + post-reshare
+  challenge). Reshare/refresh LIVE-proven via `deployed_recover_e2e` (pinned NotaryA; recovered `033fb7f8…`
+  + re-signed under the same joint key, 581s) + fast `mitm_gate_85`. (Recover is 2-of-2 — `recover_wallet`'s
+  scope; 4-of-6 survivor recovery = #40, orthogonal.) Follow-up: proxy `bridge.rs` reshare should pin its
+  KSS master (noted in-code).
 
 ---
 

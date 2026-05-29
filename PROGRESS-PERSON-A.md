@@ -393,6 +393,22 @@ Design-only for now; after 4-of-6. **Last action:** — **Blockers:** none.
 
 _(append session-by-session notes here)_
 
+### 2026-05-29 LATE NIGHT — ✅ #85 FULLY CLOSED (recovery-flow MITM surface) + version-parity redeploy → ALL Person-A tickets closed
+- **#85 CLOSED** — the last identity surface (the recovery flow) is now pinned. `coordinate_reshare_over_relay`
+  / `recover_wallet` take `expected_master_pub`: fetch `/reshare-relay/identity` (or `/refresh-relay/identity`),
+  REJECT if `fetched != pinned`, route to the pin, and run a post-reshare liveness `/identity-challenge`.
+  Merged to **main** (`5b5e397`). Refresh identity = master pub directly (same compare-to-pinned).
+- **LIVE-PROVEN:** `deployed_recover_e2e::recover_roundtrip` (pinned NotaryA `0278138e…`) — created wallet
+  `033fb7f8…` → recovered over the relay (pinned reshare: verify==pin + challenge) → re-signed + verified under
+  the SAME joint key (581s, `1 passed`). Recover is **2-of-2** (`recover_wallet`'s scope; 4-of-6 survivor
+  recovery = #40, orthogonal to this gate). Fast always-run confirmation: `mitm_gate_85_signed_identity`
+  (dkg-peer-identity / identity-challenge / reshare+refresh cases, all reject MITM).
+- **Version parity:** both Notaries REDEPLOYED from current main to an IDENTICAL `bsv-mpc-service` image
+  (distinct masters — NotaryA `0278138e…`, NotaryB `034957e3…`) on dev@calhounjohn.com (account ea3e6d…).
+- **STATE: every Person-A ticket on the 4-of-6 critical path is CLOSED** — #69, #70, #85, #86 (capstone TXID
+  `fe0dc6b7…` is the funded proof; this session closes the recovery surface + parity). Follow-up (separate,
+  non-gating): proxy `bridge.rs` threshold-change reshare should pin its KSS master out-of-band (noted in-code).
+
 ### 2026-05-29 NIGHT — 🎉 CAPSTONE ON MAINNET: genuine 4-of-6, two independent Notaries, #85-hardened → WoC TXID
 - **Spending TXID `fe0dc6b78bb100d23a4454a36b37f8f23faa978a068054c18c184c7528e3456a`**
   (https://whatsonchain.com/tx/fe0dc6b78bb100d23a4454a36b37f8f23faa978a068054c18c184c7528e3456a) —
