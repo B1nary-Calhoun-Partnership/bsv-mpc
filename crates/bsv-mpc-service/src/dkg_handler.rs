@@ -449,6 +449,18 @@ fn persist_completed_share(inner: &Arc<DkgHandlerInner>, dkg_result: &DkgResult)
             // (user-decision: re-key at completion). Index = this party's held index.
             let agent_id = hex::encode(&dkg_result.joint_key.compressed);
             let index = dkg_result.share.share_index.0;
+            // Re-provision protection (user-decision #4 — reject-unless-owner): if a
+            // share already exists at this composite slot under a DIFFERENT non-empty
+            // owner, refuse to overwrite it (a re-run by a stranger cannot clobber).
+            if let Ok(Some(existing)) = storage.get_share_owner_at_index(&agent_id, index) {
+                if !existing.is_empty() && !owner.is_empty() && existing != owner {
+                    warn!(
+                        "DkgHandler: refusing to overwrite share {agent_id}#{index} owned by a \
+                         different identity (re-provision protection)"
+                    );
+                    return;
+                }
+            }
             storage.store_share_at_index(&agent_id, index, &dkg_result.share, &owner)
         }
         None => storage.store_share(&dkg_result.session_id.hex(), &dkg_result.share),

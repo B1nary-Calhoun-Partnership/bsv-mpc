@@ -6,6 +6,7 @@
 pub mod auth;
 pub mod custody;
 pub mod dkg_handler;
+pub mod dkg_relay_handlers;
 pub mod handlers;
 /// §05.4.6 / ADR-0051 SM-position ↔ absolute-keygen-index translation, shared
 /// by the presign + interactive-signing relay handlers (anti-drift).
@@ -74,8 +75,11 @@ pub struct CustodyConfig {
 pub struct AppState {
     /// Path to the data directory where the SQLite database lives.
     pub data_dir: String,
-    /// In-memory (dev) or SQLite-backed share storage.
-    pub storage: RwLock<SqliteShareStorage>,
+    /// In-memory (dev) or SQLite-backed share storage. `Arc<RwLock<…>>` so the
+    /// `/dkg-relay` route can hand a shared handle to a `DkgHandler` that persists
+    /// the genuine-DKG share directly (ADR-0052 composite keying); existing
+    /// `.read()/.write()` callers are unchanged (Arc derefs to the RwLock).
+    pub storage: Arc<RwLock<SqliteShareStorage>>,
     /// Server start time for uptime reporting.
     pub started_at: chrono::DateTime<chrono::Utc>,
     /// Presignature provisioning to the cosigner DO (`None` = disabled).
@@ -150,6 +154,19 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/reshare-relay/egress-test",
             get(reshare_relay_handlers::handle_reshare_relay_egress_test),
+        )
+        // §06.22 / ADR-0052 genuine n-party DKG over the relay (#69 PR-2): arm the
+        // container as one keygen party (`my_index`) of a FRESH t-of-n ceremony;
+        // the device drives its `w = t−1` parties. Composite-keys the resulting
+        // share by `{joint_pubkey}#{index}` so a cosigner holding >1 index never
+        // overwrites. Heavy MPC — container only, NOT the worker isolate.
+        .route(
+            "/dkg-relay/identity",
+            get(dkg_relay_handlers::handle_dkg_relay_identity),
+        )
+        .route(
+            "/dkg-relay/init",
+            post(dkg_relay_handlers::handle_dkg_relay_init),
         )
         // Read-only
         .route("/health", get(handlers::handle_health))

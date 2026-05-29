@@ -1,0 +1,285 @@
+//! §06.22 / ADR-0052 — **genuine n-party DKG over the relay** (#69 PR-2,
+//! CONTAINER target).
+//!
+//! The device-holds-(t−1) model needs all `n` shares of a `(t, n)` joint key
+//! created by a GENUINE n-party DKG (each party independent entropy) — not the
+//! 2-of-2-then-reshare path. These routes arm the deployed container as ONE
+//! keygen party (`my_index`) of a fresh ceremony over the `mpc-dkg` relay box;
+//! the device drives its own `w = t−1` parties (one identity each, ADR-0052
+//! Model B). DKG-only — no old share, no PSS, no combine. The resulting share is
+//! composite-keyed `"{joint_pubkey}#{my_index}"` (ADR-0052) so a container that
+//! holds more than one index never overwrites.
+//!
+//!   - `GET  /dkg-relay/identity` — the container's relay / BRC-31 identity hex
+//!     (so the device can register peers + ship round-1 before arming it — the
+//!     §06.17 ordering invariant). Also the deployed-image staleness smoke test.
+//!   - `POST /dkg-relay/init` — arm the container as keygen party `my_index`.
+//!
+//! Owner-authz gated (§08.1, the authed caller becomes the share owner); requires
+//! an enforced server identity (`MPC_SERVER_PRIVATE_KEY`). Heavy MPC — container
+//! only, NOT the worker isolate.
+
+use std::sync::Arc;
+
+use axum::{
+    body::Bytes,
+    extract::State,
+    http::{HeaderMap, StatusCode},
+    response::IntoResponse,
+    Json,
+};
+use bsv_mpc_core::types::{SessionId, ThresholdConfig};
+use bsv_mpc_messagebox::types::BOX_DKG;
+use bsv_mpc_messagebox::MessageBoxClient;
+use serde::{Deserialize, Serialize};
+use tracing::{info, warn};
+
+use crate::dkg_handler::DkgHandler;
+use crate::messagebox::MessageBoxListener;
+use crate::AppState;
+
+fn err_response(
+    status: StatusCode,
+    msg: impl std::fmt::Display,
+) -> (StatusCode, Json<serde_json::Value>) {
+    (status, Json(serde_json::json!({"error": msg.to_string()})))
+}
+
+/// The canonical relay URL (mirrors the reshare/presign/refresh relay routes).
+fn relay_url() -> String {
+    std::env::var("RELAY_URL")
+        .or_else(|_| std::env::var("MESSAGEBOX_RELAY_URL"))
+        .unwrap_or_else(|_| "https://rust-message-box.dev-a3e.workers.dev".to_string())
+}
+
+// ── /dkg-relay/identity ────────────────────────────────────────────────────────
+
+/// `GET /dkg-relay/identity` — the container's relay / BRC-31 identity hex.
+/// Read-only; also the deployed-image staleness smoke test (404 ⇒ stale image).
+pub async fn handle_dkg_relay_identity(State(_state): State<Arc<AppState>>) -> impl IntoResponse {
+    match crate::auth::server_identity_priv_from_env() {
+        Ok(k) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "peer_pub_hex": k.public_key().to_hex() })),
+        ),
+        Err(e) => err_response(
+            StatusCode::PRECONDITION_FAILED,
+            format!("no server identity: {e}"),
+        ),
+    }
+}
+
+// ── /dkg-relay/init ──────────────────────────────────────────────────────────
+
+/// A ceremony peer's relay identity (absolute keygen index → identity hex).
+#[derive(Debug, Clone, Deserialize)]
+pub struct DkgRelayPeer {
+    /// The peer's ABSOLUTE keygen party index (entry of `parties_at_keygen`).
+    pub index: u16,
+    /// The peer's relay / BRC-31 identity hex.
+    pub pub_hex: String,
+}
+
+/// Request body for `POST /dkg-relay/init`. `deny_unknown_fields` rejects
+/// reshare-only fields (no `reshare_session`, `new_eval_points_hex`, contributor
+/// lists) — this is a FRESH DKG, not a reshare.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DkgRelayInitRequest {
+    /// Provisional ceremony id (owner-authz §08.1). For a FRESH DKG the joint
+    /// pubkey is not known until completion, so the durable share is RE-KEYED to
+    /// `{joint_pubkey}#{my_index}` at completion (ADR-0052 user-decision a); this
+    /// field is the caller's declared ceremony handle, not the final storage key.
+    pub agent_id: String,
+    /// The DKG session id — canonical 64-char hex, SHARED across all `n` parties.
+    pub dkg_session: String,
+    /// This container's ABSOLUTE keygen index in `0..parties`.
+    pub my_index: u16,
+    /// The threshold `t`.
+    pub threshold: u16,
+    /// The party count `n`.
+    pub parties: u16,
+    /// ALL OTHER parties (absolute index, relay identity hex), canonical ascending
+    /// — both the device's held indices and any other container indices.
+    pub peers: Vec<DkgRelayPeer>,
+}
+
+/// Response from `POST /dkg-relay/init`.
+#[derive(Debug, Serialize)]
+pub struct DkgRelayInitResponse {
+    /// This container's relay identity hex — the device addresses round messages here.
+    pub peer_pub_hex: String,
+}
+
+/// `POST /dkg-relay/init` — arm the container as keygen party `my_index` of a
+/// fresh genuine n-party DKG over the relay (§06.22 / ADR-0052). Subscribes the
+/// `mpc-dkg` box, ships round-1, then (off the hot path) generates safe primes and
+/// late-seeds them (§06.17 ordering). The share persists composite-keyed under
+/// `{joint_pubkey}#{my_index}` with the authed caller as owner.
+pub async fn handle_dkg_relay_init(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    raw: Bytes,
+) -> impl IntoResponse {
+    // §07 auth over the RAW body; the authed caller becomes the share owner (§08.1).
+    let caller = match crate::auth::verify_or_allow(
+        "POST",
+        "/dkg-relay/init",
+        &headers,
+        &raw,
+        &state.auth,
+    ) {
+        Ok(id) => id,
+        Err(resp) => return resp,
+    };
+    let body: DkgRelayInitRequest = match crate::handlers::parse_body_pub(&raw) {
+        Ok(b) => b,
+        Err(resp) => return resp,
+    };
+
+    let identity_priv = match crate::auth::server_identity_priv_from_env() {
+        Ok(k) => k,
+        Err(e) => {
+            return err_response(
+                StatusCode::PRECONDITION_FAILED,
+                format!("dkg-relay requires an enforced server identity: {e}"),
+            )
+        }
+    };
+
+    let config = match ThresholdConfig::new(body.threshold, body.parties) {
+        Ok(c) => c,
+        Err(e) => return err_response(StatusCode::BAD_REQUEST, e),
+    };
+    if body.my_index >= body.parties {
+        return err_response(
+            StatusCode::BAD_REQUEST,
+            format!("my_index {} >= parties {}", body.my_index, body.parties),
+        );
+    }
+    let dkg_session = match SessionId::from_hex(&body.dkg_session) {
+        Ok(id) => id,
+        Err(e) => {
+            return err_response(
+                StatusCode::BAD_REQUEST,
+                format!("dkg_session must be canonical 64-char hex: {e}"),
+            )
+        }
+    };
+
+    // Relay client + this container's relay identity.
+    let relay_url = relay_url();
+    let client = match MessageBoxClient::new(&relay_url, identity_priv) {
+        Ok(c) => c,
+        Err(e) => return err_response(StatusCode::BAD_GATEWAY, format!("relay client: {e}")),
+    };
+    let peer_pub_hex = match client.identity_hex().await {
+        Ok(h) => h,
+        Err(e) => return err_response(StatusCode::BAD_GATEWAY, format!("relay identity: {e}")),
+    };
+
+    let peers: Vec<(u16, String)> = body
+        .peers
+        .iter()
+        .map(|p| (p.index, p.pub_hex.clone()))
+        .collect();
+
+    // DkgHandler bound to the REAL durable storage; composite-persist the genuine
+    // share under `{joint_pubkey}#{my_index}` with owner = the authed caller (§08.1).
+    let dkg_handler = DkgHandler::new(config, body.my_index, Arc::clone(&state.storage));
+    dkg_handler.use_composite_persist(caller.identity_key.clone());
+
+    let dkg_listener =
+        match MessageBoxListener::start(client.clone(), BOX_DKG, dkg_handler.handler_fn()).await {
+            Ok(l) => l,
+            Err(e) => {
+                return err_response(StatusCode::BAD_GATEWAY, format!("dkg listener start: {e}"))
+            }
+        };
+    let (dkg_rx, dkg_round1) = match dkg_handler.initiate(dkg_session, peers).await {
+        Ok(v) => v,
+        Err(e) => {
+            dkg_listener.shutdown().await;
+            return err_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("dkg initiate: {e}"),
+            );
+        }
+    };
+    for out in &dkg_round1 {
+        if let Err(e) = client
+            .send_round_message(
+                &out.recipient_pub_hex,
+                &out.message_box,
+                &out.round_msg,
+                out.params.clone(),
+            )
+            .await
+        {
+            dkg_listener.shutdown().await;
+            return err_response(StatusCode::BAD_GATEWAY, format!("ship dkg round-1: {e}"));
+        }
+    }
+
+    // §06.17 ordering: round-1 is shipped (we are NOT late on the relay); now
+    // generate the slow safe primes off the hot path and late-seed them before the
+    // keygen→auxinfo transition consumes them. If keygen outruns prime gen, auxinfo
+    // falls back to inline generation (correct, slower).
+    {
+        let seed_handler = dkg_handler.clone();
+        tokio::spawn(async move {
+            match tokio::task::spawn_blocking(|| {
+                bsv_mpc_core::paillier_pool::generate_serialized(&mut rand::rngs::OsRng)
+            })
+            .await
+            {
+                Ok(primes) => seed_handler.seed_primes_late(dkg_session, primes),
+                Err(e) => warn!("dkg-relay: prime gen task panicked: {e}; auxinfo will inline-gen"),
+            }
+        });
+    }
+
+    // Completion task: the share is persisted by the DkgHandler's `finish_complete`
+    // (composite key, real storage) the moment this party's ceremony completes. We
+    // await completion to VERIFY persistence-before-funding (the lost-funds class)
+    // and release the listener.
+    let state_for_verify = state.clone();
+    let my_index = body.my_index;
+    tokio::spawn(async move {
+        let dkg_result = match dkg_rx.await {
+            Ok(r) => r,
+            Err(_) => {
+                warn!("dkg-relay: DKG channel dropped before completion; share NOT persisted");
+                dkg_listener.shutdown().await;
+                return;
+            }
+        };
+        dkg_listener.shutdown().await;
+        // Persistence-before-funding: the composite share for our held index MUST be
+        // durably present (finish_complete already wrote it). The device gates a
+        // fundable address on the same check across ALL its held indices.
+        let agent_id = hex::encode(&dkg_result.joint_key.compressed);
+        let present = state_for_verify
+            .storage
+            .read()
+            .ok()
+            .and_then(|s| s.get_share_at_index(&agent_id, my_index).ok().flatten())
+            .is_some();
+        if present {
+            info!(agent_id = %agent_id, my_index, "dkg-relay: ceremony complete — share durably persisted");
+        } else {
+            warn!(agent_id = %agent_id, my_index, "dkg-relay: ceremony complete but share NOT durably persisted — investigate");
+        }
+    });
+
+    info!(
+        my_index = body.my_index,
+        threshold = body.threshold,
+        parties = body.parties,
+        "dkg-relay: peer armed (genuine n-party DKG initiated), round-1 shipped"
+    );
+    (
+        StatusCode::OK,
+        Json(serde_json::to_value(DkgRelayInitResponse { peer_pub_hex }).unwrap_or_default()),
+    )
+}
