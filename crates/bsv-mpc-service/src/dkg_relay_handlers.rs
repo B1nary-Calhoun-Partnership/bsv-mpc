@@ -23,7 +23,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 
 use axum::{
     body::Bytes,
-    extract::State,
+    extract::{Query, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
     Json,
@@ -135,6 +135,75 @@ pub async fn handle_dkg_relay_identity(State(_state): State<Arc<AppState>>) -> i
     }
 }
 
+// ── /dkg-relay/peer-identity ─────────────────────────────────────────────────
+
+/// Query for `GET /dkg-relay/peer-identity` — the (session, index) whose
+/// per-index relay identity public key the caller wants.
+#[derive(Debug, Deserialize)]
+pub struct PeerIdentityQuery {
+    /// The DKG session id — canonical 64-char hex.
+    pub session: String,
+    /// The absolute keygen index this container will drive in that ceremony.
+    pub index: u16,
+}
+
+/// `GET /dkg-relay/peer-identity?session=<hex>&index=<u16>` — the **per-index**
+/// relay identity *public* key this container will use as keygen party `index`
+/// of the ceremony `session` (ADR-0052 Model B / §06.22).
+///
+/// The relay identity is a ONE-WAY HMAC of the master server identity (see
+/// `bsv_mpc_core::hd::derive_relay_index_privkey`), so the **device cannot**
+/// recompute it — it fetches each container index's relay pub here (read-only)
+/// to register the cosigner parties as relay peers before arming them. The
+/// value returned here MUST equal the `peer_pub_hex` that `POST /dkg-relay/init`
+/// reports for the same (session, index) — the device asserts that equality to
+/// catch any index-derivation drift (5b invariant).
+///
+/// Read-only and unauthenticated TODAY — the same MITM exposure as the other
+/// `/*-relay/identity` reads, tracked by `#85`: pin the master identity
+/// out-of-band + sign this fetch before god-tier-production funding.
+pub async fn handle_dkg_relay_peer_identity(
+    State(_state): State<Arc<AppState>>,
+    Query(q): Query<PeerIdentityQuery>,
+) -> impl IntoResponse {
+    let server_priv = match crate::auth::server_identity_priv_from_env() {
+        Ok(k) => k,
+        Err(e) => {
+            return err_response(
+                StatusCode::PRECONDITION_FAILED,
+                format!("no server identity: {e}"),
+            )
+        }
+    };
+    let session = match SessionId::from_hex(&q.session) {
+        Ok(s) => s,
+        Err(e) => {
+            return err_response(
+                StatusCode::BAD_REQUEST,
+                format!("session must be canonical 64-char hex: {e}"),
+            )
+        }
+    };
+    let relay_priv =
+        match bsv_mpc_core::hd::derive_relay_index_privkey(&server_priv, &session, q.index) {
+            Ok(k) => k,
+            Err(e) => {
+                return err_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("dkg-relay identity derivation: {e}"),
+                )
+            }
+        };
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "index": q.index,
+            "session": q.session,
+            "relay_pub_hex": relay_priv.public_key().to_hex(),
+        })),
+    )
+}
+
 // ── /dkg-relay/init ──────────────────────────────────────────────────────────
 
 /// A ceremony peer's relay identity (absolute keygen index → identity hex).
@@ -234,9 +303,30 @@ pub async fn handle_dkg_relay_init(
         }
     };
 
-    // Relay client + this container's relay identity.
+    // Per-index relay identity (ADR-0052 Model B): a DISTINCT relay/BRC-31
+    // identity per held keygen index, so each party lands in its OWN relay room
+    // (`{identity}-{box}`) and round messages route cleanly even when one
+    // container drives several indices (the "two Notaries, one holds two"
+    // topology). ONE-WAY HMAC of the master server identity (server_priv is the
+    // HMAC key) — a leaked relay key cannot recover server_priv, which is also
+    // the BRC-31 auth + BRC-2 share-sealing key. See `bsv_mpc_core::hd`.
+    let relay_identity_priv = match bsv_mpc_core::hd::derive_relay_index_privkey(
+        &identity_priv,
+        &dkg_session,
+        body.my_index,
+    ) {
+        Ok(k) => k,
+        Err(e) => {
+            return err_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("dkg-relay identity derivation: {e}"),
+            )
+        }
+    };
+
+    // Relay client + this container's per-index relay identity.
     let relay_url = relay_url();
-    let client = match MessageBoxClient::new(&relay_url, identity_priv) {
+    let client = match MessageBoxClient::new(&relay_url, relay_identity_priv) {
         Ok(c) => c,
         Err(e) => return err_response(StatusCode::BAD_GATEWAY, format!("relay client: {e}")),
     };

@@ -33,11 +33,13 @@
 //! BSV SDK implementation: `bsv::wallet::KeyDeriver`
 
 use crate::error::{MpcError, Result};
-use crate::types::JointPublicKey;
+use crate::types::{JointPublicKey, SessionId};
 
-use bsv::primitives::ec::PublicKey;
+use bsv::primitives::ec::{PrivateKey, PublicKey};
 use bsv::primitives::hash::sha256_hmac;
 use bsv::Address;
+use cggmp24::supported_curves::Secp256k1;
+use generic_ec::Scalar;
 
 /// Derive a BRC-42 child public key from a shared secret and invoice number.
 ///
@@ -212,6 +214,89 @@ pub fn derive_joint_key_with_secret(
     let invoice = compute_invoice(security_level, protocol_name, key_id)?;
     let child_pub = derive_child_pubkey(&root_pub, shared_secret, &invoice)?;
     pubkey_to_joint_key(&child_pub)
+}
+
+/// Domain-separation tag for the per-index DKG-relay ceremony identity.
+///
+/// Versioned (`v1`) so a future construction change is a distinct domain and
+/// can never collide with keys minted under this one. Container-internal — this
+/// string is NOT a cross-impl wire format (the derived *public* key crosses the
+/// relay-fetch boundary, but the derivation itself is purely local to the
+/// cosigner that holds `server_priv`).
+const DKG_RELAY_IDENTITY_DOMAIN_V1: &[u8] = b"bsv-mpc dkg-relay identity v1";
+
+/// Derive a **per-index, ceremony-scoped, one-way** relay identity private key
+/// for a single keygen party that a cosigner drives in a genuine n-party DKG
+/// over the MessageBox relay (ADR-0052 Model B, §06.22).
+///
+/// ```text
+/// relay_priv_i = reduce_mod_n(
+///     HMAC-SHA256(
+///         key = server_priv_bytes,
+///         msg = b"bsv-mpc dkg-relay identity v1" ‖ session_id(32) ‖ index_be_u16
+///     )
+/// )
+/// ```
+///
+/// ## Why one-way HMAC and NOT additive (`server_priv + H(pub‖i)`)
+///
+/// A cosigner that holds 2+ keygen indices (the "two Notaries, one holds two"
+/// topology) needs a DISTINCT relay identity per index so each party lands in
+/// its own relay room (`{identity}-{box}`) and round messages route cleanly.
+///
+/// The tempting shortcut — an **additive** offset `relay_priv_i = server_priv +
+/// H(pub‖i)` — is **catastrophic** and was rejected (PERSON-A-HANDOFF,
+/// ADR-0052): the offset `H(pub‖i)` is public, so leaking ANY single
+/// `relay_priv_i` immediately yields `server_priv = relay_priv_i − H(pub‖i)`.
+/// And `server_priv` is *also* the BRC-31 transport-auth key and the BRC-2
+/// share-sealing key — recovering it from one ephemeral relay key would defeat
+/// auth and unseal every custody share at once.
+///
+/// This HMAC construction is **one-way**: `server_priv` is the HMAC *key*, so
+/// no derived `relay_priv_i` (or set of them) reveals it. It is also
+/// ceremony-scoped (binds `session_id`) and index-separated (binds `index`),
+/// so identities never collide across ceremonies or indices.
+///
+/// Because the derivation is one-way, the **device cannot** recompute a
+/// cosigner's relay public key — it fetches each one read-only from the
+/// cosigner over `GET /dkg-relay/peer-identity?session&index` (a fetch the
+/// `#85` hardening will authenticate).
+///
+/// # Arguments
+/// * `server_priv` — the cosigner's enforced server identity key
+///   (`MPC_SERVER_PRIVATE_KEY`). Used ONLY as the HMAC key; never transmitted.
+/// * `session_id` — the canonical 64-char-hex DKG session id, shared across all
+///   `n` parties of the ceremony (§04).
+/// * `index` — this party's absolute keygen index in `[0, n)`.
+///
+/// # Errors
+/// `MpcError::Protocol` only in the cryptographically-negligible case that the
+/// reduced scalar is zero (≈ 2⁻²⁵⁶); the value is always reduced mod the
+/// secp256k1 group order so it is otherwise a valid private key.
+pub fn derive_relay_index_privkey(
+    server_priv: &PrivateKey,
+    session_id: &SessionId,
+    index: u16,
+) -> Result<PrivateKey> {
+    let mut msg = Vec::with_capacity(DKG_RELAY_IDENTITY_DOMAIN_V1.len() + 32 + 2);
+    msg.extend_from_slice(DKG_RELAY_IDENTITY_DOMAIN_V1);
+    msg.extend_from_slice(session_id.as_bytes());
+    msg.extend_from_slice(&index.to_be_bytes());
+
+    // server_priv is the HMAC KEY (one-way): no derived key reveals it.
+    let mac = sha256_hmac(&server_priv.to_bytes(), &msg);
+
+    // Reduce mod n so the result is ALWAYS a valid scalar in [0, n) — the
+    // ~2⁻¹²⁸ of raw HMAC outputs that land in [n, 2²⁵⁶) would otherwise be
+    // rejected by PrivateKey::from_bytes, making derivation non-total.
+    let reduced = Scalar::<Secp256k1>::from_be_bytes_mod_order(mac);
+    let reduced_bytes = reduced.to_be_bytes();
+
+    PrivateKey::from_bytes(reduced_bytes.as_bytes()).map_err(|e| {
+        MpcError::Protocol(format!(
+            "dkg-relay identity derivation produced an invalid scalar (zero key?): {e}"
+        ))
+    })
 }
 
 /// Convert a PublicKey to a JointPublicKey with BSV address.
@@ -754,5 +839,148 @@ mod tests {
         let long_invoice = "a".repeat(10000);
         let child = derive_child_pubkey(&pubkey, &pubkey, &long_invoice).unwrap();
         assert_ne!(pubkey.to_compressed(), child.to_compressed());
+    }
+
+    // -------------------------------------------------------------------
+    // derive_relay_index_privkey — per-index, one-way, ceremony-scoped
+    // DKG-relay identity (ADR-0052 Model B / §06.22). #69 PR-2 step 5a-i.
+    //
+    // These tests are the gate for the security property that killed the
+    // ADDITIVE design (`relay_priv_i = server_priv + H(pub‖i)`, which leaks
+    // server_priv — also the BRC-31 auth + BRC-2 sealing key — if any single
+    // relay key leaks). The construction here is one-way (server_priv is the
+    // HMAC key), index-separated, and ceremony-scoped. Positive + negative
+    // (separation) invariants + a frozen wire-vector are all asserted.
+    // -------------------------------------------------------------------
+
+    fn relay_server_priv() -> PrivateKey {
+        PrivateKey::from_bytes(&[0x11u8; 32]).expect("valid server priv")
+    }
+
+    fn relay_session() -> SessionId {
+        SessionId::from_bytes([0x22u8; 32])
+    }
+
+    #[test]
+    fn relay_index_privkey_is_deterministic() {
+        let sp = relay_server_priv();
+        let sess = relay_session();
+        let a = derive_relay_index_privkey(&sp, &sess, 3).unwrap();
+        let b = derive_relay_index_privkey(&sp, &sess, 3).unwrap();
+        assert_eq!(
+            a.to_bytes(),
+            b.to_bytes(),
+            "same (server_priv, session, index) MUST derive the same relay identity"
+        );
+    }
+
+    #[test]
+    fn relay_index_privkey_distinct_per_index() {
+        // Domain-separation negative: a cosigner holding {3,4,5} MUST get three
+        // DISTINCT relay identities → three distinct relay rooms. If two indices
+        // collided their round messages would cross-deliver and the ceremony
+        // would wedge ("no outgoing messages to bundle").
+        let sp = relay_server_priv();
+        let sess = relay_session();
+        let k3 = derive_relay_index_privkey(&sp, &sess, 3).unwrap();
+        let k4 = derive_relay_index_privkey(&sp, &sess, 4).unwrap();
+        let k5 = derive_relay_index_privkey(&sp, &sess, 5).unwrap();
+        assert_ne!(k3.to_bytes(), k4.to_bytes());
+        assert_ne!(k4.to_bytes(), k5.to_bytes());
+        assert_ne!(k3.to_bytes(), k5.to_bytes());
+        // pubs distinct too — the relay routes by the identity *pubkey*.
+        assert_ne!(
+            k3.public_key().to_compressed(),
+            k4.public_key().to_compressed()
+        );
+    }
+
+    #[test]
+    fn relay_index_privkey_index_endianness_is_be_u16() {
+        // index is encoded big-endian u16: index 1 and index 256 (0x0100) differ
+        // only in byte order — a little-endian bug would still produce distinct
+        // keys but with swapped bytes, so distinctness AND the frozen vector
+        // together pin BE. This asserts the distinctness half.
+        let sp = relay_server_priv();
+        let sess = relay_session();
+        let k1 = derive_relay_index_privkey(&sp, &sess, 1).unwrap();
+        let k256 = derive_relay_index_privkey(&sp, &sess, 256).unwrap();
+        assert_ne!(k1.to_bytes(), k256.to_bytes());
+    }
+
+    #[test]
+    fn relay_index_privkey_distinct_per_session() {
+        // Ceremony-scoped: the same index in a different ceremony MUST be a
+        // different identity (binds session_id → no cross-ceremony reuse).
+        let sp = relay_server_priv();
+        let a = derive_relay_index_privkey(&sp, &SessionId::from_bytes([0x22u8; 32]), 3).unwrap();
+        let b = derive_relay_index_privkey(&sp, &SessionId::from_bytes([0x23u8; 32]), 3).unwrap();
+        assert_ne!(
+            a.to_bytes(),
+            b.to_bytes(),
+            "same index in different ceremonies MUST derive different identities"
+        );
+    }
+
+    #[test]
+    fn relay_index_privkey_is_one_way_distinct_from_server_priv() {
+        // THE property that killed the additive design: the derived relay key
+        // MUST NOT equal server_priv (the identity map). An additive offset
+        // `server_priv + H(pub‖i)` lets a leaked relay key recover server_priv —
+        // and server_priv is also the BRC-31 auth + BRC-2 sealing key. One-way
+        // HMAC (server_priv = key) cannot be inverted from any derived key.
+        let sp = relay_server_priv();
+        let sess = relay_session();
+        for idx in [0u16, 1, 3, 5, 42] {
+            let k = derive_relay_index_privkey(&sp, &sess, idx).unwrap();
+            assert_ne!(
+                k.to_bytes(),
+                sp.to_bytes(),
+                "relay identity at index {idx} MUST NOT equal server_priv"
+            );
+        }
+    }
+
+    #[test]
+    fn relay_index_privkey_keys_on_server_priv() {
+        // Different server identity → different relay identity (server_priv is
+        // the HMAC key). Two INDEPENDENT Notaries must never collide on a relay
+        // identity for the same (session, index).
+        let sp_a = PrivateKey::from_bytes(&[0x11u8; 32]).unwrap();
+        let sp_b = PrivateKey::from_bytes(&[0x12u8; 32]).unwrap();
+        let sess = relay_session();
+        let a = derive_relay_index_privkey(&sp_a, &sess, 3).unwrap();
+        let b = derive_relay_index_privkey(&sp_b, &sess, 3).unwrap();
+        assert_ne!(a.to_bytes(), b.to_bytes());
+    }
+
+    #[test]
+    fn relay_index_privkey_is_valid_secp256k1_key() {
+        let sp = relay_server_priv();
+        let sess = relay_session();
+        let k = derive_relay_index_privkey(&sp, &sess, 3).unwrap();
+        let pub_c = k.public_key().to_compressed();
+        assert_eq!(pub_c.len(), 33);
+        assert!(
+            pub_c[0] == 0x02 || pub_c[0] == 0x03,
+            "derived relay identity must be a valid compressed secp256k1 point"
+        );
+    }
+
+    #[test]
+    fn relay_index_privkey_frozen_vector() {
+        // ZERO-DRIFT golden vector. Locks the EXACT construction: domain tag
+        // b"bsv-mpc dkg-relay identity v1", then session(32), then index as
+        // big-endian u16, HMAC keyed by server_priv bytes, reduced mod n. ANY
+        // change to tag / field order / endianness flips this and fails.
+        // Inputs: server_priv = [0x11;32], session = [0x22;32], index = 3.
+        let sp = relay_server_priv();
+        let sess = relay_session();
+        let k = derive_relay_index_privkey(&sp, &sess, 3).unwrap();
+        assert_eq!(
+            hex::encode(k.to_bytes()),
+            "f698e3016303f85f5358e07dbe9b23ae798182cf5d1c5bac93163f6afa40d72d",
+            "DKG-relay identity derivation drifted from the frozen vector"
+        );
     }
 }

@@ -234,6 +234,60 @@ impl MessageBoxClient {
         self.send(recipient_pub_hex, message_box, &envelope).await
     }
 
+    /// [`send_round_message`] with a bounded, IDEMPOTENT retry.
+    ///
+    /// A transient `/sendMessage` failure (connection reset, momentary
+    /// relay/network blip) otherwise drops the round message — and a single
+    /// dropped DKG/sign/presign/reshare round message stalls the recipient
+    /// until the ceremony times out. This wraps the envelope ONCE and generates
+    /// ONE stable `message_id`, then re-sends that exact `(recipient,
+    /// message_box, message_id)` tuple up to `max_attempts` times with
+    /// exponential backoff. The relay dedups on that tuple (re-sends are
+    /// no-ops) and the receive side dedups by the relay `message_id`, so
+    /// delivery is EXACTLY-ONCE across retries — a retry can never deliver a
+    /// duplicate round message (which would abort a cggmp24 state machine).
+    ///
+    /// Returns the relay `message_id` on the first success (or relay no-op of a
+    /// re-send); returns the last transport error if all attempts fail.
+    pub async fn send_round_message_reliable(
+        &self,
+        recipient_pub_hex: &str,
+        message_box: &str,
+        round_msg: &RoundMessage,
+        params: WrapParams,
+        max_attempts: u32,
+    ) -> Result<String> {
+        let recipient_pub = PublicKey::from_hex(recipient_pub_hex)
+            .map_err(|e| MessageBoxError::Protocol(format!("recipient pub hex: {e:?}")))?;
+        let envelope = wrap_round_message(round_msg, params, &recipient_pub, &self.identity_priv)
+            .map_err(MessageBoxError::Envelope)?;
+        // ONE stable id reused across attempts → idempotent re-send (relay
+        // dedups on (recipient, message_box, message_id)).
+        let message_id = generate_message_id();
+        let attempts = max_attempts.max(1);
+        let mut last_err: Option<MessageBoxError> = None;
+        for attempt in 0..attempts {
+            match self
+                .send_with_id(recipient_pub_hex, message_box, &message_id, &envelope)
+                .await
+            {
+                Ok(id) => return Ok(id),
+                Err(e) => {
+                    last_err = Some(e);
+                    if attempt + 1 < attempts {
+                        // 200ms, 400ms, 800ms, … (capped) — short, since these
+                        // are transient connection blips, not server outages.
+                        let ms = 200u64 << attempt.min(5);
+                        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                    }
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| {
+            MessageBoxError::Protocol("send_round_message_reliable: no attempt ran".into())
+        }))
+    }
+
     /// Subscribe to one mailbox and yield typed [`DecodedRoundMessage`]s —
     /// each envelope's BRC-78 inner has been decrypted with our identity
     /// priv, the BRC-31 sender signature verified against the

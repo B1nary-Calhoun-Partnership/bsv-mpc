@@ -97,6 +97,12 @@ pin-project.workspace = true
 bsv = { workspace = true }
 # Mainnet capstone E2E (gated E2E_MAINNET=1): fund via wallet:3321, broadcast via ARC, confirm on WoC.
 reqwest = { version = "0.12", features = ["json"] }
+# #69 PR-2 step-5b multi-index DKG e2e spins an IN-PROCESS bsv-mpc-service container
+# (build_router + AppState) to arm {3,4,5} over the relay — needs the axum server,
+# chrono (AppState.started_at), and a tracing subscriber for --nocapture diagnostics.
+axum.workspace = true
+chrono.workspace = true
+tracing-subscriber = { workspace = true }
 
 # wasm-bindgen skin (web client). wasm32-only — the native build never sees it,
 # so no feature flag is needed; the `wasm` module is `cfg(target_arch="wasm32")`.

@@ -88,6 +88,7 @@ async fn provision_and_connect() -> (DeployedSigner, PublicKey, Vec<u8>, String)
                 config: w.config,
                 participants: w.participants,
                 device_share_index: w.device_share_index,
+                my_indices: vec![w.device_share_index],
                 cosigner_party: w.cosigner_party,
                 dkg_session_id: w.dkg_session_id,
             },

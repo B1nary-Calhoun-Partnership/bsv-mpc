@@ -46,9 +46,17 @@ pub struct WalletMeta {
     pub config: ThresholdConfig,
     /// Signing participant set (sorted keygen indices, e.g. `[0, 1]`).
     pub participants: Vec<u16>,
-    /// This device's signing index (the coordinator party — `1` in the proven flow).
+    /// This device's PRIMARY signing index (`device_holds_combine`'s primary
+    /// share). For a 2-of-2 wallet it is the lone device index; for an n-party
+    /// device-holds-(t−1) wallet it is `my_indices[0]`.
     pub device_share_index: u16,
-    /// The deployed cosigner's keygen index (`0` in the proven flow).
+    /// ALL keygen indices this device holds (ADR-0052 device-holds-(t−1)). Length
+    /// 1 for the proven 2-of-2 wallet (`= [device_share_index]`); length `w = t−1`
+    /// for the multi-share wallet. Each share is sealed composite-keyed
+    /// `"{agent_id}#{index}"` (multi-share) or under `agent_id` (legacy 2-of-2).
+    pub my_indices: Vec<u16>,
+    /// The cosigner keygen index that co-signs to complete the quorum (the relay
+    /// trigger target). `0` in the proven 2-of-2 flow.
     pub cosigner_party: u16,
     /// The DKG session id (carried on the device's `EncryptedShare`).
     pub dkg_session_id: SessionId,

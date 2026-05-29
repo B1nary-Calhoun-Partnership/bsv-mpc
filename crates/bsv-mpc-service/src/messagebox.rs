@@ -55,6 +55,13 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
+/// Bounded idempotent retry count for shipping a round message. A round message
+/// dropped on a transient `/sendMessage` blip stalls the recipient until the
+/// ceremony times out; the re-send is a relay no-op (stable message_id) so a
+/// retry never delivers a duplicate. 4 attempts (200/400/800ms backoff) clears
+/// the brief connection contention seen under heavy concurrent send load.
+const SEND_ROUND_MSG_MAX_ATTEMPTS: u32 = 4;
+
 /// One outbound RoundMessage the handler wants to ship in response to
 /// an inbound message. The listener wraps it as a canonical envelope
 /// (BRC-78 encrypt to `recipient_pub_hex`, BRC-31 sign with our
@@ -285,16 +292,24 @@ async fn run_loop<F>(
                         out.round_msg.round,
                         out.params.to_party,
                     );
+                    // Bounded IDEMPOTENT retry: a transient `/sendMessage` blip
+                    // must not silently drop a round message (→ recipient stalls
+                    // until ceremony timeout). The stable-message_id re-send is a
+                    // relay no-op if the first attempt actually landed, so a retry
+                    // never duplicates a round message (which would abort the SM).
                     if let Err(e) = client
-                        .send_round_message(
+                        .send_round_message_reliable(
                             &out.recipient_pub_hex,
                             &out.message_box,
                             &out.round_msg,
                             out.params,
+                            SEND_ROUND_MSG_MAX_ATTEMPTS,
                         )
                         .await
                     {
-                        warn!("send_round_message failed ({send_summary}): {e}");
+                        warn!(
+                            "send_round_message failed after {SEND_ROUND_MSG_MAX_ATTEMPTS} attempts ({send_summary}): {e}"
+                        );
                     }
                 }
             }

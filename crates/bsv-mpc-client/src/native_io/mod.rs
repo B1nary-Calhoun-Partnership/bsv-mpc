@@ -23,6 +23,9 @@ pub mod storage;
 
 pub use ceremony::DeployedCosigner;
 pub use keystore::{MemNativeKeyStore, NativeKeyStore};
-pub use provision::{provision_wallet, ProvisionedWallet};
+pub use provision::{
+    provision_wallet, provision_wallet_nparty, NpartyCosigner, ProvisionedWallet,
+    ProvisionedWalletNparty,
+};
 pub use recover::recover_wallet;
 pub use signer::{DeployedSigner, DeployedSignerConfig, WalletMeta};

@@ -95,14 +95,62 @@ UNAUTH HTTP → MITM can steer DKG to an attacker co-party. MUST close before go
 `server_priv`, which is also the BRC-31 auth + BRC-2 sealing key). Topology = **2 cosigners, one
 holds 2 indices**. See handoff for the exact derivation fn + driver spec.
 
-**CLIENT SIDE — remaining (the next push):**
-- ☐ **Step 5** — client `provision_wallet_nparty` driver (mirrors the mainnet-proven
-  `coordinate_reshare_over_relay`: w DkgHandlers, one session, collect w shares,
-  composite-seal). Relay-gated hermetic test.
-- ☐ **Step 6** — `my_indices` FFI + `create_wallet_nparty` (2-of-2 back-compat).
-- ☐ **Step 7** — wire `DeployedSigner` sign-path → the merged `device_holds_combine`.
-- ☐ **Step 8** — mainnet 4-of-6 genuine-DKG E2E (with #70). Container = scale-confirm
-  via the proven standard-4 + `/dkg-relay/debug`, NOT a from-scratch unknown.
+**CLIENT SIDE — IN PROGRESS (branch `person-a/69-pr2-client-multishare`, off main):**
+- ✅ **Step 5a-i** — `bsv_mpc_core::hd::derive_relay_index_privkey(server_priv, session, index)`:
+  `reduce_mod_n(HMAC-SHA256(key=server_priv, b"bsv-mpc dkg-relay identity v1" ‖ session(32) ‖
+  index_be_u16))`. ONE-WAY (server_priv is the HMAC key — no derived key inverts it). 8 hermetic
+  unit tests (determinism, per-index/per-session distinctness, one-way ≠ server_priv,
+  keys-on-server_priv, valid key) + **frozen golden vector**
+  (`f698e3016303f85f5358e07dbe9b23ae798182cf5d1c5bac93163f6afa40d72d`). 38 hd tests GREEN.
+- ✅ **Step 5a-ii** — `handle_dkg_relay_init` now derives a per-index relay identity (distinct relay
+  room per held index) + new read-only `GET /dkg-relay/peer-identity?session&index` →
+  `relay_pub_hex`. Route-unit tests: route↔core golden cross-check + per-index distinctness + 400
+  (bad session) + the 412-no-identity case still GREEN. Container-internal ⇒ NO new cross-impl wire
+  ⇒ no gate-4 spec PR.
+- ✅ **Step 5b** — `bsv_mpc_relay::coordinate_dkg_over_relay` (NEW, sibling to
+  `coordinate_reshare_over_relay`; user-approved relay placement) + thin
+  `bsv_mpc_client::native_io::provision_wallet_nparty` wrapper (handshake → coordinate →
+  composite-seal `{agent_id}#{index}`). `CosignerEndpoint { init_url, indices, arm_signer }`
+  natively supports the 2-cosigner / one-holds-two topology. Hermetic: 2 client unit tests
+  (validate-don't-skip topology + fail-closed) + 1 coordinator guard (no-network reject). **Live
+  E2E PROVEN GREEN** `tests/dkg_4of6_multiindex_relay_e2e.rs` (device {0,1,2} + ONE in-process
+  container holding {3,4,5} via 3 one-way-derived identities, over the deployed relay):
+  **joint_pubkey `027545996f0074c9c3eaf9835c8a53052c4581ed084e3b1222e2d6f72eb9c13798`, addr
+  `1DbuHHwfUVFZxgSfhsNaBM7hQ12EDoFbiG`, 365s** — device 3 distinct signable shares at {0,1,2} +
+  ONE container persisted 3 distinct composite shares at {joint}#{3,4,5}. fmt + clippy
+  `-D warnings` workspace-wide GREEN; hd 38 / messagebox 27 / route-unit 4 / client-unit 3 GREEN.
+  - **DEBUG (2 god-tier fixes from the live run, both production-correct):**
+    (1) **pre-seed device primes** (was late-seed) — a device backing `w=t−1` parties must
+    pre-generate safe primes, else it inline-generates *inside* auxinfo `proceed()`, blocking the
+    thread for minutes (would freeze a phone). (2) **idempotent transport retry** — added
+    `MessageBoxClient::send_round_message_reliable` (stable message_id → relay no-ops re-sends →
+    exactly-once) + the `MessageBoxListener` now retries sends 4× w/ backoff. A transient
+    `/sendMessage` blip previously DROPPED a round message → ceremony stall; this hardens
+    **every** ceremony (DKG/sign/presign/reshare) on the deployed cosigner. ⚠️ touches shared
+    `bsv-mpc-messagebox` + `bsv-mpc-service` (deployed path) — additive + safe (idempotency
+    guaranteed by the relay's existing (recipient,box,message_id) dedup); all existing tests green.
+- ✅ **Step 6** — `my_indices: Vec<u16>` added to `WalletMeta` + `FfiSignerConfig` (+ back-compat
+  mapping in `connect`: empty → `[device_share_index]`); `create_wallet`/`recover_wallet` set
+  `my_indices=[device_share_index]`; new `create_wallet_nparty` + `FfiNpartyCosigner` FFI
+  (validates topology fail-closed via `provision_wallet_nparty`; sign quorum = my_indices + ONE
+  trigger cosigner). 2-of-2 back-compat GREEN (client lib 41 + hermetic_sign 3); clippy clean
+  default **and** `--features native`. Full deployed proof of `create_wallet_nparty` = step 8
+  (mirrors how `create_wallet`/`recover_wallet` are proven by their deployed e2e).
+- ⏳ **Step 7 (IN PROGRESS) — SCOPE FINDING: bigger than "wire the combine".** The combine/sign
+  CONSUME side EXISTS + is proven: `combine_sign_over_relay_nparty` (relay) + the merged
+  `device_holds_combine` kernel (#83) + the proxy's `sign_over_relay_device_holds`. **But the
+  multi-index presig GENERATION over the relay does NOT exist anywhere** — the proxy's
+  `DevicePresigSetPool::add_set` is only ever called by its mainnet E2E, which generates the
+  correlated `{0,1,2}` presigs via a LOCAL test helper (`gen_presig_set`, having all 6 shares) —
+  a within-stack shortcut, NOT a production path. A REAL client multi-index sign needs the device
+  to obtain `w` CORRELATED presigs from a genuine n-party presign-over-relay ceremony (device's
+  `w` parties + cosigner) — a new `coordinate_presign_over_relay_nparty` coordinator, ~5b-sized.
+  So Step 7 = (a) build that n-party presign coordinator + (b) the client `DeployedSigner`
+  multi-index presig pool + multi-index unseal (composite `{agent_id}#{index}`) + (c) wire the
+  sign → `combine_sign_over_relay_nparty`. Checkpoint surfaced to user.
+- ☐ **Step 8** — mainnet 4-of-6 genuine-DKG E2E (with #70). `provision_wallet_nparty` +
+  `create_wallet_nparty` full deployed proof (real BRC-31 + seal) lands here (in-process service
+  auth is a dev stub), mirroring how `recover_wallet`'s full proof is its deployed E2E.
 
 **PR-3/#70 — 2nd cosigner + mainnet 4-of-6 E2E** (the audit-closing artifact; pairs with PR-2).
 

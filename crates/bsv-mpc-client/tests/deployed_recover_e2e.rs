@@ -339,6 +339,7 @@ async fn connect_signer(
                 config: recovered.config,
                 participants: recovered.participants.clone(),
                 device_share_index: recovered.device_share_index,
+                my_indices: vec![recovered.device_share_index],
                 cosigner_party: recovered.cosigner_party,
                 dkg_session_id: recovered.dkg_session_id,
             },

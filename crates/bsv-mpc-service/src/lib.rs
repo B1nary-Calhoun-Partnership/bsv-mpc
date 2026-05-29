@@ -164,6 +164,13 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/dkg-relay/identity",
             get(dkg_relay_handlers::handle_dkg_relay_identity),
         )
+        // ADR-0052 Model B: the device fetches each cosigner index's PER-INDEX
+        // relay identity pub (one-way HMAC — the device can't recompute it) here
+        // before registering that index as a ceremony peer.
+        .route(
+            "/dkg-relay/peer-identity",
+            get(dkg_relay_handlers::handle_dkg_relay_peer_identity),
+        )
         .route(
             "/dkg-relay/init",
             post(dkg_relay_handlers::handle_dkg_relay_init),

@@ -62,11 +62,15 @@ pub fn bounded_http_client(timeout: Duration) -> Result<reqwest::Client> {
 // relay coordinator (the sign-from-bundle combiner already lived here).
 pub mod dkg;
 pub mod presign;
+pub mod provision_dkg;
 pub mod reshare;
 pub mod session;
 
 pub use dkg::{run_dkg_over_http, run_dkg_over_http_authed};
 pub use presign::{coordinate_presign_over_relay, CosignerArm};
+pub use provision_dkg::{
+    coordinate_dkg_over_relay, CosignerEndpoint, DkgOverRelay, DkgOverRelayOutput,
+};
 pub use reshare::{
     coordinate_reshare_over_relay, parse_old_share_topology, OldShareTopology, ReshareOutput,
     ReshareOverRelay,

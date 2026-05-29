@@ -633,9 +633,12 @@ pub struct FfiSignerConfig {
     pub threshold: u16,
     pub parties: u16,
     pub participants: Vec<u16>,
-    /// This device's signing index (the coordinator party).
+    /// This device's PRIMARY signing index (`= my_indices[0]`).
     pub device_share_index: u16,
-    /// The deployed cosigner's keygen index.
+    /// ALL keygen indices this device holds (ADR-0052 device-holds-(t−1)). Length
+    /// 1 for a 2-of-2 wallet; length `w = t−1` for a multi-share wallet.
+    pub my_indices: Vec<u16>,
+    /// The cosigner keygen index that co-signs to complete the quorum.
     pub cosigner_party: u16,
     /// Share-metadata session id (32-byte hex).
     pub dkg_session_id_hex: String,
@@ -712,6 +715,13 @@ impl FfiDeployedSigner {
                 config: config_t,
                 participants: config.participants,
                 device_share_index: config.device_share_index,
+                my_indices: if config.my_indices.is_empty() {
+                    // Back-compat: a host that predates `my_indices` (2-of-2)
+                    // sends none → the lone device index.
+                    vec![config.device_share_index]
+                } else {
+                    config.my_indices
+                },
                 cosigner_party: config.cosigner_party,
                 dkg_session_id,
             },
@@ -851,7 +861,132 @@ pub async fn create_wallet(
         parties,
         participants: w.participants,
         device_share_index: w.device_share_index,
+        my_indices: vec![w.device_share_index],
         cosigner_party: w.cosigner_party,
+        dkg_session_id_hex: w.dkg_session_id.hex(),
+    })
+}
+
+// ── n-party (device-holds-(t−1)) provisioning over UniFFI (issue #69 PR-2) ───
+//
+// The multi-share generalization of `create_wallet`: a genuine n-party DKG over
+// the relay where the device drives `w = t−1` keygen parties and the `cosigners`
+// drive the rest (one MAY hold several indices). On return the device's `w`
+// signable shares are sealed composite-keyed `"{agent_id}#{index}"` and the
+// `FfiSignerConfig` is ready for `FfiDeployedSigner::connect`. The 2-of-2
+// `create_wallet` above is unchanged (back-compat).
+
+/// One network-side cosigner for [`create_wallet_nparty`]: its base URL + the
+/// absolute keygen indices it drives (`indices.len() > 1` = one Notary holding
+/// several indices).
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(uniffi::Record)]
+pub struct FfiNpartyCosigner {
+    pub container_url: String,
+    pub indices: Vec<u16>,
+}
+
+/// Generous ceiling for the n-party DKG-over-relay (parallel safe-prime gen
+/// dominates; ~6 min observed for 4-of-6). A bound, not a sleep.
+#[cfg(not(target_arch = "wasm32"))]
+const NPARTY_PROVISION_TIMEOUT_SECS: u64 = 600;
+
+/// Provision an n-party (device-holds-(t−1)) wallet via a genuine n-party DKG
+/// over the relay (ADR-0052 Model B / §06.22). `device_indices` MUST be exactly
+/// `w = t−1` indices and `device_indices` + every cosigner's `indices` MUST
+/// partition `0..parties` (validated fail-closed before any network). The signer
+/// connects to the FIRST cosigner for the sign-time relay trigger; the device
+/// folds its `w` partials locally and that one cosigner completes the quorum.
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(clippy::too_many_arguments)]
+#[uniffi::export(async_runtime = "tokio")]
+pub async fn create_wallet_nparty(
+    relay_url: String,
+    identity_key_hex: String,
+    at_rest_root_hex: String,
+    bundle_dir: String,
+    policy_id_hex: String,
+    threshold: u16,
+    parties: u16,
+    device_indices: Vec<u16>,
+    cosigners: Vec<FfiNpartyCosigner>,
+    keystore: std::sync::Arc<dyn FfiKeyStore>,
+) -> Result<FfiSignerConfig, FfiError> {
+    use bsv::primitives::ec::PrivateKey;
+    use bsv_mpc_core::types::ThresholdConfig;
+
+    let identity = {
+        let bytes = hex32(&identity_key_hex, "identity_key")?;
+        PrivateKey::from_bytes(&bytes)
+            .map_err(|e| FfiError::Client(format!("identity key: {e}")))?
+    };
+    let config =
+        ThresholdConfig::new(threshold, parties).map_err(|e| FfiError::Client(e.to_string()))?;
+    let ks: std::sync::Arc<dyn crate::native_io::keystore::NativeKeyStore> =
+        std::sync::Arc::new(FfiKeyStoreAdapter(keystore));
+
+    // The sign-time relay trigger is the FIRST cosigner's first index (one
+    // cosigner partial completes the t-quorum alongside the device's `w`).
+    let primary_container = cosigners
+        .first()
+        .map(|c| c.container_url.clone())
+        .ok_or_else(|| {
+            FfiError::Client("create_wallet_nparty: at least one cosigner required".into())
+        })?;
+    let cosigner_party = cosigners
+        .first()
+        .and_then(|c| c.indices.first().copied())
+        .ok_or_else(|| {
+            FfiError::Client("create_wallet_nparty: first cosigner has no index".into())
+        })?;
+
+    let cosigner_endpoints: Vec<crate::native_io::provision::NpartyCosigner> = cosigners
+        .into_iter()
+        .map(|c| crate::native_io::provision::NpartyCosigner {
+            container_url: c.container_url,
+            indices: c.indices,
+        })
+        .collect();
+
+    let w = crate::native_io::provision::provision_wallet_nparty(
+        &relay_url,
+        identity,
+        config,
+        device_indices,
+        cosigner_endpoints,
+        std::time::Duration::from_secs(NPARTY_PROVISION_TIMEOUT_SECS),
+        ks.as_ref(),
+    )
+    .await
+    .map_err(|e| FfiError::Client(e.to_string()))?;
+
+    // Sign-time participant set = the device's `w` indices + the one trigger
+    // cosigner = `t` signers (the `device_holds_combine` quorum).
+    let device_primary = *w
+        .my_indices
+        .first()
+        .ok_or_else(|| FfiError::Client("create_wallet_nparty: device holds no index".into()))?;
+    let mut participants = w.my_indices.clone();
+    participants.push(cosigner_party);
+    participants.sort_unstable();
+    participants.dedup();
+
+    Ok(FfiSignerConfig {
+        relay_url,
+        container_url: primary_container,
+        identity_key_hex,
+        at_rest_root_hex,
+        bundle_dir,
+        policy_id_hex,
+        agent_id: w.agent_id,
+        joint_pubkey_hex: hex::encode(&w.joint_key.compressed),
+        joint_address: w.joint_key.address,
+        threshold,
+        parties,
+        participants,
+        device_share_index: device_primary,
+        my_indices: w.my_indices,
+        cosigner_party,
         dkg_session_id_hex: w.dkg_session_id.hex(),
     })
 }
@@ -926,6 +1061,7 @@ pub async fn recover_wallet(
         parties: w.config.parties,
         participants: w.participants,
         device_share_index: w.device_share_index,
+        my_indices: vec![w.device_share_index],
         cosigner_party: w.cosigner_party,
         dkg_session_id_hex: w.dkg_session_id.hex(),
     })

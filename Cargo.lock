@@ -410,12 +410,14 @@ name = "bsv-mpc-client"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "axum",
  "bsv-mpc-core",
  "bsv-mpc-messagebox",
  "bsv-mpc-relay",
  "bsv-mpc-service",
  "bsv-rs",
  "cggmp24",
+ "chrono",
  "ciborium",
  "futures",
  "generic-ec",
@@ -430,6 +432,7 @@ dependencies = [
  "sha2",
  "thiserror 2.0.18",
  "tokio",
+ "tracing-subscriber",
  "uniffi",
  "wasm-bindgen",
  "wasm-bindgen-test",
