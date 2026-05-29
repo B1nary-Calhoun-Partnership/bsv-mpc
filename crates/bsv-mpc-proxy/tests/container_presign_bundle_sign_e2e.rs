@@ -271,7 +271,7 @@ async fn container_self_presigns_coordinator_holds_ct_then_signs_from_bundle() {
         .expect("seed container share_A");
     let state = Arc::new(AppState {
         data_dir: data_dir.path().to_str().unwrap().to_string(),
-        storage: RwLock::new(storage),
+        storage: Arc::new(RwLock::new(storage)),
         started_at: chrono::Utc::now(),
         provision: None,
         // Dev-mode auth: this gate isolates the §06.17.1 crypto loop (route auth

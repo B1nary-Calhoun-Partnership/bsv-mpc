@@ -57,14 +57,40 @@ the strongest entropy/topology story. Phased to keep each PR independently green
   ACROSS impls (bsv-mpc ↔ rust-mpc) via address-preserving `reshare_replace_party`,
   vector-gated. (Answers "swap 2nd Calhoun cosigner for rust-mpc?" → yes, normatively.)
 
-**PR-2 — `IN PROGRESS` (planning via background workflow `wl5ju8hj2`)** — the big code build,
-absorbs the old PR-1b: device-side driver running w `DkgHandler`s over relay
-(`provision_wallet_nparty`); new `POST /dkg-relay/init` on `bsv-mpc-service` (mirror
-`/reshare-relay/init`) + per-(session,index) storage; durable `PresigBundle` carrying w
-own-presigs (preserves CVE-2025-66017 single-use, no asterisk); `device_share_index` →
-`my_indices` FFI (single-index default keeps 2-of-2). TDD; hermetic 6-party-DKG-over-relay
-+ mainnet 4-of-6 E2E. **Workflow producing surface map + TDD plan + risk review; present
-plan before coding.**
+**PR-2 — `IN PROGRESS` (branch `person-a/69-pr2-nparty-dkg-relay`)** — the big code build,
+absorbs the old PR-1b. KEY DE-RISK (workflow `wl5ju8hj2`): it MIRRORS the mainnet-proven
+reshare-over-relay path — `provision_wallet_nparty` ≈ `coordinate_reshare_over_relay`
+(already runs `Vec<DkgHandler>` per index), `/dkg-relay/init` ≈ `/reshare-relay/init` minus
+PSS/throwaway-combine, KEEPING the shares. User-approved 8-step TDD ladder + 5 fork-defaults
+(agent_id re-key at completion · once-per-index container arming · DEFER p2p short-circuit ·
+reject-unless-owner re-provision · ADD new mainnet test). Top risks tracked: storage-key
+collision (step 1 ✓), persistence-before-funding (gate fundable address on post-DKG re-load
+verify), CF-container 6-party-DKG feasibility (MEASURE early, container is standard-4),
+one-DkgHandler-per-index discipline.
+
+**SERVICE SIDE COMPLETE + PROVEN (branch `person-a/69-pr2-nparty-dkg-relay`, 6 commits):**
+- ✅ **Step 1** — composite `(agent_id, share_index)` storage keying. GREEN; `f7075f3`.
+- ✅ **Step 2** — DkgHandler composite-persist override + re-provision protection
+  (reject-unless-owner). Hermetic GREEN; `e76a430`.
+- ✅ **Step 3** — `POST /dkg-relay/{identity,init}` route (mirrors `/reshare-relay/init`,
+  DKG-only; `deny_unknown_fields`; `AppState.storage`→`Arc<RwLock>`). Route-unit GREEN
+  (shape contract + 412/400 gates); `daad0c7`.
+- ✅ **Step 4 — PROVEN ON LIVE RELAY** — genuine 6-party 4-of-6 DKG agreed a
+  **byte-identical joint key** over the deployed MessageBox relay: joint_pubkey
+  `029b846a…`, address `15naugTY2FycKX5BtpndLkVfGkou5jFaVP`, all 6 shares persisted,
+  ~6min. `771600e`. This validates the chosen path on real infra AND resolves the
+  CF-container concern (standard-4 + the reshare relay-DKG patterns scale to 6 parties).
+- ✅ **Diagnostics** — `/dkg-relay/debug` checkpoint trail (reuse reshare #58
+  observability); egress reuses `/reshare-relay/egress-test`. `2b8bd0c`.
+
+**CLIENT SIDE — remaining (the next push):**
+- ☐ **Step 5** — client `provision_wallet_nparty` driver (mirrors the mainnet-proven
+  `coordinate_reshare_over_relay`: w DkgHandlers, one session, collect w shares,
+  composite-seal). Relay-gated hermetic test.
+- ☐ **Step 6** — `my_indices` FFI + `create_wallet_nparty` (2-of-2 back-compat).
+- ☐ **Step 7** — wire `DeployedSigner` sign-path → the merged `device_holds_combine`.
+- ☐ **Step 8** — mainnet 4-of-6 genuine-DKG E2E (with #70). Container = scale-confirm
+  via the proven standard-4 + `/dkg-relay/debug`, NOT a from-scratch unknown.
 
 **PR-3/#70 — 2nd cosigner + mainnet 4-of-6 E2E** (the audit-closing artifact; pairs with PR-2).
 

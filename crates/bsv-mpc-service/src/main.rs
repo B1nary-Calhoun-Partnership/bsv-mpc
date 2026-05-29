@@ -145,7 +145,7 @@ async fn main() -> anyhow::Result<()> {
 
     let state = Arc::new(AppState {
         data_dir,
-        storage: RwLock::new(storage),
+        storage: Arc::new(RwLock::new(storage)),
         started_at: chrono::Utc::now(),
         provision,
         // §07.6: enforce BRC-31 owner-authz when MPC_SERVER_PRIVATE_KEY is set;

@@ -36,7 +36,7 @@ async fn presign_init_rejects_malformed_session_id() {
     let storage = SqliteShareStorage::open(data_dir.to_str().unwrap()).unwrap();
     let state = Arc::new(AppState {
         data_dir: data_dir.to_string_lossy().to_string(),
-        storage: RwLock::new(storage),
+        storage: Arc::new(RwLock::new(storage)),
         started_at: chrono::Utc::now(),
         provision: None,
         auth: AuthState::dev(), // dev mode — no owner bound, so authz allows

@@ -57,7 +57,7 @@ async fn spawn_service(
     let kek = bsv_mpc_core::custody::derive_custody_kek(&[server_byte | 1; 32]);
     let state = Arc::new(AppState {
         data_dir: data_dir.to_string_lossy().to_string(),
-        storage: RwLock::new(storage),
+        storage: Arc::new(RwLock::new(storage)),
         started_at: chrono::Utc::now(),
         provision: None,
         auth: AuthState::with_key(key_from(server_byte)),
