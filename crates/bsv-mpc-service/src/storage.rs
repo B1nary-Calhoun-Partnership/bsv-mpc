@@ -226,6 +226,69 @@ impl SqliteShareStorage {
         Ok(self.shares.get(agent_id).map(|s| s.share.clone()))
     }
 
+    // ── Composite (agent_id, share_index) keying — ADR-0052 device-holds-(t−1) ──
+    //
+    // A cosigner or device holding `w > 1` indices of ONE ceremony has the SAME
+    // joint pubkey (hence the same `agent_id`) for every held share; keying by
+    // `agent_id` alone would overwrite all but the last (last-write-wins — the
+    // PR-2 storage blocker). These store/load each held share under the separate
+    // composite key `"{agent_id}#{index}"`. An `agent_id` is a 33-byte compressed
+    // pubkey hex (no `#`), so a composite key can never collide with a bare
+    // `agent_id` (legacy single-share) key — the two namespaces are disjoint and
+    // the existing 2-of-2 / reshare / refresh path is byte-for-byte unchanged.
+
+    /// Composite storage key for one held index of an agent's ceremony.
+    fn composite_key(agent_id: &str, index: u16) -> String {
+        format!("{agent_id}#{index}")
+    }
+
+    /// Store one held share at `(agent_id, index)`, recording its `owner_identity`
+    /// (§08.1). Owner-preservation semantics match [`store_share_with_owner`].
+    pub fn store_share_at_index(
+        &mut self,
+        agent_id: &str,
+        index: u16,
+        share: &EncryptedShare,
+        owner_identity: &str,
+    ) -> anyhow::Result<()> {
+        self.store_share_with_owner(&Self::composite_key(agent_id, index), share, owner_identity)
+    }
+
+    /// Retrieve the held share at `(agent_id, index)`, if present.
+    pub fn get_share_at_index(
+        &self,
+        agent_id: &str,
+        index: u16,
+    ) -> anyhow::Result<Option<EncryptedShare>> {
+        self.get_share(&Self::composite_key(agent_id, index))
+    }
+
+    /// Read the recorded owner identity (hex) for the held share at
+    /// `(agent_id, index)`, if recorded + non-empty.
+    pub fn get_share_owner_at_index(
+        &self,
+        agent_id: &str,
+        index: u16,
+    ) -> anyhow::Result<Option<String>> {
+        self.get_share_owner(&Self::composite_key(agent_id, index))
+    }
+
+    /// Every composite-keyed index persisted for `agent_id`, ascending. Empty for
+    /// a legacy bare-`agent_id` share (those carry no composite key). Used by the
+    /// post-DKG persistence-before-funding verification (all `w` held shares MUST
+    /// be durably present before a fundable address is returned) and by
+    /// signing-time held-index lookup.
+    pub fn held_indices(&self, agent_id: &str) -> anyhow::Result<Vec<u16>> {
+        let prefix = format!("{agent_id}#");
+        let mut out: Vec<u16> = self
+            .shares
+            .keys()
+            .filter_map(|k| k.strip_prefix(&prefix).and_then(|s| s.parse::<u16>().ok()))
+            .collect();
+        out.sort_unstable();
+        Ok(out)
+    }
+
     /// Delete an agent's share and all associated state.
     pub fn delete_share(&mut self, agent_id: &str) -> anyhow::Result<()> {
         self.shares.remove(agent_id);
