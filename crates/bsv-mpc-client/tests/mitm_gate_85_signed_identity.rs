@@ -161,3 +161,42 @@ async fn identity_challenge_is_master_signed_and_rejects_mitm() {
         &sig
     ));
 }
+
+#[tokio::test]
+async fn reshare_and_refresh_identity_is_master_and_rejects_mitm() {
+    // The recovery flow (#85): /reshare-relay/identity + /refresh-relay/identity
+    // return the cosigner's MASTER pub directly. The client (coordinate_reshare_over_relay)
+    // PINS the master out-of-band and rejects any fetched identity != the pin. Assert
+    // the service returns the master AND the compare-to-pinned distinguishes the real
+    // master from a MITM substitution.
+    let (url, _server) = spawn_container().await;
+    let master = PrivateKey::from_hex(SERVER_KEY_HEX)
+        .unwrap()
+        .public_key()
+        .to_hex();
+    let attacker = PrivateKey::from_bytes(&[0x99u8; 32])
+        .unwrap()
+        .public_key()
+        .to_hex();
+
+    for path in ["/reshare-relay/identity", "/refresh-relay/identity"] {
+        let resp: serde_json::Value = reqwest::Client::new()
+            .get(format!("{url}{path}"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let fetched = resp["peer_pub_hex"].as_str().expect("peer_pub_hex");
+        // The reshare/refresh relay identity IS the master pub.
+        assert_eq!(fetched, master, "{path} MUST return the master pub");
+        // Client pin gate: correct master accepts; a wrong/MITM master is rejected
+        // (this is exactly `coordinate_reshare_over_relay`'s `fetched != pinned` check).
+        assert!(fetched == master, "{path}: correct pin accepts");
+        assert!(
+            fetched != attacker,
+            "{path}: a MITM-substituted master MUST NOT match the pin → reshare rejects"
+        );
+    }
+}

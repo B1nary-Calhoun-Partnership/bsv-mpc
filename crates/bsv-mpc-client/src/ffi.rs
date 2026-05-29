@@ -1055,6 +1055,10 @@ pub async fn recover_wallet(
     bundle_dir: String,
     policy_id_hex: String,
     backup_factor: Vec<u8>,
+    // #85 MITM gate: the cosigner's MASTER identity pubkey hex, PINNED out-of-band
+    // (empty = unpinned dev/legacy). When set, the reshare verifies the fetched
+    // container identity == it + runs a post-reshare liveness challenge.
+    cosigner_master_pub: String,
     keystore: std::sync::Arc<dyn FfiKeyStore>,
 ) -> Result<FfiSignerConfig, FfiError> {
     use bsv::primitives::ec::PrivateKey;
@@ -1072,6 +1076,11 @@ pub async fn recover_wallet(
         &container_url,
         identity,
         backup_factor,
+        if cosigner_master_pub.is_empty() {
+            None
+        } else {
+            Some(cosigner_master_pub)
+        },
         std::time::Duration::from_secs(RECOVER_TIMEOUT_SECS),
         ks.as_ref(),
     )

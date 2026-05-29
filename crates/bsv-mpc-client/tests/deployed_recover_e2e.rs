@@ -45,6 +45,9 @@ use cggmp24::ExecutionId;
 const DEFAULT_CONTAINER: &str = "https://bsv-mpc-service-container.dev-a3e.workers.dev";
 const DEFAULT_RELAY: &str = "https://rust-message-box.dev-a3e.workers.dev";
 const AT_REST_ROOT: [u8; 32] = [0x42u8; 32];
+/// #85: the deployed container's (NotaryA) master identity pubkey, PINNED — the live
+/// recover verifies the fetched reshare identity == this + the post-reshare challenge.
+const NOTARY_A_MASTER: &str = "0278138e618ebb69c8bc6af07d15e50c72d9628b2c0fd7042185ee5cf5712af0e8";
 
 fn container_url() -> String {
     std::env::var("DEPLOYED_CONTAINER_URL").unwrap_or_else(|_| DEFAULT_CONTAINER.to_string())
@@ -239,6 +242,7 @@ async fn recover_rejects_non_2of2_for_the_right_reason() {
         "https://container.invalid",
         identity,
         backup,
+        None,
         Duration::from_secs(1),
         &ks,
     )
@@ -304,6 +308,7 @@ async fn create_lose_recover(
         &container_url(),
         identity,
         backup_factor.clone(),
+        Some(NOTARY_A_MASTER.to_string()), // #85: pin NotaryA → live recover proves the reshare gate
         Duration::from_secs(360),
         recover_ks.as_ref(),
     )
@@ -521,6 +526,7 @@ async fn recover_mainnet_spends_from_the_same_address() {
         &container_url(),
         identity.clone(),
         backup_factor,
+        Some(NOTARY_A_MASTER.to_string()), // #85: pin NotaryA → live recover proves the reshare gate
         Duration::from_secs(360),
         recover_ks.as_ref(),
     )

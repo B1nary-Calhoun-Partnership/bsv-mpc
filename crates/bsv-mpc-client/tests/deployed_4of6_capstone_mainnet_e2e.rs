@@ -253,7 +253,9 @@ async fn real_mainnet_2notary_4of6_txid() {
         .expect("publicKey")
         .to_string();
     let change_script = bsv_mpc_client::txbuild::p2pkh_locking_script_from_hash(
-        &PublicKey::from_hex(&wallet_pub_hex).expect("wallet pub").hash160(),
+        &PublicKey::from_hex(&wallet_pub_hex)
+            .expect("wallet pub")
+            .hash160(),
     );
 
     let sighash_type: u32 = 0x41; // SIGHASH_ALL | FORKID
@@ -301,7 +303,10 @@ async fn real_mainnet_2notary_4of6_txid() {
     eprintln!("✔ assembled tx {} bytes — TXID={txid_hex}", raw_tx.len());
 
     let ok = broadcast_via_arc(&http, &raw_tx_hex).await;
-    assert!(ok, "ARC broadcast MUST succeed — TXID={txid_hex} rawTx={raw_tx_hex}");
+    assert!(
+        ok,
+        "ARC broadcast MUST succeed — TXID={txid_hex} rawTx={raw_tx_hex}"
+    );
 
     eprintln!();
     eprintln!("╔══════════════════════════════════════════════════════════════════╗");

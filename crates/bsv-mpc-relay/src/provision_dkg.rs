@@ -529,7 +529,8 @@ pub async fn coordinate_dkg_over_relay(
     //    doesn't co-hold. Skipped for un-pinned dev/test cosigners. ──
     for c in &p.cosigners {
         if let Some(master_hex) = &c.expected_master_pub {
-            challenge_cosigner(&c.init_url, master_hex, &joint_key.compressed).await?;
+            let challenge_url = c.init_url.replace("/dkg-relay/init", "/identity-challenge");
+            challenge_cosigner(&challenge_url, master_hex, &joint_key.compressed).await?;
         }
     }
 
@@ -546,18 +547,20 @@ pub async fn coordinate_dkg_over_relay(
     })
 }
 
-/// #85 funding gate: POST `/identity-challenge` with a fresh nonce + the joint
-/// pubkey, and verify the returned signature against the PINNED master. Proves the
-/// real cosigner is live and controls its pinned identity for THIS wallet. Fails
-/// closed on a master mismatch, a bad signature, or a transport error.
-async fn challenge_cosigner(
-    init_url: &str,
+/// #85 funding/liveness gate: POST `/identity-challenge` with a fresh nonce + the
+/// joint pubkey, and verify the returned signature against the PINNED master. Proves
+/// the real cosigner is live and controls its pinned identity for THIS wallet. Fails
+/// closed on a master mismatch, a bad signature, or a transport error. Shared by DKG
+/// provisioning AND reshare/recovery (#85); `challenge_url` is the cosigner's full
+/// `/identity-challenge` URL.
+pub(crate) async fn challenge_cosigner(
+    challenge_url: &str,
     master_pub_hex: &str,
     joint_pubkey_compressed: &[u8],
 ) -> Result<()> {
     let mut nonce = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut nonce);
-    let url = init_url.replace("/dkg-relay/init", "/identity-challenge");
+    let url = challenge_url.to_string();
     let body = serde_json::json!({
         "joint_pubkey_hex": hex::encode(joint_pubkey_compressed),
         "nonce_hex": hex::encode(nonce),

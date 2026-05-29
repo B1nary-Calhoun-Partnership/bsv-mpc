@@ -252,6 +252,14 @@ pub struct ReshareOverRelay {
     /// The local contributing party's OLD cggmp24 `KeyShare` JSON. Its secret scalar
     /// + the contributor subset's OLD eval points are extracted here.
     pub local_contributor_old_share_json: Vec<u8>,
+    /// **#85 MITM gate.** The container's MASTER identity pubkey hex, PINNED
+    /// out-of-band (the recovering device targets a *named* cosigner — it knows its
+    /// identity, not whatever the unauthenticated `/reshare-relay/identity` returns).
+    /// When `Some`, the fetched container identity MUST equal this pin (a MITM
+    /// substitution → reject) and the device routes to the PINNED value, then runs a
+    /// post-reshare liveness challenge against it (the preserved joint pubkey is the
+    /// §18 invariant) before returning the rotated shares. `None` = unpinned (legacy/dev).
+    pub expected_master_pub: Option<String>,
 }
 
 /// The reshare output: the UNCHANGED joint pubkey + this caller's rotated NEW-set
@@ -382,7 +390,21 @@ pub async fn coordinate_reshare_over_relay(
     }
 
     // ── Fetch the container's relay identity (the remote contributor) FIRST (§06.17). ──
-    let container_pub_hex = fetch_peer_identity(&p.container_init_url).await?;
+    let fetched_container_pub = fetch_peer_identity(&p.container_init_url).await?;
+    // #85: the reshare cosigner identity IS its master — when pinned, verify the
+    // fetched value equals the pin (a MITM substitution → reject) and route to the
+    // PINNED value (only the real master controls that relay identity).
+    let container_pub_hex = match &p.expected_master_pub {
+        Some(pinned) => {
+            if &fetched_container_pub != pinned {
+                return Err(MpcError::Protocol(format!(
+                    "reshare cosigner identity {fetched_container_pub} != pinned master {pinned} (#85 MITM)"
+                )));
+            }
+            pinned.clone()
+        }
+        None => fetched_container_pub,
+    };
 
     // The full NEW-set identity map: container_new_index = container; the rest = local.
     let identity_for = |idx: u16| -> Option<String> {
@@ -670,6 +692,17 @@ pub async fn coordinate_reshare_over_relay(
 
     // (The container arm was confirmed BEFORE phase A — see the early `arm_handle`
     // await above — so by here it has stored its own rotated new-(t,n) share.)
+
+    // ── #85 liveness gate: confirm the PINNED cosigner is live + controls its master
+    //    for THIS (preserved §18) joint key before returning the rotated shares — a
+    //    fresh-nonce signed challenge to the pinned master (parity with the DKG
+    //    funding gate). Skipped for un-pinned legacy/dev. ──
+    if let Some(master_hex) = &p.expected_master_pub {
+        let challenge_url = p
+            .container_init_url
+            .replace("/reshare-relay/init", "/identity-challenge");
+        crate::provision_dkg::challenge_cosigner(&challenge_url, master_hex, &jpk_bytes).await?;
+    }
 
     Ok(ReshareOutput {
         joint_pubkey_hex: hex::encode(&jpk_bytes),

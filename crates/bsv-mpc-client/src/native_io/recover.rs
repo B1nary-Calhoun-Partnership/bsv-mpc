@@ -47,11 +47,17 @@ use crate::error::ClientError;
 /// `identity` MUST be the SAME §07.4 long-lived key recorded as owner at create time
 /// (§08.1 owner-authz on `/reshare-relay/init`), so the host passes the persisted
 /// identity key, not a fresh one.
+#[allow(clippy::too_many_arguments)]
 pub async fn recover_wallet(
     relay_url: &str,
     container_url: &str,
     identity: PrivateKey,
     backup_factor: Vec<u8>,
+    // #85 MITM gate: the cosigner's MASTER identity pubkey hex, PINNED out-of-band.
+    // When Some, the reshare verifies the fetched container identity == this pin +
+    // runs a post-reshare liveness challenge against it before the rotated share is
+    // sealed/returned. None = unpinned (legacy/dev).
+    expected_master_pub: Option<String>,
     timeout: Duration,
     keystore: &dyn NativeKeyStore,
 ) -> Result<ProvisionedWallet, ClientError> {
@@ -125,6 +131,7 @@ pub async fn recover_wallet(
             local_contributor_new_index: device_index,
             local_contributor_old_index: device_index,
             local_contributor_old_share_json: backup_factor,
+            expected_master_pub,
         },
         arm_signer,
         timeout,
@@ -185,6 +192,7 @@ mod tests {
             "https://container.invalid",
             dummy_identity(),
             b"definitely-not-a-cggmp24-key-share".to_vec(),
+            None,
             Duration::from_secs(1),
             &ks,
         )
@@ -217,6 +225,7 @@ mod tests {
             "https://container.invalid",
             dummy_identity(),
             Vec::new(),
+            None,
             Duration::from_secs(1),
             &ks,
         )

@@ -1356,6 +1356,10 @@ impl MpcBridge {
                 local_contributor_new_index: 1,
                 local_contributor_old_index: proxy_old_index,
                 local_contributor_old_share_json: old_share.ciphertext,
+                // #85 follow-up: the proxy's threshold-change reshare should pin its
+                // KSS cosigner master out-of-band (mirror the native `recover_wallet`
+                // pin). Requires a proxy-side cosigner-master config; tracked separately.
+                expected_master_pub: None,
             },
             arm_request_signer,
             timeout,
