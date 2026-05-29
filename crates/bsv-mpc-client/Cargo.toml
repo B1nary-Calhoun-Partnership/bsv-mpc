@@ -99,6 +99,13 @@ rand.workspace = true
 round-based = { workspace = true, features = ["sim"] }
 futures.workspace = true
 pin-project.workspace = true
+# #98 repro: faithfully emulate the UniFFI 0.28 `async_runtime="tokio"` poll-context.
+# UniFFI's scaffolding wraps the FFI future in `async_compat::Compat::new(...)`, which
+# is then polled by the FOREIGN executor (NOT a tokio worker); `tokio::spawn` inside it
+# lands on async-compat's GLOBAL `new_current_thread` runtime. Driving the repro via
+# `futures::executor::block_on(Compat::new(...))` reproduces that exact topology, so the
+# starvation it triggers is the real #98 — not a test artifact.
+async-compat = "0.2"
 bsv = { workspace = true }
 # Mainnet capstone E2E (gated E2E_MAINNET=1): fund via wallet:3321, broadcast via ARC, confirm on WoC.
 reqwest = { version = "0.12", features = ["json"] }
