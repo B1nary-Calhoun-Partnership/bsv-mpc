@@ -7,6 +7,7 @@ pub mod auth;
 pub mod custody;
 pub mod dkg_handler;
 pub mod dkg_relay_handlers;
+pub mod ecdh_relay_handler;
 pub mod handlers;
 /// §05.4.6 / ADR-0051 SM-position ↔ absolute-keygen-index translation, shared
 /// by the presign + interactive-signing relay handlers (anti-drift).
@@ -121,6 +122,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             get(relay_handlers::handle_presign_relay_debug),
         )
         .route("/sign-relay", post(relay_handlers::handle_sign_relay))
+        // #90 distributed-ECDH partial round (Self_/Other BRC-42 derivation).
+        .route("/ecdh-relay", post(relay_handlers::handle_ecdh_relay))
         // #85 MITM gate: signed liveness/funding challenge — the cosigner proves it
         // controls its PINNED master identity for a specific wallet before funding.
         .route(

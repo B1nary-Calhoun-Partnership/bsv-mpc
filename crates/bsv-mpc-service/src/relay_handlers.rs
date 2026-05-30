@@ -590,6 +590,137 @@ pub async fn handle_sign_relay(
     )
 }
 
+// ── /ecdh-relay (#90 distributed-ECDH partial round) ─────────────────────────
+
+/// Request body for `POST /ecdh-relay` (#90).
+#[derive(Debug, Deserialize)]
+pub struct EcdhRelayRequest {
+    /// The wallet's joint pubkey hex — the §08.1 owner-authz key + composite-share
+    /// id `{agent_id}#{index}`.
+    pub agent_id: String,
+    /// 33-byte compressed counterparty pubkey hex (the `Self_`/`Other` ECDH peer;
+    /// for `Self_` the device passes the joint pubkey itself).
+    pub counterparty_pub_hex: String,
+    /// The cosigner's held keygen indices to return partials for — one
+    /// `(partial, vss_point)` pair per index. MUST be non-empty.
+    pub indices: Vec<u16>,
+    /// A fresh 32-byte device nonce hex, bound into the #85 attestation (anti-replay).
+    pub nonce_hex: String,
+}
+
+/// `POST /ecdh-relay` — the container returns `counterparty_pub * its_share(idx)`
+/// for each requested held index, plus a #85 master attestation binding the exact
+/// partial set. The device Lagrange-combines these with its own `w` local partials
+/// to recover the BRC-42 ECDH shared secret WITHOUT reconstructing the key (#90).
+///
+/// §08.1 owner-authz is enforced PER held index (composite owner, bare fallback)
+/// before that index's share scalar is used — mirrors `/sign-relay`.
+pub async fn handle_ecdh_relay(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    raw: Bytes,
+) -> impl IntoResponse {
+    // §07 auth over the RAW body, before any share material is touched.
+    let caller =
+        match crate::auth::verify_or_allow("POST", "/ecdh-relay", &headers, &raw, &state.auth) {
+            Ok(id) => id,
+            Err(resp) => return resp,
+        };
+    let body: EcdhRelayRequest = match crate::handlers::parse_body_pub(&raw) {
+        Ok(b) => b,
+        Err(resp) => return resp,
+    };
+    if body.indices.is_empty() {
+        return err_response(StatusCode::BAD_REQUEST, "indices must be non-empty");
+    }
+    // De-dup/normalize (a repeated index is a client bug; one partial each).
+    let mut indices = body.indices.clone();
+    indices.sort_unstable();
+    indices.dedup();
+
+    let counterparty_pub = match hex::decode(&body.counterparty_pub_hex)
+        .ok()
+        .and_then(|b| bsv::primitives::ec::PublicKey::from_bytes(&b).ok())
+    {
+        Some(pk) => pk,
+        None => {
+            return err_response(
+                StatusCode::BAD_REQUEST,
+                "counterparty_pub_hex must be a 33-byte compressed pubkey",
+            )
+        }
+    };
+    let nonce = match decode_32(&body.nonce_hex) {
+        Ok(n) => n,
+        Err(e) => return err_response(StatusCode::BAD_REQUEST, format!("nonce_hex: {e}")),
+    };
+    let identity_priv = match crate::auth::server_identity_priv_from_env() {
+        Ok(k) => k,
+        Err(e) => {
+            return err_response(
+                StatusCode::PRECONDITION_FAILED,
+                format!("relay ECDH requires an enforced server identity: {e}"),
+            )
+        }
+    };
+
+    // §08.1 owner-authz + durable share-load per held index (composite owner first,
+    // bare fallback for the 2-party deployment).
+    let mut shares: Vec<(u16, Vec<u8>)> = Vec::with_capacity(indices.len());
+    for &index in &indices {
+        if let Some(resp) =
+            crate::handlers::authz_owner_at_index_pub(&state, &caller, &body.agent_id, index)
+        {
+            return resp;
+        }
+        let share = match crate::handlers::load_share_or_recover_at_index_pub(
+            &state,
+            &body.agent_id,
+            index,
+        )
+        .await
+        {
+            Ok(s) => s,
+            Err(resp) => return resp,
+        };
+        shares.push((index, share.ciphertext));
+    }
+
+    let outcome = match crate::ecdh_relay_handler::issue_ecdh_partials(
+        &identity_priv,
+        &body.agent_id,
+        &counterparty_pub,
+        &nonce,
+        &shares,
+    ) {
+        Ok(o) => o,
+        Err(e) => return err_response(StatusCode::BAD_GATEWAY, format!("ecdh-relay: {e}")),
+    };
+
+    let partials_json: Vec<serde_json::Value> = outcome
+        .partials
+        .iter()
+        .map(|p| {
+            serde_json::json!({
+                "index": p.index,
+                "partial_hex": hex::encode(p.partial.to_compressed()),
+                "vss_point_hex": hex::encode(p.vss_point),
+            })
+        })
+        .collect();
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "route": "ecdh-relay",
+            "owner": caller.identity_key,
+            "partials": partials_json,
+            "master_pub_hex": outcome.master_pub_hex,
+            "attestation_sig_hex": outcome.attestation_sig_hex,
+        })),
+    )
+}
+
 // ── /identity-challenge ──────────────────────────────────────────────────────
 
 /// Request body for `POST /identity-challenge` (#85 funding gate).

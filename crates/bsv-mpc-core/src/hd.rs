@@ -425,6 +425,129 @@ pub fn verify_cosigner_challenge(
     }
 }
 
+// ── #90 distributed-ECDH partial-set attestation (#85 pin for the HTTP-direct
+//    /ecdh-relay return) ───────────────────────────────────────────────────────
+//
+// The device fetches its `Self_`/`Other` BRC-42 derivation by asking a cosigner
+// for `counterparty_pub * its_share(s)` over a single authed HTTP round-trip
+// (#90, response-direct — ECDH has no presig/pool/multi-round semantics). Unlike
+// the sign path (whose partial rides the BRC-31-authed MessageBox from the pinned
+// relay identity), the ECDH partials come back in the HTTP RESPONSE BODY — so a
+// network MITM could let a liveness challenge through yet SWAP the returned
+// partials, steering the device to a WRONG derived key (→ funds to an address the
+// attacker can derive). The fix mirrors the rest of #85: the cosigner's PINNED
+// MASTER signs an attestation that BINDS the exact partial set it returned, and
+// the device verifies it against the out-of-band-pinned master before combining a
+// single partial. A MITM cannot forge the master's signature, and cannot reuse a
+// genuine one for different partials / a different wallet / counterparty / nonce.
+
+/// Domain tag for the ECDH partial-set attestation signature (#90 / #85).
+const ECDH_PARTIALS_ATTESTATION_DOMAIN_V1: &[u8] = b"bsv-mpc ecdh-partials attestation v1";
+/// Domain tag for the canonical ECDH partial-set digest (#90).
+const ECDH_PARTIALS_DIGEST_DOMAIN_V1: &[u8] = b"bsv-mpc ecdh-partials digest v1";
+
+/// Canonical 32-byte digest over a distributed-ECDH partial set. Each entry is
+/// `(keygen_index, partial_point, vss_eval_point)`. The digest is order-INdependent
+/// (entries are sorted by `index` ascending first), so the device and cosigner
+/// agree regardless of wire order, and binds the EXACT bytes of every partial +
+/// its paired VSS eval point. Layout per entry (after sort): `index` big-endian
+/// u16 ‖ `partial.to_compressed()` (33) ‖ `vss_point` (32), under a domain tag and
+/// a big-endian u16 count prefix.
+pub fn ecdh_partials_digest(partials: &[(u16, PublicKey, [u8; 32])]) -> [u8; 32] {
+    let mut sorted: Vec<&(u16, PublicKey, [u8; 32])> = partials.iter().collect();
+    sorted.sort_by_key(|(idx, _, _)| *idx);
+
+    let mut h = Sha256::new();
+    h.update(ECDH_PARTIALS_DIGEST_DOMAIN_V1);
+    h.update((sorted.len() as u16).to_be_bytes());
+    for (idx, partial, vss_point) in sorted {
+        h.update(idx.to_be_bytes());
+        h.update(partial.to_compressed());
+        h.update(vss_point);
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&h.finalize());
+    out
+}
+
+/// The canonical 32-byte message a cosigner's MASTER identity signs to ATTEST that
+/// it returned exactly `partials_digest` for `(agent_id, counterparty_pub, nonce)`
+/// (#90 / #85). Binds `master_pub ‖ agent_id ‖ counterparty_pub ‖ nonce ‖
+/// partials_digest` under a domain tag, so an attestation cannot be replayed across
+/// cosigners, wallets, counterparties, device nonces, or a substituted partial set.
+pub fn ecdh_partials_attestation_msg(
+    master_pub: &PublicKey,
+    agent_id: &str,
+    counterparty_pub: &PublicKey,
+    nonce: &[u8; 32],
+    partials_digest: &[u8; 32],
+) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(ECDH_PARTIALS_ATTESTATION_DOMAIN_V1);
+    h.update(master_pub.to_compressed());
+    // Length-prefix the variable-length agent_id so it can't be confused with the
+    // fixed-width fields that follow (canonical-encoding hygiene).
+    h.update((agent_id.len() as u32).to_be_bytes());
+    h.update(agent_id.as_bytes());
+    h.update(counterparty_pub.to_compressed());
+    h.update(nonce);
+    h.update(partials_digest);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&h.finalize());
+    out
+}
+
+/// Sign an [`ecdh_partials_attestation_msg`] with the cosigner's MASTER identity
+/// (RFC-6979 → deterministic, low-S). Returns the 64-byte compact `r ‖ s`.
+pub fn sign_ecdh_partials_attestation(
+    master_priv: &PrivateKey,
+    agent_id: &str,
+    counterparty_pub: &PublicKey,
+    nonce: &[u8; 32],
+    partials_digest: &[u8; 32],
+) -> Result<[u8; 64]> {
+    let msg = ecdh_partials_attestation_msg(
+        &master_priv.public_key(),
+        agent_id,
+        counterparty_pub,
+        nonce,
+        partials_digest,
+    );
+    let sig = master_priv
+        .sign(&msg)
+        .map_err(|e| MpcError::Protocol(format!("ecdh-partials attestation sign: {e}")))?;
+    let mut c = [0u8; 64];
+    c[..32].copy_from_slice(sig.r());
+    c[32..].copy_from_slice(sig.s());
+    Ok(c)
+}
+
+/// Verify an ECDH partial-set attestation against the PINNED master pub (#90 / #85).
+/// Returns `true` ONLY if the pinned master signed exactly
+/// `(agent_id, counterparty_pub, nonce, partials_digest)` — a MITM-swapped partial
+/// set (different digest), a wrong master, a replayed nonce, a different wallet /
+/// counterparty, or a malformed signature all fail closed (`false`).
+pub fn verify_ecdh_partials_attestation(
+    master_pub: &PublicKey,
+    agent_id: &str,
+    counterparty_pub: &PublicKey,
+    nonce: &[u8; 32],
+    partials_digest: &[u8; 32],
+    sig_compact: &[u8; 64],
+) -> bool {
+    let msg = ecdh_partials_attestation_msg(
+        master_pub,
+        agent_id,
+        counterparty_pub,
+        nonce,
+        partials_digest,
+    );
+    match Signature::from_compact(sig_compact) {
+        Ok(sig) => master_pub.verify(&msg, &sig),
+        Err(_) => false,
+    }
+}
+
 /// Convert a PublicKey to a JointPublicKey with BSV address.
 fn pubkey_to_joint_key(pubkey: &PublicKey) -> Result<JointPublicKey> {
     let compressed = pubkey.to_compressed().to_vec();
@@ -1273,6 +1396,193 @@ mod tests {
             &joint,
             &nonce,
             &ch_sig
+        ));
+    }
+
+    // -------------------------------------------------------------------
+    // #90 ECDH partial-set attestation (#85 pin for the HTTP-direct
+    // /ecdh-relay return). The cosigner's pinned master BINDS the exact
+    // partial set it returned; the device verifies before combining. Positive
+    // round-trip + NEGATIVE (wrong master / swapped partial / replayed nonce /
+    // wrong counterparty / wrong wallet / malformed sig) + frozen zero-drift.
+    // -------------------------------------------------------------------
+
+    /// A realistic counterparty pubkey (the `Other`/`Self_` ECDH peer).
+    fn ecdh_counterparty_pub() -> PublicKey {
+        PrivateKey::from_bytes(&[0x33u8; 32]).unwrap().public_key()
+    }
+
+    /// A realistic partial set: two `(index, partial_point, vss_point)` entries.
+    fn ecdh_partials() -> Vec<(u16, PublicKey, [u8; 32])> {
+        vec![
+            (3, attested_relay_pub(3), [0x01u8; 32]),
+            (4, attested_relay_pub(4), [0x02u8; 32]),
+        ]
+    }
+
+    #[test]
+    fn ecdh_partials_digest_is_order_independent() {
+        let a = ecdh_partials();
+        let mut b = a.clone();
+        b.reverse();
+        assert_eq!(
+            ecdh_partials_digest(&a),
+            ecdh_partials_digest(&b),
+            "digest MUST be independent of wire order (sorted by index)"
+        );
+    }
+
+    #[test]
+    fn ecdh_partials_digest_changes_on_any_field() {
+        let base = ecdh_partials_digest(&ecdh_partials());
+        // swapped partial point
+        let mut p = ecdh_partials();
+        p[0].1 = attested_relay_pub(5);
+        assert_ne!(
+            base,
+            ecdh_partials_digest(&p),
+            "partial swap MUST change digest"
+        );
+        // changed vss point
+        let mut p = ecdh_partials();
+        p[1].2 = [0x09u8; 32];
+        assert_ne!(
+            base,
+            ecdh_partials_digest(&p),
+            "vss change MUST change digest"
+        );
+        // changed index
+        let mut p = ecdh_partials();
+        p[0].0 = 2;
+        assert_ne!(
+            base,
+            ecdh_partials_digest(&p),
+            "index change MUST change digest"
+        );
+    }
+
+    #[test]
+    fn ecdh_attestation_roundtrips_and_rejects_mitm() {
+        let master = relay_server_priv();
+        let master_pub = master.public_key();
+        let agent_id = "02c709186cbe1ac811a2f7eb39e17dfeeca4ce7465f009592d300494df981cc32f";
+        let cp = ecdh_counterparty_pub();
+        let nonce = [0x5au8; 32];
+        let digest = ecdh_partials_digest(&ecdh_partials());
+
+        let sig = sign_ecdh_partials_attestation(&master, agent_id, &cp, &nonce, &digest).unwrap();
+        // Positive: the pinned master verifies its own attestation.
+        assert!(verify_ecdh_partials_attestation(
+            &master_pub,
+            agent_id,
+            &cp,
+            &nonce,
+            &digest,
+            &sig
+        ));
+
+        // NEGATIVE 1 — wrong master (the MITM's key) fails closed.
+        let attacker = PrivateKey::from_bytes(&[0x99u8; 32]).unwrap().public_key();
+        assert!(
+            !verify_ecdh_partials_attestation(&attacker, agent_id, &cp, &nonce, &digest, &sig),
+            "an attestation MUST NOT verify under a non-pinned master"
+        );
+
+        // NEGATIVE 2 — MITM swaps the partial set (different digest) fails closed.
+        let mut swapped = ecdh_partials();
+        swapped[0].1 = attested_relay_pub(5);
+        let swapped_digest = ecdh_partials_digest(&swapped);
+        assert!(
+            !verify_ecdh_partials_attestation(
+                &master_pub,
+                agent_id,
+                &cp,
+                &nonce,
+                &swapped_digest,
+                &sig
+            ),
+            "a substituted partial set MUST fail the attestation"
+        );
+
+        // NEGATIVE 3 — replayed/altered device nonce fails closed.
+        assert!(!verify_ecdh_partials_attestation(
+            &master_pub,
+            agent_id,
+            &cp,
+            &[0x5bu8; 32],
+            &digest,
+            &sig
+        ));
+
+        // NEGATIVE 4 — different counterparty (cross-derivation replay) fails closed.
+        let other_cp = PrivateKey::from_bytes(&[0x44u8; 32]).unwrap().public_key();
+        assert!(!verify_ecdh_partials_attestation(
+            &master_pub,
+            agent_id,
+            &other_cp,
+            &nonce,
+            &digest,
+            &sig
+        ));
+
+        // NEGATIVE 5 — different wallet (cross-wallet replay) fails closed.
+        assert!(!verify_ecdh_partials_attestation(
+            &master_pub,
+            "03deadbeef",
+            &cp,
+            &nonce,
+            &digest,
+            &sig
+        ));
+
+        // NEGATIVE 6 — malformed signature bytes fail closed (never panic).
+        assert!(!verify_ecdh_partials_attestation(
+            &master_pub,
+            agent_id,
+            &cp,
+            &nonce,
+            &digest,
+            &[0u8; 64]
+        ));
+    }
+
+    #[test]
+    fn ecdh_attestation_frozen_vectors() {
+        // ZERO-DRIFT. RFC-6979 → deterministic signature. Inputs: master =
+        // [0x11;32], agent_id = the fixed hex below, counterparty = pub([0x33;32]),
+        // nonce = [0x5a;32], partials = ecdh_partials(). ANY change to a domain tag /
+        // field order / encoding flips these.
+        let master = relay_server_priv();
+        let agent_id = "02c709186cbe1ac811a2f7eb39e17dfeeca4ce7465f009592d300494df981cc32f";
+        let cp = ecdh_counterparty_pub();
+        let nonce = [0x5au8; 32];
+        let digest = ecdh_partials_digest(&ecdh_partials());
+        assert_eq!(
+            hex::encode(digest),
+            "ca6f2799624f810d3ef2e3658aacffa9504ede057c24dc49fa066d85d07e5635",
+            "ecdh partials digest drifted"
+        );
+        let msg =
+            ecdh_partials_attestation_msg(&master.public_key(), agent_id, &cp, &nonce, &digest);
+        assert_eq!(
+            hex::encode(msg),
+            "84c013d0d1d3394c2258562dcccbbbd3cab35d5109b8a448581c1928844a25a3",
+            "ecdh attestation message preimage drifted"
+        );
+        let sig = sign_ecdh_partials_attestation(&master, agent_id, &cp, &nonce, &digest).unwrap();
+        assert_eq!(
+            hex::encode(sig),
+            "828de750286a57ab7174ec5ecf25cec4c2cf50c560407505278816e1bd15aad0\
+             1d8f508381b7003553a257026cbe1a91b7cf242619d69613dea9008ffdee5000",
+            "ecdh attestation signature drifted"
+        );
+        assert!(verify_ecdh_partials_attestation(
+            &master.public_key(),
+            agent_id,
+            &cp,
+            &nonce,
+            &digest,
+            &sig
         ));
     }
 }
