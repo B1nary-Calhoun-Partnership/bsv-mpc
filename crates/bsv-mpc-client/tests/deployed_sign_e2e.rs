@@ -149,6 +149,106 @@ async fn ceremony_verify_signs_vs_deployed_cosigner_no_sats() {
     );
 }
 
+/// **#90/#91 DEPLOYED ECDH CAPSTONE (no sats).** Derive a `Self_` and an `Other`
+/// BRC-42 offset against the REAL deployed `/ecdh-relay` (real BRC-31 + the container's
+/// durable share-load), then PROVE the `Self_` offset is usable end-to-end: a presig +
+/// a sign with that offset verifies under the derived child key `joint + offset·G`.
+/// This is the live capstone for the #90 relay round + the #91 high-level orchestration
+/// (`DeployedSigner::derive_offset_for_counterparty`); the ECDH math correctness rides
+/// the hermetic proof (`ecdh_relay_e2e`) + the byte-identical deployed binary.
+///
+/// ```bash
+/// CLIENT_DEPLOYED_ECDH=1 cargo test -p bsv-mpc-client --features native \
+///   --test deployed_sign_e2e derive_offset_via_deployed_ecdh -- --nocapture --test-threads=1
+/// ```
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn derive_offset_via_deployed_ecdh_relay_no_sats() {
+    if std::env::var("CLIENT_DEPLOYED_ECDH").ok().as_deref() != Some("1") {
+        eprintln!("CLIENT_DEPLOYED_ECDH=1 not set — skipping the deployed ECDH capstone.");
+        return;
+    }
+    use bsv_mpc_client::native_io::DerivationCounterparty;
+    let (signer, joint_pub, _joint_compressed, _agent_id) = provision_and_connect().await;
+
+    // (1) Self_ offset via the DEPLOYED /ecdh-relay round (real BRC-31 + container share-load).
+    let derived = signer
+        .derive_offset_for_counterparty(
+            DerivationCounterparty::SelfWallet,
+            "worm memory",
+            "knowledge",
+            2,
+            "derive Self_ offset",
+            Duration::from_secs(90),
+        )
+        .await
+        .expect("deployed ECDH derive Self_");
+    eprintln!(
+        "✔ deployed Self_ ECDH round → derived address {}",
+        derived.derived_address
+    );
+
+    // Consistency: derived_pubkey == joint + offset·G.
+    let offset_pub = PrivateKey::from_bytes(&derived.brc42_offset)
+        .expect("offset scalar")
+        .public_key();
+    let expected_child =
+        bsv_mpc_core::ecdh::point_add(&joint_pub, &offset_pub).expect("joint + offset·G");
+    assert_eq!(
+        derived.derived_pubkey.to_compressed(),
+        expected_child.to_compressed(),
+        "derived pubkey must equal joint + offset·G"
+    );
+
+    // (2) Signability: a sign with the deployed-ECDH offset MUST verify under the
+    // derived child key — the offset the live round produced is usable end-to-end.
+    signer
+        .top_up_presigs(1, "presig", Duration::from_secs(180))
+        .await
+        .expect("presig top-up");
+    let sighash = [0x5au8; 32];
+    let sig = signer
+        .sign(
+            &sighash,
+            "sign derived",
+            Some(derived.brc42_offset),
+            Duration::from_secs(60),
+            Duration::from_secs(180),
+        )
+        .await
+        .expect("sign with deployed-ECDH-derived offset");
+    let mut r = [0u8; 32];
+    let mut s = [0u8; 32];
+    r.copy_from_slice(&sig.r);
+    s.copy_from_slice(&sig.s);
+    let bsv_sig = Signature::new(r, s);
+    assert!(
+        expected_child.verify(&sighash, &bsv_sig),
+        "the deployed-ECDH offset must produce a signature valid under the derived child key"
+    );
+
+    // (3) The Other-counterparty round also completes over the deployed relay + differs.
+    let other = PrivateKey::from_bytes(&[0x5cu8; 32]).unwrap().public_key();
+    let derived_other = signer
+        .derive_offset_for_counterparty(
+            DerivationCounterparty::Other(other),
+            "worm memory",
+            "knowledge",
+            2,
+            "derive Other offset",
+            Duration::from_secs(90),
+        )
+        .await
+        .expect("deployed ECDH derive Other");
+    assert_ne!(
+        derived_other.derived_address, derived.derived_address,
+        "the Other derivation must differ from Self_"
+    );
+    eprintln!(
+        "✔ DEPLOYED ECDH CAPSTONE (#90/#91): Self_ + Other offsets derived via the live \
+         /ecdh-relay; the Self_ offset signs under the derived child key. No sats."
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn real_mainnet_tx_signed_by_client_vs_deployed_cosigner() {
     if std::env::var("CLIENT_DEPLOYED_SIGN_MAINNET")
