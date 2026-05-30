@@ -60,8 +60,10 @@ bsv-mpc-messagebox = { path = "../bsv-mpc-messagebox" }
 bsv-mpc-relay = { path = "../bsv-mpc-relay" }
 bsv-mpc-service = { path = "../bsv-mpc-service" }
 # bsv-rs with `auth` (= wallet+messages+tokio) for the #64 BRC-103/104 storage
-# client; `wallet`/`transaction` for the #63 EC primitives + tx + pre-flight verify.
-bsv = { package = "bsv-rs", version = "0.3.13", features = ["auth", "wallet", "transaction"] }
+# client; `wallet`/`transaction` for the #63 EC primitives + tx + pre-flight verify;
+# `identity` (= auth+overlay) for the #95 read-only identity-resolution FFI
+# (IdentityClient over a keyless ProtoWallet::anyone() — 0 MPC, no key material).
+bsv = { package = "bsv-rs", version = "0.3.13", features = ["auth", "wallet", "transaction", "identity"] }
 # Portable native HTTP — replaces worker::Fetch (#64) + drives the relay triggers
 # (#63). rustls-tls (no OpenSSL) for a clean iOS/Android cross-build.
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }

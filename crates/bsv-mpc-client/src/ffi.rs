@@ -1717,6 +1717,229 @@ fn ffi_derived_key(dk: crate::native_io::DerivedKey) -> FfiDerivedKey {
     }
 }
 
+// ── #95 read-only identity-resolution FFI (0 MPC, no key material) ────────────
+//
+// The only BRC-100 area with NO MPC dependency: resolve a counterparty's
+// displayable identity (name / avatar / certifier badge) + list its certificates
+// over the BSV overlay (`ls_identity` lookup), via a KEYLESS `ProtoWallet::anyone()`
+// driving `bsv-rs::IdentityClient`. Read-only, no share, no signing — ships ahead of
+// the MPC FFI. Native-only/async (overlay HTTP + tokio), like the other deployed seams.
+
+/// Which overlay network the identity lookup resolves against.
+#[derive(uniffi::Enum)]
+pub enum FfiOverlayNetwork {
+    Mainnet,
+    Testnet,
+    Local,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn to_network_preset(n: &FfiOverlayNetwork) -> bsv::overlay::NetworkPreset {
+    match n {
+        FfiOverlayNetwork::Mainnet => bsv::overlay::NetworkPreset::Mainnet,
+        FfiOverlayNetwork::Testnet => bsv::overlay::NetworkPreset::Testnet,
+        FfiOverlayNetwork::Local => bsv::overlay::NetworkPreset::Local,
+    }
+}
+
+/// A resolved, display-ready identity (mirrors `bsv-rs::DisplayableIdentity`): the
+/// name/avatar + the certifier badge the host renders. All fields are display text.
+#[derive(uniffi::Record)]
+pub struct FfiDisplayableIdentity {
+    pub name: String,
+    pub avatar_url: String,
+    /// 66-char compressed-secp256k1 identity pubkey hex.
+    pub identity_key: String,
+    pub abbreviated_key: String,
+    pub badge_icon_url: String,
+    pub badge_label: String,
+    pub badge_click_url: String,
+}
+
+/// A certificate discovered for an identity — practical metadata only (the field
+/// VALUES stay encrypted in the keyless `anyone()` path; only the field NAMES + the
+/// certifier/subject/type are exposed, which is what a display surface needs).
+#[derive(uniffi::Record)]
+pub struct FfiIdentityCertificate {
+    /// 64-char hex of the 32-byte certificate type (schema id).
+    pub cert_type_hex: String,
+    /// 64-char hex of the 32-byte serial number.
+    pub serial_number_hex: String,
+    /// Subject's compressed identity pubkey hex.
+    pub subject_hex: String,
+    /// Certifier's compressed pubkey hex.
+    pub certifier_hex: String,
+    /// The certified attribute names (values are encrypted; not decryptable keyless).
+    pub field_names: Vec<String>,
+    /// Whether the certificate carries an on-chain revocation outpoint.
+    pub has_revocation_outpoint: bool,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn ffi_displayable_identity(d: bsv::identity::DisplayableIdentity) -> FfiDisplayableIdentity {
+    FfiDisplayableIdentity {
+        name: d.name,
+        avatar_url: d.avatar_url,
+        identity_key: d.identity_key,
+        abbreviated_key: d.abbreviated_key,
+        badge_icon_url: d.badge_icon_url,
+        badge_label: d.badge_label,
+        badge_click_url: d.badge_click_url,
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn ffi_identity_certificate(c: &bsv::auth::VerifiableCertificate) -> FfiIdentityCertificate {
+    let cert = &c.certificate;
+    let mut field_names: Vec<String> = cert.fields.keys().cloned().collect();
+    field_names.sort_unstable(); // deterministic order across runs
+    FfiIdentityCertificate {
+        cert_type_hex: hex::encode(cert.cert_type),
+        serial_number_hex: hex::encode(cert.serial_number),
+        subject_hex: hex::encode(cert.subject.to_compressed()),
+        certifier_hex: hex::encode(cert.certifier.to_compressed()),
+        field_names,
+        has_revocation_outpoint: cert.revocation_outpoint.is_some(),
+    }
+}
+
+/// Build a keyless `IdentityClient` over `ProtoWallet::anyone()` for the chosen
+/// network. A non-empty `ls_identity_hosts` overrides the `ls_identity` lookup hosts
+/// (else the network preset's SLAP-discovered hosts are used).
+#[cfg(not(target_arch = "wasm32"))]
+fn build_identity_client(
+    network: &FfiOverlayNetwork,
+    ls_identity_hosts: Vec<String>,
+) -> bsv::identity::IdentityClient<bsv::wallet::ProtoWallet> {
+    use bsv::identity::{IdentityClient, IdentityClientConfig};
+    use bsv::overlay::{LookupResolver, LookupResolverConfig};
+    use bsv::wallet::ProtoWallet;
+
+    let preset = to_network_preset(network);
+    let wallet = ProtoWallet::anyone();
+    let config = IdentityClientConfig {
+        network_preset: preset,
+        ..Default::default()
+    };
+    if ls_identity_hosts.is_empty() {
+        IdentityClient::new(wallet, config)
+    } else {
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert("ls_identity".to_string(), ls_identity_hosts);
+        let resolver = std::sync::Arc::new(LookupResolver::new(LookupResolverConfig {
+            network_preset: preset,
+            host_overrides: Some(overrides),
+            ..Default::default()
+        }));
+        IdentityClient::with_resolver(wallet, config, resolver)
+    }
+}
+
+/// Drive a `!Send` overlay future to completion on a DEDICATED current-thread tokio
+/// runtime (a fresh OS thread), bridging the `Send` result back over a oneshot.
+///
+/// The `bsv-rs::IdentityClient` futures are `!Send` (overlay/lookup internals), but
+/// UniFFI's `async_runtime = "tokio"` export wraps the FFI future in
+/// `async_compat::Compat<F>` which requires `F: Send`. So the outer FFI future here
+/// (spawn a thread + await a oneshot — both `Send`) satisfies the boundary while the
+/// `!Send` work is created AND driven entirely on the worker thread, never crossing it.
+#[cfg(not(target_arch = "wasm32"))]
+async fn run_identity_local<T>(
+    build: impl FnOnce() -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<T, FfiError>>>>
+        + Send
+        + 'static,
+) -> Result<T, FfiError>
+where
+    T: Send + 'static,
+{
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        let rt = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                let _ = tx.send(Err(FfiError::Client(format!("identity runtime: {e}"))));
+                return;
+            }
+        };
+        let result = rt.block_on(build());
+        let _ = tx.send(result);
+    });
+    rx.await
+        .map_err(|_| FfiError::Client("identity worker thread dropped".into()))?
+}
+
+/// **#95.** Resolve a counterparty's displayable identity by its compressed
+/// identity-key hex over the overlay (`ls_identity`). `None` ⇒ no identity found.
+/// 0 MPC, no key material. `ls_identity_hosts` empty ⇒ network-default hosts.
+#[cfg(not(target_arch = "wasm32"))]
+#[uniffi::export(async_runtime = "tokio")]
+pub async fn ffi_resolve_identity_by_key(
+    identity_key_hex: String,
+    network: FfiOverlayNetwork,
+    override_with_contacts: bool,
+    ls_identity_hosts: Vec<String>,
+) -> Result<Option<FfiDisplayableIdentity>, FfiError> {
+    run_identity_local(move || {
+        Box::pin(async move {
+            let client = build_identity_client(&network, ls_identity_hosts);
+            let resolved = client
+                .resolve_by_identity_key(&identity_key_hex, override_with_contacts)
+                .await
+                .map_err(|e| FfiError::Client(format!("resolve_by_identity_key: {e}")))?;
+            Ok(resolved.map(ffi_displayable_identity))
+        })
+    })
+    .await
+}
+
+/// **#95.** Resolve identities by certified attributes (e.g. `{"email": "..."}` or
+/// `{"userName": "..."}`) over the overlay. Returns all matches (empty ⇒ none).
+#[cfg(not(target_arch = "wasm32"))]
+#[uniffi::export(async_runtime = "tokio")]
+pub async fn ffi_resolve_identity_by_attributes(
+    attributes: std::collections::HashMap<String, String>,
+    network: FfiOverlayNetwork,
+    override_with_contacts: bool,
+    ls_identity_hosts: Vec<String>,
+) -> Result<Vec<FfiDisplayableIdentity>, FfiError> {
+    run_identity_local(move || {
+        Box::pin(async move {
+            let client = build_identity_client(&network, ls_identity_hosts);
+            let resolved = client
+                .resolve_by_attributes(attributes, override_with_contacts)
+                .await
+                .map_err(|e| FfiError::Client(format!("resolve_by_attributes: {e}")))?;
+            Ok(resolved.into_iter().map(ffi_displayable_identity).collect())
+        })
+    })
+    .await
+}
+
+/// **#95.** List the certificates discovered for an identity key over the overlay
+/// (metadata only — see [`FfiIdentityCertificate`]).
+#[cfg(not(target_arch = "wasm32"))]
+#[uniffi::export(async_runtime = "tokio")]
+pub async fn ffi_list_identity_certificates(
+    identity_key_hex: String,
+    network: FfiOverlayNetwork,
+    ls_identity_hosts: Vec<String>,
+) -> Result<Vec<FfiIdentityCertificate>, FfiError> {
+    run_identity_local(move || {
+        Box::pin(async move {
+            let client = build_identity_client(&network, ls_identity_hosts);
+            let certs = client
+                .discover_certificates(&identity_key_hex)
+                .await
+                .map_err(|e| FfiError::Client(format!("discover_certificates: {e}")))?;
+            Ok(certs.iter().map(ffi_identity_certificate).collect())
+        })
+    })
+    .await
+}
+
 // ── #68 send-path golden-vector tests (FFI == in-crate, byte-for-byte) ─────────
 #[cfg(test)]
 mod send_path_tests {
@@ -2742,5 +2965,64 @@ mod prime_pool_adapter_tests {
             pool.take().unwrap().is_none(),
             "drained ⇒ None (caller falls back to inline)"
         );
+    }
+}
+
+// ── #95 identity-resolution FFI mapping tests (pure, no network) ──────────────
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod identity_ffi_tests {
+    use super::*;
+
+    #[test]
+    fn network_preset_mapping_is_exhaustive() {
+        use bsv::overlay::NetworkPreset;
+        assert!(matches!(
+            to_network_preset(&FfiOverlayNetwork::Mainnet),
+            NetworkPreset::Mainnet
+        ));
+        assert!(matches!(
+            to_network_preset(&FfiOverlayNetwork::Testnet),
+            NetworkPreset::Testnet
+        ));
+        assert!(matches!(
+            to_network_preset(&FfiOverlayNetwork::Local),
+            NetworkPreset::Local
+        ));
+    }
+
+    #[test]
+    fn displayable_identity_maps_all_seven_fields() {
+        let d = bsv::identity::DisplayableIdentity {
+            name: "Alice".into(),
+            avatar_url: "uhrp://avatar".into(),
+            identity_key: "02abc".into(),
+            abbreviated_key: "02ab...c".into(),
+            badge_icon_url: "https://icon".into(),
+            badge_label: "X account certified by SocialCert".into(),
+            badge_click_url: "https://socialcert.net".into(),
+        };
+        let f = ffi_displayable_identity(d.clone());
+        assert_eq!(f.name, d.name);
+        assert_eq!(f.avatar_url, d.avatar_url);
+        assert_eq!(f.identity_key, d.identity_key);
+        assert_eq!(f.abbreviated_key, d.abbreviated_key);
+        assert_eq!(f.badge_icon_url, d.badge_icon_url);
+        assert_eq!(f.badge_label, d.badge_label);
+        assert_eq!(f.badge_click_url, d.badge_click_url);
+    }
+
+    /// A keyless client builds for every network + with/without a host override
+    /// (construction path is panic-free; no network I/O).
+    #[test]
+    fn build_identity_client_constructs_for_all_networks() {
+        for net in [
+            FfiOverlayNetwork::Mainnet,
+            FfiOverlayNetwork::Testnet,
+            FfiOverlayNetwork::Local,
+        ] {
+            let _default = build_identity_client(&net, vec![]);
+            let _overridden =
+                build_identity_client(&net, vec!["https://ls.example.com".to_string()]);
+        }
     }
 }
