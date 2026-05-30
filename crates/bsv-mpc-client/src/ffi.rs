@@ -1255,6 +1255,131 @@ pub fn ffi_build_payment_intent_cbor(
     Ok(buf)
 }
 
+// ── #89 BRC-42 "Anyone"-derivation FFI (0-MPC, pure local) ────────────────────
+//
+// THE M1 floor + the send-E2E gate. Pure local wrappers over the SDK-validated
+// `bsv_mpc_core::hd` derivation — `hd::test_anyone_matches_bsv_sdk_key_deriver`
+// already pins it byte-equal to `bsv-rs::KeyDeriver` for the Anyone counterparty,
+// so this is a PORT, not new crypto. 0 MPC round-trips: for "Anyone" the BRC-42
+// ECDH shared secret IS the root (joint) pubkey (the anyone counterparty key is
+// scalar 1, so `ECDH(G, root) = root_pub`), so the device derives every receive
+// address + spend offset locally with no cosigner.
+//
+// The send loop these four close (mirrors `bsv-wallet-cli::brc29::deposit_address`,
+// the reference path):
+//   receive:  ffi_brc42_child_address_anyone(joint, proto, key_id, 2) -> deposit addr
+//   spend:    ffi_brc42_offset_anyone(...)        -> brc42_offset for FfiDeployedSigner::sign
+//             ffi_brc42_child_pubkey_anyone(...)  -> the derived pubkey for the P2PKH
+//                                                    scriptSig (ffi_p2pkh_unlocking_script_hex)
+// The offset and the child pubkey are consistent BY CONSTRUCTION — both are built
+// from the SAME `hmac = HMAC-SHA256(compressed(root_pub), invoice)`: the offset IS
+// `hmac`, and `child_pub = root_pub + G*hmac`. So a signature produced with
+// `set_additive_shift(offset)` (the cggmp24-fork additive shift) verifies under the
+// child pubkey, whose hash160 is the deposit address — proven in the keystone test
+// below. BRC-29 is just this with `proto = "3241645161d8"`, `key_id = "{prefix} {suffix}"`.
+//
+// Argument order is uniform across all four (`protocol_name, key_id, security_level`
+// as the trailing trio, root pubkey first where applicable) so a Swift caller can
+// never transpose them between calls.
+
+/// Parse + validate a 33-byte compressed secp256k1 root (joint) pubkey from hex.
+/// A wrong length / bad hex / non-point input fails closed with a clear message —
+/// the device must never derive against a malformed key.
+fn parse_root_pubkey(root_pubkey_hex: &str) -> Result<bsv::primitives::ec::PublicKey, FfiError> {
+    let bytes = dehex(root_pubkey_hex, "root pubkey")?;
+    if bytes.len() != 33 {
+        return Err(FfiError::Client(format!(
+            "root pubkey must be 33 bytes (66 hex chars), got {}",
+            bytes.len()
+        )));
+    }
+    bsv::primitives::ec::PublicKey::from_bytes(&bytes)
+        .map_err(|e| FfiError::Client(format!("invalid root pubkey: {e}")))
+}
+
+/// **#89.** Build the canonical BRC-42 invoice string `"{level}-{proto}-{key_id}"`.
+///
+/// Routes through `bsv_mpc_core::hd::compute_invoice`, which canonicalizes the
+/// protocol name (`trim().to_lowercase()` + format validation) and validates the
+/// key id via the SAME `bsv-rs` path every conformant SDK uses — so two impls
+/// never derive different keys for inputs differing only in case/whitespace
+/// (the cross-impl wire-compat floor, MPC-Spec §03). Rejects `security_level > 2`,
+/// an invalid protocol name, or an invalid key id.
+#[uniffi::export]
+pub fn ffi_brc42_invoice(
+    protocol_name: String,
+    key_id: String,
+    security_level: u8,
+) -> Result<String, FfiError> {
+    bsv_mpc_core::hd::compute_invoice(security_level, &protocol_name, &key_id)
+        .map_err(|e| FfiError::Client(e.to_string()))
+}
+
+/// **#89.** The 32-byte BRC-42 additive OFFSET for the "Anyone" counterparty — the
+/// scalar the device adds to its key share(s) to sign for the derived child key.
+/// Feed it straight into [`FfiDeployedSigner::sign`]'s `brc42_offset` (or
+/// [`FfiSigningSession::init`]'s). For "Anyone" the shared secret is the root
+/// pubkey, so `offset = HMAC-SHA256(compressed(root_pub), invoice)` — identical to
+/// the shift baked into [`ffi_brc42_child_pubkey_anyone`]'s child key, so a sig made
+/// with this offset verifies under that child pubkey (keystone test below).
+#[uniffi::export]
+pub fn ffi_brc42_offset_anyone(
+    root_pubkey_hex: String,
+    protocol_name: String,
+    key_id: String,
+    security_level: u8,
+) -> Result<Vec<u8>, FfiError> {
+    let root_pub = parse_root_pubkey(&root_pubkey_hex)?;
+    let invoice = bsv_mpc_core::hd::compute_invoice(security_level, &protocol_name, &key_id)
+        .map_err(|e| FfiError::Client(e.to_string()))?;
+    Ok(bsv_mpc_core::hd::compute_brc42_hmac(&root_pub, &invoice).to_vec())
+}
+
+/// **#89.** The derived child compressed pubkey hex (33 bytes) for "Anyone":
+/// `child_pub = root_pub + G * offset`. This is the pubkey that goes in the spend's
+/// P2PKH scriptSig (via [`ffi_p2pkh_unlocking_script_hex`]) and whose hash160 is the
+/// deposit address ([`ffi_brc42_child_address_anyone`]). Thin wrapper over the
+/// SDK-validated `bsv_mpc_core::hd::derive_anyone_pubkey`.
+#[uniffi::export]
+pub fn ffi_brc42_child_pubkey_anyone(
+    root_pubkey_hex: String,
+    protocol_name: String,
+    key_id: String,
+    security_level: u8,
+) -> Result<String, FfiError> {
+    let root_pub = parse_root_pubkey(&root_pubkey_hex)?;
+    let child =
+        bsv_mpc_core::hd::derive_anyone_pubkey(&root_pub, &protocol_name, &key_id, security_level)
+            .map_err(|e| FfiError::Client(e.to_string()))?;
+    Ok(hex::encode(child.to_compressed()))
+}
+
+/// **#89.** The BRC-29/BRC-42 "Anyone" receive (deposit) Base58Check P2PKH address
+/// for the derived child key — the address the wallet shows to receive funds and
+/// that the later spend unlocks. Reuses the SDK-validated
+/// `bsv_mpc_core::hd::derive_anyone_joint_key` (which owns the address encoding)
+/// verbatim, so the address is byte-identical to the core/`bsv-rs` path.
+#[uniffi::export]
+pub fn ffi_brc42_child_address_anyone(
+    root_pubkey_hex: String,
+    protocol_name: String,
+    key_id: String,
+    security_level: u8,
+) -> Result<String, FfiError> {
+    let root_pub = parse_root_pubkey(&root_pubkey_hex)?;
+    // `derive_anyone_joint_key` reads only `.compressed`; the `address` field on the
+    // input is ignored, so seeding it empty is fine. It internally re-derives the
+    // child pubkey + encodes the address via the SDK-validated `pubkey_to_joint_key`.
+    let joint = bsv_mpc_core::JointPublicKey {
+        compressed: root_pub.to_compressed().to_vec(),
+        address: String::new(),
+    };
+    let child =
+        bsv_mpc_core::hd::derive_anyone_joint_key(&joint, &protocol_name, &key_id, security_level)
+            .map_err(|e| FfiError::Client(e.to_string()))?;
+    Ok(child.address)
+}
+
 // ── #68 send-path golden-vector tests (FFI == in-crate, byte-for-byte) ─────────
 #[cfg(test)]
 mod send_path_tests {
@@ -1764,6 +1889,311 @@ mod send_path_tests {
         assert!(
             msg.contains("missing field") && msg.contains("human_address"),
             "expected missing-field rejection naming `human_address`, got: {msg}"
+        );
+    }
+}
+
+// ── #89 BRC-42 "Anyone"-derivation FFI tests ──────────────────────────────────
+//
+// Four gates, no asterisks:
+//   1. FFI == core, byte-for-byte (the established FFI-wrapper invariant).
+//   2. KEYSTONE: the offset IS the canonical BRC-42 additive shift — `(root_priv +
+//      offset) mod n` reconstructs exactly `bsv-rs::KeyDeriver::derive_private_key`
+//      for the Anyone counterparty, and that key's pubkey/address are the FFI
+//      child pubkey/address. This is the property the deployed sign path relies on:
+//      `FfiDeployedSigner::sign(.., brc42_offset = offset)` produces a signature
+//      valid for the deposit address's key.
+//   3. ZERO-DRIFT: frozen byte literals for a fixed root key (incl. the real BRC-29
+//      protocol/key_id) — any change to the derivation flips them.
+//   4. Rejections asserted on the RIGHT reason (validate, don't skip).
+#[cfg(test)]
+mod brc42_anyone_tests {
+    use super::*;
+    use bsv::primitives::ec::PrivateKey;
+    use bsv::wallet::{Counterparty, KeyDeriver, Protocol, SecurityLevel};
+
+    /// Fixed test root private key — same bytes as `bsv_mpc_core::hd`'s `test_root_key`,
+    /// so the frozen vectors here are cross-referenceable with the core test suite.
+    const ROOT_PRIV: [u8; 32] = [
+        0x0b, 0x1e, 0x2c, 0x3d, 0x4e, 0x5f, 0x6a, 0x7b, 0x8c, 0x9d, 0xae, 0xbf, 0xc0, 0xd1, 0xe2,
+        0xf3, 0x14, 0x25, 0x36, 0x47, 0x58, 0x69, 0x7a, 0x8b, 0x9c, 0xad, 0xbe, 0xcf, 0xd0, 0xe1,
+        0xf2, 0x03,
+    ];
+
+    fn root_priv() -> PrivateKey {
+        PrivateKey::from_bytes(&ROOT_PRIV).expect("valid test root priv")
+    }
+
+    fn root_pub_hex() -> String {
+        hex::encode(root_priv().public_key().to_compressed())
+    }
+
+    /// BRC-29 payment protocol (the standard receive-address protocol) — matches
+    /// `bsv-wallet-cli::brc29::PROTOCOL` and the bsv-wallet-toolbox-rs test vectors.
+    const BRC29_PROTOCOL: &str = "3241645161d8";
+    const BRC29_KEY_ID: &str = "SfKxPIJNgdI= NaGLC6fMH50=";
+
+    /// (1) The FFI invoice equals the core canonical path, canonicalizes case, and
+    /// is frozen for the common (worm memory, block-42) input.
+    #[test]
+    fn ffi_brc42_invoice_matches_core_and_canonicalizes() {
+        let got = ffi_brc42_invoice("worm memory".into(), "block-42".into(), 2).unwrap();
+        assert_eq!(
+            got,
+            bsv_mpc_core::hd::compute_invoice(2, "worm memory", "block-42").unwrap(),
+            "FFI invoice != core compute_invoice"
+        );
+        assert_eq!(
+            got, "2-worm memory-block-42",
+            "frozen invoice vector drifted"
+        );
+        // Canonicalization rides through (uppercase + whitespace → lowercased/trimmed).
+        assert_eq!(
+            ffi_brc42_invoice("  WORM Memory  ".into(), "block-42".into(), 2).unwrap(),
+            "2-worm memory-block-42",
+            "FFI invoice must canonicalize protocol name"
+        );
+    }
+
+    /// (1) Offset / child pubkey / address all equal the core path byte-for-byte.
+    #[test]
+    fn ffi_brc42_anyone_matches_core() {
+        let rp = root_priv().public_key();
+        let rp_hex = root_pub_hex();
+        let invoice = bsv_mpc_core::hd::compute_invoice(2, "worm memory", "block-42").unwrap();
+
+        let off =
+            ffi_brc42_offset_anyone(rp_hex.clone(), "worm memory".into(), "block-42".into(), 2)
+                .unwrap();
+        assert_eq!(
+            off,
+            bsv_mpc_core::hd::compute_brc42_hmac(&rp, &invoice).to_vec(),
+            "FFI offset != core compute_brc42_hmac"
+        );
+
+        let child_pub = ffi_brc42_child_pubkey_anyone(
+            rp_hex.clone(),
+            "worm memory".into(),
+            "block-42".into(),
+            2,
+        )
+        .unwrap();
+        assert_eq!(
+            child_pub,
+            hex::encode(
+                bsv_mpc_core::hd::derive_anyone_pubkey(&rp, "worm memory", "block-42", 2)
+                    .unwrap()
+                    .to_compressed()
+            ),
+            "FFI child pubkey != core derive_anyone_pubkey"
+        );
+
+        let addr =
+            ffi_brc42_child_address_anyone(rp_hex, "worm memory".into(), "block-42".into(), 2)
+                .unwrap();
+        let joint = bsv_mpc_core::JointPublicKey {
+            compressed: rp.to_compressed().to_vec(),
+            address: String::new(),
+        };
+        assert_eq!(
+            addr,
+            bsv_mpc_core::hd::derive_anyone_joint_key(&joint, "worm memory", "block-42", 2)
+                .unwrap()
+                .address,
+            "FFI address != core derive_anyone_joint_key"
+        );
+    }
+
+    /// (2) KEYSTONE — the offset is the canonical BRC-42 additive shift for the
+    /// deposit key. Cross-checked against `bsv-rs::KeyDeriver` (the reference wallet
+    /// derivation): the FFI child pubkey/address equal `derive_public_key(Anyone)`'s,
+    /// and `(root_priv + offset) mod n` reconstructs `derive_private_key(Anyone)`
+    /// exactly. So a signature made with `set_additive_shift(offset)` verifies under
+    /// the FFI child pubkey, whose hash160 is the FFI deposit address.
+    #[test]
+    fn ffi_brc42_offset_is_canonical_additive_shift() {
+        use cggmp24::supported_curves::Secp256k1;
+        use generic_ec::Scalar;
+
+        let root = root_priv();
+        let rp_hex = root_pub_hex();
+
+        // Reference (canonical wallet) derivation for the Anyone counterparty.
+        let deriver = KeyDeriver::new(Some(root.clone()));
+        let protocol = Protocol::new(SecurityLevel::Counterparty, BRC29_PROTOCOL);
+        let ref_child_pub = deriver
+            .derive_public_key(&protocol, BRC29_KEY_ID, &Counterparty::Anyone, true)
+            .unwrap();
+        let ref_child_priv = deriver
+            .derive_private_key(&protocol, BRC29_KEY_ID, &Counterparty::Anyone)
+            .unwrap();
+
+        // (a) FFI child pubkey == the reference derived public key.
+        let ffi_child_pub = ffi_brc42_child_pubkey_anyone(
+            rp_hex.clone(),
+            BRC29_PROTOCOL.into(),
+            BRC29_KEY_ID.into(),
+            2,
+        )
+        .unwrap();
+        assert_eq!(
+            ffi_child_pub,
+            hex::encode(ref_child_pub.to_compressed()),
+            "FFI child pubkey != bsv-rs KeyDeriver derive_public_key(Anyone)"
+        );
+
+        // (b) FFI deposit address == the reference derived key's P2PKH address.
+        let ffi_addr = ffi_brc42_child_address_anyone(
+            rp_hex.clone(),
+            BRC29_PROTOCOL.into(),
+            BRC29_KEY_ID.into(),
+            2,
+        )
+        .unwrap();
+        assert_eq!(
+            ffi_addr,
+            bsv::Address::new_from_public_key(&ref_child_pub, true)
+                .unwrap()
+                .to_string(),
+            "FFI address != address of the canonical derived key"
+        );
+
+        // (c) The offset IS the additive shift: (root_priv + offset) mod n == the
+        // canonical derived PRIVATE key. This is what makes set_additive_shift work.
+        let offset =
+            ffi_brc42_offset_anyone(rp_hex, BRC29_PROTOCOL.into(), BRC29_KEY_ID.into(), 2).unwrap();
+        let offset32: [u8; 32] = offset.as_slice().try_into().expect("offset is 32 bytes");
+        let root_s = Scalar::<Secp256k1>::from_be_bytes_mod_order(root.to_bytes());
+        let off_s = Scalar::<Secp256k1>::from_be_bytes_mod_order(offset32);
+        let recon = (root_s + off_s).to_be_bytes();
+        assert_eq!(
+            recon.as_bytes(),
+            &ref_child_priv.to_bytes()[..],
+            "(root_priv + offset) mod n != canonical derive_private_key(Anyone) — \
+             the offset is NOT the BRC-42 additive shift for the deposit key"
+        );
+
+        // And the reconstructed child priv's pubkey is the FFI child pubkey (ties it
+        // all together: offset → signable child key → deposit address).
+        let recon_priv = PrivateKey::from_bytes(recon.as_bytes()).unwrap();
+        assert_eq!(
+            hex::encode(recon_priv.public_key().to_compressed()),
+            ffi_child_pub,
+            "reconstructed child priv pubkey != FFI child pubkey"
+        );
+    }
+
+    /// (3) ZERO-DRIFT frozen vectors for the real BRC-29 deposit derivation, plus a
+    /// canonical cross-check so the frozen bytes are pinned to the reference wallet,
+    /// not just to ourselves.
+    #[test]
+    fn ffi_brc42_brc29_deposit_frozen_and_canonical() {
+        let rp_hex = root_pub_hex();
+
+        let offset = ffi_brc42_offset_anyone(
+            rp_hex.clone(),
+            BRC29_PROTOCOL.into(),
+            BRC29_KEY_ID.into(),
+            2,
+        )
+        .unwrap();
+        let child_pub = ffi_brc42_child_pubkey_anyone(
+            rp_hex.clone(),
+            BRC29_PROTOCOL.into(),
+            BRC29_KEY_ID.into(),
+            2,
+        )
+        .unwrap();
+        let addr =
+            ffi_brc42_child_address_anyone(rp_hex, BRC29_PROTOCOL.into(), BRC29_KEY_ID.into(), 2)
+                .unwrap();
+
+        // Frozen — pins the EXACT bytes for ROOT_PRIV + BRC-29 (proto/key_id).
+        assert_eq!(
+            hex::encode(&offset),
+            "2c5733294d597e40682ce2365697b02974ebff8f12ebde61f9f962201312decd",
+            "BRC-29 offset drifted"
+        );
+        assert_eq!(
+            child_pub, "0358f53693f66b01e3f13694ff666dd211cfefbd3818a52572c1bd8d41e3e6b5cd",
+            "BRC-29 child pubkey drifted"
+        );
+        assert_eq!(
+            addr, "13xfx3Sa6NrXyq7tbe6RvuLzbcjXHDPkKp",
+            "BRC-29 deposit address drifted"
+        );
+
+        // Canonical cross-check: the frozen address is also what the reference
+        // wallet (bsv-rs KeyDeriver) computes for the same root key + BRC-29.
+        let deriver = KeyDeriver::new(Some(root_priv()));
+        let protocol = Protocol::new(SecurityLevel::Counterparty, BRC29_PROTOCOL);
+        let ref_pub = deriver
+            .derive_public_key(&protocol, BRC29_KEY_ID, &Counterparty::Anyone, true)
+            .unwrap();
+        assert_eq!(
+            addr,
+            bsv::Address::new_from_public_key(&ref_pub, true)
+                .unwrap()
+                .to_string(),
+            "frozen BRC-29 address != canonical bsv-rs KeyDeriver address"
+        );
+    }
+
+    /// (4) Rejections — bad root pubkey (hex / length / non-point) fails closed.
+    #[test]
+    fn ffi_brc42_rejects_bad_root_pubkey() {
+        // Bad hex.
+        let e = ffi_brc42_child_pubkey_anyone("zz".into(), "worm memory".into(), "k".into(), 2)
+            .unwrap_err();
+        assert!(
+            matches!(&e, FfiError::Client(m) if m.contains("bad hex")),
+            "got: {e}"
+        );
+        // Wrong length (32 bytes, not 33).
+        let e = ffi_brc42_offset_anyone("11".repeat(32), "worm memory".into(), "k".into(), 2)
+            .unwrap_err();
+        assert!(
+            matches!(&e, FfiError::Client(m) if m.contains("33 bytes")),
+            "got: {e}"
+        );
+        // Right length, not a valid curve point (33 bytes of 0x00).
+        let e =
+            ffi_brc42_child_address_anyone("00".repeat(33), "worm memory".into(), "k".into(), 2)
+                .unwrap_err();
+        assert!(
+            matches!(&e, FfiError::Client(m) if m.contains("invalid root pubkey")),
+            "got: {e}"
+        );
+    }
+
+    /// (4) Rejections — invalid invoice inputs fail closed with the right reason.
+    #[test]
+    fn ffi_brc42_invoice_rejects_invalid_inputs() {
+        // security_level > 2.
+        let e = ffi_brc42_invoice("worm memory".into(), "block-42".into(), 3).unwrap_err();
+        assert!(
+            matches!(&e, FfiError::Client(m) if m.contains("security_level")),
+            "got: {e}"
+        );
+        // protocol_name too short (< 5 chars).
+        let e = ffi_brc42_invoice("wm".into(), "block-42".into(), 2).unwrap_err();
+        assert!(
+            matches!(&e, FfiError::Client(m) if m.contains("protocol_name")),
+            "got: {e}"
+        );
+        // empty key_id.
+        let e = ffi_brc42_invoice("worm memory".into(), "".into(), 2).unwrap_err();
+        assert!(
+            matches!(&e, FfiError::Client(m) if m.contains("key_id")),
+            "got: {e}"
+        );
+        // A bad protocol name also rejects through the derivation entry points (not
+        // just the standalone invoice fn).
+        let e = ffi_brc42_offset_anyone(root_pub_hex(), "worm  memory".into(), "k".into(), 2)
+            .unwrap_err();
+        assert!(
+            matches!(&e, FfiError::Client(m) if m.contains("consecutive spaces") || m.contains("protocol_name")),
+            "got: {e}"
         );
     }
 }
