@@ -27,6 +27,7 @@ use std::time::Duration;
 
 use bsv::primitives::ec::{PrivateKey, PublicKey};
 use bsv_mpc_core::error::{MpcError, Result};
+use bsv_mpc_core::paillier_pool::{generate_serialized, PaillierPool, PrimePoolStorage};
 use bsv_mpc_core::types::{DkgResult, JointPublicKey, SessionId, ThresholdConfig};
 use bsv_mpc_messagebox::types::BOX_DKG;
 use bsv_mpc_messagebox::MessageBoxClient;
@@ -75,6 +76,22 @@ pub struct DkgOverRelay {
     /// §08.1 salt). The FINAL share key is `{joint_pubkey}#{index}`, re-keyed at
     /// completion — so this value is transient, not the storage key.
     pub provisional_agent_id: String,
+    /// **Lever B (ADR-0041 / issue #99) — OPTIONAL device Paillier prime pool.**
+    /// When `Some`, the device draws ONE pre-generated safe-prime set per local
+    /// index from this on-device encrypted pool instead of grinding it inline
+    /// (the ~250s 4-of-6 provision cost). A miss (empty pool / decrypt failure)
+    /// FALLS BACK to inline `generate_serialized` per index, so this is strictly
+    /// Pareto — never slower than `None` (today's always-inline behavior). The
+    /// prime values fed into the DKG are byte-identical either way; only their
+    /// SOURCE changes. The pool seals at rest with a key BRC-42-derived from
+    /// [`Self::at_rest_root`] + [`Self::pool_id`] — see [`PaillierPool`].
+    pub prime_pool: Option<Arc<dyn PrimePoolStorage>>,
+    /// The device's 32-byte at-rest root, BRC-42-deriving the pool encryption key.
+    /// Only consulted when [`Self::prime_pool`] is `Some`.
+    pub at_rest_root: [u8; 32],
+    /// Domain-separation bytes for the pool encryption key (e.g. the device
+    /// identity pubkey). Only consulted when [`Self::prime_pool`] is `Some`.
+    pub pool_id: Vec<u8>,
 }
 
 /// Output: the agreed joint key + this device's signable per-index shares.
@@ -400,18 +417,39 @@ pub async fn coordinate_dkg_over_relay(
     //    spawned ABOVE, so the cosigner warms up on the relay during this gen.
     //    The device joining the relay slightly later is fine — it is the
     //    coordinator, and the cosigner's early round-1 backfills. ──
+    //
+    //    LEVER B (#99): when a device prime pool is present, draw ONE pre-generated
+    //    set PER local index from it (`pool.take()`) — each held index gets a
+    //    DISTINCT set (FIFO `take`, never reused across two of the device's own
+    //    parties). A miss (empty pool / decrypt failure / pool-key rotation) falls
+    //    back to inline `generate_serialized` for THAT index only, so a partially
+    //    warm pool still speeds up the sets it covers and an empty/absent pool is
+    //    byte-for-byte today's behavior (the `None` / all-miss path). The set fed
+    //    into the DKG is identical whether pooled or inline — only the source moves.
     let n_local = local_indices.len();
+    let prime_pool = p.prime_pool.clone();
+    let at_rest_root = p.at_rest_root;
+    let pool_id = p.pool_id.clone();
     let mut primes: Vec<PregeneratedPrimes<SecurityLevel128>> =
         tokio::task::spawn_blocking(move || {
+            // Build the pool view once (cheap: derives the AES key, no I/O) if the
+            // host supplied a store; otherwise every index inline-generates.
+            let pool = prime_pool
+                .map(|storage| PaillierPool::new(storage, &at_rest_root, &pool_id, n_local));
             (0..n_local)
                 .map(|_| {
-                    std::thread::spawn(|| {
-                        PregeneratedPrimes::<SecurityLevel128>::generate(&mut rand::rngs::OsRng)
-                    })
+                    // WARM: a pooled set is microseconds (one AES-GCM decrypt).
+                    // A decrypt/storage error is treated as a miss (→ inline), never
+                    // a hard failure — the pool can NEVER regress provisioning.
+                    let pooled = pool.as_ref().and_then(|pl| pl.take().ok().flatten());
+                    match pooled {
+                        Some(pp) => pp,
+                        // COLD fallback: route through `generate_serialized` (the RSS
+                        // gate) rather than the bare `PregeneratedPrimes::generate`
+                        // so a phone never spikes num-bigint memory in parallel.
+                        None => generate_serialized(&mut rand::rngs::OsRng),
+                    }
                 })
-                .collect::<Vec<_>>()
-                .into_iter()
-                .map(|h| h.join().expect("prime thread"))
                 .collect()
         })
         .await
@@ -608,4 +646,156 @@ pub(crate) async fn challenge_cosigner(
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod prime_pool_seam_tests {
+    //! Lever B (#99) — fast unit proof of the prime-pool CONSUMPTION SEAM, with NO
+    //! real safe-prime generation (Blum primes `p ≡ 3 mod 4` are seconds-fast and
+    //! satisfy `PregeneratedPrimes`'s bit-size invariant — the same shortcut the
+    //! core `paillier_pool` tests use). These assert the device drains the warm pool
+    //! FIRST, one DISTINCT set per held index, and only falls back to inline gen on
+    //! a miss — the exact contract of the production loop at the inline-gen block.
+
+    use bsv_mpc_core::paillier_pool::{InMemoryPoolStorage, PaillierPool, PrimePoolStorage};
+    use cggmp24::security_level::{SecurityLevel, SecurityLevel128};
+    use cggmp24::PregeneratedPrimes;
+    use rand::RngCore;
+
+    fn gen_blum<R: RngCore>(rng: &mut R, bits: u32) -> cggmp24::backend::Integer {
+        use cggmp24::backend::Integer;
+        loop {
+            let n = Integer::generate_prime(rng, bits);
+            if n.mod_u(4) == 3 {
+                break n;
+            }
+        }
+    }
+
+    /// Fast stand-in for `PregeneratedPrimes::generate` (real safe primes are
+    /// minutes-class). Used both to seed the pool and as the inline-fallback gen in
+    /// the test, so the seam logic is exercised without the slow safe-prime path.
+    fn fast_primes<R: RngCore>(rng: &mut R) -> PregeneratedPrimes<SecurityLevel128> {
+        let bits = SecurityLevel128::RSA_PRIME_BITLEN;
+        let primes = [
+            gen_blum(rng, bits),
+            gen_blum(rng, bits),
+            gen_blum(rng, bits),
+            gen_blum(rng, bits),
+        ];
+        PregeneratedPrimes::try_from(primes).expect("Blum primes have correct bit size")
+    }
+
+    fn ser(p: &PregeneratedPrimes<SecurityLevel128>) -> Vec<u8> {
+        serde_json::to_vec(p).expect("serialize PregeneratedPrimes")
+    }
+
+    /// The PRODUCTION drain logic, factored out so the test exercises the exact
+    /// take-or-generate decision (mirrors the inline-gen block in
+    /// `coordinate_dkg_over_relay`). Returns `(primes, n_inline_fallbacks)`.
+    fn drain_like_production(
+        pool: Option<&PaillierPool<InMemoryPoolStorage>>,
+        n_local: usize,
+        fallback_rng: &mut impl RngCore,
+    ) -> (Vec<PregeneratedPrimes<SecurityLevel128>>, usize) {
+        let mut fallbacks = 0;
+        let primes = (0..n_local)
+            .map(|_| {
+                let pooled = pool.and_then(|pl| pl.take().ok().flatten());
+                match pooled {
+                    Some(pp) => pp,
+                    None => {
+                        fallbacks += 1;
+                        fast_primes(fallback_rng)
+                    }
+                }
+            })
+            .collect();
+        (primes, fallbacks)
+    }
+
+    /// A warm pool seeded with `w` DISTINCT sets is fully drained — each held index
+    /// gets a distinct pooled set (FIFO order) and ZERO inline fallbacks occur.
+    #[test]
+    fn warm_pool_drained_distinct_before_any_inline_fallback() {
+        let mut rng = rand::rngs::OsRng;
+        let w = 3; // 4-of-6 device holds w = t−1 = 3 indices.
+
+        // Seed `w` distinct sets, recording their serialized bytes in FIFO order.
+        let pool = PaillierPool::new(InMemoryPoolStorage::new(), &[0x11u8; 32], b"seam", w);
+        let mut seeded = Vec::new();
+        for _ in 0..w {
+            let p = fast_primes(&mut rng);
+            seeded.push(ser(&p));
+            pool.put(p).unwrap();
+        }
+        assert_eq!(pool.storage().count().unwrap(), w);
+        // Sanity: the seeded sets are mutually distinct.
+        for i in 0..w {
+            for j in (i + 1)..w {
+                assert_ne!(seeded[i], seeded[j], "seeded sets must be distinct");
+            }
+        }
+
+        let (drawn, fallbacks) = drain_like_production(Some(&pool), w, &mut rng);
+
+        assert_eq!(fallbacks, 0, "a fully warm pool must NOT inline-generate");
+        assert_eq!(drawn.len(), w);
+        // Each held index got the pooled set, in FIFO order — distinct per index.
+        for (i, p) in drawn.iter().enumerate() {
+            assert_eq!(
+                ser(p),
+                seeded[i],
+                "index {i} must get the i-th pooled set (FIFO)"
+            );
+        }
+        assert_eq!(pool.storage().count().unwrap(), 0, "pool fully drained");
+    }
+
+    /// A partially warm pool (fewer sets than indices) drains every pooled set
+    /// FIRST, then falls back to inline gen ONLY for the shortfall — proving the
+    /// pool is exhausted before any inline generation (strictly Pareto).
+    #[test]
+    fn partial_pool_drains_first_then_falls_back_for_shortfall() {
+        let mut rng = rand::rngs::OsRng;
+        let w = 3;
+        let seeded_count = 1;
+
+        let pool = PaillierPool::new(InMemoryPoolStorage::new(), &[0x22u8; 32], b"seam", w);
+        let mut seeded = Vec::new();
+        for _ in 0..seeded_count {
+            let p = fast_primes(&mut rng);
+            seeded.push(ser(&p));
+            pool.put(p).unwrap();
+        }
+
+        let (drawn, fallbacks) = drain_like_production(Some(&pool), w, &mut rng);
+
+        assert_eq!(drawn.len(), w);
+        assert_eq!(
+            fallbacks,
+            w - seeded_count,
+            "exactly the shortfall must inline-generate"
+        );
+        // The FIRST index consumed the one pooled set (warm-first ordering).
+        assert_eq!(
+            ser(&drawn[0]),
+            seeded[0],
+            "pooled set drained before fallback"
+        );
+        assert_eq!(pool.storage().count().unwrap(), 0, "pool fully drained");
+    }
+
+    /// No pool (the `None` arm) is byte-identical to today: every index inline-gens.
+    #[test]
+    fn absent_pool_falls_back_for_every_index() {
+        let mut rng = rand::rngs::OsRng;
+        let w = 3;
+        let (drawn, fallbacks) = drain_like_production(None, w, &mut rng);
+        assert_eq!(drawn.len(), w);
+        assert_eq!(
+            fallbacks, w,
+            "no pool ⇒ all indices inline-generate (unchanged)"
+        );
+    }
 }

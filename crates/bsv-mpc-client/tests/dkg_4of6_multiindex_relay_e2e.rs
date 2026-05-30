@@ -117,6 +117,9 @@ async fn coordinator_rejects_device_not_holding_t_minus_1_no_network() {
                 expected_master_pub: None,
             }],
             provisional_agent_id: "provisional".into(),
+            prime_pool: None,
+            at_rest_root: [0u8; 32],
+            pool_id: Vec::new(),
         },
         Duration::from_secs(1),
     )
@@ -181,6 +184,9 @@ async fn multiindex_4of6_dkg_over_relay_one_container_holds_three() {
                 ),
             }],
             provisional_agent_id: "step5b-multiindex".into(),
+            prime_pool: None,
+            at_rest_root: [0u8; 32],
+            pool_id: Vec::new(),
         },
         Duration::from_secs(600),
     )
