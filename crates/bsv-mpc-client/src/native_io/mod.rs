@@ -30,4 +30,7 @@ pub use provision::{
     ProvisionedWallet, ProvisionedWalletNparty,
 };
 pub use recover::recover_wallet;
-pub use signer::{DeployedSigner, DeployedSignerConfig, WalletMeta};
+pub use signer::{
+    derived_key_from_shared_secret, DeployedSigner, DeployedSignerConfig, DerivationCounterparty,
+    DerivedKey, WalletMeta,
+};

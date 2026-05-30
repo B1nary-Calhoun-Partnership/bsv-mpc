@@ -939,6 +939,46 @@ impl FfiDeployedSigner {
             s: res.s,
         })
     }
+
+    /// **#91 — derive the BRC-42 offset + child key for a counterparty, atomically.**
+    /// `Anyone` is local (0 MPC); `Self_`/`Other` run the distributed ECDH INTERNALLY
+    /// (unseal the device's held shares → local partials → ONE #90 relay round to the
+    /// pinned cosigner → Lagrange-combine). Returns the `brc42_offset` (feed to
+    /// [`Self::sign`]), the derived pubkey hex (the scriptSig key), the P2PKH locking
+    /// script (the sighash subscript), and the receive address — ALL from one shared
+    /// secret. `reason` is the biometric prompt for the share unseal (ignored for
+    /// `Anyone`). `timeout_secs` bounds the relay round.
+    pub async fn derive_offset_for_counterparty(
+        &self,
+        counterparty: FfiCounterparty,
+        protocol_name: String,
+        key_id: String,
+        security_level: u8,
+        reason: String,
+        timeout_secs: u64,
+    ) -> Result<FfiDerivedKey, FfiError> {
+        use crate::native_io::DerivationCounterparty;
+        let cp = match counterparty {
+            FfiCounterparty::SelfWallet => DerivationCounterparty::SelfWallet,
+            FfiCounterparty::Anyone => DerivationCounterparty::Anyone,
+            FfiCounterparty::Other { pubkey_hex } => {
+                DerivationCounterparty::Other(parse_pubkey33(&pubkey_hex, "counterparty pubkey")?)
+            }
+        };
+        let dk = self
+            .inner
+            .derive_offset_for_counterparty(
+                cp,
+                &protocol_name,
+                &key_id,
+                security_level,
+                &reason,
+                std::time::Duration::from_secs(timeout_secs),
+            )
+            .await
+            .map_err(|e| FfiError::Client(e.to_string()))?;
+        Ok(ffi_derived_key(dk))
+    }
 }
 
 // ── Provisioning seam over UniFFI (issue #65) ────────────────────────────────
@@ -1537,6 +1577,144 @@ pub fn ffi_brc42_child_address_anyone(
         bsv_mpc_core::hd::derive_anyone_joint_key(&joint, &protocol_name, &key_id, security_level)
             .map_err(|e| FfiError::Client(e.to_string()))?;
     Ok(child.address)
+}
+
+// ── #91 Self_/Other distributed-ECDH offset FFI ───────────────────────────────
+//
+// Group-B: the DIRECTED (Self_/Other) BRC-42 derivation. Unlike #89 (Anyone, 0 MPC,
+// local), Self_/Other need the ECDH shared secret `counterparty_pub * root_priv`,
+// which is split across shares — so the device computes its `w` local partials and
+// combines them with the cosigner's partial(s) from the #90 relay round. Two surfaces:
+//   - LOW-LEVEL host-driven combine: `ffi_ecdh_device_partial` (one partial per
+//     unsealed share) + `ffi_ecdh_combine_offset` (partials → the atomic FfiDerivedKey).
+//   - HIGH-LEVEL: `FfiDeployedSigner::derive_offset_for_counterparty` (below) runs the
+//     whole thing internally (unseal → local partials → relay round → combine).
+// Always the core Lagrange path (`combine_partials_lagrange`) — NOT additive
+// aggregation, which is wrong for cggmp24 VSS shares.
+
+/// One distributed-ECDH partial: `counterparty_pub * share(party_index)` (33-byte
+/// compressed point) + the VSS eval point `I[party_index]` (32 bytes) to Lagrange-pair
+/// it with.
+#[derive(uniffi::Record)]
+pub struct FfiEcdhPartial {
+    /// 33-byte compressed partial-ECDH point.
+    pub partial: Vec<u8>,
+    /// 32-byte VSS evaluation point for this partial's party.
+    pub vss_point: Vec<u8>,
+}
+
+/// A fully-derived BRC-42 child key (#91) — every field from ONE ECDH shared secret
+/// so they can never disagree (the loss-of-funds invariant).
+#[derive(uniffi::Record)]
+pub struct FfiDerivedKey {
+    /// 32-byte BRC-42 additive offset — feed to `FfiDeployedSigner::sign`'s `brc42_offset`.
+    pub brc42_offset: Vec<u8>,
+    /// Derived child compressed pubkey hex (66 chars) — goes in the spend's scriptSig.
+    pub derived_pubkey_compressed_hex: String,
+    /// Derived key's P2PKH locking-script hex (the sighash subscript).
+    pub derived_p2pkh_locking_script_hex: String,
+    /// Derived key's Base58Check P2PKH receive address.
+    pub derived_address: String,
+}
+
+/// The BRC-42 counterparty for [`FfiDeployedSigner::derive_offset_for_counterparty`].
+#[derive(uniffi::Enum)]
+pub enum FfiCounterparty {
+    /// `Self_` — derive against the wallet's own joint pubkey.
+    SelfWallet,
+    /// `Anyone` — the publicly-derivable counterparty (0 MPC, local).
+    Anyone,
+    /// `Other` — a specific external counterparty (33-byte compressed pubkey hex).
+    Other { pubkey_hex: String },
+}
+
+/// Parse a 33-byte compressed secp256k1 pubkey from hex with a contextual label.
+fn parse_pubkey33(hex_str: &str, what: &str) -> Result<bsv::primitives::ec::PublicKey, FfiError> {
+    let bytes = dehex(hex_str, what)?;
+    if bytes.len() != 33 {
+        return Err(FfiError::Client(format!(
+            "{what} must be 33 bytes (66 hex chars), got {}",
+            bytes.len()
+        )));
+    }
+    bsv::primitives::ec::PublicKey::from_bytes(&bytes)
+        .map_err(|e| FfiError::Client(format!("invalid {what}: {e}")))
+}
+
+/// **#91 low-level.** Compute the device's OWN distributed-ECDH partial for one
+/// unsealed share: `counterparty_pub * share(party_index)` + the party's VSS eval
+/// point. For host-driven combine (the host unseals each held share, calls this per
+/// share, then [`ffi_ecdh_combine_offset`]). Pure, local, 0 network.
+#[uniffi::export]
+pub fn ffi_ecdh_device_partial(
+    counterparty_pub_hex: String,
+    share_json: Vec<u8>,
+    party_index: u16,
+) -> Result<FfiEcdhPartial, FfiError> {
+    let counterparty_pub = parse_pubkey33(&counterparty_pub_hex, "counterparty pubkey")?;
+    let scalar = bsv_mpc_core::ecdh::parse_share_scalar(&share_json)
+        .map_err(|e| FfiError::Client(format!("parse share scalar: {e}")))?;
+    let vss = bsv_mpc_core::ecdh::parse_share_vss_points(&share_json)
+        .map_err(|e| FfiError::Client(format!("parse VSS points: {e}")))?;
+    let vss_point = *vss.get(party_index as usize).ok_or_else(|| {
+        FfiError::Client(format!(
+            "party_index {party_index} out of range for {} VSS points",
+            vss.len()
+        ))
+    })?;
+    let partial = bsv_mpc_core::ecdh::compute_partial_ecdh_point(&counterparty_pub, &scalar)
+        .map_err(|e| FfiError::Client(e.to_string()))?;
+    Ok(FfiEcdhPartial {
+        partial: partial.to_compressed().to_vec(),
+        vss_point: vss_point.to_vec(),
+    })
+}
+
+/// **#91 low-level.** Lagrange-combine `t` distributed-ECDH partials into the BRC-42
+/// shared secret, then derive the atomic [`FfiDerivedKey`] (offset + child pubkey +
+/// locking script + address). The partials MUST be `t` distinct parties (the device's
+/// `w` from [`ffi_ecdh_device_partial`] + the cosigner's from the #90 relay round).
+#[cfg(not(target_arch = "wasm32"))]
+#[uniffi::export]
+pub fn ffi_ecdh_combine_offset(
+    joint_pubkey_hex: String,
+    partials: Vec<FfiEcdhPartial>,
+    protocol_name: String,
+    key_id: String,
+    security_level: u8,
+) -> Result<FfiDerivedKey, FfiError> {
+    let joint_pub = parse_pubkey33(&joint_pubkey_hex, "joint pubkey")?;
+    let invoice = bsv_mpc_core::hd::compute_invoice(security_level, &protocol_name, &key_id)
+        .map_err(|e| FfiError::Client(e.to_string()))?;
+    let mut pts: Vec<(bsv::primitives::ec::PublicKey, [u8; 32])> =
+        Vec::with_capacity(partials.len());
+    for p in &partials {
+        let partial = bsv::primitives::ec::PublicKey::from_bytes(&p.partial)
+            .map_err(|e| FfiError::Client(format!("bad partial point: {e}")))?;
+        let vss_point: [u8; 32] = p
+            .vss_point
+            .as_slice()
+            .try_into()
+            .map_err(|_| FfiError::Client("vss_point must be 32 bytes".into()))?;
+        pts.push((partial, vss_point));
+    }
+    let shared_secret = bsv_mpc_core::ecdh::combine_partials_lagrange(&pts)
+        .map_err(|e| FfiError::Client(e.to_string()))?;
+    let dk = crate::native_io::derived_key_from_shared_secret(&joint_pub, &shared_secret, &invoice)
+        .map_err(|e| FfiError::Client(e.to_string()))?;
+    Ok(ffi_derived_key(dk))
+}
+
+/// Map the native `DerivedKey` to the hex-encoded FFI record (single mapper so the
+/// low-level combine + the high-level signer method emit identical shapes).
+#[cfg(not(target_arch = "wasm32"))]
+fn ffi_derived_key(dk: crate::native_io::DerivedKey) -> FfiDerivedKey {
+    FfiDerivedKey {
+        brc42_offset: dk.brc42_offset.to_vec(),
+        derived_pubkey_compressed_hex: hex::encode(dk.derived_pubkey.to_compressed()),
+        derived_p2pkh_locking_script_hex: hex::encode(dk.derived_p2pkh_locking_script),
+        derived_address: dk.derived_address,
+    }
 }
 
 // ── #68 send-path golden-vector tests (FFI == in-crate, byte-for-byte) ─────────

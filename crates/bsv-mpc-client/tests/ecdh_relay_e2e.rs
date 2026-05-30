@@ -343,3 +343,99 @@ async fn ecdh_relay_route_rejects_bad_input() {
     assert_eq!(resp.status(), 400, "bad nonce must 400");
     assert!(resp.text().await.unwrap().contains("nonce"));
 }
+
+// ── (5) #91 low-level offset FFI conformance vs bsv-rs KeyDeriver (Self_/Other) ──
+//
+// The keystone for #91's exported surface: `ffi_ecdh_device_partial` (per share) +
+// `ffi_ecdh_combine_offset` reconstruct the EXACT BRC-42 derived key the reference
+// wallet (`bsv-rs::KeyDeriver`) computes for Self_ AND Other — derived pubkey,
+// address, P2PKH script, and the additive offset (cross-checked as the canonical
+// shift: `(root_priv + offset) mod n == derive_private_key`). All four FfiDerivedKey
+// fields come from ONE shared secret (the loss-of-funds invariant).
+//
+// `feature = "native"`-gated: it exercises the UniFFI `ffi::*` surface, which only
+// exists under that feature (the #90 tests above use core/relay/service, so they run
+// without it). Run: `cargo test -p bsv-mpc-client --features native --test ecdh_relay_e2e`.
+
+#[cfg(feature = "native")]
+#[test]
+fn ffi91_low_level_combine_matches_keyderiver_self_and_other() {
+    use bsv::wallet::{Counterparty, KeyDeriver, Protocol, SecurityLevel};
+    use bsv_mpc_client::ffi::{ffi_ecdh_combine_offset, ffi_ecdh_device_partial};
+
+    let root = PrivateKey::from_bytes(&ROOT_PRIV).unwrap();
+    let root_pub = root.public_key();
+    let joint_hex = hex::encode(root_pub.to_compressed());
+    let shares = gen_shares(&root, 2, 2); // device = party 0, cosigner = party 1
+    let proto = "worm memory";
+    let key_id = "knowledge";
+
+    let server = PrivateKey::from_bytes(&[0xabu8; 32]).unwrap();
+    // (counterparty for the ECDH, SDK counterparty enum).
+    let cases: [(PublicKey, Counterparty); 2] = [
+        (root_pub.clone(), Counterparty::Self_),
+        (
+            server.public_key(),
+            Counterparty::Other(server.public_key()),
+        ),
+    ];
+
+    for (counterparty_pub, sdk_cp) in cases {
+        let cp_hex = hex::encode(counterparty_pub.to_compressed());
+
+        // Device (party 0) + cosigner (party 1) partials via the low-level FFI.
+        let dev = ffi_ecdh_device_partial(cp_hex.clone(), share_json(&shares[0]), 0).unwrap();
+        let cos = ffi_ecdh_device_partial(cp_hex, share_json(&shares[1]), 1).unwrap();
+
+        let dk = ffi_ecdh_combine_offset(
+            joint_hex.clone(),
+            vec![dev, cos],
+            proto.into(),
+            key_id.into(),
+            2,
+        )
+        .unwrap();
+
+        // Reference (canonical wallet) derivation.
+        let deriver = KeyDeriver::new(Some(root.clone()));
+        let protocol = Protocol::new(SecurityLevel::Counterparty, proto);
+        let ref_pub = deriver
+            .derive_public_key(&protocol, key_id, &sdk_cp, true)
+            .unwrap();
+        let ref_priv = deriver
+            .derive_private_key(&protocol, key_id, &sdk_cp)
+            .unwrap();
+
+        // (a) derived pubkey + (b) address == the reference wallet's.
+        assert_eq!(
+            dk.derived_pubkey_compressed_hex,
+            hex::encode(ref_pub.to_compressed()),
+            "FFI derived pubkey != bsv-rs KeyDeriver derive_public_key({sdk_cp:?})"
+        );
+        assert_eq!(
+            dk.derived_address,
+            bsv::Address::new_from_public_key(&ref_pub, true)
+                .unwrap()
+                .to_string(),
+            "FFI derived address != canonical"
+        );
+        // (c) the P2PKH locking script is the derived address's script.
+        assert_eq!(
+            dk.derived_p2pkh_locking_script_hex,
+            bsv_mpc_client::ffi::ffi_address_to_locking_script_hex(dk.derived_address.clone())
+                .unwrap(),
+            "FFI locking script != P2PKH of the derived address"
+        );
+        // (d) the offset IS the canonical additive shift: (root + offset) == ref_priv.
+        let offset32: [u8; 32] = dk.brc42_offset.as_slice().try_into().unwrap();
+        let recon = (Scalar::<Secp256k1>::from_be_bytes_mod_order(root.to_bytes())
+            + Scalar::<Secp256k1>::from_be_bytes_mod_order(offset32))
+        .to_be_bytes();
+        assert_eq!(
+            recon.as_bytes(),
+            &ref_priv.to_bytes()[..],
+            "(root_priv + offset) mod n != canonical derive_private_key({sdk_cp:?}) — \
+             the FFI offset is NOT the BRC-42 additive shift"
+        );
+    }
+}

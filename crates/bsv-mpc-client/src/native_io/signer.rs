@@ -84,6 +84,38 @@ pub struct DeployedSignerConfig {
     pub meta: WalletMeta,
 }
 
+/// The BRC-42 counterparty a derivation is computed against (#91).
+///
+/// - `SelfWallet` and `Other` need the distributed-ECDH round (the shared secret
+///   `counterparty_pub * root_priv` can't be computed locally — `root_priv` is split).
+/// - `Anyone` is local (0 MPC): the shared secret IS the joint pubkey.
+pub enum DerivationCounterparty {
+    /// `Self_` — derive against the wallet's own joint pubkey.
+    SelfWallet,
+    /// `Anyone` — the publicly-derivable counterparty (counterparty key = 1).
+    Anyone,
+    /// `Other(pubkey)` — a specific external counterparty.
+    Other(PublicKey),
+}
+
+/// A fully-derived BRC-42 child key (#91), produced ATOMICALLY from one ECDH shared
+/// secret so the four fields can never disagree (the loss-of-funds invariant): the
+/// signing `brc42_offset`, the `derived_pubkey` that goes in the spend's scriptSig,
+/// the `derived_p2pkh_locking_script` (the sighash subscript), and the
+/// `derived_address` (the receive address) ALL come from the same derivation.
+pub struct DerivedKey {
+    /// The 32-byte BRC-42 additive offset to sign the derived input
+    /// (`FfiDeployedSigner::sign`'s `brc42_offset`).
+    pub brc42_offset: [u8; 32],
+    /// The derived child compressed pubkey — `joint + offset·G`.
+    pub derived_pubkey: PublicKey,
+    /// The P2PKH locking script of the derived key (the sighash subscript + the
+    /// script funds land in).
+    pub derived_p2pkh_locking_script: Vec<u8>,
+    /// The Base58Check P2PKH receive address of the derived key.
+    pub derived_address: String,
+}
+
 /// The high-level native signer. Construct with [`DeployedSigner::connect`].
 pub struct DeployedSigner {
     cosigner: DeployedCosigner,
@@ -401,6 +433,99 @@ impl DeployedSigner {
         Ok(sig)
     }
 
+    /// **#91 — derive the BRC-42 offset + child key for a counterparty, atomically.**
+    ///
+    /// For `Anyone` this is local (0 MPC): the shared secret is the joint pubkey. For
+    /// `SelfWallet`/`Other` it runs the distributed ECDH — the device computes its `w`
+    /// local partials (`compute_partial_ecdh_point` over each unsealed held share) and
+    /// fetches ONE cosigner partial over the #90 relay round (#85-pinned), then
+    /// `combine_partials_lagrange` recovers the shared secret WITHOUT reconstructing
+    /// the key. The offset, derived pubkey, locking script, and address are all
+    /// derived from that ONE shared secret (the loss-of-funds invariant). `reason` is
+    /// the biometric prompt for the share unseal (unused on the local `Anyone` path).
+    pub async fn derive_offset_for_counterparty(
+        &self,
+        counterparty: DerivationCounterparty,
+        protocol_name: &str,
+        key_id: &str,
+        security_level: u8,
+        reason: &str,
+        timeout: Duration,
+    ) -> Result<DerivedKey, ClientError> {
+        let invoice = bsv_mpc_core::hd::compute_invoice(security_level, protocol_name, key_id)?;
+        let joint_pub = {
+            let arr: [u8; 33] = self
+                .meta
+                .joint_key
+                .compressed
+                .as_slice()
+                .try_into()
+                .map_err(|_| ClientError::Core("joint pubkey is not 33 bytes".into()))?;
+            PublicKey::from_bytes(&arr)
+                .map_err(|e| ClientError::Core(format!("joint pubkey parse: {e}")))?
+        };
+
+        // The ECDH shared secret. `Anyone` ⇒ the joint pubkey (local). `Self_`/`Other`
+        // ⇒ the distributed round: device `w` local partials + ONE cosigner partial.
+        let shared_secret = match &counterparty {
+            DerivationCounterparty::Anyone => joint_pub.clone(),
+            DerivationCounterparty::SelfWallet | DerivationCounterparty::Other(_) => {
+                let counterparty_pub = match &counterparty {
+                    DerivationCounterparty::Other(x) => x.clone(),
+                    // `Self_` derives against the wallet's own joint pubkey.
+                    _ => joint_pub.clone(),
+                };
+
+                // Device-local partials: `counterparty_pub * share(idx)` paired with
+                // the party's VSS eval point `I[idx]`, over each unsealed held share.
+                let local = if self.is_multi() {
+                    self.unseal_device_shares_multi(reason).await?
+                } else {
+                    vec![(
+                        self.meta.device_share_index,
+                        self.unseal_device_share(reason).await?,
+                    )]
+                };
+                let mut partials: Vec<(PublicKey, [u8; 32])> = Vec::with_capacity(local.len() + 1);
+                for (idx, share) in &local {
+                    let scalar = bsv_mpc_core::ecdh::parse_share_scalar(&share.ciphertext)?;
+                    let vss = bsv_mpc_core::ecdh::parse_share_vss_points(&share.ciphertext)?;
+                    let eval_point = *vss.get(*idx as usize).ok_or_else(|| {
+                        ClientError::Core(format!("VSS eval point for index {idx} out of range"))
+                    })?;
+                    let partial =
+                        bsv_mpc_core::ecdh::compute_partial_ecdh_point(&counterparty_pub, &scalar)?;
+                    partials.push((partial, eval_point));
+                }
+
+                // ONE cosigner partial reaches the t-quorum (device holds w = t−1).
+                let nonce = {
+                    use rand::RngCore;
+                    let mut n = [0u8; 32];
+                    rand::rngs::OsRng.fill_bytes(&mut n);
+                    n
+                };
+                let cosigner_partials = self
+                    .cosigner
+                    .coordinate_ecdh(
+                        &counterparty_pub,
+                        &nonce,
+                        vec![self.meta.cosigner_party],
+                        self.meta.cosigner_master_pub.clone(),
+                        timeout,
+                    )
+                    .await?;
+                for cp in cosigner_partials {
+                    partials.push((cp.partial, cp.vss_point));
+                }
+                bsv_mpc_core::ecdh::combine_partials_lagrange(&partials)?
+            }
+        };
+
+        // All outputs from the ONE shared secret (loss-of-funds invariant).
+        derived_key_from_shared_secret(&joint_pub, &shared_secret, &invoice)
+    }
+
     /// Pop pool ids until one `consume`s to a present bundle (atomic single-use).
     /// Skips ids whose file was already consumed/invalidated.
     fn take_ready_bundle(&self) -> Result<Option<PresigBundle>, ClientError> {
@@ -449,6 +574,35 @@ impl DeployedSigner {
             brc42_offset,
         )
     }
+}
+
+/// Build the full [`DerivedKey`] from a BRC-42 ECDH shared secret + invoice (#91),
+/// **pure** (no signer state) so the high-level
+/// [`DeployedSigner::derive_offset_for_counterparty`] AND the host-driven low-level
+/// FFI combine produce byte-identical outputs — the loss-of-funds invariant lives in
+/// ONE place. `offset = HMAC(shared_secret, invoice)`; `derived_pubkey = joint +
+/// offset·G`; the script + address are the child's P2PKH.
+pub fn derived_key_from_shared_secret(
+    joint_pub: &PublicKey,
+    shared_secret: &PublicKey,
+    invoice: &str,
+) -> Result<DerivedKey, ClientError> {
+    let brc42_offset = bsv_mpc_core::hd::compute_brc42_hmac(shared_secret, invoice);
+    let derived_pubkey = bsv_mpc_core::hd::derive_child_pubkey(joint_pub, shared_secret, invoice)?;
+    let addr = bsv::Address::new_from_public_key(&derived_pubkey, true)
+        .map_err(|e| ClientError::Core(format!("derive address: {e}")))?;
+    let derived_address = addr.to_string();
+    let hash = addr.public_key_hash();
+    let hash20: [u8; 20] = hash
+        .try_into()
+        .map_err(|_| ClientError::Core("address pubkey-hash is not 20 bytes".into()))?;
+    let derived_p2pkh_locking_script = crate::txbuild::p2pkh_locking_script_from_hash(&hash20);
+    Ok(DerivedKey {
+        brc42_offset,
+        derived_pubkey,
+        derived_p2pkh_locking_script,
+        derived_address,
+    })
 }
 
 /// Fail-closed pre-flight on a combined signature, **pure** (no signer state) so it

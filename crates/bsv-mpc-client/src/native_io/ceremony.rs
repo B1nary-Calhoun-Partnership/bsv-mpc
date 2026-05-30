@@ -13,7 +13,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use bsv::primitives::ec::PrivateKey;
+use bsv::primitives::ec::{PrivateKey, PublicKey};
 use bsv_mpc_core::error::{MpcError, Result};
 use bsv_mpc_core::types::{
     DkgResult, EncryptedShare, JointPublicKey, PolicyId, PresigBundle, SessionId, SigningResult,
@@ -25,8 +25,9 @@ use bsv_mpc_relay::presign::CosignerArm;
 use bsv_mpc_relay::reshare::ArmRequestSigner;
 use bsv_mpc_relay::{
     combine_sign_from_bundle_over_relay, combine_sign_over_relay_nparty,
-    coordinate_presign_over_relay, coordinate_presign_over_relay_nparty, run_dkg_over_http_authed,
-    DoTrigger, PresignCosignerArm, PresignOverRelay, PresignOverRelayOutput, RelaySession,
+    coordinate_ecdh_over_relay, coordinate_presign_over_relay,
+    coordinate_presign_over_relay_nparty, run_dkg_over_http_authed, DoTrigger, EcdhCosignerArm,
+    EcdhPartial, PresignCosignerArm, PresignOverRelay, PresignOverRelayOutput, RelaySession,
 };
 use bsv_mpc_service::FileBundleStore;
 
@@ -245,6 +246,35 @@ impl DeployedCosigner {
             trigger,
             Some(&request_signer),
             recv_timeout,
+        )
+        .await
+    }
+
+    /// **Distributed-ECDH partial round (#90/#91).** Fetch the cosigner's
+    /// `counterparty_pub * its_share(idx)` partial(s) over one authed HTTP round-trip
+    /// to `/ecdh-relay`, #85-verified against `expected_master_pub`. The caller
+    /// ([`DeployedSigner`](super::signer::DeployedSigner)) Lagrange-combines these
+    /// with its own `w` local partials to recover the BRC-42 ECDH shared secret.
+    pub async fn coordinate_ecdh(
+        &self,
+        counterparty_pub: &PublicKey,
+        nonce: &[u8; 32],
+        cosigner_indices: Vec<u16>,
+        expected_master_pub: Option<String>,
+        timeout: Duration,
+    ) -> Result<Vec<EcdhPartial>> {
+        let request_signer = request_signer_over(self.session.clone());
+        coordinate_ecdh_over_relay(
+            counterparty_pub,
+            nonce,
+            &EcdhCosignerArm {
+                url: format!("{}/ecdh-relay", self.container_url),
+                agent_id: self.agent_id.clone(),
+                indices: cosigner_indices,
+                expected_master_pub,
+            },
+            Some(&request_signer),
+            timeout,
         )
         .await
     }
