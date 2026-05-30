@@ -236,37 +236,19 @@ async fn load_share_or_recover(
     state: &AppState,
     agent_id: &str,
 ) -> Result<bsv_mpc_core::types::EncryptedShare, (StatusCode, Json<serde_json::Value>)> {
-    // 1. Local cache (hot path).
-    match state.storage.read() {
-        Ok(s) => match s.get_share(agent_id) {
-            Ok(Some(share)) => return Ok(share),
-            Ok(None) => {}
-            Err(e) => return Err(err_response(StatusCode::INTERNAL_SERVER_ERROR, e)),
-        },
-        Err(e) => return Err(err_response(StatusCode::INTERNAL_SERVER_ERROR, e)),
+    // #102: hot cache → durable custody recover (post-restart, re-binds owner) →
+    // 404, all through the single `DurableShares` seam.
+    match state.shares().load_or_recover(agent_id).await {
+        Ok(Some(share)) => Ok(share),
+        Ok(None) => Err(err_response(
+            StatusCode::NOT_FOUND,
+            format!("No share for agent: {agent_id}"),
+        )),
+        Err(e) => Err(err_response(
+            StatusCode::BAD_GATEWAY,
+            format!("share load/recover failed: {e}"),
+        )),
     }
-    // 2. Durable custody recover (cold path: post-restart) — re-binds the owner.
-    if let Some(custody) = &state.custody {
-        match custody.get_share(agent_id).await {
-            Ok(Some((share, owner))) => {
-                if let Ok(mut s) = state.storage.write() {
-                    let _ = s.store_share_with_owner(agent_id, &share, &owner);
-                }
-                return Ok(share);
-            }
-            Ok(None) => {}
-            Err(e) => {
-                return Err(err_response(
-                    StatusCode::BAD_GATEWAY,
-                    format!("custody recover failed: {e}"),
-                ))
-            }
-        }
-    }
-    Err(err_response(
-        StatusCode::NOT_FOUND,
-        format!("No share for agent: {agent_id}"),
-    ))
 }
 
 /// Bundle multiple outgoing RoundMessages into a single transport RoundMessage.
@@ -399,6 +381,25 @@ pub async fn load_share_or_recover_at_index_pub(
             }
         }
     }
+    // #102: COMPOSITE durable-custody recovery (post-restart) — the n-party share
+    // is custodied keyed by `{agent_id}#{index}`, so recover IT (not the bare key,
+    // which for an n-party wallet is absent / a wrong-index share). This closes the
+    // 4-of-6 fund-lock-across-redeploy gap.
+    match state
+        .shares()
+        .load_or_recover_at_index(agent_id, index)
+        .await
+    {
+        Ok(Some(share)) => return Ok(share),
+        Ok(None) => {}
+        Err(e) => {
+            return Err(err_response(
+                StatusCode::BAD_GATEWAY,
+                format!("composite custody recover failed: {e}"),
+            ))
+        }
+    }
+    // Bare fallback (the mainnet-proven 2-party deployment + its custody recover).
     load_share_or_recover(state, agent_id).await
 }
 
@@ -556,28 +557,24 @@ pub async fn handle_dkg_round(
                         .map(|d| d.owner_identity.clone())
                 })
                 .unwrap_or_default();
-            // #9: persist the KEK-wrapped share_A (+ its owner) to durable
-            // custody FIRST, fail-closed — a restart must never lose share_A →
-            // permanent fund-lock. If custody is configured but the put fails,
-            // do NOT finalize the DKG (drop the coordinator; report it) so the
-            // operator fixes durability before funding.
-            if let Some(custody) = &state.custody {
-                if let Err(e) = custody
-                    .put_share(&agent_id, &dkg_result.share, &owner_identity)
-                    .await
-                {
-                    if let Ok(mut store) = COORDINATOR_STORE.lock() {
-                        store.dkg.remove(&body.session_id);
-                    }
-                    return err_response(
-                        StatusCode::BAD_GATEWAY,
-                        format!("durable custody put failed; DKG not finalized: {e}"),
-                    );
+            // #9/#102: persist through the durable seam — custody-PUT FIRST
+            // (fail-closed), then the hot cache. A restart must never lose share_A →
+            // permanent fund-lock. If custody is configured but the put fails, do NOT
+            // finalize the DKG (drop the coordinator; report it) so the operator fixes
+            // durability before funding. (Same custody-first ordering as before, now
+            // through the single `DurableShares` seam shared by every persist path.)
+            if let Err(e) = state
+                .shares()
+                .persist_durable(&agent_id, &dkg_result.share, &owner_identity)
+                .await
+            {
+                if let Ok(mut store) = COORDINATOR_STORE.lock() {
+                    store.dkg.remove(&body.session_id);
                 }
-            }
-            if let Ok(mut storage) = state.storage.write() {
-                let _ =
-                    storage.store_share_with_owner(&agent_id, &dkg_result.share, &owner_identity);
+                return err_response(
+                    StatusCode::BAD_GATEWAY,
+                    format!("durable persist failed; DKG not finalized: {e}"),
+                );
             }
             // Clean up coordinator
             if let Ok(mut store) = COORDINATOR_STORE.lock() {

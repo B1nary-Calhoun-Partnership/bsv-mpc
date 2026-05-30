@@ -698,7 +698,7 @@ pub async fn handle_reshare_relay_init(
                         .expect("new threshold config validated above"),
                     joint_pubkey_compressed: jpk_bytes.clone(),
                 };
-                rotate_on_commit(&state_for_commit, &agent_id, &rotated);
+                rotate_on_commit(&state_for_commit, &agent_id, &rotated).await;
                 checkpoint("taskB:rotated", false);
             }
             Err(e) => {
@@ -725,23 +725,35 @@ pub async fn handle_reshare_relay_init(
 /// (empty owner preserves the §08.1 owner binding) and purge all presignatures for
 /// the agent — they were generated against the OLD `(t, n)` share and MUST NOT be
 /// consumable across the reshare boundary.
-fn rotate_on_commit(state: &Arc<AppState>, agent_id: &str, rotated: &EncryptedShare) {
-    match state.storage.write() {
-        Ok(mut storage) => {
-            if let Err(e) = storage.store_share_with_owner(agent_id, rotated, "") {
-                warn!("reshare-relay: failed to rotate share for {agent_id}: {e}");
-                return;
-            }
-            let purged = storage
-                .delete_presignatures_for_agent(agent_id)
-                .unwrap_or(0);
-            info!(
-                agent_id = %agent_id,
-                purged_presigs = purged,
-                "reshare-relay: share ROTATED to new (t,n) + {purged} stale presigs purged"
-            );
-        }
-        Err(_) => warn!("reshare-relay: storage lock poisoned; share NOT rotated for {agent_id}"),
+async fn rotate_on_commit(state: &Arc<AppState>, agent_id: &str, rotated: &EncryptedShare) {
+    // Preserve the §08.1 owner across rotation: read it so the DURABLE custody record
+    // seals the REAL owner (custody has no cache-style "empty = preserve" semantics).
+    let owner = state
+        .storage
+        .read()
+        .ok()
+        .and_then(|s| s.get_share_owner(agent_id).ok().flatten())
+        .unwrap_or_default();
+    // #102: rotate through the durable seam — custody-PUT the rotated share FIRST so a
+    // container restart can't strand the NEW (t,n) share while the OLD one is already
+    // cryptographically invalidated (the reshare fund-lock gap), then the hot cache.
+    if let Err(e) = state
+        .shares()
+        .persist_durable(agent_id, rotated, &owner)
+        .await
+    {
+        warn!("reshare-relay: failed to durably rotate share for {agent_id}: {e}");
+        return;
+    }
+    if let Ok(mut storage) = state.storage.write() {
+        let purged = storage
+            .delete_presignatures_for_agent(agent_id)
+            .unwrap_or(0);
+        info!(
+            agent_id = %agent_id,
+            purged_presigs = purged,
+            "reshare-relay: share ROTATED to new (t,n) (durable) + {purged} stale presigs purged"
+        );
     }
 }
 

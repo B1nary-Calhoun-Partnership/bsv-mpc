@@ -32,7 +32,7 @@ use bsv_mpc_core::types::{SessionId, ThresholdConfig};
 use bsv_mpc_messagebox::types::BOX_DKG;
 use bsv_mpc_messagebox::MessageBoxClient;
 use serde::{Deserialize, Serialize};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::dkg_handler::DkgHandler;
 use crate::messagebox::MessageBoxListener;
@@ -425,6 +425,8 @@ pub async fn handle_dkg_relay_init(
     // and release the listener.
     let state_for_verify = state.clone();
     let my_index = body.my_index;
+    // Captured for the durable custody PUT in the completion task (§08.1 owner).
+    let owner_identity = caller.identity_key.clone();
     tokio::spawn(async move {
         let dkg_result = match dkg_rx.await {
             Ok(r) => r,
@@ -436,22 +438,31 @@ pub async fn handle_dkg_relay_init(
         };
         checkpoint("task:dkg_complete", false);
         dkg_listener.shutdown().await;
-        // Persistence-before-funding: the composite share for our held index MUST be
-        // durably present (finish_complete already wrote it). The device gates a
-        // fundable address on the same check across ALL its held indices.
         let agent_id = hex::encode(&dkg_result.joint_key.compressed);
-        let present = state_for_verify
-            .storage
-            .read()
-            .ok()
-            .and_then(|s| s.get_share_at_index(&agent_id, my_index).ok().flatten())
-            .is_some();
-        if present {
-            checkpoint("task:share_persisted", false);
-            info!(agent_id = %agent_id, my_index, "dkg-relay: ceremony complete — share durably persisted");
-        } else {
-            checkpoint("task:share_MISSING", false);
-            warn!(agent_id = %agent_id, my_index, "dkg-relay: ceremony complete but share NOT durably persisted — investigate");
+        // #102: the SM's `finish_complete` wrote the HOT CACHE; now make the composite
+        // share DURABLE (custody-PUT keyed `{agent_id}#{my_index}`) — the gap that
+        // left 4-of-6 notary shares wiped on redeploy. Fail-closed: if custody is
+        // configured but the put fails, EVICT the cache entry so the wallet is
+        // non-functional rather than functional-but-not-durable (no funded-then-
+        // stranded-on-restart window).
+        match state_for_verify
+            .shares()
+            .persist_durable_at_index(&agent_id, my_index, &dkg_result.share, &owner_identity)
+            .await
+        {
+            Ok(()) => {
+                checkpoint("task:share_durably_custodied", false);
+                info!(agent_id = %agent_id, my_index, "dkg-relay: complete — composite share durably custodied (survives restart)");
+            }
+            Err(e) => {
+                checkpoint("task:share_custody_FAILED", false);
+                if let Ok(mut s) = state_for_verify.storage.write() {
+                    let _ = s.delete_share(&crate::storage::SqliteShareStorage::composite_key(
+                        &agent_id, my_index,
+                    ));
+                }
+                error!(agent_id = %agent_id, my_index, "dkg-relay: composite share custody FAILED ({e}); evicted from cache (fail-closed — NOT fundable until re-provisioned)");
+            }
         }
     });
 

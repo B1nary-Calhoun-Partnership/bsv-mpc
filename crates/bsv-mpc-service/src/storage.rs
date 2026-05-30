@@ -237,8 +237,11 @@ impl SqliteShareStorage {
     // `agent_id` (legacy single-share) key — the two namespaces are disjoint and
     // the existing 2-of-2 / reshare / refresh path is byte-for-byte unchanged.
 
-    /// Composite storage key for one held index of an agent's ceremony.
-    fn composite_key(agent_id: &str, index: u16) -> String {
+    /// Composite storage key for one held index of an agent's ceremony. `pub` so the
+    /// [`DurableShareStore`](crate::durable_store::DurableShareStore) custody seam keys
+    /// the durable record by the SAME string the in-memory cache uses (single source
+    /// of the key format — no drift between cache + custody).
+    pub fn composite_key(agent_id: &str, index: u16) -> String {
         format!("{agent_id}#{index}")
     }
 

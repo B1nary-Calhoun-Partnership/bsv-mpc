@@ -7,6 +7,9 @@ pub mod auth;
 pub mod custody;
 pub mod dkg_handler;
 pub mod dkg_relay_handlers;
+/// #102 — the durable share-custody seam (`AppState::shares()`): custody-first,
+/// fail-closed persist + transparent restart recovery for bare AND composite keys.
+pub mod durable_store;
 pub mod ecdh_relay_handler;
 pub mod handlers;
 /// §05.4.6 / ADR-0051 SM-position ↔ absolute-keygen-index translation, shared
@@ -91,6 +94,16 @@ pub struct AppState {
     pub auth: AuthState,
     /// Durable share custody to the worker DO (`None` = disabled / in-memory only).
     pub custody: Option<CustodyConfig>,
+}
+
+impl AppState {
+    /// The #102 durable share-custody seam: custody-first fail-closed persist +
+    /// transparent restart recovery, for bare AND composite keys. EVERY share
+    /// persist/recover should go through this (not `state.storage` directly), so a
+    /// fundable share can never be in-memory-only. See [`durable_store`].
+    pub fn shares(&self) -> durable_store::DurableShares<'_> {
+        durable_store::DurableShares::new(&self.storage, self.custody.as_ref())
+    }
 }
 
 /// Build the Axum router with all KSS endpoints.

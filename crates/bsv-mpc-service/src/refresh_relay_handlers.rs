@@ -231,7 +231,7 @@ pub async fn handle_refresh_relay_init(
     tokio::spawn(async move {
         match rx.await {
             Ok(commit) => {
-                rotate_on_commit(&state_for_commit, &agent_id, &commit);
+                rotate_on_commit(&state_for_commit, &agent_id, &commit).await;
             }
             Err(_) => {
                 warn!(
@@ -269,23 +269,38 @@ pub async fn handle_refresh_relay_init(
 /// (empty owner preserves the §08.1 owner binding) and purge all presignatures
 /// for the agent — they were generated against the now-dead share and MUST NOT be
 /// consumable across the refresh boundary.
-fn rotate_on_commit(state: &Arc<AppState>, agent_id: &str, commit: &bsv_mpc_core::RefreshCommit) {
-    match state.storage.write() {
-        Ok(mut storage) => {
-            if let Err(e) = storage.store_share_with_owner(agent_id, &commit.rotated_share, "") {
-                warn!("refresh-relay: failed to rotate share for {agent_id}: {e}");
-                return;
-            }
-            let purged = storage
-                .delete_presignatures_for_agent(agent_id)
-                .unwrap_or(0);
-            info!(
-                agent_id = %agent_id,
-                purged_presigs = purged,
-                "refresh-relay: share ROTATED + {purged} stale presigs purged (§18.9)"
-            );
-        }
-        Err(_) => warn!("refresh-relay: storage lock poisoned; share NOT rotated for {agent_id}"),
+async fn rotate_on_commit(
+    state: &Arc<AppState>,
+    agent_id: &str,
+    commit: &bsv_mpc_core::RefreshCommit,
+) {
+    // Preserve the §08.1 owner across rotation (custody seals the REAL owner; it has
+    // no cache-style "empty = preserve" semantics).
+    let owner = state
+        .storage
+        .read()
+        .ok()
+        .and_then(|s| s.get_share_owner(agent_id).ok().flatten())
+        .unwrap_or_default();
+    // #102: rotate through the durable seam — custody-PUT the rotated share FIRST so a
+    // restart can't strand the refreshed share while the pre-refresh one is dead.
+    if let Err(e) = state
+        .shares()
+        .persist_durable(agent_id, &commit.rotated_share, &owner)
+        .await
+    {
+        warn!("refresh-relay: failed to durably rotate share for {agent_id}: {e}");
+        return;
+    }
+    if let Ok(mut storage) = state.storage.write() {
+        let purged = storage
+            .delete_presignatures_for_agent(agent_id)
+            .unwrap_or(0);
+        info!(
+            agent_id = %agent_id,
+            purged_presigs = purged,
+            "refresh-relay: share ROTATED (durable) + {purged} stale presigs purged (§18.9)"
+        );
     }
 }
 
