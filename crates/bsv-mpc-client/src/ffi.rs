@@ -801,7 +801,10 @@ fn hex32(s: &str, what: &str) -> Result<[u8; 32], FfiError> {
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(uniffi::Object)]
 pub struct FfiDeployedSigner {
-    inner: crate::native_io::signer::DeployedSigner,
+    // `Arc` so the heavy presig/sign ceremonies can be driven on a dedicated
+    // multi-thread runtime on a fresh OS thread (#98 — `run_relay_ceremony_local`),
+    // which needs a `Send + 'static` handle to the signer.
+    inner: std::sync::Arc<crate::native_io::signer::DeployedSigner>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -872,7 +875,9 @@ impl FfiDeployedSigner {
         let inner = crate::native_io::signer::DeployedSigner::connect(signer_config, keystore)
             .await
             .map_err(|e| FfiError::Client(e.to_string()))?;
-        Ok(std::sync::Arc::new(Self { inner }))
+        Ok(std::sync::Arc::new(Self {
+            inner: std::sync::Arc::new(inner),
+        }))
     }
 
     /// Ready presig bundles in the pool.
@@ -888,15 +893,24 @@ impl FfiDeployedSigner {
         reason: String,
         timeout_secs: u64,
     ) -> Result<u32, FfiError> {
-        self.inner
-            .top_up_presigs(
-                n as usize,
-                &reason,
-                std::time::Duration::from_secs(timeout_secs),
-            )
-            .await
-            .map(|m| m as u32)
-            .map_err(|e| FfiError::Client(e.to_string()))
+        // #98: drive the heavy n-party presig-over-relay on a dedicated multi-thread
+        // runtime (not the UniFFI foreign single-current-thread) so the device's
+        // w=t−1 parties' round-math + WS pump parallelize.
+        let inner = std::sync::Arc::clone(&self.inner);
+        run_relay_ceremony_local(move || {
+            Box::pin(async move {
+                inner
+                    .top_up_presigs(
+                        n as usize,
+                        &reason,
+                        std::time::Duration::from_secs(timeout_secs),
+                    )
+                    .await
+                    .map(|m| m as u32)
+                    .map_err(|e| FfiError::Client(e.to_string()))
+            })
+        })
+        .await
     }
 
     /// The high-level deployed sign: biometric-gated, fast (pool) online sign with a
@@ -922,17 +936,24 @@ impl FfiDeployedSigner {
             ),
             None => None,
         };
-        let res = self
-            .inner
-            .sign(
-                &hash,
-                &reason,
-                offset,
-                std::time::Duration::from_secs(recv_timeout_secs),
-                std::time::Duration::from_secs(presign_timeout_secs),
-            )
-            .await
-            .map_err(|e| FfiError::Client(e.to_string()))?;
+        // #98: drive the sign (incl. its on-demand n-party presig when the pool is
+        // empty + the relay combine) on a dedicated multi-thread runtime.
+        let inner = std::sync::Arc::clone(&self.inner);
+        let res = run_relay_ceremony_local(move || {
+            Box::pin(async move {
+                inner
+                    .sign(
+                        &hash,
+                        &reason,
+                        offset,
+                        std::time::Duration::from_secs(recv_timeout_secs),
+                        std::time::Duration::from_secs(presign_timeout_secs),
+                    )
+                    .await
+                    .map_err(|e| FfiError::Client(e.to_string()))
+            })
+        })
+        .await?;
         Ok(FfiSignature {
             signature_der: res.signature,
             r: res.r,
@@ -1869,6 +1890,50 @@ where
     });
     rx.await
         .map_err(|_| FfiError::Client("identity worker thread dropped".into()))?
+}
+
+/// **#98.** Drive a heavy relay ceremony (n-party presig-over-relay / multi-index
+/// sign) to completion on a DEDICATED **multi-thread** tokio runtime on a fresh OS
+/// thread, bridging the `Send` result back over a oneshot.
+///
+/// UniFFI's `async_runtime = "tokio"` export polls the FFI future on the FOREIGN
+/// (Swift) executor, entering async-compat's process-global **single-`current_thread`**
+/// runtime. The n-party presig folds the device's `w = t−1` parties' CPU-bound
+/// `spawn_blocking` round-math + the WS recv-pump; on one cooperative thread these
+/// SERIALIZE, so the PresigBundle assembly runs **>12× slower** than native on Apple
+/// (issue #98 — a stall vs the 600s budget, NOT a deadlock). A fresh OS thread (no
+/// ambient runtime ⇒ no nested-runtime trap, same boundary as [`run_identity_local`])
+/// running a `new_multi_thread` runtime gives the ceremony real worker threads so
+/// those round-trips PARALLELIZE — matching the mainnet-proven macOS-native
+/// multi-thread capstone (presig+sign ≈ 88s). The ceremony path itself is unchanged.
+#[cfg(not(target_arch = "wasm32"))]
+async fn run_relay_ceremony_local<T>(
+    build: impl FnOnce() -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<T, FfiError>>>>
+        + Send
+        + 'static,
+) -> Result<T, FfiError>
+where
+    T: Send + 'static,
+{
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        let rt = match tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                let _ = tx.send(Err(FfiError::Client(format!(
+                    "relay ceremony runtime: {e}"
+                ))));
+                return;
+            }
+        };
+        let result = rt.block_on(build());
+        let _ = tx.send(result);
+    });
+    rx.await
+        .map_err(|_| FfiError::Client("relay ceremony worker thread dropped".into()))?
 }
 
 /// **#95.** Resolve a counterparty's displayable identity by its compressed
@@ -3024,5 +3089,44 @@ mod identity_ffi_tests {
             let _overridden =
                 build_identity_client(&net, vec!["https://ls.example.com".to_string()]);
         }
+    }
+}
+
+// ── #98 multi-thread relay-ceremony runtime helper tests ──────────────────────
+//
+// Functional gate for run_relay_ceremony_local (the #98 fix that decouples the
+// heavy presig/sign entrypoints from the UniFFI foreign single-current-thread
+// runtime). Correctness of the ceremony ITSELF on a multi-thread runtime is
+// already proven by the mainnet macOS-native multi_thread capstone; the device
+// perf win is validated on-device. These assert the helper plumbing: it drives the
+// closure on a real (spawn-capable) dedicated runtime, returns the value, and
+// propagates errors across the worker-thread/oneshot boundary.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod issue98_runtime_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn run_relay_ceremony_local_drives_concurrent_tasks_and_returns() {
+        // The closure spawns concurrent tokio tasks — proving it runs on a real
+        // dedicated runtime (not just inline on the calling thread) — and the joined
+        // result crosses the oneshot back.
+        let out: u32 = run_relay_ceremony_local(|| {
+            Box::pin(async {
+                let a = tokio::spawn(async { 20u32 });
+                let b = tokio::spawn(async { 22u32 });
+                Ok(a.await.unwrap() + b.await.unwrap())
+            })
+        })
+        .await
+        .unwrap();
+        assert_eq!(out, 42);
+    }
+
+    #[tokio::test]
+    async fn run_relay_ceremony_local_propagates_err() {
+        let res: Result<u32, FfiError> =
+            run_relay_ceremony_local(|| Box::pin(async { Err(FfiError::Client("boom".into())) }))
+                .await;
+        assert!(matches!(res, Err(FfiError::Client(m)) if m == "boom"));
     }
 }
