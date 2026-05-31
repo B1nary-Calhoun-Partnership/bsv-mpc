@@ -267,6 +267,12 @@ pub async fn coordinate_presign_over_relay_nparty(
     };
     let session_hex = session.hex();
 
+    // #96/#98: arm per-ceremony stage timing. Device-side ONLY — the deployed
+    // Linux cosigner never runs this coordinator, so it records nothing and its
+    // behavior is unchanged. The breakdown surfaces in the assembly-timeout error
+    // string + a tracing line on success; no FFI signature change.
+    bsv_mpc_core::presig_timing::arm();
+
     // ── Device mints fresh relay identities for its co-located parties. ──
     let mut local_parties: Vec<LocalParty> = Vec::new();
     for (idx, share) in &p.local_shares {
@@ -288,7 +294,9 @@ pub async fn coordinate_presign_over_relay_nparty(
     local_parties.sort_by_key(|lp| lp.index);
 
     // ── Fetch the external cosigner's relay identity FIRST (§06.17 ordering). ──
+    let t_identity = std::time::Instant::now();
     let fetched_cosigner_pub = fetch_presign_cosigner_identity(&p.cosigner.init_url).await?;
+    bsv_mpc_core::presig_timing::record("presig.coord.identity_fetch", t_identity.elapsed());
     // #85: when pinned, the presign cosigner identity IS the master — verify the
     // fetched value matches the pin (a MITM substitution → reject) and route to the
     // PINNED value, never whatever the unauthenticated GET returned.
@@ -376,6 +384,7 @@ pub async fn coordinate_presign_over_relay_nparty(
     let return_box = presig_return_box(&session_hex);
     let mut handlers: Vec<(u16, PresignHandler)> = Vec::new();
     let mut listeners: Vec<MessageBoxListener> = Vec::new();
+    let t_listeners = std::time::Instant::now();
     for lp in &local_parties {
         let store: Arc<dyn BundleStore> = Arc::new(InMemoryBundleStore::new());
         let handler = PresignHandler::new(PresignHandlerConfig {
@@ -401,6 +410,7 @@ pub async fn coordinate_presign_over_relay_nparty(
         handlers.push((lp.index, handler));
         listeners.push(listener);
     }
+    bsv_mpc_core::presig_timing::record("presig.coord.listeners", t_listeners.elapsed());
 
     let shutdown_all = |ls: Vec<MessageBoxListener>| async move {
         for l in ls {
@@ -412,6 +422,7 @@ pub async fn coordinate_presign_over_relay_nparty(
     let mut primary_rx = None;
     let mut extra_rxs: Vec<(u16, tokio::sync::oneshot::Receiver<PresignOutcome>)> = Vec::new();
     let mut sends: Vec<(usize, Vec<bsv_mpc_service::OutgoingRoundMessage>)> = Vec::new();
+    let t_initiate = std::time::Instant::now();
     for (pos, lp) in local_parties.iter().enumerate() {
         let handler = &handlers[pos].1;
         let peers = match peers_for(lp.index) {
@@ -439,7 +450,10 @@ pub async fn coordinate_presign_over_relay_nparty(
         }
     }
 
+    bsv_mpc_core::presig_timing::record("presig.coord.initiate", t_initiate.elapsed());
+
     // ── Ship each device party's round-1 (reliable idempotent retry). ──
+    let t_ship = std::time::Instant::now();
     for (pos, out) in sends {
         for o in out {
             if let Err(e) = local_parties[pos]
@@ -459,8 +473,11 @@ pub async fn coordinate_presign_over_relay_nparty(
         }
     }
 
+    bsv_mpc_core::presig_timing::record("presig.coord.ship_round1", t_ship.elapsed());
+
     // ── Confirm the arm (auth/owner errors surface here in seconds with the real
     //    error, not as an opaque presign timeout). ──
+    let t_arm = std::time::Instant::now();
     match arm_handle.await {
         Ok(Ok(())) => {}
         Ok(Err(e)) => {
@@ -474,6 +491,7 @@ pub async fn coordinate_presign_over_relay_nparty(
             )));
         }
     }
+    bsv_mpc_core::presig_timing::record("presig.coord.arm_confirm", t_arm.elapsed());
 
     // ── Await the primary's bundle (the gate — completion requires every cosigner
     //    + co-located return ciphertext to have arrived). ──
@@ -486,7 +504,10 @@ pub async fn coordinate_presign_over_relay_nparty(
             ));
         }
     };
-    let bundle: PresigBundle = match tokio::time::timeout(timeout, primary_rx).await {
+    let t_assembly = std::time::Instant::now();
+    let assembled = tokio::time::timeout(timeout, primary_rx).await;
+    bsv_mpc_core::presig_timing::record("presig.coord.assembly_wait", t_assembly.elapsed());
+    let bundle: PresigBundle = match assembled {
         Ok(Ok(PresignOutcome::BundlePersisted(b))) => *b,
         Ok(Ok(PresignOutcome::ReturnShipped)) => {
             shutdown_all(listeners).await;
@@ -501,10 +522,17 @@ pub async fn coordinate_presign_over_relay_nparty(
             )));
         }
         Err(_) => {
+            // #96/#98: the bundle never assembled within budget. Fold the stage
+            // breakdown into the error so the on-device run reports WHERE the time
+            // went (`coord.assembly_wait` vs the summed `handler.round*.exec` CPU)
+            // instead of just "slow" — stages are ordered by total so the dominant
+            // cost survives even if the host truncates the error string.
+            let summary = bsv_mpc_core::presig_timing::summary();
+            bsv_mpc_core::presig_timing::disarm();
             shutdown_all(listeners).await;
-            return Err(MpcError::Protocol(
-                "presign-over-relay: timed out awaiting PresigBundle assembly".into(),
-            ));
+            return Err(MpcError::Protocol(format!(
+                "presign-over-relay: timed out awaiting PresigBundle assembly — {summary}"
+            )));
         }
     };
 
@@ -597,6 +625,16 @@ pub async fn coordinate_presign_over_relay_nparty(
                 .into(),
         ));
     }
+
+    // #96/#98: the ceremony assembled within budget — emit the breakdown for any
+    // context that installs a tracing subscriber (the native test harness /
+    // `--nocapture`); on device with no subscriber this is simply dropped.
+    bsv_mpc_core::presig_timing::disarm();
+    tracing::info!(
+        target: "presig.timing",
+        "presign-over-relay assembled — {}",
+        bsv_mpc_core::presig_timing::summary()
+    );
 
     Ok(PresignOverRelayOutput {
         session_id: session,

@@ -474,17 +474,26 @@ impl PresignHandler {
         let participants = self.inner.parties_at_keygen.clone();
         let pool = participants.len(); // generate one presig per initiate is plenty for the SM
 
-        let (mgr, initial) = tokio::task::spawn_blocking(
-            move || -> anyhow::Result<(PresigningManager, Vec<RoundMessage>)> {
-                let mut mgr = PresigningManager::new(session_id, share, participants, pool.max(1));
-                let initial = mgr
-                    .init_generate()
-                    .map_err(|e| anyhow::anyhow!("PresigningManager::init_generate: {e}"))?;
-                Ok((mgr, initial))
-            },
-        )
-        .await
-        .map_err(|e| anyhow::anyhow!("init_generate task panicked: {e}"))??;
+        // #96/#98 diagnostic timing: `exec` = pure CPU inside the blocking task;
+        // the surrounding `await` guard adds the tokio blocking-pool queue wait, so
+        // `await − exec` exposes runtime starvation across the device's parties.
+        let (mgr, initial) = {
+            let _await = bsv_mpc_core::presig_timing::guard("presig.handler.round1.await");
+            tokio::task::spawn_blocking(
+                move || -> anyhow::Result<(PresigningManager, Vec<RoundMessage>)> {
+                    bsv_mpc_core::presig_timing::time("presig.handler.round1.exec", move || {
+                        let mut mgr =
+                            PresigningManager::new(session_id, share, participants, pool.max(1));
+                        let initial = mgr.init_generate().map_err(|e| {
+                            anyhow::anyhow!("PresigningManager::init_generate: {e}")
+                        })?;
+                        Ok((mgr, initial))
+                    })
+                },
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("init_generate task panicked: {e}"))??
+        };
 
         let (tx, rx) = oneshot::channel::<PresignOutcome>();
         let mut outgoing = wrap_protocol(
@@ -672,14 +681,24 @@ impl PresignHandler {
             } = slot;
             let inbound_round_msg = next.round_msg;
 
-            let (result, mgr) = tokio::task::spawn_blocking(move || {
-                let r = mgr
-                    .process_generate_round(vec![inbound_round_msg])
-                    .map_err(|e| anyhow::anyhow!("PresigningManager::process_generate_round: {e}"));
-                (r, mgr)
-            })
-            .await
-            .map_err(|e| anyhow::anyhow!("process_generate_round task panicked: {e}"))?;
+            // #96/#98 diagnostic timing (see `initiate`): `exec` = pure round math,
+            // `await − exec` = blocking-pool queue starvation. This is the per-round
+            // cggmp24 Paillier/bignum cost that dominates the on-device CPU peg.
+            let (result, mgr) = {
+                let _await = bsv_mpc_core::presig_timing::guard("presig.handler.round.await");
+                tokio::task::spawn_blocking(move || {
+                    bsv_mpc_core::presig_timing::time("presig.handler.round.exec", move || {
+                        let r = mgr
+                            .process_generate_round(vec![inbound_round_msg])
+                            .map_err(|e| {
+                                anyhow::anyhow!("PresigningManager::process_generate_round: {e}")
+                            });
+                        (r, mgr)
+                    })
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("process_generate_round task panicked: {e}"))?
+            };
 
             let result = result?;
 

@@ -63,6 +63,11 @@ pub mod paillier_pool;
 pub mod policy;
 pub mod presig_at_rest;
 pub mod presig_encryption;
+// Diagnostic stage timing for the device-side presig-over-relay ceremony (#96 →
+// #98). Native-only: it uses `std::time::Instant` (unsupported on
+// wasm32-unknown-unknown) and the presig coordinator path is itself native-only.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod presig_timing;
 pub mod presigning;
 pub mod primes_at_rest;
 pub mod proof;
