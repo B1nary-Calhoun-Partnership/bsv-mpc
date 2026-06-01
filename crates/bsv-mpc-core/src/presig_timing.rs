@@ -72,7 +72,36 @@ struct State {
     /// rounds appear here, with the bad index) from "the SM never emitted them"
     /// (absent from BOTH `sends` and `dropped` → an upstream deadlock).
     dropped: BTreeMap<u8, BTreeSet<u16>>,
+    /// Inbound log keyed by the **TRUE cggmp24 round** ([`round_based::ProtocolMessage::round`]
+    /// of the decoded SM message), NOT the cosmetic wire counter: round → set of
+    /// sender SM-positions a message of that round was CONSUMED from. For
+    /// CGGMP'24 presigning the rounds are `0`=round1a (commit bcast), `1`=round1b
+    /// (p2p proof), `5`=reliability-echo (the round-1a sync bcast), `2`=round2
+    /// (MtA p2p), `3`=round3 (delta bcast). The round-2 EMISSION GATE is the
+    /// reliability echo: a party only proceeds to round2 once it has consumed a
+    /// `5` from EVERY peer. So `recv: r0=[…] r1=[…] r5=[1,2]` with a peer missing
+    /// from `r5` (and no `r2`/`r3`) pinpoints the deadlock to a never-delivered (or
+    /// never-emitted) reliability echo from that peer — the #98 stall, finally
+    /// localized to the exact (round, sender) the SM is starved on. Recorded in
+    /// [`crate::dkg::drive_inline`] the instant a message is fed to the SM.
+    recvs: BTreeMap<u16, BTreeSet<u16>>,
+    /// Fatal SM / handler abort reasons, captured at the point they are raised
+    /// (BEFORE the `MessageBoxListener` swallows them with a `warn!` the device
+    /// has no stdout to show). A reliability-check failure
+    /// (`SigningAborted::Round1aNotReliable`) or a duplicate-overwrite
+    /// (`AttemptToOverwriteReceivedMsg`) aborts the cggmp24 SM mid-presign and
+    /// produces NO round2 — exactly the "9–10 handler rounds then no progress"
+    /// signature — yet today surfaces only as a generic 600s "awaiting
+    /// PresigBundle assembly" timeout. Folding the real abort string into the
+    /// timeout summary (device) + `/presign-relay/debug` (cosigner) turns that
+    /// opaque stall into the precise cggmp24 error. Capped to avoid unbounded
+    /// growth on a pathological loop.
+    errors: Vec<String>,
 }
+
+/// Cap on retained [`State::errors`] so a degenerate error loop can't grow the
+/// summary without bound; the first few aborts are the diagnostic signal.
+const MAX_ERRORS: usize = 8;
 
 #[derive(Default, Clone, Copy)]
 struct Acc {
@@ -90,6 +119,8 @@ pub fn arm() {
             stages: BTreeMap::new(),
             sends: BTreeMap::new(),
             dropped: BTreeMap::new(),
+            recvs: BTreeMap::new(),
+            errors: Vec::new(),
         });
     }
     ENABLED.store(true, Ordering::Relaxed);
@@ -149,6 +180,42 @@ pub fn record_dropped(round: u8, to_abs: u16) {
     if let Ok(mut g) = STATE.lock() {
         if let Some(s) = g.as_mut() {
             s.dropped.entry(round).or_default().insert(to_abs);
+        }
+    }
+}
+
+/// Record that this node CONSUMED a message of TRUE cggmp24 `round`
+/// ([`round_based::ProtocolMessage::round`]) from sender SM-position `from`.
+/// No-op when disarmed. Surfaces in [`summary`] as `recv: r{round}=[senders …]`
+/// so the round-2 emission gate (the reliability echo, round `5`) is visible:
+/// a peer absent from `r5` while `r0`/`r1` are full localizes the #98 stall to a
+/// never-arriving reliability echo from that exact peer. See [`State::recvs`].
+pub fn record_recv(round: u16, from: u16) {
+    if !enabled() {
+        return;
+    }
+    if let Ok(mut g) = STATE.lock() {
+        if let Some(s) = g.as_mut() {
+            s.recvs.entry(round).or_default().insert(from);
+        }
+    }
+}
+
+/// Record a fatal SM / handler abort `reason` at the point it is raised, before
+/// the listener swallows it. No-op when disarmed; capped at [`MAX_ERRORS`].
+/// Surfaces in [`summary`] as `errors: [reason; …]` so a swallowed
+/// `Round1aNotReliable` / `AttemptToOverwriteReceivedMsg` abort becomes the
+/// device timeout string (and the cosigner `/presign-relay/debug`) instead of an
+/// opaque "awaiting PresigBundle assembly" 600s timeout. See [`State::errors`].
+pub fn record_error(reason: impl Into<String>) {
+    if !enabled() {
+        return;
+    }
+    if let Ok(mut g) = STATE.lock() {
+        if let Some(s) = g.as_mut() {
+            if s.errors.len() < MAX_ERRORS {
+                s.errors.push(reason.into());
+            }
         }
     }
 }
@@ -233,6 +300,21 @@ pub fn summary() -> String {
             out.push_str(&format!(" r{round}=[{}]", list.join(",")));
         }
     }
+    if !s.recvs.is_empty() {
+        // TRUE cggmp24 round → senders consumed. Presigning: 0=round1a, 1=round1b,
+        // 5=reliability-echo (round-2 gate), 2=round2, 3=round3. A peer missing from
+        // r5 (with no r2/r3) localizes the #98 stall to a never-delivered echo.
+        out.push_str(" | recv:");
+        for (round, froms) in &s.recvs {
+            let list: Vec<String> = froms.iter().map(|p| p.to_string()).collect();
+            out.push_str(&format!(" r{round}=[{}]", list.join(",")));
+        }
+    }
+    if !s.errors.is_empty() {
+        out.push_str(" | errors: [");
+        out.push_str(&s.errors.join("; "));
+        out.push(']');
+    }
     out
 }
 
@@ -265,11 +347,24 @@ mod tests {
         {
             let _g = guard("scope");
         }
+        // Inbound-by-true-round + fatal-abort capture (the #98 stall localizers).
+        record_recv(0, 1);
+        record_recv(0, 2);
+        record_recv(5, 1); // reliability echo from peer 1 only — peer 2 missing
+        record_error("round1a not reliable: parties [2]");
         let s = summary();
         assert!(s.contains("presig.timing wall="), "summary: {s}");
         assert!(s.contains("net=0.0s/2x"), "two net samples summed: {s}");
         assert!(s.contains("cpu="), "cpu time recorded: {s}");
         assert!(s.contains("scope="), "guard recorded: {s}");
+        assert!(
+            s.contains("recv: r0=[1,2] r5=[1]"),
+            "recv-by-true-round: {s}"
+        );
+        assert!(
+            s.contains("errors: [round1a not reliable: parties [2]]"),
+            "fatal abort surfaced: {s}"
+        );
 
         // Disarm leaves the summary readable but stops new recording.
         disarm();
