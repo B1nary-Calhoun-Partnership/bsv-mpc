@@ -292,6 +292,14 @@ async fn run_loop<F>(
                         out.round_msg.round,
                         out.params.to_party,
                     );
+                    // #96/#98 send-routing diagnostic: record which wire round this
+                    // node posted to which party (device coordinator only — no-op on
+                    // the cosigner). Reveals whether the deterministically-missing
+                    // n-party rounds were ever addressed to the cosigner SEND-side.
+                    bsv_mpc_core::presig_timing::record_send(
+                        out.round_msg.round,
+                        out.params.to_party,
+                    );
                     // Bounded IDEMPOTENT retry: a transient `/sendMessage` blip
                     // must not silently drop a round message (→ recipient stalls
                     // until ceremony timeout). The stable-message_id re-send is a

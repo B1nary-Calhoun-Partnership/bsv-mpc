@@ -587,6 +587,19 @@ impl PresignHandler {
         &self,
         mut inbound: DecodedRoundMessage,
     ) -> anyhow::Result<Vec<OutgoingRoundMessage>> {
+        // #96/#98 deployed-stall visibility: record EVERY inbound the cosigner
+        // receives after arming, queryable at `GET /presign-relay/debug`. If the
+        // trail shows `arm:round1_shipped` then NO `hdl:rx`, the relay never
+        // delivered the device's rounds to the container (egress-NAT / subscribe
+        // race) — the background phase the existing trail couldn't see.
+        crate::relay_handlers::presign_checkpoint(
+            format!(
+                "hdl:rx round={} from_abs={} box={} via={:?}",
+                inbound.round_msg.round, inbound.round_msg.from.0, inbound.message_box, inbound.via
+            ),
+            false,
+        );
+
         // Route by the in-RoundMessage sentinel, NOT message_box: the relay
         // delivers by identity and a single connection subscribes to both
         // `mpc_{sid}` and `presig_return_{sid}`, so message_box can't tell them
@@ -774,6 +787,21 @@ impl PresignHandler {
         mut mgr: PresigningManager,
     ) -> anyhow::Result<Vec<OutgoingRoundMessage>> {
         let presig_id = session_id.hex();
+        // #96/#98 visibility: the cosigner reached round-3 (so it DID receive the
+        // device's rounds). If this fires but the device still times out, the
+        // failing leg is the return ciphertext delivery cosigner→relay→device.
+        crate::relay_handlers::presign_checkpoint(
+            format!(
+                "hdl:round3_done role={} session={}",
+                if self.is_coordinator() {
+                    "coord"
+                } else {
+                    "cosigner"
+                },
+                &presig_id[..presig_id.len().min(12)]
+            ),
+            false,
+        );
 
         let (meta, raw) = mgr
             .take_raw()
@@ -857,6 +885,17 @@ impl PresignHandler {
                 self.inner.my_party_index, self.inner.coordinator_party
             );
             self.fire_completion(session_id, PresignOutcome::ReturnShipped);
+            // #96/#98: the cosigner produced its return ciphertext; `run_loop` ships
+            // it next. If this fires but the coordinator never assembles the bundle,
+            // the relay dropped the return on the cosigner→device leg.
+            crate::relay_handlers::presign_checkpoint(
+                format!(
+                    "hdl:return_built to_coord={} box=presig_return session={}",
+                    self.inner.coordinator_party,
+                    &presig_id[..presig_id.len().min(12)]
+                ),
+                false,
+            );
             Ok(vec![out])
         }
     }

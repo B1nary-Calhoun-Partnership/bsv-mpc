@@ -41,7 +41,7 @@
 //! the `await` (queue + run) dwarfs the in-closure `exec`, the runtime is
 //! serializing the device's `w = t−1` parties instead of overlapping them.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -58,6 +58,13 @@ struct State {
     t0: Instant,
     /// stage name → accumulated (sum, max, count).
     stages: BTreeMap<&'static str, Acc>,
+    /// Outbound routing log: wire round number → set of recipient party indices
+    /// this node POSTED that round to. Reveals send-side addressing — e.g. if the
+    /// device sends rounds 1/6/7 to the cosigner but never rounds 2–5, those rounds
+    /// are dropped/mis-addressed upstream of delivery (the deterministic n-party
+    /// presign stall). Folded into [`summary`], so the device's timeout error shows
+    /// exactly what it shipped where.
+    sends: BTreeMap<u8, BTreeSet<u16>>,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -74,6 +81,7 @@ pub fn arm() {
         *g = Some(State {
             t0: Instant::now(),
             stages: BTreeMap::new(),
+            sends: BTreeMap::new(),
         });
     }
     ENABLED.store(true, Ordering::Relaxed);
@@ -104,6 +112,21 @@ pub fn record(stage: &'static str, dur: Duration) {
             if dur > a.max {
                 a.max = dur;
             }
+        }
+    }
+}
+
+/// Record that this node POSTED a `round` message addressed to party `to_party`.
+/// No-op when disarmed. Aggregated across all co-located parties; surfaces in
+/// [`summary`] as `sends: r{n}=[parties …]` so a deterministic n-party stall reveals
+/// which rounds reached the cosigner's inbox on the SEND side.
+pub fn record_send(round: u8, to_party: u16) {
+    if !enabled() {
+        return;
+    }
+    if let Ok(mut g) = STATE.lock() {
+        if let Some(s) = g.as_mut() {
+            s.sends.entry(round).or_default().insert(to_party);
         }
     }
 }
@@ -164,6 +187,13 @@ pub fn summary() -> String {
             a.count,
             a.max.as_secs_f64(),
         ));
+    }
+    if !s.sends.is_empty() {
+        out.push_str(" | sends:");
+        for (round, parties) in &s.sends {
+            let list: Vec<String> = parties.iter().map(|p| p.to_string()).collect();
+            out.push_str(&format!(" r{round}=[{}]", list.join(",")));
+        }
     }
     out
 }

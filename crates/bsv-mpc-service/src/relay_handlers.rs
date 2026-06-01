@@ -83,7 +83,7 @@ fn presign_now_millis() -> u64 {
         .unwrap_or(0)
 }
 
-fn presign_checkpoint(label: impl Into<String>, reset: bool) {
+pub(crate) fn presign_checkpoint(label: impl Into<String>, reset: bool) {
     if let Ok(mut cps) = PRESIGN_CHECKPOINTS.lock() {
         if reset {
             cps.clear();

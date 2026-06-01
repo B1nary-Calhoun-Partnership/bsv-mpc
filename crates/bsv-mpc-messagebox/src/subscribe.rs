@@ -33,6 +33,7 @@
 //!    [`InboundEnvelopeEvent`]; on WS disconnect, reconnect with §06.12
 //!    exponential backoff (1s → cap 30s) + re-backfill.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -99,9 +100,40 @@ const BACKFILL_TIMEOUT: Duration = Duration::from_secs(8);
 /// ceremony converging without hammering the relay.
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
+/// WS-connected **reliability safety-net** interval. Even while the WebSocket is
+/// up and live-pushing, re-drain `/listMessages` this often.
+///
+/// WS live-push is a latency FAST PATH, not a reliability guarantee: through CF
+/// egress-NAT it is lossy + duplicating + reordering (root-caused 2026-05-31 — a
+/// deployed presign cosigner's `WsPush` silently dropped rounds 2–5, leaving them
+/// unacked in the relay box; the WS never disconnected, so the reconnect re-drain
+/// never fired, and the ceremony burned the full 600s budget). PULL is therefore
+/// the source of truth: this periodic re-drain recovers anything push dropped
+/// within one interval. `/listMessages` is non-destructive and the consumer dedups
+/// by `message_id`, so push + poll = exactly-once delivery to the handler. Matches
+/// the HTTP-fallback [`POLL_INTERVAL`] so recovery latency is bounded the same way
+/// on both transports.
+const WSPUSH_SAFETY_NET_INTERVAL: Duration = Duration::from_secs(2);
+
 /// Max wait for a `leftRoom`-equivalent on graceful shutdown — best
 /// effort; we proceed to close regardless.
 const LEAVE_TIMEOUT_MS: u64 = 1_000;
+
+/// Whether a subscribed mailbox needs the WS-push **reliability drain**
+/// ([`periodic_drain`]).
+///
+/// True ONLY for the per-session presign mailboxes — `mpc_{session}` (round-trip)
+/// and `presig_return_{session}` — which carry the multi-round n-party presign over
+/// a CF egress-NAT'd cosigner where live-push is lossy (it silently dropped rounds
+/// 2–5). The FIXED ceremony boxes (`mpc-dkg`, `mpc-sign`, `mpc-refresh`, `mpc-ecdh`,
+/// …) keep the proven WS-only path: their delivery is healthy, and a periodic
+/// re-drain during DKG's slow safe-prime rounds floods the channel + churns
+/// per-duplicate acks (root-caused 2.4× DKG slowdown + a hung custody PUT). The
+/// session boxes use the `mpc_` (underscore) / `presig_return_` prefixes; the fixed
+/// boxes use `mpc-` (hyphen) — see `types.rs`.
+fn box_needs_reliability_drain(message_box: &str) -> bool {
+    message_box.starts_with("mpc_") || message_box.starts_with("presig_return_")
+}
 
 /// Type alias for the upstream transport over our native sink.
 type NativeSocketIoTransport = SocketIoTransport<WsSender>;
@@ -199,7 +231,12 @@ pub async fn subscribe(auth: Arc<MessageBoxAuth>, boxes: Vec<String>) -> Result<
     // is a separate auth from the BRC-103 WS subscribe below, and a stalled authed
     // HTTP path must not block the live subscribe. Anything missed here is caught
     // by the post-join re-drain (also best-effort) + live WS push.
-    match tokio::time::timeout(BACKFILL_TIMEOUT, drain_backfill(&auth, &boxes, &inbound_tx)).await {
+    match tokio::time::timeout(
+        BACKFILL_TIMEOUT,
+        drain_backfill(&auth, &boxes, &inbound_tx, None),
+    )
+    .await
+    {
         Ok(true) => {}
         Ok(false) => {
             return Err(MessageBoxError::Protocol(
@@ -471,9 +508,18 @@ enum PumpExit {
     Disconnected(String),
 }
 
-/// Pump a live connection: forward inbound `sendMessage` Generals,
-/// detect disconnect (the dispatch task completing), and handle
-/// shutdown (send `leaveRoom` for each room, best-effort).
+/// Pump a live connection: forward inbound `sendMessage` Generals (the WS latency
+/// fast-path), detect disconnect (the dispatch task completing), and handle shutdown
+/// (`leaveRoom` per room, best-effort).
+///
+/// The reliability **pull** path runs as a SEPARATE concurrent task
+/// ([`periodic_drain`], spawned by the callers) — deliberately NOT a branch in this
+/// `select!`. Awaiting a bounded `/listMessages` inside a `select!` arm runs that arm
+/// to completion before any other arm is re-polled, so it would starve WS-push
+/// forwarding for the whole drain (root-caused 2026-05-31: an in-arm drain stalled
+/// live-push and 2.4×-slowed a deployed DKG, cascading into a double-arm + a hung
+/// custody PUT). Pull and push therefore run concurrently; the consumer dedups by
+/// `message_id`.
 async fn pump(
     conn: &mut LiveConn,
     identity_hex: &str,
@@ -508,6 +554,39 @@ async fn pump(
     }
 }
 
+/// Reliability **pull** drain — the source-of-truth path that runs ALONGSIDE (never
+/// inside) the WS [`pump`], so a slow/bounded `/listMessages` can never starve
+/// live-push forwarding. WS push is a latency accelerator; this re-drain recovers
+/// anything push drops/reorders within one [`WSPUSH_SAFETY_NET_INTERVAL`] (root
+/// cause: CF egress-NAT silently dropped presign rounds 2–5 from a connected WS that
+/// never reconnected, so the reconnect re-drain never fired). Spawned per live
+/// connection and aborted when the pump exits. Dedup is downstream by `message_id`,
+/// so push + poll = exactly-once delivery to the handler.
+async fn periodic_drain(
+    auth: Arc<MessageBoxAuth>,
+    boxes: Vec<String>,
+    inbound: mpsc::Sender<Result<InboundEnvelopeEvent>>,
+) {
+    let mut ticker = tokio::time::interval(WSPUSH_SAFETY_NET_INTERVAL);
+    ticker.tick().await; // consume the immediate first tick — the caller drained on (re)connect.
+                         // Per-poller dedup (see `drain_backfill`): forward each message_id once so a
+                         // still-unacked in-flight row is never re-sent every tick.
+    let mut seen: HashSet<String> = HashSet::new();
+    loop {
+        ticker.tick().await;
+        // Bounded so a hung authed `/listMessages` (issue #58) self-heals on the next
+        // tick instead of wedging the drain. `Ok(false)` = consumer dropped → exit.
+        if let Ok(false) = tokio::time::timeout(
+            BACKFILL_TIMEOUT,
+            drain_backfill(&auth, &boxes, &inbound, Some(&mut seen)),
+        )
+        .await
+        {
+            return;
+        }
+    }
+}
+
 /// Best-effort `leaveRoom` for each subscribed room, then let the
 /// connection drop (which aborts dispatch + closes the WS).
 async fn graceful_leave(conn: &LiveConn, identity_hex: &str, boxes: &[String]) {
@@ -537,8 +616,10 @@ async fn run_loop_polling(
     inbound: mpsc::Sender<Result<InboundEnvelopeEvent>>,
     mut shutdown: oneshot::Receiver<()>,
 ) {
+    // Per-poller dedup (see `drain_backfill`): this fallback is a repeating poller too.
+    let mut seen: HashSet<String> = HashSet::new();
     loop {
-        if !drain_backfill(&auth, &boxes, &inbound).await {
+        if !drain_backfill(&auth, &boxes, &inbound, Some(&mut seen)).await {
             return; // consumer gone
         }
         tokio::select! {
@@ -575,7 +656,12 @@ async fn run_loop_with_conn(
     // tight single budget did not — the deployed presign timed out here.) Bound it
     // best-effort like the initial backfill so the WS pump starts promptly; live
     // push + the reconnect re-drain recover anything this pass missed.
-    match tokio::time::timeout(BACKFILL_TIMEOUT, drain_backfill(&auth, &boxes, &inbound)).await {
+    match tokio::time::timeout(
+        BACKFILL_TIMEOUT,
+        drain_backfill(&auth, &boxes, &inbound, None),
+    )
+    .await
+    {
         Ok(true) => {}
         Ok(false) => return, // consumer gone
         Err(_) => warn!(
@@ -583,7 +669,19 @@ async fn run_loop_with_conn(
              starting WS pump anyway — live push delivers"
         ),
     }
-    match pump(&mut conn, &identity_hex, &boxes, &inbound, &mut shutdown).await {
+    // Run the reliability pull-drain concurrently with the WS pump — but ONLY for the
+    // per-session presign mailboxes that need it (see `box_needs_reliability_drain`);
+    // fixed-box ceremonies (DKG, refresh, sign) keep the proven WS-only path. Aborted
+    // the instant the pump exits so it never outlives the connection.
+    let drain = boxes
+        .iter()
+        .any(|b| box_needs_reliability_drain(b))
+        .then(|| tokio::spawn(periodic_drain(auth.clone(), boxes.clone(), inbound.clone())));
+    let exit = pump(&mut conn, &identity_hex, &boxes, &inbound, &mut shutdown).await;
+    if let Some(drain) = drain {
+        drain.abort();
+    }
+    match exit {
         PumpExit::Shutdown => return,
         PumpExit::Disconnected(reason) => {
             warn!("subscribe disconnected (initial session): {reason}");
@@ -611,7 +709,11 @@ async fn run_loop(
         // backfill row from the same gap. Bounded best-effort (same reason as the
         // post-join re-drain above): a hung BRC-104 `/listMessages` must not block
         // the reconnect's `pump` from re-establishing WS live-push.
-        match tokio::time::timeout(BACKFILL_TIMEOUT, drain_backfill(&auth, &boxes, &inbound)).await
+        match tokio::time::timeout(
+            BACKFILL_TIMEOUT,
+            drain_backfill(&auth, &boxes, &inbound, None),
+        )
+        .await
         {
             Ok(true) => {}
             Ok(false) => return, // consumer gone
@@ -633,7 +735,19 @@ async fn run_loop(
         match connect {
             Ok(mut conn) => {
                 backoff = RECONNECT_BACKOFF_INITIAL; // healthy — reset.
-                match pump(&mut conn, &identity_hex, &boxes, &inbound, &mut shutdown).await {
+                                                     // Concurrent reliability pull-drain — presign session boxes only
+                                                     // (see `box_needs_reliability_drain`); aborted on exit.
+                let drain = boxes
+                    .iter()
+                    .any(|b| box_needs_reliability_drain(b))
+                    .then(|| {
+                        tokio::spawn(periodic_drain(auth.clone(), boxes.clone(), inbound.clone()))
+                    });
+                let exit = pump(&mut conn, &identity_hex, &boxes, &inbound, &mut shutdown).await;
+                if let Some(drain) = drain {
+                    drain.abort();
+                }
+                match exit {
                     PumpExit::Shutdown => return,
                     PumpExit::Disconnected(reason) => {
                         warn!(reconnect_in = ?backoff, "subscribe disconnected: {reason}");
@@ -661,11 +775,23 @@ async fn drain_backfill(
     auth: &Arc<MessageBoxAuth>,
     boxes: &[String],
     inbound: &mpsc::Sender<Result<InboundEnvelopeEvent>>,
+    mut seen: Option<&mut HashSet<String>>,
 ) -> bool {
     for message_box in boxes {
         match http::list_messages(auth, message_box).await {
             Ok(list) => {
                 for msg in list.messages {
+                    // Per-poller dedup: forward each `message_id` AT MOST ONCE from a
+                    // repeating poller, so a still-unacked in-flight row is not re-sent
+                    // every tick — that re-flooding + the consumer's per-duplicate ack
+                    // is what 2.4×-slowed a deployed DKG. One-shot callers (initial /
+                    // post-join / reconnect backfill) pass `None`: re-sending is rare
+                    // there and the consumer dedups downstream.
+                    if let Some(seen) = seen.as_deref_mut() {
+                        if !msg.message_id.is_empty() && !seen.insert(msg.message_id.clone()) {
+                            continue;
+                        }
+                    }
                     let event = InboundEnvelopeEvent {
                         message_box: message_box.clone(),
                         sender: msg.sender,
@@ -784,6 +910,28 @@ mod tests {
         assert!(
             map_send_message(&app_event("joinedRoom", json!({"roomId":"x"})), "02abc").is_none()
         );
+    }
+
+    #[test]
+    fn reliability_drain_scoped_to_presign_session_boxes_only() {
+        // Per-session presign mailboxes (egress-NAT lossy live-push) → drain ON.
+        let sid = "f25e7c5e560e01926dfbfd70f3940352c1349e1e69a2f17c1668bda988014e0b";
+        assert!(box_needs_reliability_drain(&format!("mpc_{sid}")));
+        assert!(box_needs_reliability_drain(&format!("presig_return_{sid}")));
+        // FIXED ceremony boxes keep the proven WS-only path — the drain MUST NOT run
+        // for DKG (its slow safe-prime rounds + a re-drain = the 2.4× regression).
+        for fixed in [
+            "mpc-dkg",
+            "mpc-sign",
+            "mpc-presign",
+            "mpc-refresh",
+            "mpc-ecdh",
+        ] {
+            assert!(
+                !box_needs_reliability_drain(fixed),
+                "{fixed} must NOT get the reliability drain"
+            );
+        }
     }
 
     #[test]
