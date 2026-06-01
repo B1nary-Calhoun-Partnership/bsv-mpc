@@ -742,7 +742,11 @@ pub async fn handle_presign_round(
                 .unwrap_or_default(),
             ),
         ),
-        PresigningRoundResult::Complete => {
+        // Live presign runs over the relay (`presign_handler`); this 2-party HTTP
+        // `/presign/round` flow is ordered request/response, so the completing drive
+        // carries no undelivered final-round messages (the `Complete` payload is empty
+        // here) — see the #98 fix in `presigning::PresigningRoundResult`.
+        PresigningRoundResult::Complete(_final_msgs) => {
             // Extract this party's Presignature_A + the joint key it belongs to
             // (drop the std lock before any await), then remove the spent session.
             let (extracted, agent_id) = {

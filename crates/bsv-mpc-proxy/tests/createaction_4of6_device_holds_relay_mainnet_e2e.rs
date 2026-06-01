@@ -170,7 +170,7 @@ fn gen_presig_set(
                 .process_generate_round(inbound)
                 .expect("presign round")
             {
-                PresigningRoundResult::Complete => done[i] = true,
+                PresigningRoundResult::Complete(_) => done[i] = true,
                 PresigningRoundResult::NextRound(msgs) => next[i] = msgs,
             }
         }

@@ -104,14 +104,14 @@ fn gen_presig_pair(share0: EncryptedShare, share1: EncryptedShare) -> (Vec<u8>, 
         let r1 = m1.process_generate_round(o0.clone()).expect("m1 round");
         o0 = match r0 {
             PresigningRoundResult::NextRound(m) => m,
-            PresigningRoundResult::Complete => {
+            PresigningRoundResult::Complete(_) => {
                 d0 = true;
                 vec![]
             }
         };
         o1 = match r1 {
             PresigningRoundResult::NextRound(m) => m,
-            PresigningRoundResult::Complete => {
+            PresigningRoundResult::Complete(_) => {
                 d1 = true;
                 vec![]
             }

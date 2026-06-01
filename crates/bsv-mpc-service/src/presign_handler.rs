@@ -756,7 +756,21 @@ impl PresignHandler {
                         .unwrap_or_default();
                     queue.extend(drained);
                 }
-                PresigningRoundResult::Complete => {
+                PresigningRoundResult::Complete(final_msgs) => {
+                    // #98 deadlock fix: the SM's FINAL-round protocol messages were
+                    // produced in the SAME drive as completion (this happens under the
+                    // reordered delivery of the egress-NAT relay path). They MUST still
+                    // be sent to peers — otherwise every peer still waiting on this
+                    // party's last round stalls until the 600s ceremony timeout. Ship
+                    // them alongside the return ciphertext.
+                    let mut final_outgoing = wrap_protocol(
+                        &final_msgs,
+                        session_id,
+                        joint_pubkey,
+                        &peers,
+                        &self.inner.parties_at_keygen,
+                    );
+                    all_outgoing.append(&mut final_outgoing);
                     let mut more = self
                         .on_presign_complete(session_id, joint_pubkey, peers, mgr)
                         .await?;

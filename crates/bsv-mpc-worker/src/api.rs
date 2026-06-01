@@ -565,7 +565,11 @@ pub async fn handle_presign_round(mut req: Request) -> Result<Response> {
             };
             Response::from_json(&response)
         }
-        PresigningRoundResult::Complete => {
+        // Live presign runs over the relay; this 2-party HTTP `/presign/round` flow is
+        // ordered request/response, so the completing drive carries no undelivered
+        // final-round messages (empty `Complete` payload) — see the #98 fix in
+        // `presigning::PresigningRoundResult`.
+        PresigningRoundResult::Complete(_final_msgs) => {
             // Presignature has been added to the manager's internal pool.
             // Clean up the session (the presignature lives in the manager's pool).
             PRESIGNING_SESSIONS

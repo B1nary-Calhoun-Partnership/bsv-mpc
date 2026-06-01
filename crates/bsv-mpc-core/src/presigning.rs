@@ -52,7 +52,7 @@
 //!     let incoming = transport.receive_round().await;
 //!     match mgr.process_generate_round(incoming)? {
 //!         PresigningRoundResult::NextRound(msgs) => transport.send_all(msgs).await,
-//!         PresigningRoundResult::Complete => break, // presig added to pool
+//!         PresigningRoundResult::Complete(_) => break, // presig added to pool
 //!     }
 //! }
 //!
@@ -108,8 +108,13 @@ type PresigningSm = Box<
 pub enum PresigningRoundResult {
     /// The protocol needs another round. Contains outgoing messages to send.
     NextRound(Vec<RoundMessage>),
-    /// Presigning is complete. The presignature has been added to the pool.
-    Complete,
+    /// Presigning is complete (the presignature was added to the pool). Carries the
+    /// FINAL-round outgoing messages produced in the SAME drive as completion — they
+    /// MUST still be sent to peers. Under reordered delivery a party can receive every
+    /// peer's last-round message before it emits its own, so its final send and its
+    /// completion coincide in one drive; dropping those messages stalls every peer
+    /// that still needs this party's final round (the #98 n-party presign deadlock).
+    Complete(Vec<RoundMessage>),
 }
 
 // ---------------------------------------------------------------------------
@@ -387,7 +392,9 @@ impl PresigningManager {
                 let boxed: Box<dyn std::any::Any + Send> = Box::new(presig_output);
                 self.raw_pool.push(boxed);
 
-                Ok(PresigningRoundResult::Complete)
+                // Hand the caller the final-round outgoing produced in this same drive
+                // so it is still sent to peers (see `PresigningRoundResult::Complete`).
+                Ok(PresigningRoundResult::Complete(outgoing))
             }
         }
     }
@@ -776,6 +783,146 @@ mod tests {
             .collect()
     }
 
+    /// Run an `n`-of-`n` DKG (keygen + aux info) via the round-based sim, returning
+    /// complete key shares. Generalizes [`run_dkg_2of2`] for the n-party reorder repro.
+    async fn run_dkg(n: u16, t: u16) -> Vec<cggmp24::KeyShare<Secp256k1, SecurityLevel128>> {
+        use rand::Rng;
+        let mut rng = rand::rngs::OsRng;
+
+        let eid_bytes: [u8; 32] = rng.gen();
+        let eid = ExecutionId::new(&eid_bytes);
+        let incomplete_shares = round_based::sim::run(n, |i, party| {
+            let party = buffer_outgoing(party);
+            let mut party_rng = rand::rngs::OsRng;
+            async move {
+                cggmp24::keygen::<Secp256k1>(eid, i, n)
+                    .set_threshold(t)
+                    .start(&mut party_rng, party)
+                    .await
+            }
+        })
+        .unwrap()
+        .expect_ok()
+        .into_vec();
+
+        let eid_bytes_aux: [u8; 32] = rng.gen();
+        let eid_aux = ExecutionId::new(&eid_bytes_aux);
+        let primes: Vec<_> = (0..n)
+            .map(|_| generate_pregenerated_primes(&mut rng))
+            .collect();
+        let aux_infos = round_based::sim::run(n, |i, party| {
+            let party = buffer_outgoing(party);
+            let mut party_rng = rand::rngs::OsRng;
+            let pregenerated = primes[usize::from(i)].clone();
+            async move {
+                cggmp24::aux_info_gen(eid_aux, i, n, pregenerated)
+                    .start(&mut party_rng, party)
+                    .await
+            }
+        })
+        .unwrap()
+        .expect_ok()
+        .into_vec();
+
+        incomplete_shares
+            .into_iter()
+            .zip(aux_infos)
+            .map(|(share, aux)| {
+                cggmp24::KeyShare::from_parts((share, aux)).expect("key share validation")
+            })
+            .collect()
+    }
+
+    /// **Repro for the deployed n-party presign deadlock (#98).** The egress-NAT
+    /// WS-push path delivers round messages REORDERED; the in-process sim tests deliver
+    /// in-order, masking it. This drives a real n-of-n presign through our
+    /// `PresigningManager`/`drive_inline`, but feeds each party its inbound in
+    /// ADVERSARIAL order — the pending message with the HIGHEST wire-round first — so
+    /// every SM repeatedly sees future-round messages before current-round ones,
+    /// exercising the out-of-order buffer. A correct transport must still complete.
+    #[tokio::test]
+    async fn nparty_presign_survives_reordered_delivery() {
+        // Deliver `msgs` from `sender` to recipients (broadcast → every other party;
+        // p2p → the named `to`). Full n-of-n → signing position == party index.
+        fn push_routed(
+            sender: usize,
+            msgs: Vec<RoundMessage>,
+            np: usize,
+            pending: &mut Vec<(usize, RoundMessage)>,
+        ) {
+            for m in msgs {
+                match m.to {
+                    Some(ShareIndex(to)) => pending.push((to as usize, m)),
+                    None => {
+                        for r in 0..np {
+                            if r != sender {
+                                pending.push((r, m.clone()));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let n: u16 = 3;
+        let key_shares = run_dkg(n, n).await;
+        let session_id = SessionId::from_str_hash("presign-reorder-repro");
+        let config = ThresholdConfig::new(n, n).unwrap();
+        let participants: Vec<u16> = (0..n).collect();
+        let np = n as usize;
+        let mut mgrs: Vec<PresigningManager> = (0..n)
+            .map(|i| {
+                PresigningManager::new(
+                    session_id,
+                    wrap_key_share(&key_shares[i as usize], i, config, &session_id),
+                    participants.clone(),
+                    5,
+                )
+            })
+            .collect();
+        let mut done = vec![false; np];
+
+        let mut pending: Vec<(usize, RoundMessage)> = Vec::new();
+        for (s, mgr) in mgrs.iter_mut().enumerate() {
+            let out = mgr.init_generate().unwrap();
+            push_routed(s, out, np, &mut pending);
+        }
+
+        let mut steps = 0u32;
+        while !done.iter().all(|&d| d) {
+            steps += 1;
+            assert!(steps < 10_000, "step budget exceeded (livelock?)");
+            assert!(
+                !pending.is_empty(),
+                "DEADLOCK: no pending messages but parties incomplete (done={done:?})"
+            );
+            // Adversarial reorder: take the HIGHEST-round pending message.
+            let idx = pending
+                .iter()
+                .enumerate()
+                .max_by_key(|(_, (_, m))| m.round)
+                .map(|(i, _)| i)
+                .unwrap();
+            let (recipient, msg) = pending.remove(idx);
+            if done[recipient] {
+                continue;
+            }
+            match mgrs[recipient].process_generate_round(vec![msg]) {
+                Ok(PresigningRoundResult::NextRound(out)) => {
+                    push_routed(recipient, out, np, &mut pending)
+                }
+                // The fix under test: the completing party's final-round messages are
+                // STILL routed to peers — without this the test deadlocks (done=[F,T,F]).
+                Ok(PresigningRoundResult::Complete(out)) => {
+                    push_routed(recipient, out, np, &mut pending);
+                    done[recipient] = true
+                }
+                Err(e) => panic!("party {recipient} SM error on reordered delivery: {e}"),
+            }
+        }
+        assert!(done.iter().all(|&d| d), "all parties must complete");
+    }
+
     /// Wrap a cggmp24 KeyShare into our EncryptedShare format (placeholder encryption).
     fn wrap_key_share(
         key_share: &cggmp24::KeyShare<Secp256k1, SecurityLevel128>,
@@ -978,7 +1125,7 @@ mod tests {
             let result_1 = mgr_1.process_generate_round(outgoing_0.clone()).unwrap();
 
             match (result_0, result_1) {
-                (PresigningRoundResult::Complete, PresigningRoundResult::Complete) => {
+                (PresigningRoundResult::Complete(_), PresigningRoundResult::Complete(_)) => {
                     // Both completed
                     break;
                 }
@@ -986,12 +1133,12 @@ mod tests {
                     outgoing_0 = m0;
                     outgoing_1 = m1;
                 }
-                (PresigningRoundResult::Complete, PresigningRoundResult::NextRound(m1)) => {
+                (PresigningRoundResult::Complete(_), PresigningRoundResult::NextRound(m1)) => {
                     // Manager 0 completed first, feed remaining to manager 1
                     outgoing_0 = vec![];
                     outgoing_1 = m1;
                 }
-                (PresigningRoundResult::NextRound(m0), PresigningRoundResult::Complete) => {
+                (PresigningRoundResult::NextRound(m0), PresigningRoundResult::Complete(_)) => {
                     outgoing_0 = m0;
                     outgoing_1 = vec![];
                 }
@@ -1051,7 +1198,9 @@ mod tests {
                 let result_1 = mgr_1.process_generate_round(outgoing_0.clone()).unwrap();
 
                 match (result_0, result_1) {
-                    (PresigningRoundResult::Complete, PresigningRoundResult::Complete) => break,
+                    (PresigningRoundResult::Complete(_), PresigningRoundResult::Complete(_)) => {
+                        break
+                    }
                     (
                         PresigningRoundResult::NextRound(m0),
                         PresigningRoundResult::NextRound(m1),
@@ -1059,11 +1208,11 @@ mod tests {
                         outgoing_0 = m0;
                         outgoing_1 = m1;
                     }
-                    (PresigningRoundResult::Complete, PresigningRoundResult::NextRound(m1)) => {
+                    (PresigningRoundResult::Complete(_), PresigningRoundResult::NextRound(m1)) => {
                         outgoing_0 = vec![];
                         outgoing_1 = m1;
                     }
-                    (PresigningRoundResult::NextRound(m0), PresigningRoundResult::Complete) => {
+                    (PresigningRoundResult::NextRound(m0), PresigningRoundResult::Complete(_)) => {
                         outgoing_0 = m0;
                         outgoing_1 = vec![];
                     }
@@ -1115,16 +1264,16 @@ mod tests {
             let r0 = mgr_0.process_generate_round(out_1.clone()).unwrap();
             let r1 = mgr_1.process_generate_round(out_0.clone()).unwrap();
             match (r0, r1) {
-                (PresigningRoundResult::Complete, PresigningRoundResult::Complete) => break,
+                (PresigningRoundResult::Complete(_), PresigningRoundResult::Complete(_)) => break,
                 (PresigningRoundResult::NextRound(m0), PresigningRoundResult::NextRound(m1)) => {
                     out_0 = m0;
                     out_1 = m1;
                 }
-                (PresigningRoundResult::Complete, PresigningRoundResult::NextRound(m1)) => {
+                (PresigningRoundResult::Complete(_), PresigningRoundResult::NextRound(m1)) => {
                     out_0 = vec![];
                     out_1 = m1;
                 }
-                (PresigningRoundResult::NextRound(m0), PresigningRoundResult::Complete) => {
+                (PresigningRoundResult::NextRound(m0), PresigningRoundResult::Complete(_)) => {
                     out_0 = m0;
                     out_1 = vec![];
                 }
@@ -1218,16 +1367,16 @@ mod tests {
             let r0 = mgr_0.process_generate_round(out_1.clone()).unwrap();
             let r1 = mgr_1.process_generate_round(out_0.clone()).unwrap();
             match (r0, r1) {
-                (PresigningRoundResult::Complete, PresigningRoundResult::Complete) => break,
+                (PresigningRoundResult::Complete(_), PresigningRoundResult::Complete(_)) => break,
                 (PresigningRoundResult::NextRound(m0), PresigningRoundResult::NextRound(m1)) => {
                     out_0 = m0;
                     out_1 = m1;
                 }
-                (PresigningRoundResult::Complete, PresigningRoundResult::NextRound(m1)) => {
+                (PresigningRoundResult::Complete(_), PresigningRoundResult::NextRound(m1)) => {
                     out_0 = vec![];
                     out_1 = m1;
                 }
-                (PresigningRoundResult::NextRound(m0), PresigningRoundResult::Complete) => {
+                (PresigningRoundResult::NextRound(m0), PresigningRoundResult::Complete(_)) => {
                     out_0 = m0;
                     out_1 = vec![];
                 }

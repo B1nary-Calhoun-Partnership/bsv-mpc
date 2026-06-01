@@ -860,7 +860,11 @@ impl MpcBridge {
                         })?;
                         proxy_wire_msgs = next_msgs;
                     }
-                    PresigningRoundResult::Complete => {
+                    // Live presign runs over the relay; this 2-party HTTP presign flow is
+                    // ordered request/response, so the completing drive carries no
+                    // undelivered final-round messages (empty `Complete` payload) — see
+                    // the #98 fix in `presigning::PresigningRoundResult`.
+                    PresigningRoundResult::Complete(_final_msgs) => {
                         // Presignature added to manager's internal pool — take
                         // the raw output (Presignature + PresignaturePublicData).
                         let (presig, raw) = mgr.take_raw().ok_or_else(|| {
