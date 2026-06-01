@@ -1098,6 +1098,7 @@ fn wrap_protocol(
                 "PresignHandler: outgoing from SM-position {} outside subset {:?}; dropping",
                 rm.from.0, parties_at_keygen
             );
+            bsv_mpc_core::presig_timing::record_dropped(rm.round, u16::MAX);
             continue;
         };
         // Resolve targets (by absolute index) + the absolute `to` for the wire.
@@ -1115,6 +1116,7 @@ fn wrap_protocol(
                 to_abs,
                 peers.iter().map(|(p, _)| *p).collect::<Vec<_>>()
             );
+            bsv_mpc_core::presig_timing::record_dropped(rm.round, to_abs.unwrap_or(u16::MAX));
             continue;
         }
         // Emit with ABSOLUTE from/to on the wire (§05.4.6).

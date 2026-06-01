@@ -65,6 +65,13 @@ struct State {
     /// presign stall). Folded into [`summary`], so the device's timeout error shows
     /// exactly what it shipped where.
     sends: BTreeMap<u8, BTreeSet<u16>>,
+    /// Outbound DROP log: wire round → set of target absolute indices that
+    /// `wrap_protocol` discarded (target not in the peer set, or a `from`/`to`
+    /// SM-position that didn't translate — recorded as `u16::MAX`). Distinguishes
+    /// "the SM emitted rounds 2–5 to the cosigner but routing DROPPED them" (these
+    /// rounds appear here, with the bad index) from "the SM never emitted them"
+    /// (absent from BOTH `sends` and `dropped` → an upstream deadlock).
+    dropped: BTreeMap<u8, BTreeSet<u16>>,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -82,6 +89,7 @@ pub fn arm() {
             t0: Instant::now(),
             stages: BTreeMap::new(),
             sends: BTreeMap::new(),
+            dropped: BTreeMap::new(),
         });
     }
     ENABLED.store(true, Ordering::Relaxed);
@@ -127,6 +135,20 @@ pub fn record_send(round: u8, to_party: u16) {
     if let Ok(mut g) = STATE.lock() {
         if let Some(s) = g.as_mut() {
             s.sends.entry(round).or_default().insert(to_party);
+        }
+    }
+}
+
+/// Record that `wrap_protocol` DROPPED an outbound `round` message bound for target
+/// absolute index `to_abs` (`u16::MAX` = a `from`/`to` SM-position that didn't
+/// translate). No-op when disarmed. See [`State::dropped`].
+pub fn record_dropped(round: u8, to_abs: u16) {
+    if !enabled() {
+        return;
+    }
+    if let Ok(mut g) = STATE.lock() {
+        if let Some(s) = g.as_mut() {
+            s.dropped.entry(round).or_default().insert(to_abs);
         }
     }
 }
@@ -192,6 +214,22 @@ pub fn summary() -> String {
         out.push_str(" | sends:");
         for (round, parties) in &s.sends {
             let list: Vec<String> = parties.iter().map(|p| p.to_string()).collect();
+            out.push_str(&format!(" r{round}=[{}]", list.join(",")));
+        }
+    }
+    if !s.dropped.is_empty() {
+        out.push_str(" | dropped:");
+        for (round, abss) in &s.dropped {
+            let list: Vec<String> = abss
+                .iter()
+                .map(|a| {
+                    if *a == u16::MAX {
+                        "?".to_string()
+                    } else {
+                        a.to_string()
+                    }
+                })
+                .collect();
             out.push_str(&format!(" r{round}=[{}]", list.join(",")));
         }
     }

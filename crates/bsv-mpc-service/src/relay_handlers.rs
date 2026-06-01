@@ -115,6 +115,10 @@ pub async fn handle_presign_relay_debug() -> impl IntoResponse {
         "count": cps.len(),
         "last_age_ms": cps.last().map(|(t, _)| now.saturating_sub(*t)),
         "steps": steps,
+        // Cosigner-side send/drop routing (armed in `handle_presign_relay_init`):
+        // reveals which rounds THIS party produced + posted to its peers, so a
+        // deterministic n-party stall is mapped from BOTH ends at once.
+        "timing": bsv_mpc_core::presig_timing::summary(),
     }))
 }
 
@@ -312,6 +316,12 @@ pub async fn handle_presign_relay_init(
             true,
         );
     }
+
+    // #98 cosigner-side routing visibility: arm the send/drop log for THIS presign so
+    // `GET /presign-relay/debug` shows which rounds the cosigner produced + posted
+    // (maps the deterministic n-party stall from the cosigner end too). The shared
+    // `record_send`/`record_dropped` hooks are no-ops until armed.
+    bsv_mpc_core::presig_timing::arm();
 
     let policy_id = match &body.policy_id_hex {
         Some(h) => match hex::decode(h) {
