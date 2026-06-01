@@ -97,6 +97,18 @@ struct State {
     /// opaque stall into the precise cggmp24 error. Capped to avoid unbounded
     /// growth on a pathological loop.
     errors: Vec<String>,
+    /// **Shared-context fingerprints**, deduped. Each party records one
+    /// `eid=… jpk=… aux=…` line in `init_generate`: the presigning ExecutionId
+    /// (the Fiat-Shamir `sid`), the joint pubkey, and a digest of the GLOBAL
+    /// aux-info (`key_share.aux.N` + `pedersen_params`) — the EXACT inputs the
+    /// round1b `pi_enc_elg` proof binds. Every party of one ceremony MUST produce
+    /// the identical string (same wallet + DKG + session), so a consistent run
+    /// dedups to ONE entry. A `SigningAborted::EncProofOfK` abort with the device
+    /// showing one `ctx` and the cosigner showing a DIFFERENT one localizes the
+    /// failure to a sid / joint-key / aux MISMATCH (the device's persisted wallet
+    /// vs the notary's recovered share), not the protocol code. Set (not Vec) so
+    /// the device's `w` co-located parties collapse to one when they agree.
+    contexts: BTreeSet<String>,
 }
 
 /// Cap on retained [`State::errors`] so a degenerate error loop can't grow the
@@ -121,6 +133,7 @@ pub fn arm() {
             dropped: BTreeMap::new(),
             recvs: BTreeMap::new(),
             errors: Vec::new(),
+            contexts: BTreeSet::new(),
         });
     }
     ENABLED.store(true, Ordering::Relaxed);
@@ -220,6 +233,21 @@ pub fn record_error(reason: impl Into<String>) {
     }
 }
 
+/// Record this party's shared-context fingerprint (`eid=… jpk=… aux=…`) at
+/// `init_generate`. No-op when disarmed; deduped (see [`State::contexts`]). All
+/// parties of one ceremony MUST produce the same string — a divergence under an
+/// `EncProofOfK` abort is the sid/joint-key/aux mismatch.
+pub fn record_context(fingerprint: impl Into<String>) {
+    if !enabled() {
+        return;
+    }
+    if let Ok(mut g) = STATE.lock() {
+        if let Some(s) = g.as_mut() {
+            s.contexts.insert(fingerprint.into());
+        }
+    }
+}
+
 /// Time a **synchronous** block (e.g. the CPU-bound body inside a
 /// `spawn_blocking`) and record its elapsed under `stage`. When disarmed, calls
 /// `f` directly with no `Instant` overhead.
@@ -313,6 +341,14 @@ pub fn summary() -> String {
     if !s.errors.is_empty() {
         out.push_str(" | errors: [");
         out.push_str(&s.errors.join("; "));
+        out.push(']');
+    }
+    if !s.contexts.is_empty() {
+        // One entry per DISTINCT shared-context fingerprint. >1 entry (or the
+        // cosigner's `/debug` showing a different one than the device) = a sid /
+        // joint-key / aux MISMATCH driving the EncProofOfK abort.
+        out.push_str(" | ctx: [");
+        out.push_str(&s.contexts.iter().cloned().collect::<Vec<_>>().join(" || "));
         out.push(']');
     }
     out

@@ -312,6 +312,32 @@ impl PresigningManager {
             );
         }
 
+        // #98 context-mismatch localizer: fingerprint the SHARED inputs the round1b
+        // `pi_enc_elg` proof binds — the ExecutionId (`sid`), the joint pubkey, and a
+        // digest of the GLOBAL aux-info (`aux.N` + `pedersen_params`). EVERY party of
+        // one ceremony MUST produce the identical fingerprint; a divergence under an
+        // `EncProofOfK` abort pinpoints the failure to a sid/joint-key/aux mismatch
+        // (a stale persisted wallet vs the cosigner's recovered share) rather than the
+        // protocol code. No-op unless armed; native-only (`presig_timing` uses
+        // `Instant`, and presign generation never runs on the wasm worker).
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let eid6 = hex::encode(&eid_bytes[..6]);
+            let jpk = crate::signing::share_joint_pubkey_or_zero(&self.share, "presigning");
+            let jpk6 = hex::encode(&jpk[..6]);
+            let aux6 = {
+                let mut h = Sha256::new();
+                if let Ok(b) = serde_json::to_vec(&key_share.aux.N) {
+                    h.update(&b);
+                }
+                if let Ok(b) = serde_json::to_vec(&key_share.aux.pedersen_params) {
+                    h.update(&b);
+                }
+                hex::encode(&h.finalize()[..6])
+            };
+            crate::presig_timing::record_context(format!("eid={eid6} jpk={jpk6} aux={aux6}"));
+        }
+
         let sm: PresigningSm = Box::new(round_based::state_machine::wrap_protocol(
             move |party| async move {
                 let eid = ExecutionId::new(&eid_bytes);
