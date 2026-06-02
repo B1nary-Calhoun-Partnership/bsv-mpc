@@ -1,5 +1,29 @@
 # Handoff — on-device 4-of-6 presig deadlock (#98 / 100cash#31)
 
+> ## ✅ CLOSED 2026-06-02 — PROVEN ON MAINNET
+> Drive-13 completed the full device-holds-3 / 2-notary 4-of-6 path end-to-end. Audit-closing TXID
+> **`897a03f82f49accc85673844e44eb497837fdddd0f6cc2af7941bc6f9ec834e6`** (WhatsOnChain-indexed).
+> `presig.coord.assembly_wait` collapsed from the 600s timeout to ~71s — the "deadlock" is gone.
+>
+> **ACTUAL root cause:** a **single-slot Swift keystore** vs a 4-of-6 device holding `w = t−1 = 3`
+> shares (indices `[0,1,2]`). Sealing 3 overwrote down to 1, so `unseal_device_shares_multi` got
+> `[s2,s2,s2]` instead of `[s0,s1,s2]` → the n-party presig derived its aux-info from the wrong
+> shares → it diverged from the cosigner's → `SigningAborted::EncProofOfK` ("signing protocol
+> failed"). **NOT the Enclave, NOT the relay, NOT the SM.** Fixed Swift-side (ordered multi-slot
+> keystore). On the Rust side, the ctx-aux fingerprint diagnostic localized it (aux diverges, eid+jpk
+> agree) and `keyshare_aux_fingerprint_survives_serde_roundtrip` (`f49e5af`) proved the shared core
+> preserves aux exactly — correctly pointing at DROPPED shares, not mangled bytes. A fail-fast guard
+> (`acc7aad`, `unseal_device_shares_multi`) now rejects a colliding/single-slot keystore with a
+> precise error instead of the cryptic downstream `EncProofOfK`.
+>
+> **Detours fixed along the way (real, but separate):** the early-return-share loss (`70831d9`,
+> guarded) and the **relay `/sendMessage` DO-push hang** (`rust-message-box` `877af2a`, deployed
+> `0eadb6e7`: bounded the inline best-effort WS push to a recipient DO with a 2s timeout).
+>
+> Everything below is the (now-historical) live investigation, kept for the record.
+
+---
+
 **Status: OPEN. Root cause NOT yet found.** A real bug was found + fixed (`5fa31d5`) but it is
 **not** the deployed bug — drive 9 (with the fix, both sides rebuilt) is **byte-identical** to
 drive 8 (pre-fix). Do not assume the fix helped the live ceremony; it did not.
