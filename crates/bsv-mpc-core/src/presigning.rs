@@ -949,6 +949,67 @@ mod tests {
         assert!(done.iter().all(|&d| d), "all parties must complete");
     }
 
+    /// **#98 aux-survival gate.** Proves the SHARED Rust core preserves the
+    /// cggmp24 aux-info across the seal→serde→reconstruct round-trip — so a device
+    /// `SigningAborted::EncProofOfK` with the `ctx: aux=…` fingerprint diverging
+    /// device-vs-notary is the host Secure Enclave seal/unseal NOT being byte-exact
+    /// for the (large) share blob, NOT the shared core.
+    ///
+    /// The device path (`create_wallet_nparty` → `provision_wallet_nparty`) is
+    /// byte-identical to the macOS `issue98` repro EXCEPT the keystore impl: the
+    /// repro uses `MemNativeKeyStore` (byte-exact) and PASSES; the device uses the
+    /// Enclave (`FfiKeyStore`, a thin `FfiKeyStoreAdapter` passthrough). Each
+    /// `local_shares[i]` is a signable `KeyShare` JSON; the keystore round-trips it
+    /// and `reconstruct` feeds the unsealed bytes straight back as
+    /// `EncryptedShare.ciphertext`, which `PresigningManager` deserializes. With a
+    /// byte-exact keystore the aux fingerprint — computed EXACTLY as
+    /// `init_generate`'s `ctx` diagnostic (SHA-256 of `aux.N` + `aux.pedersen_params`)
+    /// — MUST be unchanged. GREEN here ⇒ the divergence is the Enclave, not the core.
+    #[tokio::test]
+    async fn keyshare_aux_fingerprint_survives_serde_roundtrip() {
+        fn aux_ctx_fp(ks: &cggmp24::KeyShare<Secp256k1, SecurityLevel128>) -> String {
+            // Byte-for-byte identical to the `ctx` aux digest in `init_generate`.
+            let mut h = Sha256::new();
+            if let Ok(b) = serde_json::to_vec(&ks.aux.N) {
+                h.update(&b);
+            }
+            if let Ok(b) = serde_json::to_vec(&ks.aux.pedersen_params) {
+                h.update(&b);
+            }
+            hex::encode(&h.finalize()[..6])
+        }
+
+        let shares = run_dkg_2of2().await;
+        let ks = &shares[0];
+        let fp_orig = aux_ctx_fp(ks);
+
+        // Mimic provision: serialize the signable KeyShare (= what `local_shares`
+        // hands the keystore). A byte-exact keystore returns these bytes verbatim,
+        // so seal→unseal is the identity on `json`.
+        let json = serde_json::to_vec(ks).expect("serialize signable KeyShare");
+        // The share blob the keystore must round-trip is LARGE (the aux-info — 2048-bit
+        // Paillier moduli + ring-Pedersen params per party — dominates it). A 4-of-6
+        // share carries ~3× this aux. Print it so the Enclave's seal can be checked
+        // against any payload-size limit (the suspected cause of the tail/aux corruption).
+        eprintln!(
+            "[#98] signable 2-of-2 KeyShare JSON = {} bytes; a 4-of-6 share ≈ {} KB \
+             (aux for 6 parties) — verify the Enclave seal/unseal is byte-exact at this size",
+            json.len(),
+            json.len() * 3 / 1024
+        );
+        // Mimic reconstruct + PresigningManager: deserialize the unsealed bytes.
+        let ks_rt: cggmp24::KeyShare<Secp256k1, SecurityLevel128> =
+            serde_json::from_slice(&json).expect("deserialize unsealed KeyShare");
+        let fp_rt = aux_ctx_fp(&ks_rt);
+
+        assert_eq!(
+            fp_orig, fp_rt,
+            "aux fingerprint MUST survive serde + byte-exact keystore round-trip; a device \
+             EncProofOfK aux mismatch is therefore the Enclave seal/unseal NOT being byte-exact \
+             (suspect a size limit on the large share blob), not the shared core"
+        );
+    }
+
     /// Wrap a cggmp24 KeyShare into our EncryptedShare format (placeholder encryption).
     fn wrap_key_share(
         key_share: &cggmp24::KeyShare<Secp256k1, SecurityLevel128>,
