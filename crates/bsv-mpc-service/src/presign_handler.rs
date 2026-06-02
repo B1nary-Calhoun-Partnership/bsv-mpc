@@ -152,6 +152,19 @@ struct PresignHandlerInner {
     /// cggmp24 presigning SM already buffers out-of-order rounds internally
     /// (`presigning.rs` `wire_buffer`), so replay order across rounds is safe.
     pending_inbound: Mutex<HashMap<SessionId, Vec<DecodedRoundMessage>>>,
+    /// **Early-RETURN-share buffer (coordinator only).** A cosigner ships its
+    /// BRC-2 return ciphertext (`RETURN_SHARE_ROUND`) the instant IT finishes
+    /// round 3. Under reordered/parallel delivery that can reach the coordinator
+    /// BEFORE the coordinator's own round 3 completes and opens its
+    /// [`CollectionSlot`]. The old code returned `Ok(())` here intending the relay
+    /// to "leave it un-acked for redelivery" — but [`crate::messagebox`]'s
+    /// `run_loop` ACKs every delivered message regardless of handler outcome, so
+    /// that ciphertext was DELETED from the relay box and never re-delivered → the
+    /// bundle never assembled → the 600s "awaiting PresigBundle assembly" timeout.
+    /// So we BUFFER early return shares here, keyed by session, and replay them the
+    /// moment [`Self::on_presign_complete`] opens the collection slot. Mirrors
+    /// [`Self::pending_inbound`] for protocol traffic.
+    pending_return_shares: Mutex<HashMap<SessionId, Vec<DecodedRoundMessage>>>,
 }
 
 /// What a party's completion receiver yields.
@@ -451,6 +464,7 @@ impl PresignHandler {
                 collections: Mutex::new(HashMap::new()),
                 completion_tx: Mutex::new(HashMap::new()),
                 pending_inbound: Mutex::new(HashMap::new()),
+                pending_return_shares: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -551,10 +565,18 @@ impl PresignHandler {
                 // `drive_protocol` — NOT `dispatch_one`, which would translate again.
                 match self.drive_protocol(msg).await {
                     Ok(mut more) => outgoing.append(&mut more),
-                    Err(e) => warn!(
-                        "PresignHandler: replay of buffered inbound for session {} failed: {e}",
-                        session_id.hex()
-                    ),
+                    Err(e) => {
+                        // Surface the abort (drive_protocol already recorded the SM
+                        // error; this covers a replay-path failure too) so it is not
+                        // lost to a stdout-less device.
+                        bsv_mpc_core::presig_timing::record_error(format!(
+                            "buffered-replay failed: {e}"
+                        ));
+                        warn!(
+                            "PresignHandler: replay of buffered inbound for session {} failed: {e}",
+                            session_id.hex()
+                        );
+                    }
                 }
             }
         }
@@ -693,6 +715,9 @@ impl PresignHandler {
                 peers,
             } = slot;
             let inbound_round_msg = next.round_msg;
+            // Capture the inbound coordinates BEFORE the message moves into the
+            // blocking task — needed to label a fatal SM abort below.
+            let (in_wire_round, in_from) = (inbound_round_msg.round, inbound_round_msg.from.0);
 
             // #96/#98 diagnostic timing (see `initiate`): `exec` = pure round math,
             // `await − exec` = blocking-pool queue starvation. This is the per-round
@@ -713,7 +738,33 @@ impl PresignHandler {
                 .map_err(|e| anyhow::anyhow!("process_generate_round task panicked: {e}"))?
             };
 
-            let result = result?;
+            // #98: a fatal cggmp24 SM abort (e.g. `SigningAborted::Round1aNotReliable`
+            // from a reliability-echo hash mismatch, or `AttemptToOverwriteReceivedMsg`
+            // from a duplicate) ends the presign mid-flight and produces NO round2 —
+            // the exact "9–10 handler rounds then nothing" deadlock signature. The
+            // `MessageBoxListener` swallows this `Err` with a `warn!` the device has no
+            // stdout to show, so today it surfaces only as a generic 600s "awaiting
+            // PresigBundle assembly" timeout. Capture the REAL abort reason into the
+            // ceremony timing (folded into the device's timeout summary string) AND the
+            // cosigner's `/presign-relay/debug` trail BEFORE propagating, so the next run
+            // names the precise cggmp24 error instead of an opaque stall.
+            let result = match result {
+                Ok(r) => r,
+                Err(e) => {
+                    let presig_id = session_id.hex();
+                    crate::relay_handlers::presign_checkpoint(
+                        format!(
+                            "hdl:SM_ABORT session={} wire_round={in_wire_round} from={in_from} err={e}",
+                            &presig_id[..presig_id.len().min(12)]
+                        ),
+                        false,
+                    );
+                    bsv_mpc_core::presig_timing::record_error(format!(
+                        "SM abort (wire_round={in_wire_round} from={in_from}): {e}"
+                    ));
+                    return Err(e);
+                }
+            };
 
             match result {
                 PresigningRoundResult::NextRound(next_msgs) => {
@@ -857,6 +908,28 @@ impl PresignHandler {
                 presig_id,
                 n - 1
             );
+            // Replay any return shares that arrived BEFORE this round-3 completion
+            // opened the collection slot. They were BUFFERED (not dropped) by
+            // `collect_return_share` precisely so the listener's unconditional ack
+            // couldn't lose them; now that the slot exists each stores positionally
+            // and the last may assemble the bundle.
+            let buffered_returns: Vec<DecodedRoundMessage> = self
+                .inner
+                .pending_return_shares
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&session_id)
+                .unwrap_or_default();
+            if !buffered_returns.is_empty() {
+                debug!(
+                    "PresignHandler[coord]: replaying {} early return share(s) for session {}",
+                    buffered_returns.len(),
+                    presig_id
+                );
+                for rs in buffered_returns {
+                    self.collect_return_share(rs).await?;
+                }
+            }
             // Maybe everything already arrived (return shares can race ahead).
             self.try_finalize_bundle(session_id, joint_pubkey).await?;
             Ok(vec![])
@@ -915,15 +988,14 @@ impl PresignHandler {
     }
 
     /// Coordinator: a return ciphertext arrived. Store it positionally and try
-    /// to finalize.
-    async fn collect_return_share(&self, inbound: DecodedRoundMessage) -> anyhow::Result<()> {
+    /// to finalize — or BUFFER it if the collection slot isn't open yet.
+    async fn collect_return_share(&self, mut inbound: DecodedRoundMessage) -> anyhow::Result<()> {
         if !self.is_coordinator() {
             warn!("PresignHandler: non-coordinator received a return-box message; ignoring");
             return Ok(());
         }
         let session_id = inbound.round_msg.session_id;
         let from_party = inbound.round_msg.from.0;
-        let ciphertext = inbound.round_msg.payload;
 
         let pos = self
             .inner
@@ -937,35 +1009,52 @@ impl PresignHandler {
                 )
             })?;
 
-        let joint_pubkey = {
+        // Store positionally IFF the collection slot already exists (the
+        // coordinator's own round-3 has completed). Take the ciphertext + ack id
+        // out of `inbound` only on that path so the Buffer path can move the WHOLE
+        // intact message into `pending_return_shares`.
+        let stored_jpk: Option<[u8; 33]> = {
             let mut col = self
                 .inner
                 .collections
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
-            let Some(slot) = col.get_mut(&session_id) else {
-                // Round-3 hasn't completed on the coordinator yet (return share
-                // raced ahead of the coordinator's own SM completion). The
-                // collection slot — which holds the sealed own-share — doesn't
-                // exist yet, so we can't store this ciphertext positionally.
-                // Re-deliver: surface as an error so the listener logs + the
-                // relay leaves the message un-acked for redelivery on the next
-                // backfill (§06.12). In practice the coordinator (party 0) drives
-                // round-3 to completion before the cosigner ships, so this is
-                // rare.
-                warn!(
-                    "PresignHandler[coord]: return share for session {} arrived before \
-                     coordinator round-3 complete; leaving un-acked for redelivery",
-                    session_id.hex()
-                );
-                return Ok(());
-            };
-            slot.cosigner_shares[pos] = Some(ciphertext);
-            slot.ack_ids.push(inbound.message_id);
-            slot.joint_pubkey
+            match col.get_mut(&session_id) {
+                Some(slot) => {
+                    slot.cosigner_shares[pos] =
+                        Some(std::mem::take(&mut inbound.round_msg.payload));
+                    slot.ack_ids.push(std::mem::take(&mut inbound.message_id));
+                    Some(slot.joint_pubkey)
+                }
+                None => None,
+            }
         };
 
-        self.try_finalize_bundle(session_id, joint_pubkey).await?;
+        match stored_jpk {
+            Some(joint_pubkey) => self.try_finalize_bundle(session_id, joint_pubkey).await?,
+            None => {
+                // Round-3 hasn't completed on the coordinator yet (the return share
+                // raced ahead of the coordinator's own SM completion), so the
+                // collection slot doesn't exist. BUFFER the intact ciphertext — the
+                // listener ACKs every delivered message regardless of handler
+                // outcome, so returning Ok WITHOUT buffering (the old behaviour)
+                // deleted it from the relay box forever → the bundle never assembled
+                // → the 600s "awaiting PresigBundle assembly" timeout. `on_presign_complete`
+                // replays this the instant it opens the slot.
+                self.inner
+                    .pending_return_shares
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .entry(session_id)
+                    .or_default()
+                    .push(inbound);
+                debug!(
+                    "PresignHandler[coord]: return share for session {} arrived before \
+                     coordinator round-3 complete; BUFFERED for replay",
+                    session_id.hex()
+                );
+            }
+        }
         Ok(())
     }
 

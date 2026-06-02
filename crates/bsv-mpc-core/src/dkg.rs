@@ -871,7 +871,7 @@ pub(crate) fn drive_inline<O, E, M, SM, ErrFn>(
 ) -> Result<DriveStep<O>>
 where
     SM: StateMachine<Output = std::result::Result<O, E>, Msg = M> + ?Sized,
-    M: Serialize + serde::de::DeserializeOwned,
+    M: Serialize + serde::de::DeserializeOwned + round_based::ProtocolMessage,
     E: std::fmt::Display,
     ErrFn: Fn(String) -> MpcError,
 {
@@ -902,6 +902,20 @@ where
                 *next_msg_id += 1;
                 let incoming = wire_to_incoming(wire, *next_msg_id)
                     .map_err(|e| err_ctor(format!("{phase_tag}: failed to parse incoming: {e}")))?;
+                // #98 stall localizer: log the message by its TRUE cggmp24 round
+                // (NOT the cosmetic wire counter) the instant it is fed to the SM.
+                // No-op unless the device/cosigner armed `presig_timing` for a
+                // presign, so DKG/sign/refresh pay nothing. Reveals exactly which
+                // (round, sender) each SM is starved on — e.g. a reliability echo
+                // (round 5) missing from one peer = the round-2 emission gate.
+                // Native-only: `presig_timing` uses `std::time::Instant` and the
+                // presign coordinator path is native (the wasm worker only does
+                // light online-sign, never the n-party presig — see root CLAUDE.md).
+                #[cfg(not(target_arch = "wasm32"))]
+                crate::presig_timing::record_recv(
+                    round_based::ProtocolMessage::round(&incoming.msg),
+                    incoming.sender,
+                );
                 sm.received_msg(incoming)
                     .map_err(|_| err_ctor(format!("{phase_tag}: SM rejected incoming message")))?;
             }

@@ -230,6 +230,32 @@ impl DeployedSigner {
                 },
             ));
         }
+        // GUARD (#98): the keystore MUST honor the per-`{agent_id}#index` contract —
+        // a DISTINCT sealed share per held index. A SINGLE-SLOT keystore (one stored
+        // share, overwritten on each seal and returned for every key) hands back the
+        // same share `w` times; the n-party presig then derives its aux-info from the
+        // wrong shares and aborts far downstream as a cryptic `EncProofOfK` /
+        // "signing protocol failed" (the slot-count bug that blocked 100cash#31 for 12
+        // drives). Fail fast HERE with the real reason. (w==1 can't collide.)
+        if shares.len() > 1 {
+            let mut seen = std::collections::HashSet::with_capacity(shares.len());
+            for (idx, s) in &shares {
+                if !seen.insert(s.ciphertext.as_slice()) {
+                    return Err(ClientError::Host {
+                        seam: "keystore",
+                        reason: format!(
+                            "keystore returned a DUPLICATE share for device index {idx}: it must \
+                             store one distinct share per '{{agent_id}}#index' ({} held), but \
+                             appears SINGLE-SLOT (sealing {} shares overwrote down to one). The \
+                             reconstructed aux-info would diverge from the cosigner's and fail the \
+                             presign enc-proofs. Make the keystore multi-slot (account-per-index).",
+                            self.meta.my_indices.len(),
+                            self.meta.my_indices.len()
+                        ),
+                    });
+                }
+            }
+        }
         Ok(shares)
     }
 
