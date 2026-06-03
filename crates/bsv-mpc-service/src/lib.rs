@@ -4,6 +4,7 @@
 //! so they can be used from integration tests and embedded deployments.
 
 pub mod auth;
+pub mod aux_setup_handlers;
 pub mod custody;
 pub mod dkg_handler;
 pub mod dkg_relay_handlers;
@@ -202,6 +203,27 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/dkg-relay/debug",
             get(dkg_relay_handlers::handle_dkg_relay_debug),
+        )
+        // #104 aux-REUSE: the one-time group aux-setup ceremony (capture + KEK-seal
+        // this index's aux). `/aux-setup/identity` is the staleness smoke (404 ⇒
+        // old image); peer-identity reuses the dkg-relay derivation verbatim.
+        .route(
+            "/aux-setup/identity",
+            get(aux_setup_handlers::handle_aux_setup_identity),
+        )
+        .route(
+            "/aux-setup/peer-identity",
+            get(dkg_relay_handlers::handle_dkg_relay_peer_identity),
+        )
+        .route(
+            "/aux-setup/init",
+            post(aux_setup_handlers::handle_aux_setup_init),
+        )
+        // #104 must-do #2: aux-bound liveness challenge — the live master signs over
+        // its sealed moduli so the device can refuse a setup-time modulus swap.
+        .route(
+            "/aux-setup/challenge",
+            post(aux_setup_handlers::handle_aux_setup_challenge),
         )
         // Read-only
         .route("/health", get(handlers::handle_health))

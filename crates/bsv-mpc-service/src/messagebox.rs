@@ -284,6 +284,14 @@ async fn run_loop<F>(
                     debug!("handler returned no outbound messages ({inbound_summary})");
                     continue;
                 }
+                // NOTE (#8): a per-round CONCURRENT ship (futures::join_all over `outgoing`)
+                // cut the keygen-round exchange (51s→35s, time-to-address 60s→44s) but a full
+                // 4-of-6 run then TIMED OUT in aux ("party 0 timed out awaiting DKG completion",
+                // ~800s aux vs ~250-470s normal) — bursting many concurrent /sendMessage almost
+                // certainly stressed the already-flaky CF-Worker+D1 relay (which also reset
+                // independently in another run). REVERTED to the proven sequential ship until
+                // the relay transport is hardened (D1 write latency / reliability) — that is the
+                // real time-to-address wall, not client-side concurrency. See PLAN.md / task #8.
                 for out in outgoing {
                     let send_summary = format!(
                         "to={}... box={} round={} to_party={}",

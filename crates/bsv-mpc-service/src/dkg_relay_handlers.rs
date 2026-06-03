@@ -259,6 +259,17 @@ pub struct DkgRelayInitRequest {
     /// ALL OTHER parties (absolute index, relay identity hex), canonical ascending
     /// — both the device's held indices and any other container indices.
     pub peers: Vec<DkgRelayPeer>,
+    /// #104 aux-REUSE (optional): the 32-byte group-id (hex) this wallet's group
+    /// belongs to. When present (with `aux_epoch`), the container tries to load +
+    /// validate its sealed aux for this `(group_id, my_index)` and REUSE it —
+    /// skipping the entire (~180-300s) aux SM. Absent ⇒ a fresh aux ceremony runs
+    /// (the pre-#104 path, strictly Pareto).
+    #[serde(default)]
+    pub group_id: Option<String>,
+    /// #104 aux-REUSE (optional): the pinned-Notary epoch the reused aux must
+    /// match (must-do #10). Required alongside `group_id` to attempt reuse.
+    #[serde(default)]
+    pub aux_epoch: Option<u64>,
 }
 
 /// Response from `POST /dkg-relay/init`.
@@ -368,6 +379,35 @@ pub async fn handle_dkg_relay_init(
     let dkg_handler = DkgHandler::new(config, body.my_index, Arc::clone(&state.storage));
     dkg_handler.use_composite_persist(caller.identity_key.clone());
 
+    // #104 aux-REUSE: if this wallet declares a group_id (+ epoch) and we hold a
+    // sealed, VALIDATED aux for this (group, index), load it so the coordinator
+    // skips the entire aux SM (the per-wallet time-to-sendable lever). The full
+    // binding gate runs inside `try_load_validated_aux`; any miss/rejection ⇒
+    // `None` ⇒ fall back to a fresh aux ceremony (Pareto). On success we also SKIP
+    // the prime-gen task below (no aux SM consumes primes).
+    let reusing_aux = match (body.group_id.as_deref(), body.aux_epoch) {
+        (Some(group_id_hex), Some(aux_epoch)) => {
+            match crate::aux_setup_handlers::try_load_validated_aux(
+                &state,
+                group_id_hex,
+                body.parties,
+                body.threshold,
+                body.my_index,
+                aux_epoch,
+            )
+            .await
+            {
+                Some(aux_json) => {
+                    dkg_handler.set_loaded_aux_json(aux_json);
+                    checkpoint("init:aux_reused", false);
+                    true
+                }
+                None => false,
+            }
+        }
+        _ => false,
+    };
+
     let dkg_listener =
         match MessageBoxListener::start(client.clone(), BOX_DKG, dkg_handler.handler_fn()).await {
             Ok(l) => l,
@@ -405,7 +445,10 @@ pub async fn handle_dkg_relay_init(
     // generate the slow safe primes off the hot path and late-seed them before the
     // keygen→auxinfo transition consumes them. If keygen outruns prime gen, auxinfo
     // falls back to inline generation (correct, slower).
-    {
+    //
+    // #104: SKIP entirely when reusing a sealed aux — the aux SM never runs, so no
+    // primes are consumed (this is the whole point: no per-wallet prime gen).
+    if !reusing_aux {
         let seed_handler = dkg_handler.clone();
         tokio::spawn(async move {
             match tokio::task::spawn_blocking(|| {

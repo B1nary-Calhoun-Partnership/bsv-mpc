@@ -147,6 +147,10 @@ async fn presign_then_sign_4of6_device_holds_over_relay() {
             prime_pool: None,
             at_rest_root: [0u8; 32],
             pool_id: Vec::new(),
+            on_keygen: None,
+            device_aux: None,
+            group_id: None,
+            aux_epoch: None,
         },
         Duration::from_secs(600),
     )

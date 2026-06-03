@@ -45,6 +45,14 @@ pub enum PhaseTag {
     Sign = 0x04,
     Ecdh = 0x05,
     Refresh = 0x06,
+    /// Standalone group-scoped aux-info setup (#104 aux reuse). DISTINCT from
+    /// `DkgAuxInfo` (0x02), which binds a per-wallet joint key — `AuxSetup`
+    /// binds the FROZEN group tuple (masters, index→master map, n, t, security
+    /// level) via a group-id in the session_id slot, with the all-zero
+    /// joint_pubkey carve-out (no joint key exists at setup time). The 0x07
+    /// phase byte Fiat-Shamir-separates aux-setup proofs from every per-wallet
+    /// keygen/aux sid. Reuse aux, NEVER reuse sid (must-do #3).
+    AuxSetup = 0x07,
 }
 
 impl PhaseTag {
@@ -57,6 +65,7 @@ impl PhaseTag {
             Self::Sign => "sign",
             Self::Ecdh => "ecdh",
             Self::Refresh => "refresh",
+            Self::AuxSetup => "aux-setup",
         }
     }
 }
@@ -106,6 +115,74 @@ pub fn canonical_execution_id(params: &ExecutionParams) -> [u8; 32] {
     let mut bytes = [0u8; 32];
     bytes.copy_from_slice(&out);
     bytes
+}
+
+// ---------------------------------------------------------------------------
+// §02.7 Group-scoped aux-setup ExecutionId (#104 aux reuse)
+// ---------------------------------------------------------------------------
+
+/// Domain separator for the #104 aux-setup group descriptor hash. Versioned —
+/// a bump invalidates every persisted group-id (fail-closed regenerate).
+pub const AUX_GROUP_DESCRIPTOR_DOMAIN: &[u8] = b"bsv-mpc aux-setup group descriptor v1";
+
+/// The FROZEN group tuple an aux-info vector is bound to (#104, security must-do
+/// #3). Aux-info is reusable across wallets ONLY for a fixed (device, Notary-set)
+/// group; this descriptor pins exactly that group. `index_masters[i]` is the
+/// 33-byte compressed master identity pubkey that controls share index `i`, so
+/// the ordered vector simultaneously encodes the participating masters, the
+/// index→master map, and `n = index_masters.len()`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuxGroupDescriptor {
+    /// `index_masters[i]` = compressed master identity controlling share index
+    /// `i`. Length is `n`. Order is significant and canonical (index `0..n`).
+    /// For our 4-of-6 device-holds-3 topology this is
+    /// `[dev, dev, dev, notaryA, notaryA, notaryB]`.
+    pub index_masters: Vec<[u8; 33]>,
+    /// Threshold `t` (min signers).
+    pub threshold: u16,
+    /// Security level in bits (e.g. 128). Binds the aux parameter regime so a
+    /// security-level change forces a fresh group-id (must-do #10).
+    pub security_level_bits: u16,
+}
+
+/// Compute the canonical 32-byte group-id for an aux-setup group (#104).
+///
+/// `SHA-256(domain || n(u16 BE) || index_masters[0..n] (33B each) || t(u16 BE)
+/// || security_level_bits(u16 BE))`. All `n` parties compute byte-identical
+/// output from the same frozen tuple; any master rotation, index reassignment,
+/// `n`/`t` change, or security-level change yields a DIFFERENT group-id ⇒ a
+/// different aux-setup ExecutionId ⇒ fail-closed at load (must-do #10).
+pub fn aux_group_id(d: &AuxGroupDescriptor) -> [u8; 32] {
+    let n = d.index_masters.len() as u16;
+    let mut h = Sha256::new();
+    h.update(AUX_GROUP_DESCRIPTOR_DOMAIN);
+    h.update(n.to_be_bytes());
+    for m in &d.index_masters {
+        h.update(m);
+    }
+    h.update(d.threshold.to_be_bytes());
+    h.update(d.security_level_bits.to_be_bytes());
+    let out = h.finalize();
+    let mut bytes = [0u8; 32];
+    bytes.copy_from_slice(&out);
+    bytes
+}
+
+/// Canonical 32-byte ExecutionId for the standalone aux-setup ceremony (#104).
+///
+/// Binds `PhaseTag::AuxSetup` + the group-id (placed in the session_id slot)
+/// with the all-zero joint_pubkey carve-out (no joint key exists at aux-setup,
+/// mirroring the §02.4 keygen carve-out). Reuses the §02.2 86-byte preimage
+/// formula verbatim, so both implementations (bsv-mpc, rust-mpc) derive
+/// byte-identical output and the merge-gate vectors hold. NEVER bind a
+/// per-wallet joint key here — the entire point of #104 is one aux vector
+/// reused across many wallets, each with its own keygen sid.
+pub fn canonical_aux_setup_execution_id(group_id: &[u8; 32]) -> [u8; 32] {
+    canonical_execution_id(&ExecutionParams::new_v1(
+        PhaseTag::AuxSetup,
+        SessionId(*group_id),
+        [0u8; 33],
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -445,5 +522,99 @@ mod tests {
 
         let params = ExecutionParams::new_v1(PhaseTag::Sign, SessionId(session_bytes), joint_pk);
         assert_eq!(canonical_execution_id(&params), sha(&preimage));
+    }
+
+    // ---- #104 aux-setup: group-id + eid carve-out, reconstructed by hand ----
+    fn sample_4of6_descriptor() -> (AuxGroupDescriptor, [u8; 33], [u8; 33], [u8; 33]) {
+        let dev =
+            from_hex_33("0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798");
+        let a = from_hex_33("02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5");
+        let b = from_hex_33("02f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9");
+        let desc = AuxGroupDescriptor {
+            index_masters: vec![dev, dev, dev, a, a, b],
+            threshold: 4,
+            security_level_bits: 128,
+        };
+        (desc, dev, a, b)
+    }
+
+    #[test]
+    fn aux_group_id_preimage_reconstructed() {
+        let (desc, dev, a, b) = sample_4of6_descriptor();
+        let mut gp = Vec::new();
+        gp.extend_from_slice(AUX_GROUP_DESCRIPTOR_DOMAIN);
+        gp.extend_from_slice(&6u16.to_be_bytes());
+        for m in [&dev, &dev, &dev, &a, &a, &b] {
+            gp.extend_from_slice(m);
+        }
+        gp.extend_from_slice(&4u16.to_be_bytes());
+        gp.extend_from_slice(&128u16.to_be_bytes());
+        // domain(37) + n(2) + 6*33 + t(2) + sec(2) = 241
+        assert_eq!(gp.len(), AUX_GROUP_DESCRIPTOR_DOMAIN.len() + 2 + 6 * 33 + 2 + 2);
+        assert_eq!(aux_group_id(&desc), sha(&gp));
+    }
+
+    #[test]
+    fn aux_setup_eid_carve_out_and_86_byte_preimage() {
+        let (desc, _, _, _) = sample_4of6_descriptor();
+        let gid = aux_group_id(&desc);
+
+        let mut ep = Vec::new();
+        ep.extend_from_slice(EXECUTION_ID_DOMAIN);
+        ep.push(SPEC_VERSION_V1);
+        ep.push(AlgorithmTag::Cggmp24 as u8);
+        ep.push(PhaseTag::AuxSetup as u8);
+        ep.extend_from_slice(&gid);
+        ep.extend_from_slice(&[0u8; 33]);
+        assert_eq!(ep.len(), 86);
+        assert_eq!(canonical_aux_setup_execution_id(&gid), sha(&ep));
+    }
+
+    #[test]
+    fn aux_setup_eid_domain_separated_from_per_wallet_auxinfo() {
+        // The 0x07 phase byte must make aux-setup non-replayable across the
+        // per-wallet DkgAuxInfo (0x02) phase even for the SAME 32 bytes (#3).
+        let (desc, _, _, _) = sample_4of6_descriptor();
+        let gid = aux_group_id(&desc);
+        let per_wallet_auxinfo = canonical_execution_id(&ExecutionParams::new_v1(
+            PhaseTag::DkgAuxInfo,
+            SessionId(gid),
+            [0u8; 33],
+        ));
+        assert_ne!(canonical_aux_setup_execution_id(&gid), per_wallet_auxinfo);
+    }
+
+    #[test]
+    fn aux_group_id_fails_closed_on_any_tuple_change() {
+        // must-do #10: any frozen-tuple change ⇒ a different group-id.
+        let (base, dev, a, b) = sample_4of6_descriptor();
+        let base_id = aux_group_id(&base);
+
+        // rotated Notary B master
+        let rotated_b =
+            from_hex_33("03f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9");
+        let mut d = base.clone();
+        d.index_masters = vec![dev, dev, dev, a, a, rotated_b];
+        assert_ne!(aux_group_id(&d), base_id);
+
+        // reassigned index (swap who holds index 2 vs 5)
+        let mut d = base.clone();
+        d.index_masters = vec![dev, dev, b, a, a, dev];
+        assert_ne!(aux_group_id(&d), base_id);
+
+        // threshold change 4 → 3
+        let mut d = base.clone();
+        d.threshold = 3;
+        assert_ne!(aux_group_id(&d), base_id);
+
+        // security-level change 128 → 192
+        let mut d = base.clone();
+        d.security_level_bits = 192;
+        assert_ne!(aux_group_id(&d), base_id);
+
+        // n change (drop the last index)
+        let mut d = base.clone();
+        d.index_masters = vec![dev, dev, dev, a, a];
+        assert_ne!(aux_group_id(&d), base_id);
     }
 }

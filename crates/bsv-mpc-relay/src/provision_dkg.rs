@@ -92,6 +92,34 @@ pub struct DkgOverRelay {
     /// Domain-separation bytes for the pool encryption key (e.g. the device
     /// identity pubkey). Only consulted when [`Self::prime_pool`] is `Some`.
     pub pool_id: Vec<u8>,
+    /// **#101 (Shape B) — OPTIONAL keygen-done callback (the instant-address lever).**
+    /// Invoked exactly ONCE, the instant all `w` device parties agree on a
+    /// byte-identical keygen joint key — BEFORE the slow aux-info phase — and AFTER
+    /// the #85 liveness gate has passed against that joint key. So the surfaced
+    /// address is already #85-verified and safe to label fundable. The ceremony then
+    /// CONTINUES to aux-info + completion in this SAME call (the relay listeners and
+    /// cosigner arms are never torn down across the gap). `None` ⇒ byte-identical to
+    /// today: no early surface, and the #85 gate runs at completion as before.
+    pub on_keygen: Option<Box<dyn FnOnce(JointPublicKey, SessionId) + Send>>,
+
+    /// **#104 aux-REUSE — OPTIONAL per-local-index pre-validated aux.** When
+    /// `Some`, each `(index, aux_json_bytes)` entry is loaded into THIS device's
+    /// in-process keygen party for `index` (`DkgHandler::set_loaded_aux_json`), so
+    /// the device SKIPS the entire aux SM AND the device prime pre-seed for that
+    /// index — the per-wallet time-to-sendable lever. The aux MUST already have
+    /// passed `bsv_mpc_core::aux_binding::validate_aux_for_load` (the caller / FFI
+    /// unseals + validates before threading it here). `None` ⇒ today's fresh-aux
+    /// path (every index runs the ~180-300s aux SM). Each entry's index MUST be a
+    /// member of [`Self::local_indices`].
+    pub device_aux: Option<Vec<(u16, Vec<u8>)>>,
+    /// **#104 aux-REUSE — the 32-byte group-id** this wallet's group belongs to.
+    /// When `Some` (with [`Self::aux_epoch`]), it is shipped in every cosigner arm
+    /// so each Notary loads + reuses ITS sealed aux for `(group_id, index)`. `None`
+    /// ⇒ no group declared ⇒ Notaries run fresh aux.
+    pub group_id: Option<[u8; 32]>,
+    /// **#104 aux-REUSE — the pinned-Notary epoch** the reused aux must match
+    /// (must-do #10). Shipped alongside [`Self::group_id`].
+    pub aux_epoch: Option<u64>,
 }
 
 /// Output: the agreed joint key + this device's signable per-index shares.
@@ -105,26 +133,26 @@ pub struct DkgOverRelayOutput {
 }
 
 #[derive(serde::Deserialize)]
-struct PeerIdentityResponse {
-    relay_pub_hex: String,
+pub(crate) struct PeerIdentityResponse {
+    pub(crate) relay_pub_hex: String,
     /// #85: the cosigner's MASTER pub (what the device pins) + its attestation over
     /// (master, session, index, relay_pub). `Option` so an un-hardened/legacy
     /// container still parses — but a PINNED device rejects a missing attestation.
     #[serde(default)]
-    master_pub_hex: Option<String>,
+    pub(crate) master_pub_hex: Option<String>,
     #[serde(default)]
-    attestation_hex: Option<String>,
+    pub(crate) attestation_hex: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
-struct ArmResponse {
-    peer_pub_hex: String,
+pub(crate) struct ArmResponse {
+    pub(crate) peer_pub_hex: String,
 }
 
 /// Fresh isolated SQLite storage for an in-process device keygen party. The share
 /// is read out of the completion channel (`DkgResult`) and sealed by the caller,
 /// so this storage is incidental — a unique temp path avoids collisions.
-fn fresh_storage() -> Arc<RwLock<SqliteShareStorage>> {
+pub(crate) fn fresh_storage() -> Arc<RwLock<SqliteShareStorage>> {
     let mut tag = [0u8; 8];
     rand::rngs::OsRng.fill_bytes(&mut tag);
     let dir = std::env::temp_dir().join(format!("mpc-provision-dkg-{}", hex::encode(tag)));
@@ -219,13 +247,15 @@ async fn arm_dkg_container(
     threshold: u16,
     parties: u16,
     peers: &[(u16, String)],
+    // #104: when set, the Notary loads + reuses its sealed aux for (group_id, idx).
+    aux_reuse: Option<(String, u64)>,
     timeout: Duration,
 ) -> Result<String> {
     let peers_json: Vec<serde_json::Value> = peers
         .iter()
         .map(|(i, h)| serde_json::json!({ "index": i, "pub_hex": h }))
         .collect();
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "agent_id": agent_id,
         "dkg_session": session_hex,
         "my_index": my_index,
@@ -233,6 +263,10 @@ async fn arm_dkg_container(
         "parties": parties,
         "peers": peers_json,
     });
+    if let Some((group_id_hex, aux_epoch)) = aux_reuse {
+        body["group_id"] = serde_json::Value::String(group_id_hex);
+        body["aux_epoch"] = serde_json::Value::from(aux_epoch);
+    }
     let body_bytes = serde_json::to_vec(&body)
         .map_err(|e| MpcError::Serialization(format!("serialize dkg-relay/init: {e}")))?;
     let path = reqwest::Url::parse(init_url)
@@ -272,12 +306,15 @@ async fn arm_dkg_container(
 /// arming each cosigner index via `POST /dkg-relay/init`. Returns the agreed joint
 /// key + the device's signable per-index shares (the caller seals them).
 pub async fn coordinate_dkg_over_relay(
-    p: DkgOverRelay,
+    mut p: DkgOverRelay,
     timeout: Duration,
 ) -> Result<DkgOverRelayOutput> {
     let proto = |e: bsv_mpc_messagebox::error::MessageBoxError| MpcError::Protocol(e.to_string());
     let cfg = ThresholdConfig::new(p.threshold, p.parties)?;
     let n = p.parties;
+    // #8 DIAGNOSTIC: keygen-phase per-step timing (eprintln surfaces to the sim test log).
+    let _kg = std::time::Instant::now();
+    eprintln!("KGSTEP 0 start");
 
     // ── Topology validation: device + cosigner indices MUST partition 0..n exactly,
     //    and the device MUST hold w = t−1 (the device-holds invariant — anything
@@ -325,6 +362,7 @@ pub async fn coordinate_dkg_over_relay(
         local_clients.push(c);
         local_pubs.push(ph);
     }
+    eprintln!("KGSTEP 1 local-identities done +{:?}", _kg.elapsed());
 
     // ── Fetch each cosigner index's per-index relay pub FIRST (§06.17 — the device
     //    must know every peer's identity before it ships round-1 / arms anyone). ──
@@ -342,6 +380,7 @@ pub async fn coordinate_dkg_over_relay(
             cosigner_pubs.push((idx, pub_hex));
         }
     }
+    eprintln!("KGSTEP 2 cosigner-pub-fetches done +{:?}", _kg.elapsed());
 
     // ── Full identity map: absolute index → relay pub. ──
     let identity_for = |idx: u16| -> Option<String> {
@@ -381,6 +420,12 @@ pub async fn coordinate_dkg_over_relay(
             let agent_id = p.provisional_agent_id.clone();
             let session_hex_c = session_hex.clone();
             let t = p.threshold;
+            // #104: ship (group_id, aux_epoch) so the Notary reuses its sealed aux
+            // for this index — present only when the device declares a group.
+            let aux_reuse = match (p.group_id, p.aux_epoch) {
+                (Some(gid), Some(epoch)) => Some((hex::encode(gid), epoch)),
+                _ => None,
+            };
             arm_handles.push(tokio::spawn(async move {
                 let armed = arm_dkg_container(
                     &init_url,
@@ -391,6 +436,7 @@ pub async fn coordinate_dkg_over_relay(
                     t,
                     n,
                     &peers,
+                    aux_reuse,
                     arm_timeout,
                 )
                 .await?;
@@ -426,7 +472,19 @@ pub async fn coordinate_dkg_over_relay(
     //    warm pool still speeds up the sets it covers and an empty/absent pool is
     //    byte-for-byte today's behavior (the `None` / all-miss path). The set fed
     //    into the DKG is identical whether pooled or inline — only the source moves.
-    let n_local = local_indices.len();
+    // #104 aux-REUSE: indices whose aux is being REUSED need NO primes (the aux SM
+    // never runs for them). Generate primes only for the remaining (fresh-aux)
+    // local indices; reuse-indices `set_loaded_aux_json` below.
+    let device_aux_map: std::collections::HashMap<u16, Vec<u8>> = p
+        .device_aux
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    let n_prime = local_indices
+        .iter()
+        .filter(|i| !device_aux_map.contains_key(i))
+        .count();
     let prime_pool = p.prime_pool.clone();
     let at_rest_root = p.at_rest_root;
     let pool_id = p.pool_id.clone();
@@ -435,8 +493,8 @@ pub async fn coordinate_dkg_over_relay(
             // Build the pool view once (cheap: derives the AES key, no I/O) if the
             // host supplied a store; otherwise every index inline-generates.
             let pool = prime_pool
-                .map(|storage| PaillierPool::new(storage, &at_rest_root, &pool_id, n_local));
-            (0..n_local)
+                .map(|storage| PaillierPool::new(storage, &at_rest_root, &pool_id, n_prime));
+            (0..n_prime)
                 .map(|_| {
                     // WARM: a pooled set is microseconds (one AES-GCM decrypt).
                     // A decrypt/storage error is treated as a miss (→ inline), never
@@ -461,42 +519,81 @@ pub async fn coordinate_dkg_over_relay(
         .iter()
         .map(|&idx| DkgHandler::new(cfg, idx, fresh_storage()))
         .collect();
-    for (h, pp) in dkg_handlers.iter().zip(primes.drain(..)) {
-        h.seed_primes_for(session, pp);
+    // #104: per local index, either REUSE its pre-validated aux (skip the aux SM)
+    // or seed it a freshly-generated prime set. `primes` holds exactly the sets
+    // for the non-reuse indices, consumed in local-index order.
+    let mut prime_iter = primes.drain(..);
+    for (h, &idx) in dkg_handlers.iter().zip(local_indices.iter()) {
+        match device_aux_map.get(&idx) {
+            Some(aux_bytes) => {
+                let aux_json = String::from_utf8(aux_bytes.clone()).map_err(|e| {
+                    MpcError::Protocol(format!("dkg-over-relay: device aux for index {idx} not UTF-8: {e}"))
+                })?;
+                h.set_loaded_aux_json(aux_json);
+            }
+            None => {
+                let pp = prime_iter.next().ok_or_else(|| {
+                    MpcError::Protocol(format!(
+                        "dkg-over-relay: no prime set for non-reuse index {idx} (internal count error)"
+                    ))
+                })?;
+                h.seed_primes_for(session, pp);
+            }
+        }
     }
-    let mut listeners: Vec<MessageBoxListener> = Vec::new();
-    for (pos, h) in dkg_handlers.iter().enumerate() {
-        let l = MessageBoxListener::start(local_clients[pos].clone(), BOX_DKG, h.handler_fn())
-            .await
-            .map_err(|e| MpcError::Protocol(format!("dkg-over-relay listener: {e}")))?;
-        listeners.push(l);
-    }
+    // #8: start the w device-party listeners CONCURRENTLY (each is an independent relay WS
+    // subscribe; sequential was ~5.5s). try_join_all preserves order so listeners[pos] ↔
+    // local_indices[pos].
+    let listener_futs = dkg_handlers.iter().enumerate().map(|(pos, h)| {
+        let client = local_clients[pos].clone();
+        let hf = h.handler_fn();
+        async move {
+            MessageBoxListener::start(client, BOX_DKG, hf)
+                .await
+                .map_err(|e| MpcError::Protocol(format!("dkg-over-relay listener: {e}")))
+        }
+    });
+    let listeners: Vec<MessageBoxListener> = futures::future::try_join_all(listener_futs).await?;
+    eprintln!("KGSTEP 3 listeners-started done +{:?}", _kg.elapsed());
     let mut rxs = Vec::new();
+    // #101: keygen-boundary receivers, one per local party. Taken right after
+    // `initiate` (which registers them). Only awaited when `on_keygen` is set.
+    let mut keygen_rxs: Vec<Option<tokio::sync::oneshot::Receiver<JointPublicKey>>> = Vec::new();
     let mut sends: Vec<(usize, Vec<OutgoingRoundMessage>)> = Vec::new();
     for (pos, &idx) in local_indices.iter().enumerate() {
         let (rx, out) = dkg_handlers[pos]
             .initiate(session, peers_for(idx)?)
             .await
             .map_err(|e| MpcError::Protocol(format!("dkg-over-relay initiate: {e}")))?;
+        keygen_rxs.push(dkg_handlers[pos].take_keygen_rx(session));
         rxs.push(rx);
         sends.push((pos, out));
     }
+    // #8: ship ALL round-1 messages CONCURRENTLY. Each `/sendMessage` is an independent
+    // ~1-2s CF-Worker+D1 write; sending the device's w parties' round-1 broadcasts
+    // SEQUENTIALLY was the dominant keygen-phase cost (~18s of the 67s time-to-address).
+    // Safe: the relay dedups on the stable message_id (bounded idempotent retry inside
+    // send_round_message_reliable), and the receiving SM buffers out-of-order arrivals.
+    let mut send_futs = Vec::new();
     for (pos, out) in sends {
+        let client = &local_clients[pos];
         for o in out {
-            // Reliable (bounded idempotent retry): a dropped round-1 message
-            // stalls the whole ceremony; the stable-id re-send is a relay no-op.
-            local_clients[pos]
-                .send_round_message_reliable(
-                    &o.recipient_pub_hex,
-                    &o.message_box,
-                    &o.round_msg,
-                    o.params,
-                    4,
-                )
-                .await
-                .map_err(proto)?;
+            send_futs.push(async move {
+                client
+                    .send_round_message_reliable(
+                        &o.recipient_pub_hex,
+                        &o.message_box,
+                        &o.round_msg,
+                        o.params,
+                        4,
+                    )
+                    .await
+                    .map_err(|e| MpcError::Protocol(e.to_string()))
+            });
         }
     }
+    futures::future::try_join_all(send_futs).await?;
+    eprintln!("KGSTEP 4 round-1-shipped done +{:?}", _kg.elapsed());
 
     // ── Confirm every cosigner arm succeeded (auth/owner errors surface here in
     //    seconds, with the real error, instead of as an opaque DKG timeout). ──
@@ -518,6 +615,90 @@ pub async fn coordinate_dkg_over_relay(
                 )));
             }
         }
+    }
+
+    eprintln!("KGSTEP 5 arms-confirmed done +{:?}", _kg.elapsed());
+    // ── #101 KEYGEN CHECKPOINT (Shape B): surface the address the instant keygen
+    //    completes — BEFORE aux-info — but only when the caller asked for it. The
+    //    background `MessageBoxListener` tasks (started above) keep driving each
+    //    handler's `process_round`, so these keygen oneshots resolve mid-ceremony
+    //    while the completion oneshots (awaited below) resolve later from the SAME
+    //    drive — no separate drive, no deadlock. ──
+    let keygen_checkpoint_ran = p.on_keygen.is_some();
+    if let Some(on_keygen) = p.on_keygen.take() {
+        let mut keygen_jks: Vec<JointPublicKey> = Vec::with_capacity(keygen_rxs.len());
+        for (pos, krx) in keygen_rxs.into_iter().enumerate() {
+            let krx = match krx {
+                Some(r) => r,
+                None => {
+                    for l in listeners {
+                        let _ = l.shutdown().await;
+                    }
+                    return Err(MpcError::Protocol(format!(
+                        "dkg-over-relay: party {} missing keygen receiver",
+                        local_indices[pos]
+                    )));
+                }
+            };
+            match tokio::time::timeout(timeout, krx).await {
+                Ok(Ok(jk)) => keygen_jks.push(jk),
+                Ok(Err(e)) => {
+                    for l in listeners {
+                        let _ = l.shutdown().await;
+                    }
+                    return Err(MpcError::Protocol(format!(
+                        "dkg-over-relay: party {} keygen channel dropped: {e}",
+                        local_indices[pos]
+                    )));
+                }
+                Err(_) => {
+                    for l in listeners {
+                        let _ = l.shutdown().await;
+                    }
+                    return Err(MpcError::Protocol(format!(
+                        "dkg-over-relay: party {} timed out awaiting keygen completion",
+                        local_indices[pos]
+                    )));
+                }
+            }
+        }
+        // GATE: byte-identical keygen joint key across the device's own w parties
+        // (mirror of the final completion gate) — a disagreeing keygen can never
+        // surface a bogus address.
+        let keygen_jk = keygen_jks[0].clone();
+        for (pos, jk) in keygen_jks.iter().enumerate() {
+            if jk.compressed != keygen_jk.compressed {
+                for l in listeners {
+                    let _ = l.shutdown().await;
+                }
+                return Err(MpcError::Protocol(format!(
+                    "dkg-over-relay: device party {} keygen pubkey != party {} — keygen disagreement",
+                    local_indices[pos], local_indices[0]
+                )));
+            }
+        }
+        // #85 FUNDING GATE — MOVED to the keygen checkpoint (was at completion).
+        // Confirm each PINNED cosigner is live + controls its master FOR THIS joint
+        // key BEFORE the address is surfaced as fundable. Binds only
+        // `joint_key.compressed`, which is final at keygen (aux-info never changes
+        // it). Fail-closed: any challenge error tears down and aborts the ceremony.
+        for c in &p.cosigners {
+            if let Some(master_hex) = &c.expected_master_pub {
+                let challenge_url = c.init_url.replace("/dkg-relay/init", "/identity-challenge");
+                if let Err(e) =
+                    challenge_cosigner(&challenge_url, master_hex, &keygen_jk.compressed).await
+                {
+                    for l in listeners {
+                        let _ = l.shutdown().await;
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        // #85-verified: surface the address now. Aux-info CONTINUES below in this
+        // SAME call (Shape B) — listeners + cosigner arms are never torn down.
+        eprintln!("KGSTEP 6 keygen-rounds+#85 done (=time-to-address) +{:?}", _kg.elapsed());
+        on_keygen(keygen_jk, session);
     }
 
     // ── Await the device's completions. ──
@@ -564,11 +745,18 @@ pub async fn coordinate_dkg_over_relay(
     //    that could be funded. A fresh-nonce signed challenge to the pinned master
     //    catches a cosigner that participated under a MITM'd/wrong identity (its
     //    challenge fails) — so funds never move to a joint key the real Notary
-    //    doesn't co-hold. Skipped for un-pinned dev/test cosigners. ──
-    for c in &p.cosigners {
-        if let Some(master_hex) = &c.expected_master_pub {
-            let challenge_url = c.init_url.replace("/dkg-relay/init", "/identity-challenge");
-            challenge_cosigner(&challenge_url, master_hex, &joint_key.compressed).await?;
+    //    doesn't co-hold. Skipped for un-pinned dev/test cosigners.
+    //
+    //    #101: when the keygen checkpoint ran (`on_keygen` was `Some`), this gate
+    //    ALREADY fired there against the byte-identical keygen joint key — don't
+    //    re-challenge. When there was no early surface (`on_keygen` None), run it
+    //    here exactly as before — byte-identical to today's behavior. ──
+    if !keygen_checkpoint_ran {
+        for c in &p.cosigners {
+            if let Some(master_hex) = &c.expected_master_pub {
+                let challenge_url = c.init_url.replace("/dkg-relay/init", "/identity-challenge");
+                challenge_cosigner(&challenge_url, master_hex, &joint_key.compressed).await?;
+            }
         }
     }
 

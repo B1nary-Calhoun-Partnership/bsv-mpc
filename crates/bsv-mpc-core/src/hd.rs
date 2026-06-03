@@ -425,6 +425,127 @@ pub fn verify_cosigner_challenge(
     }
 }
 
+// ── #104 aux-setup liveness/binding CHALLENGE (the aux analogue of #85's
+//    cosigner_challenge — there is no joint key at aux-setup) ──────────────────
+//
+// At aux-setup the #85 funding gate (`cosigner_challenge_msg`, which binds
+// `joint_pubkey`) is structurally inapplicable: NO joint key exists yet — one aux
+// vector will back MANY future wallets. So the device cannot bind a Notary's
+// liveness to a wallet. Instead, before persisting the group aux, each pinned
+// Notary master signs a fresh-nonce challenge that binds the EXACT moduli it
+// contributed at its index (`N_i`, `hat_N_i`, `s_i`, `t_i`) to the frozen group
+// (`group_id`) and aux session. The device verifies it under the OUT-OF-BAND-
+// pinned master (must-do #2) — proving the real Notary is live AND that those
+// moduli came from it, not a relay-MITM standing in with attacker-factored (but
+// well-formed, so ZK-passing) moduli. Stored in the binding envelope and
+// re-verifiable at load for defense-in-depth.
+
+/// Domain tag for the #104 aux-setup liveness/binding challenge signature.
+const AUX_LIVENESS_CHALLENGE_DOMAIN_V1: &[u8] = b"bsv-mpc aux-setup liveness challenge v1";
+
+/// The canonical 32-byte message a pinned Notary MASTER signs to prove it is LIVE
+/// and genuinely contributed the moduli at `index` during aux-setup (#104 must-do
+/// #2). Binds `master_pub ‖ group_id ‖ aux_session ‖ index ‖ N_i ‖ hat_N_i ‖ s_i
+/// ‖ t_i ‖ nonce`, each variable-length modulus length-prefixed so the preimage
+/// is unambiguous — a signature cannot be replayed across groups, sessions,
+/// indices, moduli sets, or challenges. The device picks a fresh `nonce`. The
+/// moduli are passed as big-endian magnitude bytes (`Integer::to_bytes_msf()` at
+/// the call site) so this helper stays free of the cggmp24 backend type.
+#[allow(clippy::too_many_arguments)]
+pub fn aux_liveness_challenge_msg(
+    master_pub: &PublicKey,
+    group_id: &[u8; 32],
+    aux_session: &[u8; 32],
+    index: u16,
+    n_i_msf: &[u8],
+    hat_n_i_msf: &[u8],
+    s_i_msf: &[u8],
+    t_i_msf: &[u8],
+    nonce: &[u8; 32],
+) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(AUX_LIVENESS_CHALLENGE_DOMAIN_V1);
+    h.update(master_pub.to_compressed());
+    h.update(group_id);
+    h.update(aux_session);
+    h.update(index.to_be_bytes());
+    for field in [n_i_msf, hat_n_i_msf, s_i_msf, t_i_msf] {
+        h.update((field.len() as u32).to_be_bytes());
+        h.update(field);
+    }
+    h.update(nonce);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&h.finalize());
+    out
+}
+
+/// Sign an [`aux_liveness_challenge_msg`] with the Notary's MASTER identity
+/// (RFC-6979 → deterministic, low-S). Returns the 64-byte compact `r ‖ s`.
+#[allow(clippy::too_many_arguments)]
+pub fn sign_aux_liveness_challenge(
+    master_priv: &PrivateKey,
+    group_id: &[u8; 32],
+    aux_session: &[u8; 32],
+    index: u16,
+    n_i_msf: &[u8],
+    hat_n_i_msf: &[u8],
+    s_i_msf: &[u8],
+    t_i_msf: &[u8],
+    nonce: &[u8; 32],
+) -> Result<[u8; 64]> {
+    let msg = aux_liveness_challenge_msg(
+        &master_priv.public_key(),
+        group_id,
+        aux_session,
+        index,
+        n_i_msf,
+        hat_n_i_msf,
+        s_i_msf,
+        t_i_msf,
+        nonce,
+    );
+    let sig = master_priv
+        .sign(&msg)
+        .map_err(|e| MpcError::Protocol(format!("aux liveness sign: {e}")))?;
+    let mut c = [0u8; 64];
+    c[..32].copy_from_slice(sig.r());
+    c[32..].copy_from_slice(sig.s());
+    Ok(c)
+}
+
+/// Verify an aux-setup liveness/binding challenge against the PINNED master pub
+/// (#104 must-do #2). Fails closed on a wrong master, wrong group/session/index,
+/// any altered modulus, a replayed/altered nonce, or a malformed signature.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_aux_liveness_challenge(
+    master_pub: &PublicKey,
+    group_id: &[u8; 32],
+    aux_session: &[u8; 32],
+    index: u16,
+    n_i_msf: &[u8],
+    hat_n_i_msf: &[u8],
+    s_i_msf: &[u8],
+    t_i_msf: &[u8],
+    nonce: &[u8; 32],
+    sig_compact: &[u8; 64],
+) -> bool {
+    let msg = aux_liveness_challenge_msg(
+        master_pub,
+        group_id,
+        aux_session,
+        index,
+        n_i_msf,
+        hat_n_i_msf,
+        s_i_msf,
+        t_i_msf,
+        nonce,
+    );
+    match Signature::from_compact(sig_compact) {
+        Ok(sig) => master_pub.verify(&msg, &sig),
+        Err(_) => false,
+    }
+}
+
 // ── #90 distributed-ECDH partial-set attestation (#85 pin for the HTTP-direct
 //    /ecdh-relay return) ───────────────────────────────────────────────────────
 //
@@ -1341,6 +1462,66 @@ mod tests {
             &joint,
             &nonce,
             &[0u8; 64]
+        ));
+    }
+
+    #[test]
+    fn aux_liveness_challenge_roundtrips_and_rejects_every_substitution() {
+        let master = relay_server_priv();
+        let master_pub = master.public_key();
+        let group_id = [0x11u8; 32];
+        let aux_session = [0x22u8; 32];
+        let n_i = vec![0xAAu8; 256];
+        let hat_n_i = vec![0xBBu8; 256];
+        let s_i = vec![0xCCu8; 200];
+        let t_i = vec![0xDDu8; 200];
+        let nonce = [0x5au8; 32];
+
+        let sig = sign_aux_liveness_challenge(
+            &master, &group_id, &aux_session, 3, &n_i, &hat_n_i, &s_i, &t_i, &nonce,
+        )
+        .unwrap();
+        // Positive: the pinned master verifies its own challenge.
+        assert!(verify_aux_liveness_challenge(
+            &master_pub, &group_id, &aux_session, 3, &n_i, &hat_n_i, &s_i, &t_i, &nonce, &sig
+        ));
+
+        let v = |mp: &PublicKey,
+                 g: &[u8; 32],
+                 a: &[u8; 32],
+                 idx: u16,
+                 n: &[u8],
+                 hn: &[u8],
+                 s: &[u8],
+                 t: &[u8],
+                 no: &[u8; 32]| {
+            verify_aux_liveness_challenge(mp, g, a, idx, n, hn, s, t, no, &sig)
+        };
+
+        // Wrong master (a relay-MITM standing in as the Notary) → fails closed.
+        let attacker = PrivateKey::from_bytes(&[0x99u8; 32]).unwrap().public_key();
+        assert!(!v(&attacker, &group_id, &aux_session, 3, &n_i, &hat_n_i, &s_i, &t_i, &nonce));
+        // Wrong group / session / index (replay across groups, sessions, slots).
+        assert!(!v(&master_pub, &[0x12u8; 32], &aux_session, 3, &n_i, &hat_n_i, &s_i, &t_i, &nonce));
+        assert!(!v(&master_pub, &group_id, &[0x23u8; 32], 3, &n_i, &hat_n_i, &s_i, &t_i, &nonce));
+        assert!(!v(&master_pub, &group_id, &aux_session, 4, &n_i, &hat_n_i, &s_i, &t_i, &nonce));
+        // ANY altered modulus (the coherent-swap defense) → fails closed.
+        assert!(!v(&master_pub, &group_id, &aux_session, 3, &[0xAAu8; 255], &hat_n_i, &s_i, &t_i, &nonce));
+        assert!(!v(&master_pub, &group_id, &aux_session, 3, &n_i, &[0xBBu8; 255], &s_i, &t_i, &nonce));
+        assert!(!v(&master_pub, &group_id, &aux_session, 3, &n_i, &hat_n_i, &[0xCCu8; 199], &t_i, &nonce));
+        assert!(!v(&master_pub, &group_id, &aux_session, 3, &n_i, &hat_n_i, &s_i, &[0xDDu8; 199], &nonce));
+        // Length-prefix ambiguity guard: shifting a byte between N_i and hat_N_i
+        // (concatenation would collide without the per-field length prefix).
+        let mut n_short = n_i.clone();
+        let extra = n_short.pop().unwrap();
+        let mut hat_long = vec![extra];
+        hat_long.extend_from_slice(&hat_n_i);
+        assert!(!v(&master_pub, &group_id, &aux_session, 3, &n_short, &hat_long, &s_i, &t_i, &nonce));
+        // Replayed/altered nonce → fails closed.
+        assert!(!v(&master_pub, &group_id, &aux_session, 3, &n_i, &hat_n_i, &s_i, &t_i, &[0x5bu8; 32]));
+        // Malformed signature bytes → fails closed (never panic).
+        assert!(!verify_aux_liveness_challenge(
+            &master_pub, &group_id, &aux_session, 3, &n_i, &hat_n_i, &s_i, &t_i, &nonce, &[0u8; 64]
         ));
     }
 
