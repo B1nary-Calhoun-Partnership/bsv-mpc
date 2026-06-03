@@ -358,6 +358,147 @@ async fn presign_then_sign_4of6_device_holds_over_relay() {
         "the device-holds 4-of-6 signature MUST verify under the joint pubkey"
     );
 
+    // ── 5. #34 KEYSTONE — the SAME production 4-of-6 path signs a BRC-42 DERIVED key.
+    //    A fresh presign + a sign carrying a non-nil offset (every signer applies it)
+    //    → the signature MUST verify under the derived child key (joint + offset·G)
+    //    and MUST NOT verify under the root joint key, proving the threshold quorum
+    //    actually applies the offset (the money-loop receive/change spend path). ──
+    let derived_offset: [u8; 32] = {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(b"#34 device-holds 4-of-6 DERIVED-key sign over the relay");
+        let mut b = [0u8; 32];
+        b.copy_from_slice(&h.finalize());
+        b[0] &= 0x7f; // < 2^255 < curve order ⇒ raw bytes == mod-order scalar (consistent)
+        b
+    };
+    // Rebuild the device signable shares (the first set was consumed by the presign).
+    let local_shares2: Vec<(u16, EncryptedShare)> = dkg
+        .local_shares
+        .iter()
+        .map(|(idx, keyshare_json)| {
+            (
+                *idx,
+                EncryptedShare {
+                    nonce: vec![0u8; 12],
+                    ciphertext: keyshare_json.clone(),
+                    session_id: dkg.session_id,
+                    share_index: ShareIndex(*idx),
+                    config,
+                    joint_pubkey_compressed: joint.clone(),
+                },
+            )
+        })
+        .collect();
+    let presign2 = coordinate_presign_over_relay_nparty(
+        PresignOverRelay {
+            relay_url: relay_url.clone(),
+            config,
+            local_shares: local_shares2,
+            cosigner: PresignCosignerArm {
+                init_url: format!("{container_url}/presign-relay/init"),
+                index: COSIGNER_SIGN_INDEX,
+                arm_signer: noop_signer(),
+                expected_master_pub: Some(
+                    PrivateKey::from_hex(SERVER_KEY_HEX).unwrap().public_key().to_hex(),
+                ),
+            },
+            agent_id: agent_id.clone(),
+            policy_id: PolicyId([0u8; 32]),
+            at_rest_root: [7u8; 32],
+        },
+        Duration::from_secs(300),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("#34 second presign over the relay MUST produce a set: {e}"));
+
+    let participants2 = presign2.participants.clone();
+    let primary_index2 = presign2.primary_index;
+    let presig_id2 = presign2.session_id.hex();
+    let mut my_presig_box2: Option<Box<dyn Any + Send>> = None;
+    let mut extra_local_presigs2: Vec<(u16, Box<dyn Any + Send>)> = Vec::new();
+    for (party, raw) in presign2.device_presigs {
+        if party == primary_index2 {
+            my_presig_box2 = Some(raw);
+        } else {
+            let sig_idx = participants2.iter().position(|&p| p == party).unwrap() as u16;
+            extra_local_presigs2.push((sig_idx, raw));
+        }
+    }
+    let my_presig_box2 = my_presig_box2.expect("primary presig box present (derived)");
+    let primary_share2 = local_shares_lookup(&dkg, primary_index2, &joint, config);
+
+    let sighash2: [u8; 32] = {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(b"#34 derived-key sighash");
+        let mut b = [0u8; 32];
+        b.copy_from_slice(&h.finalize());
+        b
+    };
+    let sign_session2 =
+        bsv_mpc_core::types::SessionId::from_str_hash(&format!("hd34-sign-{agent_id}"));
+    let combiner_priv2 = {
+        let h = bsv_mpc_core::types::SessionId::from_str_hash(&format!("hd34-combiner-{agent_id}"));
+        PrivateKey::from_bytes(&h.0).unwrap()
+    };
+    let do_index2 = participants2
+        .iter()
+        .position(|&p| p == COSIGNER_SIGN_INDEX)
+        .unwrap() as u16;
+
+    let derived_result = bsv_mpc_relay::combine_sign_over_relay_nparty(
+        &relay_url,
+        combiner_priv2,
+        primary_share2,
+        extra_local_presigs2,
+        participants2.clone(),
+        config,
+        sign_session2,
+        &sighash2,
+        my_presig_box2,
+        &joint_key,
+        Some(derived_offset), // #34: DERIVED-key sign — the combiner applies the offset
+        DoTrigger {
+            url: format!("{container_url}/sign-relay"),
+            presig_a_json: Vec::new(),
+            do_index: do_index2,
+            agent_id: Some(agent_id.clone()),
+            auth_headers: Vec::new(),
+            cosigner_encrypted_share: Some(presign2.cosigner_encrypted_share),
+            brc42_offset: Some(hex::encode(derived_offset)), // …and so does the cosigner
+            presig_id: Some(presig_id2),
+        },
+        None,
+        Duration::from_secs(120),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("#34 device-holds 4-of-6 DERIVED sign over the relay MUST sign: {e}"));
+
+    // child_pub = joint + offset·G (the same point the spend path derives). The derived
+    // signature verifies under it AND must NOT verify under the root joint key.
+    let offset_pub = PrivateKey::from_bytes(&derived_offset)
+        .expect("offset scalar")
+        .public_key();
+    let child_pub =
+        bsv_mpc_core::ecdh::point_add(&pubkey, &offset_pub).expect("joint + offset·G");
+    let mut dsig_bytes = [0u8; 64];
+    dsig_bytes[..32].copy_from_slice(&derived_result.r);
+    dsig_bytes[32..].copy_from_slice(&derived_result.s);
+    let derived_bsv_sig = bsv::Signature::from_compact(&dsig_bytes).expect("derived compact sig");
+    assert!(
+        child_pub.verify(&sighash2, &derived_bsv_sig),
+        "#34: the 4-of-6 DERIVED signature MUST verify under child = joint + offset·G"
+    );
+    assert!(
+        !pubkey.verify(&sighash2, &derived_bsv_sig),
+        "#34: the 4-of-6 DERIVED signature MUST NOT verify under the ROOT joint key (offset applied)"
+    );
+    eprintln!(
+        "✔✔ #34 KEYSTONE PROVEN — the production 4-of-6 device-holds path signs a BRC-42 DERIVED \
+         key over the live relay: verifies under joint+offset·G, fails under root."
+    );
+
     eprintln!(
         "✔✔ STEP 7a PROVEN — genuine n-party presign + device-holds 4-of-6 sign over the live \
          relay → BSV-valid signature under joint key {agent_id}. Total {:?}.",
