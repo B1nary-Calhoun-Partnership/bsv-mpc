@@ -385,6 +385,60 @@ pub fn ffi_beef_subject_raw_tx_hex(beef_hex: String) -> Result<String, FfiError>
     Ok(subject.to_hex())
 }
 
+/// Wrap a BEEF (v1/v2, or already-atomic) as **AtomicBEEF** targeting a single subject
+/// transaction — the form `internalizeAction` HARD-REQUIRES (rust-wallet-infra
+/// `internalize_action.rs:166-168` rejects a non-atomic BEEF: "BEEF is not AtomicBEEF
+/// (missing atomic_txid)"). Mirrors `bsv-wallet-cli atomic_beef::ensure_atomic`: the
+/// target txid is the caller-supplied `atomic_txid` › the BEEF's own `atomic_txid` ›
+/// the unique LEAF tx (auto-detected). Swift must never parse BEEF bytes (load-bearing
+/// rule), so this wrap lives behind the FFI. Returns AtomicBEEF hex.
+#[uniffi::export]
+pub fn ffi_beef_to_atomic(
+    beef_hex: String,
+    atomic_txid: Option<String>,
+) -> Result<String, FfiError> {
+    let beef_bytes = dehex(&beef_hex, "beef")?;
+    let mut beef = bsv::transaction::Beef::from_binary(&beef_bytes)
+        .map_err(|e| FfiError::Client(format!("parse BEEF: {e}")))?;
+    // Target precedence mirrors `ensure_atomic`: explicit arg, then the BEEF's own
+    // atomic_txid, then the single unreferenced leaf transaction.
+    let target = match atomic_txid
+        .filter(|s| !s.is_empty())
+        .or_else(|| beef.atomic_txid.clone())
+    {
+        Some(t) => t,
+        None => find_leaf_txid(&beef)?,
+    };
+    let atomic = beef
+        .to_binary_atomic(&target)
+        .map_err(|e| FfiError::Client(format!("to AtomicBEEF (target {target}): {e}")))?;
+    Ok(hex::encode(atomic))
+}
+
+/// The single LEAF transaction of a BEEF — the tx whose txid no OTHER tx in the BEEF
+/// lists as an input (i.e. the newest/subject tx). Mirrors `bsv-wallet-cli
+/// atomic_beef::find_leaf_txid`. Errors on 0 leaves (a cycle) or >1 (ambiguous — the
+/// caller must pass an explicit `atomic_txid`).
+fn find_leaf_txid(beef: &bsv::transaction::Beef) -> Result<String, FfiError> {
+    use std::collections::HashSet;
+    let all: HashSet<String> = beef.txs.iter().map(|t| t.txid()).collect();
+    let referenced: HashSet<String> = beef
+        .txs
+        .iter()
+        .flat_map(|t| t.input_txids.iter().cloned())
+        .collect();
+    let leaves: Vec<String> = all.difference(&referenced).cloned().collect();
+    match leaves.len() {
+        1 => Ok(leaves.into_iter().next().unwrap()),
+        0 => Err(FfiError::Client(
+            "BEEF has no leaf transaction (every tx is referenced as an input — a cycle)".into(),
+        )),
+        n => Err(FfiError::Client(format!(
+            "BEEF has {n} leaf transactions; ambiguous which to internalize — pass an explicit atomic_txid"
+        ))),
+    }
+}
+
 /// Derive the P2PKH locking-script hex from a base58check address — the encoding
 /// the device must NOT hand-roll in Swift. Validates the base58check checksum and
 /// the 25-byte `version ‖ hash160 ‖ checksum` layout.
@@ -2659,6 +2713,119 @@ mod send_path_tests {
         assert_eq!(
             parsed.inputs[0].prev_txid_hex, src_txid,
             "prev txid (display order)"
+        );
+    }
+
+    /// `ffi_beef_to_atomic` wraps a plain BEEF v1 as AtomicBEEF targeting the auto-detected
+    /// LEAF (subject) tx — the exact form `internalizeAction` requires. It is byte-identical
+    /// to the canonical `Beef::to_binary_atomic(leaf)` (`ensure_atomic`'s contract), the leaf
+    /// is the spend (not its ancestor), the subject tx survives the wrap, an explicit target
+    /// matches auto-detection, and it is idempotent on an already-atomic input.
+    #[test]
+    fn ffi_beef_to_atomic_wraps_leaf_subject() {
+        use bsv::script::LockingScript;
+        use bsv::transaction::{Beef, Transaction, TransactionInput, TransactionOutput};
+
+        let mut src = Transaction::new();
+        src.add_output(TransactionOutput {
+            satoshis: Some(100_000),
+            locking_script: LockingScript::from_hex(&p2pkh_hex([0x33u8; 20])).unwrap(),
+            change: false,
+        })
+        .unwrap();
+
+        let mut spend = Transaction::new();
+        spend.version = 1;
+        spend
+            .add_input(TransactionInput::with_source_transaction(src, 0))
+            .unwrap();
+        spend
+            .add_output(TransactionOutput {
+                satoshis: Some(99_000),
+                locking_script: LockingScript::from_hex(&p2pkh_hex([0x44u8; 20])).unwrap(),
+                change: false,
+            })
+            .unwrap();
+        let leaf_txid = spend.id();
+        let beef_hex = hex::encode(spend.to_beef_v1(true).expect("to_beef_v1"));
+
+        // Auto-detected leaf wrap.
+        let atomic_hex = ffi_beef_to_atomic(beef_hex.clone(), None).expect("to atomic");
+        let atomic_bytes = hex::decode(&atomic_hex).unwrap();
+
+        // (1) It IS AtomicBEEF, targeting the leaf/subject tx (the form internalize requires).
+        let parsed = Beef::from_binary(&atomic_bytes).expect("parse atomic");
+        assert_eq!(
+            parsed.atomic_txid.as_deref(),
+            Some(leaf_txid.as_str()),
+            "AtomicBEEF must target the leaf (subject) tx — not its ancestor"
+        );
+
+        // (2) Byte-identical to the canonical ensure_atomic (to_binary_atomic on the leaf).
+        let mut canon = Beef::from_binary(&hex::decode(&beef_hex).unwrap()).unwrap();
+        let expected = canon.to_binary_atomic(&leaf_txid).unwrap();
+        assert_eq!(atomic_bytes, expected, "FFI output != to_binary_atomic(leaf)");
+
+        // (3) The subject tx is preserved through the wrap.
+        assert_eq!(
+            ffi_beef_subject_raw_tx_hex(atomic_hex.clone()).unwrap(),
+            ffi_beef_subject_raw_tx_hex(beef_hex.clone()).unwrap(),
+            "subject tx must survive the atomic wrap"
+        );
+
+        // (4) An explicit target equals auto-detection.
+        assert_eq!(
+            ffi_beef_to_atomic(beef_hex, Some(leaf_txid.clone())).unwrap(),
+            atomic_hex,
+            "explicit leaf target must match auto-detection"
+        );
+
+        // (5) Idempotent: re-wrapping an already-atomic BEEF still targets the same leaf.
+        let rewrap = ffi_beef_to_atomic(atomic_hex.clone(), None).expect("re-wrap atomic");
+        let reparsed = Beef::from_binary(&hex::decode(&rewrap).unwrap()).unwrap();
+        assert_eq!(
+            reparsed.atomic_txid.as_deref(),
+            Some(leaf_txid.as_str()),
+            "re-wrapping an already-atomic BEEF is idempotent on the target"
+        );
+    }
+
+    /// Rejection (validate-don't-skip): bad hex and an unknown explicit target both fail
+    /// CLEANLY at the FFI rather than producing a malformed AtomicBEEF the server rejects.
+    #[test]
+    fn ffi_beef_to_atomic_rejects_bad_input() {
+        use bsv::script::LockingScript;
+        use bsv::transaction::{Transaction, TransactionInput, TransactionOutput};
+
+        // Non-hex input → Err.
+        assert!(
+            ffi_beef_to_atomic("nothex".into(), None).is_err(),
+            "non-hex BEEF must be rejected"
+        );
+
+        // A valid BEEF but an explicit target txid not present in it → Err (not silent).
+        let mut src = Transaction::new();
+        src.add_output(TransactionOutput {
+            satoshis: Some(100_000),
+            locking_script: LockingScript::from_hex(&p2pkh_hex([0x33u8; 20])).unwrap(),
+            change: false,
+        })
+        .unwrap();
+        let mut spend = Transaction::new();
+        spend
+            .add_input(TransactionInput::with_source_transaction(src, 0))
+            .unwrap();
+        spend
+            .add_output(TransactionOutput {
+                satoshis: Some(99_000),
+                locking_script: LockingScript::from_hex(&p2pkh_hex([0x44u8; 20])).unwrap(),
+                change: false,
+            })
+            .unwrap();
+        let beef_hex = hex::encode(spend.to_beef_v1(true).expect("to_beef_v1"));
+        assert!(
+            ffi_beef_to_atomic(beef_hex, Some("00".repeat(32))).is_err(),
+            "an atomic_txid absent from the BEEF must be rejected"
         );
     }
 
