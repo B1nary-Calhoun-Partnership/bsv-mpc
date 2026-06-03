@@ -609,6 +609,33 @@ impl crate::native_io::keystore::NativeKeyStore for FfiKeyStoreAdapter {
     }
 }
 
+/// Host-implemented **#101 (Shape B) provisioning progress callback** — the
+/// instant-address lever. Fired ONCE by [`create_wallet_nparty`] the instant DKG
+/// keygen completes (and is #85-verified) — BEFORE the slow aux-info phase —
+/// carrying the joint pubkey/address. That address is safe to RECEIVE to (aux-info
+/// is signing-only; the keygen-only artifact physically cannot sign) and is
+/// byte-identical to the eventual final key. The SAME `create_wallet_nparty` call
+/// then continues to aux-info and returns the full [`FfiSignerConfig`]. ASYNC +
+/// `with_foreign`, mirroring [`FfiKeyStore`]: the host typically persists a PARTIAL
+/// wallet record here (address known, `auxDone=false`) so a receive-capable address
+/// survives an app kill before aux-info finishes.
+#[cfg(not(target_arch = "wasm32"))]
+#[uniffi::export(with_foreign)]
+#[async_trait::async_trait]
+pub trait FfiProvisionProgress: Send + Sync {
+    /// The keygen-phase joint key is final + #85-verified. `agent_id` == the joint
+    /// pubkey hex (the wallet id); `my_indices` are the device's held keygen indices
+    /// (the share slots); `dkg_session_id_hex` is the ceremony id.
+    async fn keygen_done(
+        &self,
+        joint_pubkey_hex: String,
+        joint_address: String,
+        agent_id: String,
+        dkg_session_id_hex: String,
+        my_indices: Vec<u16>,
+    );
+}
+
 // ── Device Paillier prime pool (Lever B / ADR-0041 / issue #100) ──────────────
 //
 // The device pre-generates Paillier safe-prime sets in the BACKGROUND and stores
@@ -738,6 +765,252 @@ pub async fn ffi_prime_pool_backfill(
     .map_err(|e| FfiError::Client(format!("prime-pool backfill task panicked: {e}")))?
     .map_err(|e| FfiError::Client(format!("prime-pool backfill: {e}")))?;
     Ok(added as u32)
+}
+
+// ── #104 aux-REUSE — the one-time group aux store + setup ceremony ────────────
+//
+// Aux-info is KEY-GRADE (its secret p,q let a holder forge the threshold ZK
+// proofs), so the device's aux blobs are sealed by the HOST's Secure Enclave —
+// the same trust boundary as the cggmp24 key share ([`FfiKeyStore`]), NOT the
+// opaque prime-pool store. The blob crossing the boundary is the serialized
+// `AuxInfo` + its MAC'd binding record; the host seals/unseals it (biometric-
+// gated) keyed `(group_id, index)`. On unseal, Rust RE-VALIDATES the binding
+// envelope (`validate_aux_for_load`) BEFORE any reuse — a tampered/swapped/stale
+// blob is rejected at the load boundary and the wallet falls back to fresh aux.
+
+/// The plaintext device aux blob serialized across the FFI seal boundary. Opaque
+/// to the host (it Secure-Enclave-seals these bytes verbatim); Rust re-validates
+/// the embedded binding record on unseal.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SealedDeviceAux {
+    index: u16,
+    /// Serialized `AuxInfo<SecurityLevel128>` (UTF-8 JSON).
+    aux_json: String,
+    record: bsv_mpc_core::aux_binding::AuxBindingRecord,
+    mac: [u8; 32],
+}
+
+/// Host-implemented KEY-GRADE store for the device's group aux blobs (Secure
+/// Enclave). Mirrors the [`FfiKeyStore`] foreign-callback pattern (async +
+/// biometric-gated unseal), keyed `(group_id_hex, index)`. The host seals the
+/// opaque bytes; it never inspects or derives them.
+#[cfg(not(target_arch = "wasm32"))]
+#[uniffi::export(with_foreign)]
+#[async_trait::async_trait]
+pub trait FfiAuxStore: Send + Sync {
+    /// Device-seal (Secure Enclave) the group's aux blob bytes for `index`.
+    async fn seal_aux(
+        &self,
+        group_id_hex: String,
+        index: u16,
+        blob: Vec<u8>,
+    ) -> Result<(), FfiError>;
+
+    /// Unseal the device-sealed aux blob bytes for `(group, index)`; `reason` drives
+    /// the biometric prompt. Errors if absent (not yet set up) or unseal fails.
+    async fn unseal_aux(
+        &self,
+        group_id_hex: String,
+        index: u16,
+        reason: String,
+    ) -> Result<Vec<u8>, FfiError>;
+
+    /// True once the group's aux has been set up (its blobs sealed) for `group_id_hex`.
+    async fn has_aux(&self, group_id_hex: String) -> Result<bool, FfiError>;
+}
+
+/// Map an [`FfiNpartyCosigner`] list → the provision `NpartyCosigner` endpoints
+/// (shared by `create_wallet_nparty` + `setup_group_aux`).
+#[cfg(not(target_arch = "wasm32"))]
+fn map_nparty_cosigners(
+    cosigners: Vec<FfiNpartyCosigner>,
+) -> Vec<crate::native_io::provision::NpartyCosigner> {
+    cosigners
+        .into_iter()
+        .map(|c| crate::native_io::provision::NpartyCosigner {
+            container_url: c.container_url,
+            indices: c.indices,
+            expected_master_pub: if c.expected_master_pub.is_empty() {
+                None
+            } else {
+                Some(c.expected_master_pub)
+            },
+        })
+        .collect()
+}
+
+/// Build the optional device prime pool from a host store + the device identity
+/// (shared by `create_wallet_nparty` + `setup_group_aux`). The pool key roots in
+/// `at_rest_root` + the device identity pubkey (`pool_id`).
+#[cfg(not(target_arch = "wasm32"))]
+fn build_provision_prime_pool(
+    prime_pool_store: Option<std::sync::Arc<dyn FfiPrimePoolStore>>,
+    at_rest_root: [u8; 32],
+    identity: &bsv::primitives::ec::PrivateKey,
+) -> Result<Option<crate::native_io::provision::ProvisionPrimePool>, FfiError> {
+    match prime_pool_store {
+        Some(store) => {
+            let pool_id = hex::decode(identity.public_key().to_hex())
+                .map_err(|e| FfiError::Client(format!("identity pubkey hex: {e}")))?;
+            Ok(Some(crate::native_io::provision::ProvisionPrimePool {
+                storage: std::sync::Arc::new(FfiPrimePoolStoreAdapter(store)),
+                at_rest_root,
+                pool_id,
+            }))
+        }
+        None => Ok(None),
+    }
+}
+
+/// **#104 — run the one-time group aux-setup ceremony.** Runs the n-party aux-info
+/// ceremony ONCE for the fixed `(device, Notary-set)` group, Secure-Enclave-seals
+/// the device's per-index aux blobs via `aux_store`, and returns the `group_id` hex.
+/// Every later [`create_wallet_nparty`] for this group passes that `group_id` + the
+/// same `aux_store` to SKIP the (~180–300s) per-wallet aux phase (the time-to-
+/// sendable lever). Run-once + background (overlap OAuth); idempotent at the host
+/// (it can `has_aux` first). The Notaries capture + KEK-seal their own aux during
+/// the ceremony.
+///
+/// Security is enforced inside the ceremony (every Notary pinned → #85 attestation +
+/// the aux-bound liveness challenge + the MAC'd binding envelope). `aux_epoch` is the
+/// pinned-Notary epoch this aux is minted for; a per-wallet load requiring a
+/// different epoch refuses to reuse (must-do #10).
+#[cfg(not(target_arch = "wasm32"))]
+#[uniffi::export(async_runtime = "tokio")]
+#[allow(clippy::too_many_arguments)]
+pub async fn setup_group_aux(
+    relay_url: String,
+    identity_key_hex: String,
+    at_rest_root_hex: String,
+    threshold: u16,
+    parties: u16,
+    device_indices: Vec<u16>,
+    cosigners: Vec<FfiNpartyCosigner>,
+    aux_epoch: u64,
+    aux_store: std::sync::Arc<dyn FfiAuxStore>,
+    prime_pool_store: Option<std::sync::Arc<dyn FfiPrimePoolStore>>,
+) -> Result<String, FfiError> {
+    use bsv::primitives::ec::PrivateKey;
+    use bsv_mpc_core::types::ThresholdConfig;
+
+    let identity = {
+        let bytes = hex32(&identity_key_hex, "identity_key")?;
+        PrivateKey::from_bytes(&bytes)
+            .map_err(|e| FfiError::Client(format!("identity key: {e}")))?
+    };
+    let at_rest_root = hex32(&at_rest_root_hex, "at_rest_root")?;
+    let config =
+        ThresholdConfig::new(threshold, parties).map_err(|e| FfiError::Client(e.to_string()))?;
+
+    let endpoints = map_nparty_cosigners(cosigners);
+    let prime_pool = build_provision_prime_pool(prime_pool_store, at_rest_root, &identity)?;
+
+    let setup = crate::native_io::provision::setup_group_aux_nparty(
+        &relay_url,
+        identity,
+        config,
+        device_indices,
+        endpoints,
+        aux_epoch,
+        at_rest_root,
+        prime_pool,
+        std::time::Duration::from_secs(NPARTY_PROVISION_TIMEOUT_SECS),
+    )
+    .await
+    .map_err(|e| FfiError::Client(e.to_string()))?;
+
+    let group_id_hex = hex::encode(setup.group_id);
+    // Key-grade-seal each device aux blob into the host's Secure Enclave.
+    for b in setup.blobs {
+        let aux_json = String::from_utf8(b.aux_json)
+            .map_err(|e| FfiError::Client(format!("aux json not UTF-8: {e}")))?;
+        let sealed = SealedDeviceAux {
+            index: b.index,
+            aux_json,
+            record: b.record,
+            mac: b.mac,
+        };
+        let bytes = serde_json::to_vec(&sealed)
+            .map_err(|e| FfiError::Client(format!("serialize device aux blob: {e}")))?;
+        aux_store
+            .seal_aux(group_id_hex.clone(), b.index, bytes)
+            .await?;
+    }
+    Ok(group_id_hex)
+}
+
+/// Unseal + RE-VALIDATE the device's aux blobs for a group, returning the
+/// per-index `(index, aux_json_bytes)` to thread into the per-wallet provision — or
+/// `None` (full fresh-aux fallback) if the group is not fully set up OR any blob
+/// fails the binding gate (a tamper/stale signal: never partial-reuse around it).
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(clippy::too_many_arguments)]
+async fn load_validated_device_aux(
+    aux_store: &std::sync::Arc<dyn FfiAuxStore>,
+    group_id_hex: &str,
+    group_id: [u8; 32],
+    at_rest_root: [u8; 32],
+    device_indices: &[u16],
+    threshold: u16,
+    parties: u16,
+    aux_epoch: u64,
+) -> Option<Vec<(u16, Vec<u8>)>> {
+    use bsv_mpc_core::aux_binding::{
+        derive_binding_mac_key, validate_aux_json_for_load, AuxLoadExpectation,
+    };
+    let mac_key = derive_binding_mac_key(&at_rest_root);
+    let expect = AuxLoadExpectation {
+        group_id,
+        n: parties as usize,
+        threshold,
+        security_level_bits: 128,
+        aux_epoch,
+    };
+    let mut sorted = device_indices.to_vec();
+    sorted.sort_unstable();
+    let mut out: Vec<(u16, Vec<u8>)> = Vec::with_capacity(sorted.len());
+    for &idx in &sorted {
+        let bytes = match aux_store
+            .unseal_aux(
+                group_id_hex.to_string(),
+                idx,
+                "Reuse your wallet setup".to_string(),
+            )
+            .await
+        {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("AUXREUSE: unseal miss for {group_id_hex}#{idx} ({e}); fresh-aux fallback");
+                return None;
+            }
+        };
+        let sealed: SealedDeviceAux = match serde_json::from_slice(&bytes) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("AUXREUSE: blob {group_id_hex}#{idx} deserialize failed ({e}); fresh-aux fallback");
+                return None;
+            }
+        };
+        if let Err(e) = validate_aux_json_for_load(
+            &expect,
+            idx,
+            &sealed.aux_json,
+            &sealed.record,
+            &sealed.mac,
+            &mac_key,
+        ) {
+            // Fail-safe to fresh aux (correct, slower) — NEVER reuse a rejected blob.
+            eprintln!("AUXREUSE: binding gate REJECTED {group_id_hex}#{idx} ({e}); fresh-aux fallback");
+            return None;
+        }
+        out.push((idx, sealed.aux_json.into_bytes()));
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
 }
 
 /// FFI config for a provisioned wallet's deployed signer (all hex/primitive — no
@@ -1128,6 +1401,22 @@ pub async fn create_wallet_nparty(
     // a key BRC-42-derived from `at_rest_root_hex` + the device identity pubkey (the
     // `pool_id`); the host stores only opaque ciphertext.
     prime_pool_store: Option<std::sync::Arc<dyn FfiPrimePoolStore>>,
+    // #101 (Shape B) — OPTIONAL keygen-done progress callback (the instant-address
+    // lever). When supplied, the device surfaces the joint pubkey/address the instant
+    // keygen completes (and is #85-verified), via `progress.keygen_done(...)`, then
+    // this SAME call continues to aux-info and returns the full config. `None` ⇒
+    // byte-identical to today (config only returned after both phases).
+    progress: Option<std::sync::Arc<dyn FfiProvisionProgress>>,
+    // #104 aux-REUSE — OPTIONAL. When `aux_store` is supplied AND `group_id_hex` is
+    // non-empty (the device already ran `setup_group_aux` for this group), the device
+    // unseals + RE-VALIDATES its per-index aux blobs and SKIPS the per-wallet aux
+    // phase (+ prime-gen) for each, shipping `(group_id, aux_epoch)` so the Notaries
+    // reuse theirs — the time-to-sendable lever. Any miss/tamper/stale falls back to
+    // a full fresh-aux provision (strictly Pareto). Empty `group_id_hex` / `None`
+    // store ⇒ today's fresh-aux path. `aux_epoch` is the currently-required epoch.
+    aux_store: Option<std::sync::Arc<dyn FfiAuxStore>>,
+    group_id_hex: String,
+    aux_epoch: u64,
 ) -> Result<FfiSignerConfig, FfiError> {
     use bsv::primitives::ec::PrivateKey;
     use bsv_mpc_core::types::ThresholdConfig;
@@ -1197,6 +1486,70 @@ pub async fn create_wallet_nparty(
         None => None,
     };
 
+    // #101: bridge the optional host progress callback into the relay's sync
+    // `on_keygen` hook. `device_indices` is moved into the provision call below, so
+    // snapshot the sorted held indices for the callback FIRST. The host method is
+    // async while the relay fires `on_keygen` synchronously at the keygen checkpoint
+    // — so we `tokio::spawn` the host call fire-and-forget and let aux-info continue
+    // immediately (Shape B: single in-flight call, listeners never torn down).
+    let on_keygen: Option<
+        Box<dyn FnOnce(bsv_mpc_core::types::JointPublicKey, bsv_mpc_core::types::SessionId) + Send>,
+    > = progress.map(|prog| {
+        let mut my_indices = device_indices.clone();
+        my_indices.sort_unstable();
+        Box::new(
+            move |jk: bsv_mpc_core::types::JointPublicKey,
+                  session: bsv_mpc_core::types::SessionId| {
+                let agent_id = hex::encode(&jk.compressed);
+                let joint_pubkey_hex = agent_id.clone();
+                let joint_address = jk.address.clone();
+                let dkg_session_id_hex = hex::encode(session.0);
+                tokio::spawn(async move {
+                    prog.keygen_done(
+                        joint_pubkey_hex,
+                        joint_address,
+                        agent_id,
+                        dkg_session_id_hex,
+                        my_indices,
+                    )
+                    .await;
+                });
+            },
+        ) as Box<dyn FnOnce(_, _) + Send>
+    });
+
+    // #104 aux-REUSE: when the host supplied an aux store + a group_id, unseal +
+    // RE-VALIDATE the device's per-index aux blobs; on full success thread them in
+    // (skip the per-wallet aux phase). Any miss/tamper/stale ⇒ full fresh-aux. The
+    // borrow of `device_indices` ends here, before it is moved into the provision.
+    #[allow(clippy::type_complexity)]
+    let (device_aux, aux_group_id, aux_epoch_opt): (
+        Option<Vec<(u16, Vec<u8>)>>,
+        Option<[u8; 32]>,
+        Option<u64>,
+    ) = match (&aux_store, group_id_hex.is_empty()) {
+        (Some(store), false) => {
+            let gid = hex32(&group_id_hex, "group_id")?;
+            let arr = hex32(&at_rest_root_hex, "at_rest_root")?;
+            match load_validated_device_aux(
+                store,
+                &group_id_hex,
+                gid,
+                arr,
+                &device_indices,
+                threshold,
+                parties,
+                aux_epoch,
+            )
+            .await
+            {
+                Some(blobs) => (Some(blobs), Some(gid), Some(aux_epoch)),
+                None => (None, None, None),
+            }
+        }
+        _ => (None, None, None),
+    };
+
     let w = crate::native_io::provision::provision_wallet_nparty(
         &relay_url,
         identity,
@@ -1206,6 +1559,10 @@ pub async fn create_wallet_nparty(
         std::time::Duration::from_secs(NPARTY_PROVISION_TIMEOUT_SECS),
         ks.as_ref(),
         prime_pool,
+        on_keygen,
+        device_aux,
+        aux_group_id,
+        aux_epoch_opt,
     )
     .await
     .map_err(|e| FfiError::Client(e.to_string()))?;
@@ -3128,5 +3485,88 @@ mod issue98_runtime_tests {
             run_relay_ceremony_local(|| Box::pin(async { Err(FfiError::Client("boom".into())) }))
                 .await;
         assert!(matches!(res, Err(FfiError::Client(m)) if m == "boom"));
+    }
+}
+
+// ── #51/#99 prime-pool round-trip DIAGNOSTIC ──────────────────────────────────
+//
+// The warm signup baseline (2026-06-02) showed warm 4-of-6 provision at ~350s —
+// no faster than cold — implying the device prime-pool `take()` is MISSING and
+// falling back to serial inline gen. This test isolates the EXACT FFI round-trip
+// the device uses: `ffi_prime_pool_backfill` (the prewarm WRITE side) encrypts a
+// set into a store, then a relay-style `PaillierPool` built with the SAME at-rest
+// root + pool_id (the create_wallet READ side) `take()`s it. If `take` returns
+// `Some`, the pool MECHANISM is sound (and the 350s is slow-sim aux-ZK, not a
+// miss); if `None`/`Err`, the round-trip is genuinely broken. `#[ignore]` because
+// it runs ONE real safe-prime generation (seconds-to-minutes).
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod prime_pool_roundtrip_diag {
+    use super::*;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct MemPool(Mutex<Vec<FfiEncryptedPrimes>>);
+
+    impl FfiPrimePoolStore for MemPool {
+        fn put_encrypted(&self, blob: FfiEncryptedPrimes) -> Result<(), FfiError> {
+            self.0.lock().unwrap().push(blob);
+            Ok(())
+        }
+        fn take_encrypted(&self) -> Result<Option<FfiEncryptedPrimes>, FfiError> {
+            let mut q = self.0.lock().unwrap();
+            if q.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(q.remove(0)))
+            }
+        }
+        fn count(&self) -> Result<u32, FfiError> {
+            Ok(self.0.lock().unwrap().len() as u32)
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "runs one real safe-prime generation (slow); diagnostic only"]
+    async fn backfill_then_relay_take_roundtrips() {
+        // Same shapes the device passes: 32-byte at-rest root + a 33-byte compressed
+        // pubkey hex as pool_id (exactly what Swift sends to BOTH backfill and
+        // create_wallet).
+        let at_rest_root_hex = "11".repeat(32);
+        let pool_id_hex =
+            "0268241017f56cefa28c09b67076b62b8c8b87d6756e303bd92637c42d1eb26e14".to_string();
+
+        let store: std::sync::Arc<dyn FfiPrimePoolStore> = std::sync::Arc::new(MemPool::default());
+
+        // WRITE side — exactly `prewarm` → `ffi_prime_pool_backfill`.
+        let added = ffi_prime_pool_backfill(
+            at_rest_root_hex.clone(),
+            pool_id_hex.clone(),
+            1,
+            store.clone(),
+        )
+        .await
+        .expect("backfill must succeed");
+        assert_eq!(added, 1, "backfill should add exactly 1 set to reach floor=1");
+        assert_eq!(store.count().unwrap(), 1, "store should hold the 1 set");
+
+        // READ side — exactly what `coordinate_dkg_over_relay` builds: a fresh
+        // PaillierPool over the SAME store with root = hex32(at_rest_root_hex) and
+        // pool_id = decode(pool_id_hex) (create_wallet uses hex::decode(pubkey)).
+        let root = hex32(&at_rest_root_hex, "root").unwrap();
+        let pool_id = dehex(&pool_id_hex, "pool_id").unwrap();
+        let pool = bsv_mpc_core::paillier_pool::PaillierPool::new(
+            FfiPrimePoolStoreAdapter(store.clone()),
+            &root,
+            &pool_id,
+            1,
+        );
+        let taken = pool.take().expect("take must not error");
+        assert!(
+            taken.is_some(),
+            "RELAY-SIDE take() MISSED a set the prewarm WROTE — the pool round-trip is BROKEN \
+             (this is the ~350s warm-provision regression). If this assert holds, the mechanism \
+             is sound and the slow warm number is aux-ZK on the sim, not a miss."
+        );
+        assert_eq!(store.count().unwrap(), 0, "the set should be consumed");
     }
 }

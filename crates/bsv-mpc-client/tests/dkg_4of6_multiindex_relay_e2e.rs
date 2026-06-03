@@ -120,6 +120,10 @@ async fn coordinator_rejects_device_not_holding_t_minus_1_no_network() {
             prime_pool: None,
             at_rest_root: [0u8; 32],
             pool_id: Vec::new(),
+            on_keygen: None,
+            device_aux: None,
+            group_id: None,
+            aux_epoch: None,
         },
         Duration::from_secs(1),
     )
@@ -187,6 +191,10 @@ async fn multiindex_4of6_dkg_over_relay_one_container_holds_three() {
             prime_pool: None,
             at_rest_root: [0u8; 32],
             pool_id: Vec::new(),
+            on_keygen: None,
+            device_aux: None,
+            group_id: None,
+            aux_epoch: None,
         },
         Duration::from_secs(600),
     )

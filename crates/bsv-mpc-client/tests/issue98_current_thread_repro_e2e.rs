@@ -110,6 +110,7 @@ async fn ceremony() {
         Duration::from_secs(700),
         keystore.as_ref(),
         None,
+        None, // #101: no keygen-done callback in this repro path
     )
     .await
     .expect("provision_wallet_nparty (2-Notary DKG + #85 verify + seal) MUST succeed");

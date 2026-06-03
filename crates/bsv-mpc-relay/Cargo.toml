@@ -20,6 +20,9 @@ serde_json.workspace = true
 hex.workspace = true
 tracing.workspace = true
 tokio = { workspace = true }
+# #8: concurrent round-message sends (join_all) — the device's round-1 ship is the
+# sequential-HTTP keygen-phase bottleneck (each /sendMessage is a ~1-2s CF+D1 write).
+futures.workspace = true
 # §18.2 reshare-over-relay coordinator (#66): extract the old secret scalar + VSS
 # eval points from a serialized cggmp24 KeyShare + drive the throwaway DKG primes.
 cggmp24 = { workspace = true }

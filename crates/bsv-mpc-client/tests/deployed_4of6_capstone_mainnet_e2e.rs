@@ -79,6 +79,7 @@ async fn provision_and_connect_4of6() -> (DeployedSigner, PublicKey, Vec<u8>) {
         Duration::from_secs(700),
         keystore.as_ref(),
         None,
+        None, // #101: no keygen-done callback in this capstone path
     )
     .await
     .expect("provision_wallet_nparty (2-Notary DKG + #85 verify + seal) MUST succeed");

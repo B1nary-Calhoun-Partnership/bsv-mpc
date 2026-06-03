@@ -63,6 +63,7 @@ pub fn bounded_http_client(timeout: Duration) -> Result<reqwest::Client> {
 pub mod dkg;
 pub mod ecdh;
 pub mod presign;
+pub mod provision_aux;
 pub mod provision_dkg;
 pub mod provision_presign;
 pub mod reshare;
@@ -71,6 +72,10 @@ pub mod session;
 pub use dkg::{run_dkg_over_http, run_dkg_over_http_authed};
 pub use ecdh::{coordinate_ecdh_over_relay, EcdhCosignerArm, EcdhPartial};
 pub use presign::{coordinate_presign_over_relay, CosignerArm};
+pub use provision_aux::{
+    coordinate_aux_setup_over_relay, AuxCosignerEndpoint, AuxSetupBlob, AuxSetupOutput,
+    AuxSetupOverRelay,
+};
 pub use provision_dkg::{
     coordinate_dkg_over_relay, CosignerEndpoint, DkgOverRelay, DkgOverRelayOutput,
 };

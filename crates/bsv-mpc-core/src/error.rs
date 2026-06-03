@@ -90,6 +90,14 @@ pub enum MpcError {
     /// manifest that failed canonical CBOR (de)serialization at load time.
     #[error("Policy error: {0}")]
     Policy(String),
+
+    /// A persisted aux-info blob was REJECTED at load time by the #104
+    /// binding-envelope gate — a swapped/stale/coherently-tampered modulus, a
+    /// wrong group/epoch, a duplicate modulus, a MAC mismatch, or a structural
+    /// shape violation. ALWAYS fail-closed: nothing funded reuses this aux. The
+    /// message names the SPECIFIC reason (validate-don't-skip).
+    #[error("aux-binding REJECT: {0}")]
+    AuxBindingRejected(String),
 }
 
 /// A specialized `Result` type for MPC operations.

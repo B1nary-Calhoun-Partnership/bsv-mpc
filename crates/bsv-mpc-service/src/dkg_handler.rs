@@ -30,7 +30,9 @@ use std::sync::{Arc, Mutex};
 use bsv_mpc_core::canonical::{canonical_execution_id, ExecutionParams, PhaseTag};
 use bsv_mpc_core::dkg::{DkgCoordinator, DkgRoundResult};
 use bsv_mpc_core::envelope::WrapParams;
-use bsv_mpc_core::types::{DkgResult, RoundMessage, SessionId, ShareIndex, ThresholdConfig};
+use bsv_mpc_core::types::{
+    DkgResult, JointPublicKey, RoundMessage, SessionId, ShareIndex, ThresholdConfig,
+};
 use bsv_mpc_messagebox::DecodedRoundMessage;
 use cggmp24::security_level::SecurityLevel128;
 use cggmp24::PregeneratedPrimes;
@@ -59,6 +61,18 @@ struct DkgHandlerInner {
     storage: Arc<std::sync::RwLock<SqliteShareStorage>>,
     coordinators: Mutex<HashMap<SessionId, CoordinatorSlot>>,
     completion_tx: Mutex<HashMap<SessionId, oneshot::Sender<DkgResult>>>,
+    /// **#101 keygen-boundary notifier (sender).** Fired ONCE the first time
+    /// `coord.keygen_joint_key()` is `Some` after a `process_round` — i.e. the
+    /// instant the KEYGEN phase completes, BEFORE the slow aux-info phase. Carries
+    /// the joint pubkey+address (byte-identical to the eventual `DkgResult.joint_key`
+    /// per `dkg.rs` `keygen_joint_key`). `take`-removed on first fire so it fires at
+    /// most once per session; aux-info then continues in the SAME ceremony (Shape B).
+    keygen_done_tx: Mutex<HashMap<SessionId, oneshot::Sender<JointPublicKey>>>,
+    /// **#101 keygen-boundary notifier (receiver).** Handed to the n-party relay
+    /// coordinator via [`DkgHandler::take_keygen_rx`]. Kept separate from the
+    /// `initiate` return so the HTTP/2-party callers (and every other `initiate`
+    /// call site) are untouched — only the device relay path consumes it.
+    keygen_done_rx: Mutex<HashMap<SessionId, oneshot::Receiver<JointPublicKey>>>,
     /// One-shot primes keyed by `session_id`. Consumed at coordinator
     /// instantiation; populated via [`DkgHandler::seed_primes_for`].
     primes_pool: Mutex<HashMap<SessionId, PregeneratedPrimes<SecurityLevel128>>>,
@@ -92,6 +106,22 @@ struct DkgHandlerInner {
     /// ceremony does not overwrite. Set via [`DkgHandler::use_composite_persist`]
     /// by the `/dkg-relay/init` route before `initiate`.
     persist_override: Mutex<Option<String>>,
+    /// #104 aux-setup CAPTURE: when `Some(group_id)`, this ceremony is a
+    /// standalone group aux-setup — the coordinator is told to derive the
+    /// group-scoped aux sid ([`DkgCoordinator::set_aux_setup_group_id`]) and to
+    /// capture the generated aux ([`DkgCoordinator::set_capture_aux_info`]). Set
+    /// via [`DkgHandler::set_aux_setup_capture`] before `initiate`.
+    aux_setup_group_id: Mutex<Option<[u8; 32]>>,
+    /// #104 aux-reuse LOAD: when `Some(json)`, the coordinator REUSES this
+    /// persisted aux instead of running the aux SM
+    /// ([`DkgCoordinator::set_loaded_aux_info_from_json`]). Set via
+    /// [`DkgHandler::set_loaded_aux_json`] before `initiate`.
+    loaded_aux_json: Mutex<Option<String>>,
+    /// #104 aux-setup CAPTURE result: the serialized aux captured at the
+    /// auxinfo-complete arm, stored here just before completion fires. Drained
+    /// once by the `/aux-setup/init` completion task via
+    /// [`DkgHandler::take_captured_aux`] to KEK-seal into custody.
+    captured_aux: Mutex<Option<String>>,
 }
 
 /// Clone-able handle. Cheap (`Arc`-shared inside); the handler closure
@@ -121,12 +151,51 @@ impl DkgHandler {
                 storage,
                 coordinators: Mutex::new(HashMap::new()),
                 completion_tx: Mutex::new(HashMap::new()),
+                keygen_done_tx: Mutex::new(HashMap::new()),
+                keygen_done_rx: Mutex::new(HashMap::new()),
                 primes_pool: Mutex::new(HashMap::new()),
                 late_prime_cells: Mutex::new(HashMap::new()),
                 pending_inbound: Mutex::new(HashMap::new()),
                 persist_override: Mutex::new(None),
+                aux_setup_group_id: Mutex::new(None),
+                loaded_aux_json: Mutex::new(None),
+                captured_aux: Mutex::new(None),
             }),
         }
+    }
+
+    /// #104: mark this ceremony as a STANDALONE group aux-setup (CAPTURE mode).
+    /// The coordinator derives the group-scoped aux sid and captures the
+    /// generated aux for KEK-sealing. Call BEFORE [`initiate`](Self::initiate).
+    pub fn set_aux_setup_capture(&self, group_id: [u8; 32]) {
+        *self
+            .inner
+            .aux_setup_group_id
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(group_id);
+    }
+
+    /// #104: REUSE a persisted, already-validated group aux (LOAD mode). The
+    /// coordinator skips the aux SM and fuses the fresh keygen with this aux. The
+    /// JSON MUST have passed `aux_binding::validate_aux_for_load` first. Call
+    /// BEFORE [`initiate`](Self::initiate).
+    pub fn set_loaded_aux_json(&self, json: String) {
+        *self
+            .inner
+            .loaded_aux_json
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(json);
+    }
+
+    /// #104: drain the aux captured during a setup ceremony (CAPTURE mode), to
+    /// KEK-seal into custody. `None` if not a capture ceremony or not yet
+    /// captured.
+    pub fn take_captured_aux(&self) -> Option<String> {
+        self.inner
+            .captured_aux
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
     }
 
     /// Persist completed shares under the COMPOSITE key
@@ -251,6 +320,28 @@ impl DkgHandler {
                 // init via `seed_primes_late`). Harmless when primes were
                 // already set eagerly above — the eager set takes precedence.
                 coord.set_late_prime_cell(coord_late_cell);
+                // #104 CAPTURE: standalone group aux-setup — group-scoped sid +
+                // capture the generated aux.
+                if let Some(group_id) = *inner
+                    .aux_setup_group_id
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                {
+                    coord.set_aux_setup_group_id(group_id);
+                    coord.set_capture_aux_info(true);
+                }
+                // #104 LOAD: reuse a persisted, pre-validated aux — skip the aux
+                // SM entirely (no prime gen needed on this path).
+                if let Some(json) = inner
+                    .loaded_aux_json
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .as_deref()
+                {
+                    coord
+                        .set_loaded_aux_info_from_json(json)
+                        .map_err(|e| anyhow::anyhow!("set loaded aux failed: {e}"))?;
+                }
                 let initial = coord
                     .init()
                     .map_err(|e| anyhow::anyhow!("DkgCoordinator::init failed: {e}"))?;
@@ -275,6 +366,24 @@ impl DkgHandler {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
             tx.insert(session_id, completion_tx);
+        }
+        // #101: register the keygen-boundary notifier (both ends) BEFORE the
+        // buffered-inbound replay below, so a replayed round that crosses the
+        // keygen→auxinfo transition fires it. The relay path takes the rx via
+        // `take_keygen_rx`; the HTTP/2-party path never takes it (the sender just
+        // buffers one value into the still-registered rx, dropped at completion).
+        {
+            let (ktx, krx) = oneshot::channel::<JointPublicKey>();
+            self.inner
+                .keygen_done_tx
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(session_id, ktx);
+            self.inner
+                .keygen_done_rx
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(session_id, krx);
         }
         let buffered: Vec<DecodedRoundMessage> = {
             let mut coords = self
@@ -313,6 +422,24 @@ impl DkgHandler {
         }
 
         Ok((completion_rx, outgoing))
+    }
+
+    /// #101 (Shape B): take the keygen-boundary receiver for `session_id`. It
+    /// resolves with the joint pubkey/address the instant the KEYGEN phase completes
+    /// (BEFORE the slow aux-info phase) — byte-identical to the eventual final key.
+    /// The n-party relay coordinator calls this right after [`initiate`](Self::initiate)
+    /// so it can surface an instant, #85-verified address while the SAME ceremony
+    /// continues to aux-info. Returns `None` if already taken or no such session;
+    /// the HTTP/2-party path simply never calls it.
+    pub fn take_keygen_rx(
+        &self,
+        session_id: SessionId,
+    ) -> Option<oneshot::Receiver<JointPublicKey>> {
+        self.inner
+            .keygen_done_rx
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&session_id)
     }
 
     /// Returns the closure to hand to
@@ -397,6 +524,22 @@ async fn dispatch_one(
         match round_result {
             DkgRoundResult::NextRound(next_msgs) => {
                 let mut outgoing = wrap_outgoing(&next_msgs, session_id, &peers);
+                // #101: the keygen→auxinfo transition is the FIRST round on which
+                // `keygen_joint_key()` becomes `Some` (dkg.rs sets it in
+                // `handle_keygen_complete`, then falls through to the auxinfo drive
+                // which returns `NextRound`). Fire the keygen-done notifier exactly
+                // once (take-remove) so the relay can surface the address the instant
+                // keygen completes; aux-info then continues in THIS same ceremony.
+                if let Some(jk) = coord.keygen_joint_key() {
+                    if let Some(tx) = inner
+                        .keygen_done_tx
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .remove(&session_id)
+                    {
+                        let _ = tx.send(jk);
+                    }
+                }
                 {
                     let mut coords = inner.coordinators.lock().unwrap_or_else(|p| p.into_inner());
                     coords.insert(session_id, CoordinatorSlot { coord, peers });
@@ -475,11 +618,27 @@ fn persist_completed_share(inner: &Arc<DkgHandlerInner>, dkg_result: &DkgResult)
 fn finish_complete(
     inner: &Arc<DkgHandlerInner>,
     session_id: SessionId,
-    coord: DkgCoordinator,
+    mut coord: DkgCoordinator,
     dkg_result: DkgResult,
     all_outgoing: Vec<OutgoingRoundMessage>,
 ) -> anyhow::Result<Vec<OutgoingRoundMessage>> {
-    persist_completed_share(inner, &dkg_result);
+    // #104 CAPTURE: stash the group aux serialized at the auxinfo-complete arm
+    // BEFORE the completion notifier fires, so the `/aux-setup/init` task can
+    // drain it (via `take_captured_aux`) the moment its `dkg_rx` resolves. No-op
+    // (returns None) for ordinary / reuse ceremonies. In capture mode the fused
+    // DkgResult is a THROWAWAY (a discardable keygen fused with the group aux) —
+    // do NOT persist it; only the captured aux is kept.
+    let captured = coord.take_captured_aux_info_json();
+    let is_capture = captured.is_some();
+    if let Some(aux_json) = captured {
+        *inner
+            .captured_aux
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(aux_json);
+    }
+    if !is_capture {
+        persist_completed_share(inner, &dkg_result);
+    }
     info!(
         "DkgHandler: ceremony complete — session={} joint_pubkey={}",
         hex::encode(session_id.as_bytes()),
@@ -498,6 +657,25 @@ fn finish_complete(
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .remove(&session_id);
+    // #101: in the normal flow the keygen notifier already fired at the NextRound
+    // boundary (take-removed). If the ceremony somehow reached Complete without ever
+    // returning a post-keygen NextRound (degenerate single-call path), fire it now
+    // with the final joint key so a relay awaiting it never hangs; then drop the rx.
+    {
+        let ktx = inner
+            .keygen_done_tx
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&session_id);
+        if let Some(ktx) = ktx {
+            let _ = ktx.send(dkg_result.joint_key.clone());
+        }
+        inner
+            .keygen_done_rx
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&session_id);
+    }
     let tx = {
         let mut txs = inner
             .completion_tx

@@ -289,6 +289,38 @@ pub struct DkgCoordinator {
     /// (or are generated during) the auxinfo phase. See
     /// [`crate::dkg::SharedPrimeCell`].
     late_primes: Option<SharedPrimeCell>,
+
+    /// #104 aux-reuse: when `Some`, this ceremony is a STANDALONE group-scoped
+    /// aux-setup. The 32-byte group-id binds the frozen group tuple (masters,
+    /// index→master map, n, t, security level — see
+    /// [`crate::canonical::aux_group_id`]). The keygen→auxinfo transition then
+    /// derives the aux ExecutionId from this group-id (jpk-free,
+    /// `PhaseTag::AuxSetup`) instead of binding the per-wallet keygen joint key,
+    /// so all `n` parties agree on a group-scoped aux sid that is reusable
+    /// across wallets yet non-replayable across groups or per-wallet keygen sids
+    /// (security must-do #3). `None` for ordinary per-wallet provisioning.
+    aux_setup_group_id: Option<[u8; 32]>,
+
+    /// #104 aux-reuse (LOAD mode): a persisted, group-scoped `AuxInfo` to REUSE
+    /// for this party's index instead of running the (~180-300s) auxinfo SM.
+    /// When `Some`, the keygen→auxinfo transition skips the aux SM entirely and
+    /// `assemble_dkg_result` fuses the freshly-generated incomplete share with
+    /// THIS aux (`from_parts`, UNCHANGED). The aux must already have passed the
+    /// Stage-3 binding-envelope load validation before being set here — core
+    /// does NOT re-derive trust from the aux bytes (`from_parts` only checks
+    /// `N[i]==p*q`). `None` for the ordinary / setup-capture paths.
+    loaded_aux_info: Option<cggmp24::key_share::AuxInfo<SecurityLevel128>>,
+
+    /// #104 aux-reuse (CAPTURE mode): when `true`, the standalone aux-setup
+    /// ceremony serializes the freshly-generated `AuxInfo` into
+    /// `captured_aux_info_json` at the auxinfo-complete arm (BEFORE the
+    /// throwaway fuse), so the caller can persist + seal it for later reuse.
+    capture_aux_info: bool,
+
+    /// #104 aux-reuse: holds the serialized `AuxInfo` captured during a setup
+    /// ceremony (`capture_aux_info == true`). Drained once via
+    /// [`take_captured_aux_info_json`](Self::take_captured_aux_info_json).
+    captured_aux_info_json: Option<String>,
 }
 
 /// A caller-shared cell for [late-seeding primes](DkgCoordinator::set_late_prime_cell)
@@ -348,7 +380,73 @@ impl DkgCoordinator {
             eid_bytes,
             pregenerated_primes: None,
             late_primes: None,
+            aux_setup_group_id: None,
+            loaded_aux_info: None,
+            capture_aux_info: false,
+            captured_aux_info_json: None,
         }
+    }
+
+    /// Mark this ceremony as a STANDALONE group-scoped aux-setup (#104 aux
+    /// reuse). The 32-byte `group_id` (from [`crate::canonical::aux_group_id`])
+    /// binds the frozen group tuple; at the keygen→auxinfo transition the aux
+    /// ExecutionId is derived from it (jpk-free, `PhaseTag::AuxSetup`) instead
+    /// of the throwaway per-ceremony joint key — so the resulting aux is bound
+    /// to the GROUP, reusable across wallets, and Fiat-Shamir-separated from any
+    /// per-wallet keygen sid (security must-do #3).
+    ///
+    /// Must be called before the keygen→auxinfo transition (in practice, before
+    /// `init()`).
+    pub fn set_aux_setup_group_id(&mut self, group_id: [u8; 32]) {
+        self.aux_setup_group_id = Some(group_id);
+    }
+
+    /// #104 aux-reuse (LOAD): supply a persisted, group-scoped `AuxInfo` to
+    /// REUSE for this party's index, skipping the auxinfo SM. The aux MUST have
+    /// already passed the Stage-3 binding-envelope validation against the
+    /// frozen group descriptor (and this party's `my_index`) BEFORE being set —
+    /// `from_parts` only checks `N[i]==p*q`, so trust is established out-of-band,
+    /// not re-derived from the aux bytes here. Must be called before the
+    /// keygen→auxinfo transition (in practice, before `init()`).
+    pub fn set_loaded_aux_info(
+        &mut self,
+        aux: cggmp24::key_share::AuxInfo<SecurityLevel128>,
+    ) {
+        self.loaded_aux_info = Some(aux);
+    }
+
+    /// #104 aux-reuse (LOAD): like [`set_loaded_aux_info`](Self::set_loaded_aux_info)
+    /// but from the `serde_json` encoding of a
+    /// `cggmp24::key_share::AuxInfo<SecurityLevel128>`. Deserialization runs the
+    /// crate's baseline `is_valid()` (Pedersen `s,t` coprime to `hat_N`, Paillier
+    /// prime/modulus bit-length floors) — necessary but NOT sufficient; the
+    /// caller MUST also have passed the Stage-3 binding-envelope check (which
+    /// binds identity, the index→master map, per-index N digests, and the
+    /// aux-epoch — none of which the crate validates).
+    pub fn set_loaded_aux_info_from_json(&mut self, json: &str) -> Result<()> {
+        let aux: cggmp24::key_share::AuxInfo<SecurityLevel128> = serde_json::from_str(json)
+            .map_err(|e| MpcError::Dkg(format!("loaded AuxInfo JSON: {e}")))?;
+        self.loaded_aux_info = Some(aux);
+        Ok(())
+    }
+
+    /// #104 aux-reuse (CAPTURE): mark this STANDALONE aux-setup ceremony to
+    /// serialize the freshly-generated `AuxInfo` at the auxinfo-complete arm so
+    /// the caller can persist + seal it for reuse. Pair with
+    /// [`set_aux_setup_group_id`](Self::set_aux_setup_group_id) so the captured
+    /// aux is group-scoped. Drain the result with
+    /// [`take_captured_aux_info_json`](Self::take_captured_aux_info_json) after
+    /// the ceremony completes.
+    pub fn set_capture_aux_info(&mut self, capture: bool) {
+        self.capture_aux_info = capture;
+    }
+
+    /// #104 aux-reuse (CAPTURE): take the serialized `AuxInfo` captured during a
+    /// setup ceremony. Returns `None` if capture was not enabled or the
+    /// ceremony has not yet completed its auxinfo phase. Consumes the value
+    /// (drained once).
+    pub fn take_captured_aux_info_json(&mut self) -> Option<String> {
+        self.captured_aux_info_json.take()
     }
 
     /// Set pre-generated Paillier primes for aux info generation.
@@ -505,9 +603,42 @@ impl DkgCoordinator {
                 }
                 Some(incomplete_share) => {
                     self.handle_keygen_complete(incomplete_share)?;
-                    // Fall through to auxinfo drive.
+                    // Normal/capture: transitioned to AuxInfo (fall through).
+                    // #104 reuse fork: transitioned straight to Complete (handled
+                    // by the next block) — no auxinfo SM, no further rounds.
                 }
             }
+        }
+
+        // #104 aux-reuse fast path: keygen produced the incomplete share and a
+        // persisted aux was preloaded, so the auxinfo SM was skipped. Fuse the
+        // real incomplete share with the loaded aux NOW (one ceremony shorter).
+        if self.phase == DkgPhase::Complete {
+            let loaded = self.loaded_aux_info.take().ok_or_else(|| {
+                MpcError::Dkg(
+                    "reuse fork reached Complete without a loaded aux (internal error)".into(),
+                )
+            })?;
+            // #104 must-do #7: explicit from_parts pre-assertions — NEVER treat a
+            // from_parts success as proof. The full binding-envelope gate
+            // (`aux_binding::validate_aux_for_load`) runs at the orchestration
+            // layer before the aux is ever loaded; this is the always-on
+            // structural backstop that cannot be bypassed.
+            let n = usize::from(self.config.parties);
+            if loaded.N.len() != n || loaded.pedersen_params.len() != n {
+                return Err(MpcError::AuxBindingRejected(format!(
+                    "loaded aux vector length (N={}, pedersen={}) != n={n}",
+                    loaded.N.len(),
+                    loaded.pedersen_params.len()
+                )));
+            }
+            if usize::from(self.my_index.0) >= n {
+                return Err(MpcError::AuxBindingRejected(format!(
+                    "my_index {} out of range for n={n}",
+                    self.my_index.0
+                )));
+            }
+            return self.assemble_dkg_result(loaded);
         }
 
         if self.phase == DkgPhase::AuxInfo {
@@ -518,6 +649,15 @@ impl DkgCoordinator {
                 }
                 Some(aux_info) => {
                     self.phase = DkgPhase::Complete;
+                    // #104 CAPTURE: a standalone aux-setup ceremony serializes
+                    // the group-scoped aux BEFORE the (throwaway) fuse, so the
+                    // caller can persist + seal it for reuse.
+                    if self.capture_aux_info {
+                        let json = serde_json::to_string(&aux_info).map_err(|e| {
+                            MpcError::Dkg(format!("failed to serialize captured aux-info: {e}"))
+                        })?;
+                        self.captured_aux_info_json = Some(json);
+                    }
                     return self.assemble_dkg_result(aux_info);
                 }
             }
@@ -703,15 +843,40 @@ impl DkgCoordinator {
             .map_err(|e| MpcError::Dkg(format!("failed to serialize incomplete share: {e}")))?;
         self.incomplete_share_json = Some(share_json);
 
-        // Build the auxinfo SM. ExecutionId per MPC-Spec §02.4 includes the
-        // joint pubkey (auxinfo is non-keygen, so the all-zero carve-out
-        // does NOT apply).
-        let aux_eid_bytes =
-            crate::canonical::canonical_execution_id(&crate::canonical::ExecutionParams::new_v1(
-                crate::canonical::PhaseTag::DkgAuxInfo,
-                self.session_id,
-                jpk,
-            ));
+        // #104 aux-reuse fork (LOAD): a persisted, group-scoped aux was
+        // preloaded for this party's index, so skip the entire auxinfo SM
+        // (~180-300s) and jump straight to Complete. `process_round` then fuses
+        // the freshly-generated incomplete share with the loaded aux via
+        // `assemble_dkg_result` (UNCHANGED). This is the per-wallet fast path —
+        // the whole point of #104.
+        if self.loaded_aux_info.is_some() {
+            tracing::info!(
+                party = self.my_index.0,
+                "keygen complete; REUSING preloaded aux-info — skipping aux SM (#104)"
+            );
+            self.phase = DkgPhase::Complete;
+            return Ok(());
+        }
+
+        // Build the auxinfo SM ExecutionId.
+        //
+        // #104 aux-setup (group-scoped): when this is a standalone aux-setup
+        // ceremony, derive a jpk-FREE, group-scoped aux sid (PhaseTag::AuxSetup
+        // + the frozen-group-id) so the resulting aux is bound to the GROUP and
+        // reusable across wallets, NOT to this ceremony's throwaway joint key
+        // (security must-do #3). Otherwise, the ordinary per-wallet path binds
+        // the joint pubkey per MPC-Spec §02.4 (auxinfo is non-keygen, so the
+        // all-zero carve-out does NOT apply there).
+        let aux_eid_bytes = match self.aux_setup_group_id {
+            Some(group_id) => crate::canonical::canonical_aux_setup_execution_id(&group_id),
+            None => crate::canonical::canonical_execution_id(
+                &crate::canonical::ExecutionParams::new_v1(
+                    crate::canonical::PhaseTag::DkgAuxInfo,
+                    self.session_id,
+                    jpk,
+                ),
+            ),
+        };
         let my_index = self.my_index.0;
         let n = self.config.parties;
         // Prefer eagerly-set primes; otherwise pull from the caller-shared late
@@ -1542,5 +1707,191 @@ mod tests {
         }
 
         panic!("DKG did not complete within 20 rounds");
+    }
+
+    // ================================================================
+    // #104 aux-reuse: capture + load seams + cryptographic soundness
+    // ================================================================
+
+    /// Drive a 2-party DKG through two `DkgCoordinator`s to completion. `setup`
+    /// configures each coordinator (capture / load / primes) before `init()`.
+    /// When `forbid_aux_info` is set, asserts neither coordinator ever enters the
+    /// aux-info phase — the #104 reuse fast path goes keygen → Complete with NO
+    /// aux SM. Returns the two results plus the two coordinators (so the caller
+    /// can drain a captured aux).
+    fn drive_2party_dkg(
+        session: SessionId,
+        setup: impl FnOnce(&mut DkgCoordinator, &mut DkgCoordinator),
+        forbid_aux_info: bool,
+    ) -> (DkgResult, DkgResult, DkgCoordinator, DkgCoordinator) {
+        let config = ThresholdConfig::new(2, 2).unwrap();
+        let mut c0 = DkgCoordinator::new(session, config, ShareIndex(0));
+        let mut c1 = DkgCoordinator::new(session, config, ShareIndex(1));
+        setup(&mut c0, &mut c1);
+        let mut out0 = c0.init().expect("c0 init");
+        let mut out1 = c1.init().expect("c1 init");
+        for round in 0..40 {
+            if forbid_aux_info {
+                assert_ne!(c0.phase(), "aux_info", "reuse path must skip the aux SM (c0)");
+                assert_ne!(c1.phase(), "aux_info", "reuse path must skip the aux SM (c1)");
+            }
+            let r0 = c0.process_round(out1.clone()).expect("c0 round");
+            let r1 = c1.process_round(out0.clone()).expect("c1 round");
+            match (r0, r1) {
+                (DkgRoundResult::NextRound(n0), DkgRoundResult::NextRound(n1)) => {
+                    out0 = n0;
+                    out1 = n1;
+                }
+                (DkgRoundResult::Complete(a), DkgRoundResult::Complete(b)) => {
+                    return (a, b, c0, c1);
+                }
+                _ => panic!("2-party DKG desynchronized at round {round}"),
+            }
+        }
+        panic!("2-party DKG did not complete in 40 rounds");
+    }
+
+    /// Full interactive 2-of-2 sign of `sighash` with the given complete key
+    /// shares (cggmp24 sim, no presig). Returns party 0's cggmp24 signature.
+    fn sign_2of2(
+        shares: &[cggmp24::KeyShare<Secp256k1, SecurityLevel128>],
+        sighash: &[u8; 32],
+    ) -> cggmp24::Signature<Secp256k1> {
+        use generic_ec::Scalar;
+        let participants: Vec<u16> = (0..shares.len() as u16).collect();
+        let mut rng = rand::rngs::OsRng;
+        let eid_bytes: [u8; 32] = rand::Rng::gen(&mut rng);
+        let eid = ExecutionId::new(&eid_bytes);
+        let scalar = Scalar::<Secp256k1>::from_be_bytes_mod_order(*sighash);
+        round_based::sim::run_with_setup(shares.iter(), |i, party, share| {
+            let party = buffer_outgoing(party);
+            let mut r = rand::rngs::OsRng;
+            let p = participants.clone();
+            async move {
+                let data = cggmp24::signing::PrehashedDataToSign::from_scalar(scalar);
+                cggmp24::signing(eid, i, &p, share)
+                    .sign(&mut r, party, &data)
+                    .await
+            }
+        })
+        .unwrap()
+        .expect_ok()
+        .into_vec()
+        .into_iter()
+        .next()
+        .expect("at least one signature")
+    }
+
+    fn keyshare_from_result(r: &DkgResult) -> cggmp24::KeyShare<Secp256k1, SecurityLevel128> {
+        serde_json::from_slice(&r.share.ciphertext).expect("complete KeyShare deserializes")
+    }
+
+    /// The cryptographic heart of #104: a SINGLE group aux vector, generated once
+    /// under a group-scoped sid, is REUSED to provision two distinct wallets —
+    /// each via the load fast path (NO aux SM, NO prime gen) — and each produces
+    /// an ECDSA signature that verifies under its OWN joint key. Proves: (a) the
+    /// capture seam emits the aux, (b) the load seam fuses it via `from_parts`
+    /// without re-running aux, (c) reuse yields distinct keys, (d) reuse is
+    /// cryptographically sound (both wallets sign + verify).
+    #[test]
+    fn aux_reuse_capture_load_and_sign_two_distinct_wallets() {
+        use generic_ec::Scalar;
+        let mut rng = rand::rngs::OsRng;
+
+        // A frozen 2-party group descriptor (device idx 0 + one notary idx 1).
+        let m0 = [0x02u8; 33];
+        let m1 = [0x03u8; 33];
+        let group_id = crate::canonical::aux_group_id(&crate::canonical::AuxGroupDescriptor {
+            index_masters: vec![m0, m1],
+            threshold: 2,
+            security_level_bits: 128,
+        });
+
+        // ── (1) STANDALONE AUX-SETUP CEREMONY (capture) ─────────────────────
+        // keygen (throwaway) + aux under the GROUP-scoped sid; captures the aux
+        // vector. The ONLY ceremony that runs aux (uses test primes).
+        let p0 = generate_test_primes(&mut rng);
+        let p1 = generate_test_primes(&mut rng);
+        let (setup_r0, _setup_r1, mut sc0, mut sc1) = drive_2party_dkg(
+            SessionId::from_str_hash("aux-setup-ceremony"),
+            |c0, c1| {
+                c0.set_aux_setup_group_id(group_id);
+                c0.set_capture_aux_info(true);
+                c0.set_pregenerated_primes(p0);
+                c1.set_aux_setup_group_id(group_id);
+                c1.set_capture_aux_info(true);
+                c1.set_pregenerated_primes(p1);
+            },
+            false,
+        );
+        let aux0_json = sc0
+            .take_captured_aux_info_json()
+            .expect("captured aux for index 0");
+        let aux1_json = sc1
+            .take_captured_aux_info_json()
+            .expect("captured aux for index 1");
+        // Drained exactly once.
+        assert!(sc0.take_captured_aux_info_json().is_none());
+        let j_setup = setup_r0.joint_key.compressed.clone();
+
+        // ── (2) WALLET A: per-wallet provision REUSING the group aux (load) ──
+        // Fresh keygen, NO primes set, aux SM SKIPPED (forbid_aux_info = true).
+        let (a0, a1, _, _) = drive_2party_dkg(
+            SessionId::from_str_hash("wallet-A"),
+            |c0, c1| {
+                c0.set_loaded_aux_info_from_json(&aux0_json).expect("load aux0");
+                c1.set_loaded_aux_info_from_json(&aux1_json).expect("load aux1");
+            },
+            true,
+        );
+        assert_eq!(
+            a0.joint_key.compressed, a1.joint_key.compressed,
+            "wallet A parties must agree on the joint key"
+        );
+
+        // ── (3) WALLET B: a SECOND wallet reusing the SAME group aux ────────
+        let (b0, b1, _, _) = drive_2party_dkg(
+            SessionId::from_str_hash("wallet-B"),
+            |c0, c1| {
+                c0.set_loaded_aux_info_from_json(&aux0_json).expect("load aux0");
+                c1.set_loaded_aux_info_from_json(&aux1_json).expect("load aux1");
+            },
+            true,
+        );
+        assert_eq!(b0.joint_key.compressed, b1.joint_key.compressed);
+
+        // ── DISTINCT KEYS: one aux vector → three independent joint keys ────
+        assert_ne!(a0.joint_key.compressed, j_setup, "wallet A != setup key");
+        assert_ne!(b0.joint_key.compressed, j_setup, "wallet B != setup key");
+        assert_ne!(
+            a0.joint_key.compressed, b0.joint_key.compressed,
+            "two wallets reusing the same aux MUST have distinct joint keys"
+        );
+
+        // ── SOUNDNESS: each reused-aux wallet produces a VERIFYING ECDSA sig ─
+        let ks_a = [keyshare_from_result(&a0), keyshare_from_result(&a1)];
+        let ks_b = [keyshare_from_result(&b0), keyshare_from_result(&b1)];
+        let sighash = [0x42u8; 32];
+        let data = cggmp24::signing::PrehashedDataToSign::from_scalar(
+            Scalar::<Secp256k1>::from_be_bytes_mod_order(sighash),
+        );
+
+        let sig_a = sign_2of2(&ks_a, &sighash);
+        let pub_a = *ks_a[0].core.shared_public_key;
+        sig_a
+            .verify(&pub_a, &data)
+            .expect("wallet A signature must verify under joint_A");
+
+        let sig_b = sign_2of2(&ks_b, &sighash);
+        let pub_b = *ks_b[0].core.shared_public_key;
+        sig_b
+            .verify(&pub_b, &data)
+            .expect("wallet B signature must verify under joint_B");
+
+        // Cross-negative: A's signature must NOT verify under B's key.
+        assert!(
+            sig_a.verify(&pub_b, &data).is_err(),
+            "wallet A's signature must NOT verify under wallet B's key"
+        );
     }
 }
